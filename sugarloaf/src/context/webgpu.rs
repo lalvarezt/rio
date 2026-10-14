@@ -38,13 +38,20 @@ impl<'a> WgpuContext<'a> {
         let backend = wgpu::Backends::from_env().unwrap_or(wgpu_backend);
         let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
         instance_desc.backends = backend;
-        let instance = wgpu::Instance::new(instance_desc);
+        let instance = {
+            let _timing =
+                tracing::debug_span!(target: "rio_profile", "gpu.instance").entered();
+            wgpu::Instance::new(instance_desc)
+        };
 
         tracing::info!("selected instance: {instance:?}");
         tracing::info!("initializing the surface");
 
-        let surface: wgpu::Surface<'a> =
-            instance.create_surface(sugarloaf_window).unwrap();
+        let surface: wgpu::Surface<'a> = {
+            let _timing =
+                tracing::debug_span!(target: "rio_profile", "gpu.surface").entered();
+            instance.create_surface(sugarloaf_window).unwrap()
+        };
 
         // A translucent window needs an adapter whose surface offers an
         // alpha-carrying composite mode. On Windows that decides whether
@@ -110,6 +117,8 @@ impl<'a> WgpuContext<'a> {
         let alpha_capable_adapter: Option<wgpu::Adapter> = None;
 
         let default_adapter = |surface: &wgpu::Surface| {
+            let _timing =
+                tracing::debug_span!(target: "rio_profile", "gpu.adapter").entered();
             futures::executor::block_on(instance.request_adapter(
                 &wgpu::RequestAdapterOptions {
                     // Hard-coded — sugarloaf used to expose a
@@ -126,6 +135,8 @@ impl<'a> WgpuContext<'a> {
             .expect("Request adapter")
         };
         let request_device = |adapter: &wgpu::Adapter| {
+            let _timing =
+                tracing::debug_span!(target: "rio_profile", "gpu.device").entered();
             if let Ok(result) = futures::executor::block_on(
                 adapter.request_device(&wgpu::DeviceDescriptor::default()),
             ) {
@@ -214,6 +225,8 @@ impl<'a> WgpuContext<'a> {
             }
         };
 
+        let configure_timing =
+            tracing::debug_span!(target: "rio_profile", "gpu.configure").entered();
         surface.configure(
             &device,
             &wgpu::SurfaceConfiguration {
@@ -228,6 +241,7 @@ impl<'a> WgpuContext<'a> {
                 desired_maximum_frame_latency: 2,
             },
         );
+        drop(configure_timing);
 
         let max_texture_dimension_2d = device.limits().max_texture_dimension_2d;
 

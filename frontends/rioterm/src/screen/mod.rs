@@ -143,6 +143,8 @@ impl Screen<'_> {
         font_library: &rio_backend::sugarloaf::font::FontLibrary,
         open_url: Option<String>,
     ) -> Result<Screen<'screen>, Box<dyn Error>> {
+        #[cfg(feature = "profiling")]
+        let _timing = crate::profiling::span("startup.screen");
         let size = window_properties.size;
         let scale = window_properties.scale;
         let raw_window_handle = window_properties.raw_window_handle;
@@ -217,6 +219,8 @@ impl Screen<'_> {
             prefer_alpha_capable_adapter: !window_should_be_opaque(config),
         };
 
+        #[cfg(feature = "profiling")]
+        let gpu_timing = crate::profiling::span("startup.sugarloaf");
         let mut sugarloaf: Sugarloaf = match Sugarloaf::new(
             sugarloaf_window,
             sugarloaf_renderer,
@@ -230,6 +234,8 @@ impl Screen<'_> {
             }
         };
 
+        #[cfg(feature = "profiling")]
+        drop(gpu_timing);
         #[cfg(wgpu_backend)]
         sugarloaf.update_filters(config.renderer.filters.as_slice());
 
@@ -3996,6 +4002,8 @@ impl Screen<'_> {
     }
 
     pub(crate) fn render(&mut self) -> Option<crate::context::renderable::WindowUpdate> {
+        #[cfg(feature = "profiling")]
+        let _timing = crate::profiling::span("frame.screen");
         self.update_close_button_hover(self.mouse.x, self.mouse.y);
         if self.renderer.is_window_focused {
             self.context_manager.clear_current_bell();
@@ -4745,6 +4753,8 @@ impl Screen<'_> {
             }
 
             if should_present {
+                #[cfg(feature = "profiling")]
+                let _present_timing = crate::profiling::span("frame.present");
                 if frame_grids.is_empty() {
                     self.sugarloaf.render();
                 } else {
@@ -4756,6 +4766,9 @@ impl Screen<'_> {
                 if self.sugarloaf.take_frame_dropped() {
                     self.mark_dirty();
                     self.context_manager.request_render();
+                } else {
+                    #[cfg(feature = "profiling")]
+                    crate::profiling::frame();
                 }
             } else {
                 // Nothing to draw this frame, but `Renderer::run`

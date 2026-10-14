@@ -18,6 +18,8 @@ pub const DEFAULT_ICON: Icon = Icon::Glyph("\u{ea85}");
 pub const SSH_ICON: Icon = Icon::Glyph("\u{f08c0}");
 
 pub fn load_font(library: &FontLibrary) -> Option<usize> {
+    #[cfg(feature = "profiling")]
+    let _timing = crate::profiling::span("header.load_app_font");
     if let Some(id) = library.font_id_for_postscript_name("SymbolsNFM") {
         return Some(id);
     }

@@ -16,6 +16,11 @@ readme.workspace = true
 name = "rio"
 path = "src/main.rs"
 
+[[bin]]
+name = "rio-profile"
+path = "src/main.rs"
+required-features = ["profiling"]
+
 [dependencies]
 global-hotkey = "0.8.0"
 base64 = { workspace = true }
@@ -105,6 +110,7 @@ workspace = true
 features = ["wgpu"]
 
 [features]
+profiling = []
 default = ["wayland", "x11"]
 audio = ["cpal"]
 x11 = [

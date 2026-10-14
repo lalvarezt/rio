@@ -301,6 +301,9 @@ impl Text {
         {
             std::collections::hash_map::Entry::Occupied(e) => *e.get(),
             std::collections::hash_map::Entry::Vacant(e) => {
+                let _timing =
+                    tracing::debug_span!(target: "rio_profile", "ui.font_fallback")
+                        .entered();
                 let mut ss = SpanStyle::default();
                 let weight = if opts.bold {
                     Weight::BOLD

@@ -55,6 +55,8 @@ pub fn centered_text_y(
     cy: f32,
     opts: &DrawOpts,
 ) -> f32 {
+    #[cfg(feature = "profiling")]
+    let _timing = crate::profiling::span("header.vertical_bounds");
     let (top, height) = sugarloaf
         .text_mut()
         .vertical_bounds(text, opts)
@@ -63,6 +65,8 @@ pub fn centered_text_y(
 }
 
 fn load_font(library: &FontLibrary, name: &str, file: &str) -> Option<usize> {
+    #[cfg(feature = "profiling")]
+    let _timing = crate::profiling::span("header.load_font");
     if let Some(id) = library.font_id_for_postscript_name(name) {
         return Some(id);
     }
@@ -177,6 +181,8 @@ impl Header {
     }
 
     pub fn render(&mut self, sugarloaf: &mut Sugarloaf, width: f32, color: [f32; 4]) {
+        #[cfg(feature = "profiling")]
+        let _timing = crate::profiling::span("header.render");
         if self.fullscreen {
             self.hover = None;
             self.opacity.fill(0.0);

@@ -143,6 +143,8 @@ fn fit_title_to_width<'a>(
     max_width: f32,
     #[allow(unused)] opts: &DrawOpts,
 ) -> Cow<'a, str> {
+    #[cfg(feature = "profiling")]
+    let _timing = crate::profiling::span("tabs.fit_title");
     #[cfg(target_os = "windows")]
     {
         let ui = sugarloaf.text_mut();
@@ -752,6 +754,8 @@ impl Island {
         sugarloaf: &mut Sugarloaf,
         context_manager: &ContextManager<EventProxy>,
     ) {
+        #[cfg(feature = "profiling")]
+        let _timing = crate::profiling::span("tabs.measure_widths");
         let opts = DrawOpts {
             font_size: crate::renderer::windows_chrome::snap(
                 TITLE_FONT_SIZE,
@@ -1358,6 +1362,8 @@ impl Island {
         context_manager: &ContextManager<EventProxy>,
         bg_color: [f32; 4],
     ) {
+        #[cfg(feature = "profiling")]
+        let _timing = crate::profiling::span("tabs.render");
         let (window_width, _window_height, scale_factor) = dimensions;
         let num_tabs = context_manager.len();
         let current_tab_index = context_manager.current_index();

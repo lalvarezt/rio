@@ -15,9 +15,11 @@ mod ime;
 mod layout;
 mod messenger;
 mod mouse;
-#[cfg(windows)]
+#[cfg(all(windows, not(feature = "profiling")))]
 mod panic;
 mod platform;
+#[cfg(feature = "profiling")]
+mod profiling;
 mod renderer;
 mod router;
 mod scheduler;
@@ -105,6 +107,10 @@ fn setup_logs_by_filter_level(
         .with_ansi(true)
         .with_filter(env_filter.parse("")?);
     let subscriber = tracing_subscriber::registry().with(stdout_subscriber);
+    #[cfg(feature = "profiling")]
+    let subscriber = subscriber.with(profiling::TimingLayer.with_filter(
+        tracing_subscriber::filter::filter_fn(|meta| meta.target() == "rio_profile"),
+    ));
 
     let mut log_file_path = PathBuf::new();
     if log_file {
@@ -134,7 +140,9 @@ fn setup_logs_by_filter_level(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(windows)]
+    #[cfg(feature = "profiling")]
+    profiling::init();
+    #[cfg(all(windows, not(feature = "profiling")))]
     panic::attach_handler();
 
     // When linked with the windows subsystem windows won't automatically attach
@@ -234,8 +242,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     setup_environment_variables(&config);
 
+    #[cfg(all(feature = "profiling", windows))]
+    {
+        config.shell.program = Some("cmd.exe".to_owned());
+        config.shell.args = vec![
+            "/d".into(),
+            "/q".into(),
+            "/k".into(),
+            "title RIO_PROFILE_READY".into(),
+        ];
+        config.navigation.hide_if_single = false;
+        config.confirm_before_quit = false;
+    }
+
+    #[cfg(feature = "profiling")]
+    let event_loop_timing = profiling::span("startup.event_loop");
     let window_event_loop =
         rio_window::event_loop::EventLoop::<EventPayload>::with_user_event().build()?;
+    #[cfg(feature = "profiling")]
+    drop(event_loop_timing);
 
     let app_id = args.window_options.terminal_options.app_id;
 

@@ -502,6 +502,8 @@ impl Router<'_> {
         fonts: rio_backend::sugarloaf::font::SugarloafFonts,
         clipboard: Clipboard,
     ) -> Router<'b> {
+        #[cfg(feature = "profiling")]
+        let _timing = crate::profiling::span("startup.font_library");
         let (font_library, fonts_not_found) =
             rio_backend::sugarloaf::font::FontLibrary::new(fonts);
 
@@ -880,8 +882,12 @@ impl<'a> RouteWindow<'a> {
             startup_notify::reset_activation_token_env();
         }
 
+        #[cfg(feature = "profiling")]
+        let window_timing = crate::profiling::span("startup.native_window");
         let winit_window = event_loop.create_window(window_builder).unwrap();
         configure_window(&winit_window, config, quake);
+        #[cfg(feature = "profiling")]
+        drop(window_timing);
 
         let properties = ScreenWindowProperties {
             size: winit_window.inner_size(),

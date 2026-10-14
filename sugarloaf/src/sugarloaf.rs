@@ -233,9 +233,17 @@ impl Sugarloaf<'_> {
     ) -> Result<Sugarloaf<'a>, Box<SugarloafWithErrors<'a>>> {
         let font_features = renderer.font_features.to_owned();
         let colorspace = renderer.colorspace;
-        let ctx = Context::new(window, renderer);
+        let ctx = {
+            let _timing =
+                tracing::debug_span!(target: "rio_profile", "gpu.context").entered();
+            Context::new(window, renderer)
+        };
 
-        let renderer = Renderer::new(&ctx, colorspace);
+        let renderer = {
+            let _timing =
+                tracing::debug_span!(target: "rio_profile", "gpu.pipelines").entered();
+            Renderer::new(&ctx, colorspace)
+        };
         let state = SugarState::new(layout, font_library, &font_features);
 
         let font_cache = FontCache::new();

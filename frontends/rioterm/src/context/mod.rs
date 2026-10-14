@@ -261,6 +261,8 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         dimension: ContextDimension,
         config: &ContextManagerConfig,
     ) -> Result<Context<T>, Box<dyn Error>> {
+        #[cfg(feature = "profiling")]
+        let _timing = crate::profiling::span("startup.context");
         let route_id = ROUTE_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
 
         #[cfg(test)]
@@ -357,6 +359,8 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
         #[cfg(target_os = "windows")]
         {
+            #[cfg(feature = "profiling")]
+            let _timing = crate::profiling::span("startup.conpty");
             pty = match create_pty(
                 shell_program,
                 shell_args.to_vec(),
@@ -819,6 +823,8 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[cfg(target_os = "windows")]
     pub fn application_for_tab(&self, index: usize) -> Option<TabApplication> {
+        #[cfg(feature = "profiling")]
+        let _timing = crate::profiling::span("tabs.application");
         let context = self.contexts.get(index)?.current();
         let terminal = context.terminal.lock();
         let reported_app = terminal

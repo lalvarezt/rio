@@ -54,6 +54,8 @@ impl Application<'_> {
         event_loop: &EventLoop<EventPayload>,
         app_id: Option<String>,
     ) -> Application<'app> {
+        #[cfg(feature = "profiling")]
+        let _timing = crate::profiling::span("startup.application");
         // SAFETY: Since this takes a pointer to the winit event loop, it MUST be dropped first,
         // which is done in `exiting`.
         let clipboard =
@@ -173,6 +175,8 @@ impl Application<'_> {
         route_id: usize,
         raw_title: Option<&str>,
     ) {
+        #[cfg(feature = "profiling")]
+        crate::profiling::shell_title(route_id, raw_title);
         if let Some(route) = self.router.routes.get_mut(&window_id) {
             if route
                 .window
@@ -367,6 +371,20 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             None,
             self.app_id.as_deref(),
         );
+
+        #[cfg(feature = "profiling")]
+        if cause == StartCause::Init {
+            let tabs = crate::profiling::tab_count();
+            if let Some(route) = self.router.routes.values_mut().next() {
+                for _ in 1..tabs {
+                    route
+                        .window
+                        .screen
+                        .context_manager
+                        .add_context(false, crate::context::next_rich_text_id());
+                }
+            }
+        }
 
         if cause == StartCause::Init {
             self.setup_quake_hotkey();
@@ -2390,6 +2408,17 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(feature = "profiling")]
+        if crate::profiling::finished() {
+            event_loop.exit();
+            return;
+        }
+        #[cfg(feature = "profiling")]
+        if crate::profiling::needs_frame() {
+            for route in self.router.routes.values_mut() {
+                route.request_overlay_redraw();
+            }
+        }
         // A confirmed quit can be set from any input path (keys today,
         // a future mouse or menu handler tomorrow); honoring it here,
         // once per event batch, keeps the exit independent of which
@@ -2406,6 +2435,13 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
         let control_flow = match self.scheduler.update() {
             Some(instant) => ControlFlow::WaitUntil(instant),
             None => ControlFlow::Wait,
+        };
+        #[cfg(feature = "profiling")]
+        let control_flow = match control_flow {
+            ControlFlow::WaitUntil(deadline) => ControlFlow::WaitUntil(
+                deadline.min(Instant::now() + Duration::from_millis(50)),
+            ),
+            _ => ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(50)),
         };
         event_loop.set_control_flow(control_flow);
     }
@@ -2459,6 +2495,8 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
     // This is irreversible - if this event is emitted, it is guaranteed to be the last event that gets emitted.
     // You generally want to treat this as an “do on quit” event.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        #[cfg(feature = "profiling")]
+        crate::profiling::report();
         // Ensure that all the windows are dropped, so the destructors for
         // Renderer and contexts ran.
         self.router.routes.clear();

@@ -454,6 +454,8 @@ impl Renderer {
         sugarloaf: &mut Sugarloaf,
         context_manager: &mut ContextManager<EventProxy>,
     ) -> (Option<crate::context::renderable::WindowUpdate>, bool) {
+        #[cfg(feature = "profiling")]
+        let _timing = crate::profiling::span("frame.renderer");
         let mut any_panel_dirty = false;
         let grid = context_manager.current_grid_mut();
         let active_route = grid.current().route_id;
