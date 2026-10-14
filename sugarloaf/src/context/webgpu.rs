@@ -31,17 +31,37 @@ impl<'a> WgpuContext<'a> {
         // - `vulkan`
         // - `metal`
         // - `dx12`
-        // - `dx11`
         // - `gl`
         // - `webgpu`
-        // - `primary`
         let backend = wgpu::Backends::from_env().unwrap_or(wgpu_backend);
         let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
         instance_desc.backends = backend;
         let instance = {
             let _timing =
                 tracing::debug_span!(target: "rio_profile", "gpu.instance").entered();
-            wgpu::Instance::new(instance_desc)
+            #[cfg(target_os = "windows")]
+            let instance = {
+                use std::collections::HashMap;
+                use std::sync::{Mutex, OnceLock};
+
+                // Backends and instance options are process-wide on Windows.
+                // Keep adapter selection per surface, but initialize each
+                // requested set of graphics backends only once.
+                static INSTANCES: OnceLock<
+                    Mutex<HashMap<wgpu::Backends, wgpu::Instance>>,
+                > = OnceLock::new();
+                let mut instances = INSTANCES
+                    .get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock()
+                    .unwrap();
+                instances
+                    .entry(backend)
+                    .or_insert_with(|| wgpu::Instance::new(instance_desc))
+                    .clone()
+            };
+            #[cfg(not(target_os = "windows"))]
+            let instance = wgpu::Instance::new(instance_desc);
+            instance
         };
 
         tracing::info!("selected instance: {instance:?}");
