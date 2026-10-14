@@ -1184,6 +1184,17 @@ impl Window {
         }
     }
 
+    pub fn request_close(&self) {
+        unsafe {
+            PostMessageW(
+                self.hwnd(),
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+                0,
+                0,
+            );
+        }
+    }
+
     #[inline]
     pub fn set_title_background_color(&self, color: Color) {
         unsafe {

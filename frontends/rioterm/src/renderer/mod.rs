@@ -6,6 +6,8 @@ pub(crate) fn is_printable_text(text: &str) -> bool {
     !text.is_empty() && text.chars().all(|c| !c.is_control())
 }
 
+#[cfg(target_os = "windows")]
+mod app_icons;
 pub mod assistant;
 pub mod command_palette;
 pub mod confirm_quit;
@@ -16,6 +18,8 @@ pub mod scrollbar;
 pub mod search;
 pub mod trail_cursor;
 pub mod utils;
+#[cfg(target_os = "windows")]
+pub mod windows_chrome;
 
 use rio_backend::event::TerminalDamage;
 

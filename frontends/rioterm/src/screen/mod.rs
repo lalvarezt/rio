@@ -2864,6 +2864,58 @@ impl Screen<'_> {
         if self.allow_manual_dragging {
             self.start_window_drag(window);
         }
+        #[cfg(target_os = "windows")]
+        if !window.is_decorated() {
+            self.mouse.left_button_state = ElementState::Released;
+            let _ = window.drag_window();
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn windows_header_action(
+        &self,
+    ) -> Option<crate::renderer::windows_chrome::HeaderAction> {
+        let scale = self.sugarloaf.scale_factor();
+        self.renderer.island.as_ref()?.window_header.hit_test(
+            self.mouse.x as f32 / scale,
+            self.mouse.y as f32 / scale,
+            self.sugarloaf.window_size().width / scale,
+        )
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn handle_windows_header_click(
+        &mut self,
+        window: &rio_window::window::Window,
+        clipboard: &mut Clipboard,
+    ) -> bool {
+        use crate::renderer::windows_chrome::HeaderAction;
+        use rio_window::platform::windows::WindowExtWindows;
+        let Some(action) = self.windows_header_action() else {
+            return false;
+        };
+        match action {
+            HeaderAction::Minimize => window.set_minimized(true),
+            HeaderAction::Maximize => window.set_maximized(!window.is_maximized()),
+            HeaderAction::Close => window.request_close(),
+            HeaderAction::NewTab => self.create_tab(clipboard),
+        }
+        true
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn update_windows_header_hover(&mut self, x: f64, y: f64) -> bool {
+        let scale = self.sugarloaf.scale_factor();
+        let width = self.sugarloaf.window_size().width / scale;
+        let changed = self.renderer.island.as_mut().is_some_and(|island| {
+            island
+                .window_header
+                .hover(x as f32 / scale, y as f32 / scale, width)
+        });
+        if changed {
+            self.mark_dirty();
+        }
+        changed
     }
 
     #[inline]
@@ -2895,6 +2947,28 @@ impl Screen<'_> {
         let num_tabs = self.context_manager.len();
         let scale_factor = self.sugarloaf.scale_factor();
 
+        #[cfg(target_os = "windows")]
+        let tab_changed = {
+            let layout = self.island_tab_layout(num_tabs);
+            let x = mouse_x as f32 / scale_factor - layout.left_margin;
+            let hovered_tab = (self.renderer.navigation.island_visible(num_tabs)
+                && mouse_y >= 0.0
+                && mouse_y <= (ISLAND_HEIGHT * scale_factor) as f64
+                && x >= 0.0
+                && x < layout.tabs_width
+                && layout.tab_width > 0.0)
+                .then(|| ((x / layout.tab_width) as usize).min(num_tabs - 1));
+            let changed = self
+                .renderer
+                .island
+                .as_mut()
+                .is_some_and(|island| island.set_tab_hover(hovered_tab));
+            if changed {
+                self.mark_dirty();
+            }
+            changed
+        };
+
         let hovering = num_tabs > 1
             && self.renderer.navigation.island_visible(num_tabs)
             && mouse_y <= (ISLAND_HEIGHT * scale_factor) as f64
@@ -2904,12 +2978,35 @@ impl Screen<'_> {
                 mouse_x as f32 / scale_factor,
             );
 
-        self.apply_close_hover(hovering)
+        let changed = self.apply_close_hover(hovering);
+        #[cfg(target_os = "windows")]
+        return changed || tab_changed;
+        #[cfg(not(target_os = "windows"))]
+        changed
     }
 
     #[inline]
     pub fn clear_close_button_hover(&mut self) -> bool {
-        self.apply_close_hover(false)
+        let changed = self.apply_close_hover(false);
+        #[cfg(target_os = "windows")]
+        {
+            let header_changed = self
+                .renderer
+                .island
+                .as_mut()
+                .is_some_and(|island| island.window_header.clear_hover());
+            let tab_changed = self
+                .renderer
+                .island
+                .as_mut()
+                .is_some_and(|island| island.set_tab_hover(None));
+            if tab_changed || header_changed {
+                self.mark_dirty();
+            }
+            return changed || tab_changed || header_changed;
+        }
+        #[cfg(not(target_os = "windows"))]
+        changed
     }
 
     pub fn handle_island_click(
@@ -3760,6 +3857,16 @@ impl Screen<'_> {
             &mut self.sugarloaf,
             &self.context_manager.current().dimension,
         );
+        #[cfg(target_os = "windows")]
+        if let Some(island) = &mut self.renderer.island {
+            let width =
+                self.sugarloaf.window_size().width / self.sugarloaf.scale_factor();
+            island.window_header.render(
+                &mut self.sugarloaf,
+                width,
+                self.renderer.named_colors.foreground,
+            );
+        }
         self.sugarloaf.render();
     }
 

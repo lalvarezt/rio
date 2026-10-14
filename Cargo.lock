@@ -4066,6 +4066,7 @@ dependencies = [
  "raw-window-handle",
  "regex",
  "rio-backend",
+ "rio-fonts",
  "rio-grid",
  "rio-notifier",
  "rio-unicode",

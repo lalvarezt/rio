@@ -13,21 +13,40 @@ use rio_backend::program_status::{
     BlockedKind, ProgramState, ProgramStatusRecord, ProgramStatusStore,
 };
 use rio_backend::sugarloaf::text::DrawOpts;
-use rio_backend::sugarloaf::{Attributes, Sugarloaf};
+#[cfg(not(target_os = "windows"))]
+use rio_backend::sugarloaf::Attributes;
+use rio_backend::sugarloaf::Sugarloaf;
 use rustc_hash::FxHashMap;
 use std::borrow::Cow;
 use std::time::Instant;
 
+#[cfg(not(target_os = "windows"))]
 pub const ISLAND_HEIGHT: f32 = 38.0;
+#[cfg(target_os = "windows")]
+pub const ISLAND_HEIGHT: f32 = crate::renderer::windows_chrome::HEADER_HEIGHT;
 const PROGRESS_BAR_HEIGHT: f32 = 3.0;
 
 const PROGRESS_BAR_TIMEOUT_SECS: u64 = 15;
+#[cfg(not(target_os = "windows"))]
 const TITLE_FONT_SIZE: f32 = 12.0;
+#[cfg(target_os = "windows")]
+const TITLE_FONT_SIZE: f32 = 15.0;
 
+#[cfg(not(target_os = "windows"))]
 const TAB_PADDING_X: f32 = 27.0;
+#[cfg(target_os = "windows")]
+const TAB_PADDING_X: f32 = 40.0;
+#[cfg(target_os = "windows")]
+const TAB_TITLE_PADDING_RIGHT: f32 = 14.0;
 const TAB_GAP: f32 = 6.0;
+#[cfg(not(target_os = "windows"))]
 const TAB_INSET_Y: f32 = 7.0;
+#[cfg(target_os = "windows")]
+const TAB_INSET_Y: f32 = 8.0;
+#[cfg(not(target_os = "windows"))]
 const TAB_RADIUS: f32 = 6.0;
+#[cfg(target_os = "windows")]
+const TAB_RADIUS: f32 = 19.0;
 const TITLE_ELLIPSIS: char = '…';
 /// Bell dot for tabs that rang while in the background, and the gap
 /// between it and the tab title. A dot, not a glyph: the UI text layer
@@ -118,13 +137,43 @@ fn fit_title_to_width<'a>(
     sugarloaf: &mut Sugarloaf,
     title: &'a str,
     max_width: f32,
+    #[allow(unused)] opts: &DrawOpts,
 ) -> Cow<'a, str> {
-    let attrs = Attributes::default();
-    fit_title_with_widths(title, max_width, |c| {
-        sugarloaf.char_advance(c, attrs, TITLE_FONT_SIZE)
-    })
+    #[cfg(target_os = "windows")]
+    {
+        let ui = sugarloaf.text_mut();
+        if ui.measure(title, opts) <= max_width {
+            return Cow::Borrowed(title);
+        }
+        let ellipsis = TITLE_ELLIPSIS.to_string();
+        if ui.measure(&ellipsis, opts) > max_width {
+            return Cow::Borrowed("");
+        }
+        let boundaries: Vec<usize> = title.char_indices().map(|(i, _)| i).collect();
+        let mut low = 0;
+        let mut high = boundaries.len();
+        while low < high {
+            let mid = (low + high) / 2;
+            let candidate = format!("{}{}", &title[..boundaries[mid]], ellipsis);
+            if ui.measure(&candidate, opts) <= max_width {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        let end = low.checked_sub(1).map_or(0, |i| boundaries[i]);
+        return Cow::Owned(format!("{}{}", &title[..end], ellipsis));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let attrs = Attributes::default();
+        fit_title_with_widths(title, max_width, |c| {
+            sugarloaf.char_advance(c, attrs, TITLE_FONT_SIZE)
+        })
+    }
 }
 
+#[cfg(any(test, not(target_os = "windows")))]
 fn fit_title_with_widths<'a>(
     title: &'a str,
     max_width: f32,
@@ -170,11 +219,19 @@ pub fn tab_strip_layout(
 ) -> TabStripLayout {
     #[cfg(target_os = "macos")]
     let left_margin = ISLAND_MARGIN_LEFT_MACOS;
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let left_margin = 0.0;
+    #[cfg(target_os = "windows")]
+    let left_margin = 6.0;
 
+    #[cfg(target_os = "windows")]
+    let right_margin = ISLAND_MARGIN_RIGHT
+        + crate::renderer::windows_chrome::controls_width(window_width / scale_factor)
+        + 8.0;
+    #[cfg(not(target_os = "windows"))]
+    let right_margin = ISLAND_MARGIN_RIGHT;
     let available_width =
-        (window_width / scale_factor) - ISLAND_MARGIN_RIGHT - left_margin;
+        ((window_width / scale_factor) - right_margin - left_margin).max(0.0);
     let tab_width =
         (available_width / num_tabs.max(1) as f32).clamp(0.0, max_tab_width.max(0.0));
     TabStripLayout {
@@ -210,6 +267,89 @@ fn island_fills(bg: [f32; 4]) -> IslandFills {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn windows_island_fills(bg: [f32; 4]) -> IslandFills {
+    let mut fills = island_fills(bg);
+    fills.inactive[3] = 0.0;
+    if 0.2126 * bg[0] + 0.7152 * bg[1] + 0.0722 * bg[2] > 0.5 {
+        fills.outline = Some([0.0, 0.0, 0.0, 0.12]);
+    } else {
+        fills.active = [1.0, 1.0, 1.0, 0.11];
+        fills.outline = Some([1.0, 1.0, 1.0, 0.16]);
+    }
+    fills
+}
+
+#[cfg(target_os = "windows")]
+fn mix_color(from: [f32; 4], to: [f32; 4], amount: f32) -> [f32; 4] {
+    std::array::from_fn(|i| from[i] + (to[i] - from[i]) * amount)
+}
+
+#[cfg(target_os = "windows")]
+fn fade_toward(value: &mut f32, target: f32, dt: f32) {
+    *value += (target - *value) * (1.0 - (-dt / 0.045).exp());
+    if (*value - target).abs() < 0.005 {
+        *value = target;
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn draw_tab_icon(
+    sugarloaf: &mut Sugarloaf,
+    x: f32,
+    color: [f32; 4],
+    order: u8,
+    icon: &str,
+    font_id: Option<usize>,
+) {
+    let cy = ISLAND_HEIGHT / 2.0;
+    sugarloaf.rounded_rect(
+        None,
+        x,
+        cy - 11.0,
+        24.0,
+        22.0,
+        [color[0], color[1], color[2], color[3] * 0.08],
+        0.05,
+        5.0,
+        order,
+    );
+    if let Some(font_id) = font_id {
+        crate::renderer::windows_chrome::draw_font_icon(
+            sugarloaf,
+            icon,
+            x + 12.0,
+            cy,
+            18.0,
+            color,
+            font_id,
+        );
+        return;
+    }
+    if crate::renderer::windows_chrome::draw_icon(
+        sugarloaf,
+        "\u{e756}",
+        x + 12.0,
+        cy,
+        18.0,
+        color,
+    ) {
+        return;
+    }
+    sugarloaf.line(x + 5.0, cy - 3.0, x + 8.0, cy, 1.2, 0.0, color, order);
+    sugarloaf.line(x + 8.0, cy, x + 5.0, cy + 3.0, 1.2, 0.0, color, order);
+    sugarloaf.line(
+        x + 11.0,
+        cy + 3.0,
+        x + 15.0,
+        cy + 3.0,
+        1.2,
+        0.0,
+        color,
+        order,
+    );
+}
+
 #[inline]
 fn over(dst: [f32; 4], src: [f32; 4]) -> [f32; 4] {
     let a = src[3];
@@ -234,17 +374,29 @@ fn draw_island(
     punch: Option<[f32; 4]>,
     order: u8,
 ) {
+    #[cfg(target_os = "windows")]
+    let (x, y, w, h) = {
+        let scale = sugarloaf.scale_factor();
+        let snap = |v| crate::renderer::windows_chrome::snap(v, scale);
+        let left = snap(x);
+        let top = snap(y);
+        (left, top, snap(x + w) - left, snap(y + h) - top)
+    };
+    #[cfg(target_os = "windows")]
+    let border = 1.0 / sugarloaf.scale_factor();
+    #[cfg(not(target_os = "windows"))]
+    let border = 1.0;
     match outline {
         Some(ring) => {
             sugarloaf.rounded_rect(None, x, y, w, h, ring, 0.05, radius, order);
-            let fw = (w - 2.0).max(0.0);
-            let fh = (h - 2.0).max(0.0);
-            let fr = (radius - 1.0).clamp(0.0, fw.min(fh) / 2.0);
+            let fw = (w - border * 2.0).max(0.0);
+            let fh = (h - border * 2.0).max(0.0);
+            let fr = (radius - border).clamp(0.0, fw.min(fh) / 2.0);
             if let Some(bg) = punch {
                 sugarloaf.rounded_rect(
                     None,
-                    x + 1.0,
-                    y + 1.0,
+                    x + border,
+                    y + border,
                     fw,
                     fh,
                     bg,
@@ -253,7 +405,17 @@ fn draw_island(
                     order,
                 );
             }
-            sugarloaf.rounded_rect(None, x + 1.0, y + 1.0, fw, fh, fill, 0.05, fr, order);
+            sugarloaf.rounded_rect(
+                None,
+                x + border,
+                y + border,
+                fw,
+                fh,
+                fill,
+                0.05,
+                fr,
+                order,
+            );
         }
         None => sugarloaf.rounded_rect(None, x, y, w, h, fill, 0.05, radius, order),
     }
@@ -286,6 +448,7 @@ fn single_title_budget(window_width: f32, scale_factor: f32, left_margin: f32) -
 /// enough left to sit under the traffic lights on macOS. Physical in,
 /// logical out, as above.
 #[inline]
+#[cfg(any(test, not(target_os = "windows")))]
 fn single_title_x(
     window_width: f32,
     scale_factor: f32,
@@ -297,6 +460,12 @@ fn single_title_x(
 
 #[inline]
 fn close_button_center(island_x: f32, island_w: f32) -> Option<f32> {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (island_x, island_w);
+        None
+    }
+    #[cfg(not(target_os = "windows"))]
     (island_w >= CLOSE_MIN_ISLAND_WIDTH)
         .then_some(island_x + island_w - CLOSE_MARGIN_RIGHT)
 }
@@ -333,6 +502,12 @@ fn draw_close_button(
         CLOSE_ALPHA_IDLE
     };
     let color = [color[0], color[1], color[2], color[3] * alpha];
+    #[cfg(target_os = "windows")]
+    if crate::renderer::windows_chrome::draw_icon(
+        sugarloaf, "\u{e8bb}", cx, cy, 8.0, color,
+    ) {
+        return;
+    }
     sugarloaf.line(
         cx - r,
         cy - r,
@@ -356,6 +531,8 @@ fn draw_close_button(
 }
 
 pub struct Island {
+    #[cfg(target_os = "windows")]
+    pub window_header: crate::renderer::windows_chrome::Header,
     pub hide_if_single: bool,
     /// Cap on tab width in logical px (`navigation.max-tab-width`).
     pub max_tab_width: f32,
@@ -397,6 +574,15 @@ pub struct Island {
     /// Cursor is over the active island's close button — draws the
     /// hover backdrop. Updated on every cursor move by `Screen`.
     close_hover: bool,
+    #[cfg(target_os = "windows")]
+    hovered_tab: Option<usize>,
+    #[cfg(target_os = "windows")]
+    selected_tab: usize,
+    /// Selection and hover opacity, animated only while changing.
+    #[cfg(target_os = "windows")]
+    tab_appearance: FxHashMap<usize, (f32, f32)>,
+    #[cfg(target_os = "windows")]
+    close_hover_opacity: f32,
 }
 
 impl Island {
@@ -407,6 +593,8 @@ impl Island {
         max_tab_width: f32,
     ) -> Self {
         Self {
+            #[cfg(target_os = "windows")]
+            window_header: crate::renderer::windows_chrome::Header::new(),
             hide_if_single,
             max_tab_width,
             inactive_text_color,
@@ -430,6 +618,14 @@ impl Island {
             slide_springs: FxHashMap::default(),
             last_anim_frame: Instant::now(),
             close_hover: false,
+            #[cfg(target_os = "windows")]
+            hovered_tab: None,
+            #[cfg(target_os = "windows")]
+            selected_tab: 0,
+            #[cfg(target_os = "windows")]
+            tab_appearance: FxHashMap::default(),
+            #[cfg(target_os = "windows")]
+            close_hover_opacity: 0.0,
         }
     }
 
@@ -438,6 +634,13 @@ impl Island {
     pub fn set_close_hover(&mut self, hover: bool) -> bool {
         let changed = self.close_hover != hover;
         self.close_hover = hover;
+        changed
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn set_tab_hover(&mut self, tab: Option<usize>) -> bool {
+        let changed = self.hovered_tab != tab;
+        self.hovered_tab = tab;
         changed
     }
 
@@ -634,6 +837,19 @@ impl Island {
 
     /// Check if the island needs continuous rendering (for animations)
     pub fn needs_redraw(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        if self.window_header.needs_redraw() {
+            return true;
+        }
+        #[cfg(target_os = "windows")]
+        if self.close_hover_opacity != u8::from(self.close_hover) as f32
+            || self.tab_appearance.iter().any(|(&i, &(active, hover))| {
+                active != u8::from(i == self.selected_tab) as f32
+                    || hover != u8::from(Some(i) == self.hovered_tab) as f32
+            })
+        {
+            return true;
+        }
         // A held drag doesn't need continuous frames: the floating tab
         // only moves on CursorMoved (which requests its own redraws);
         // only the slide springs animate between input events.
@@ -754,6 +970,15 @@ impl Island {
             .drain()
             .map(|(i, v)| (Self::remap_index(i, from, to), v))
             .collect();
+        #[cfg(target_os = "windows")]
+        {
+            self.tab_appearance = self
+                .tab_appearance
+                .drain()
+                .map(|(i, v)| (Self::remap_index(i, from, to), v))
+                .collect();
+            self.selected_tab = Self::remap_index(self.selected_tab, from, to);
+        }
         if let Some(picker) = self.color_picker_tab {
             self.color_picker_tab = Some(Self::remap_index(picker, from, to));
         }
@@ -804,6 +1029,15 @@ impl Island {
             .drain()
             .map(|(i, v)| (swap_key(i), v))
             .collect();
+        #[cfg(target_os = "windows")]
+        {
+            self.tab_appearance = self
+                .tab_appearance
+                .drain()
+                .map(|(i, v)| (swap_key(i), v))
+                .collect();
+            self.selected_tab = swap_key(self.selected_tab);
+        }
         if let Some(picker) = self.color_picker_tab {
             self.color_picker_tab = Some(swap_key(picker));
         }
@@ -939,6 +1173,12 @@ impl Island {
         let (window_width, _window_height, scale_factor) = dimensions;
         let num_tabs = context_manager.len();
         let current_tab_index = context_manager.current_index();
+        #[cfg(target_os = "windows")]
+        self.window_header.render(
+            sugarloaf,
+            window_width / scale_factor,
+            self.active_text_color,
+        );
 
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         self.sync_focused_program_status(context_manager);
@@ -952,14 +1192,22 @@ impl Island {
             // tabs.
             self.drag = None;
             self.slide_springs.clear();
-            self.render_progress_bar(sugarloaf, window_width, scale_factor, 0.0);
+            #[cfg(target_os = "windows")]
+            {
+                self.tab_appearance.clear();
+                self.close_hover_opacity = u8::from(self.close_hover) as f32;
+            }
+            let progress_y = if cfg!(target_os = "windows") {
+                ISLAND_HEIGHT
+            } else {
+                0.0
+            };
+            self.render_progress_bar(sugarloaf, window_width, scale_factor, progress_y);
             return;
         }
 
-        // A lone tab draws as a centred title with no island, and cannot be
-        // reordered. A drag can only start with two or more tabs, but one can
-        // outlive the second tab (its shell exits mid-drag), and that would
-        // float an island where the title belongs.
+        // A lone tab cannot be reordered. Cancel a drag if the other tab's
+        // shell exits while it is in progress.
         if num_tabs == 1 {
             self.drag = None;
             self.slide_springs.clear();
@@ -988,6 +1236,24 @@ impl Island {
         self.slide_springs
             .retain(|_, s| s.update(dt, DRAG_ANIMATION_LENGTH));
 
+        #[cfg(target_os = "windows")]
+        {
+            self.selected_tab = current_tab_index;
+            self.tab_appearance.retain(|&i, _| i < num_tabs);
+            for i in 0..num_tabs {
+                let active = u8::from(i == current_tab_index) as f32;
+                let hover = u8::from(Some(i) == self.hovered_tab) as f32;
+                let appearance = self.tab_appearance.entry(i).or_insert((active, 0.0));
+                fade_toward(&mut appearance.0, active, dt);
+                fade_toward(&mut appearance.1, hover, dt);
+            }
+            fade_toward(
+                &mut self.close_hover_opacity,
+                u8::from(self.close_hover) as f32,
+                dt,
+            );
+        }
+
         let layout =
             tab_strip_layout(window_width, scale_factor, num_tabs, self.max_tab_width);
         let TabStripLayout {
@@ -1004,11 +1270,44 @@ impl Island {
         let drag_index = self.drag_index();
         let floating_left = self.drag_floating_left(&layout);
 
-        // Adaptive island fills, derived from the effective window bg
-        // each frame so OSC 11 and theme changes stay coherent. The
-        // strip itself keeps the plain window background — the islands
-        // float directly on it, with no strip tint or border lines.
+        // Derive the chrome from the effective background so OSC 11 and
+        // theme changes keep the tab strip coherent with the terminal.
+        #[cfg(not(target_os = "windows"))]
         let fills = island_fills(bg_color);
+        #[cfg(target_os = "windows")]
+        let fills = windows_island_fills(bg_color);
+        #[cfg(target_os = "windows")]
+        let group_fill = {
+            let mut color = fills.inactive;
+            color[3] = 0.045;
+            color
+        };
+        #[cfg(target_os = "windows")]
+        {
+            sugarloaf.rounded_rect(
+                None,
+                left_margin,
+                6.0,
+                layout.tabs_width,
+                ISLAND_HEIGHT - 12.0,
+                group_fill,
+                0.05,
+                ((ISLAND_HEIGHT - 12.0) / 2.0).min(layout.tabs_width / 2.0),
+                0,
+            );
+            let mut divider = fills.outline.unwrap_or(fills.active);
+            divider[3] *= 0.55;
+            sugarloaf.rect(
+                None,
+                0.0,
+                ISLAND_HEIGHT - 1.0,
+                window_width / scale_factor,
+                1.0,
+                divider,
+                0.0,
+                0,
+            );
+        }
 
         // Render each tab
         for tab_index in 0..num_tabs {
@@ -1033,17 +1332,27 @@ impl Island {
             // tab or past the left edge (issue #1508).
             let raw_title = self.get_title_for_tab(context_manager, tab_index);
             let program_status = self.status_for_tab(context_manager, tab_index);
+            #[cfg(target_os = "windows")]
+            let app_icon = context_manager
+                .program_and_title_for_tab(tab_index)
+                .map(|(program, title)| {
+                    super::app_icons::for_program(
+                        &program,
+                        &title,
+                        program_status.as_ref(),
+                    )
+                })
+                .unwrap_or(super::app_icons::DEFAULT_ICON);
             let raw_title = Self::status_title(program_status.as_ref(), &raw_title);
             if raw_title.is_empty() {
                 x_position += tab_width;
                 continue;
             }
-            // A lone tab has nothing to be distinguished from, so it gets no
-            // island at all: just its title, centred across the strip. That
-            // leaves the width of the window to spend on the title, and no
-            // fill to carry a custom colour, which moves to the text.
-            let single = num_tabs == 1;
+            // Windows keeps the same pill for one or many tabs. Other
+            // platforms centre a lone title without an island.
+            let single = num_tabs == 1 && !cfg!(target_os = "windows");
 
+            #[cfg(not(target_os = "windows"))]
             let text_color = if single {
                 match context_manager.custom_color(tab_index) {
                     Some(mut custom) => {
@@ -1057,11 +1366,27 @@ impl Island {
             } else {
                 self.inactive_text_color
             };
+            #[cfg(target_os = "windows")]
+            let text_color = mix_color(
+                self.inactive_text_color,
+                self.active_text_color,
+                self.tab_appearance[&tab_index].0,
+            );
 
             let title_opts = DrawOpts {
                 font_size: TITLE_FONT_SIZE,
                 color: color_u8(text_color),
+                #[cfg(target_os = "windows")]
+                font_id: Some(rio_backend::sugarloaf::font::FONT_ID_REGULAR),
                 ..DrawOpts::default()
+            };
+            #[cfg(target_os = "windows")]
+            let title_opts = DrawOpts {
+                font_size: crate::renderer::windows_chrome::snap(
+                    TITLE_FONT_SIZE,
+                    scale_factor,
+                ),
+                ..title_opts
             };
 
             // The bell mark is its own text run: the UI text layer resolves
@@ -1073,10 +1398,15 @@ impl Island {
             let max_text_width = if single {
                 single_title_budget(window_width, scale_factor, left_margin) - bell_width
             } else {
-                tab_width - TAB_PADDING_X * 2.0 - bell_width
+                #[cfg(target_os = "windows")]
+                let right_padding = TAB_TITLE_PADDING_RIGHT;
+                #[cfg(not(target_os = "windows"))]
+                let right_padding = TAB_PADDING_X;
+                tab_width - TAB_PADDING_X - right_padding - bell_width
             }
             .max(0.0);
-            let title = fit_title_to_width(sugarloaf, &raw_title, max_text_width);
+            let title =
+                fit_title_to_width(sugarloaf, &raw_title, max_text_width, &title_opts);
 
             // UI text always paints in a final pass above every rect,
             // so the floating tab's opaque background can't occlude
@@ -1088,18 +1418,36 @@ impl Island {
                 overlap > TAB_PADDING_X
             });
 
-            if !hidden_by_drag {
+            let show_title = !hidden_by_drag;
+            #[cfg(target_os = "windows")]
+            let show_title = show_title && max_text_width >= TITLE_FONT_SIZE;
+            if show_title {
                 // Measure → centre → draw. Immediate mode, no cached
                 // text_id bookkeeping. The bell mark and the title are
                 // centred as one group.
+                #[cfg(not(target_os = "windows"))]
                 let text_width =
                     sugarloaf.text_mut().measure(&title, &title_opts) + bell_width;
+                #[cfg(not(target_os = "windows"))]
                 let text_x = if single {
                     single_title_x(window_width, scale_factor, text_width, left_margin)
                 } else {
                     tab_x + (tab_width - text_width) / 2.0
                 };
+                #[cfg(target_os = "windows")]
+                let text_x = tab_x + TAB_PADDING_X;
+                #[cfg(not(target_os = "windows"))]
                 let text_y = (ISLAND_HEIGHT / 2.0) - (TITLE_FONT_SIZE / 2.);
+                #[cfg(target_os = "windows")]
+                let (text_x, text_y) = (
+                    crate::renderer::windows_chrome::snap(text_x, scale_factor),
+                    crate::renderer::windows_chrome::centered_text_y(
+                        sugarloaf,
+                        "Mg",
+                        ISLAND_HEIGHT / 2.0,
+                        &title_opts,
+                    ),
+                );
                 if bell {
                     // Centered on the title's lowercase body, not the strip:
                     // the em box hangs from `text_y` with its optical middle
@@ -1140,6 +1488,7 @@ impl Island {
             // bleach custom colors to pastel on light themes, so the
             // hierarchy is carried by the mute instead.
             let (ix, iy, iw, ih, radius) = island_rect(tab_x, tab_width);
+            #[cfg(not(target_os = "windows"))]
             let fill = match context_manager.custom_color(tab_index) {
                 Some(mut custom) => {
                     if !is_active {
@@ -1155,6 +1504,36 @@ impl Island {
                     }
                 }
             };
+            #[cfg(target_os = "windows")]
+            let fill = {
+                let (active, hover) = self.tab_appearance[&tab_index];
+                match context_manager.custom_color(tab_index) {
+                    Some(mut custom) => {
+                        custom[3] *=
+                            INACTIVE_CUSTOM_MUTE + (1.0 - INACTIVE_CUSTOM_MUTE) * active;
+                        custom
+                    }
+                    None => {
+                        let mut fill = mix_color(fills.inactive, fills.active, active);
+                        fill[3] += hover * (1.0 - active) * 0.04;
+                        fill
+                    }
+                }
+            };
+            #[cfg(not(target_os = "windows"))]
+            let outline = fills.outline;
+            #[cfg(target_os = "windows")]
+            let outline = fills
+                .outline
+                .filter(|_| self.tab_appearance[&tab_index].0 > 0.0)
+                .map(|mut color| {
+                    color[3] *= self.tab_appearance[&tab_index].0;
+                    color
+                });
+            #[cfg(not(target_os = "windows"))]
+            let tab_background = bg_color;
+            #[cfg(target_os = "windows")]
+            let tab_background = over(bg_color, group_fill);
             draw_island(
                 sugarloaf,
                 ix,
@@ -1163,22 +1542,40 @@ impl Island {
                 ih,
                 radius,
                 fill,
-                fills.outline,
-                Some(bg_color),
+                outline,
+                Some(tab_background),
                 0,
             );
             self.render_tab_status_line(sugarloaf, program_status.as_ref(), ix, iw, 1);
 
+            #[cfg(target_os = "windows")]
+            if !hidden_by_drag && iw >= CLOSE_MIN_ISLAND_WIDTH {
+                draw_tab_icon(
+                    sugarloaf,
+                    ix + 8.0,
+                    text_color,
+                    1,
+                    app_icon,
+                    self.window_header.app_font,
+                );
+            }
+
             if is_active && num_tabs > 1 {
                 if let Some(cx) = close_button_center(ix, iw) {
-                    if self.close_hover {
+                    #[cfg(not(target_os = "windows"))]
+                    let hover_opacity = u8::from(self.close_hover) as f32;
+                    #[cfg(target_os = "windows")]
+                    let hover_opacity = self.close_hover_opacity;
+                    if hover_opacity > 0.0 {
+                        let mut hover_fill = fills.close_hover;
+                        hover_fill[3] *= hover_opacity;
                         sugarloaf.rounded_rect(
                             None,
                             cx - CLOSE_HOVER_HALF,
                             ISLAND_HEIGHT / 2.0 - CLOSE_HOVER_HALF,
                             CLOSE_HOVER_HALF * 2.0,
                             CLOSE_HOVER_HALF * 2.0,
-                            fills.close_hover,
+                            hover_fill,
                             0.05,
                             CLOSE_HOVER_CORNER_RADIUS,
                             1,
@@ -1245,22 +1642,80 @@ impl Island {
             }
 
             let program_status = self.status_for_tab(context_manager, drag_idx);
+            #[cfg(target_os = "windows")]
+            let app_icon = context_manager
+                .program_and_title_for_tab(drag_idx)
+                .map(|(program, title)| {
+                    super::app_icons::for_program(
+                        &program,
+                        &title,
+                        program_status.as_ref(),
+                    )
+                })
+                .unwrap_or(super::app_icons::DEFAULT_ICON);
             self.render_tab_status_line(sugarloaf, program_status.as_ref(), ix, iw, 12);
+            #[cfg(target_os = "windows")]
+            if iw >= CLOSE_MIN_ISLAND_WIDTH {
+                draw_tab_icon(
+                    sugarloaf,
+                    ix + 8.0,
+                    self.active_text_color,
+                    12,
+                    app_icon,
+                    self.window_header.app_font,
+                );
+            }
+
             let raw_title = self.get_title_for_tab(context_manager, drag_idx);
             let raw_title = Self::status_title(program_status.as_ref(), &raw_title);
             if !raw_title.is_empty() {
-                let max_text_width = (tab_width - TAB_PADDING_X * 2.0).max(0.0);
-                let title = fit_title_to_width(sugarloaf, &raw_title, max_text_width);
+                #[cfg(target_os = "windows")]
+                let right_padding = TAB_TITLE_PADDING_RIGHT;
+                #[cfg(not(target_os = "windows"))]
+                let right_padding = TAB_PADDING_X;
+                let max_text_width = (tab_width - TAB_PADDING_X - right_padding).max(0.0);
                 let title_opts = DrawOpts {
                     font_size: TITLE_FONT_SIZE,
                     color: color_u8(self.active_text_color),
+                    #[cfg(target_os = "windows")]
+                    font_id: Some(rio_backend::sugarloaf::font::FONT_ID_REGULAR),
                     ..DrawOpts::default()
                 };
-                let ui = sugarloaf.text_mut();
-                let text_width = ui.measure(&title, &title_opts);
+                #[cfg(target_os = "windows")]
+                let title_opts = DrawOpts {
+                    font_size: crate::renderer::windows_chrome::snap(
+                        TITLE_FONT_SIZE,
+                        scale_factor,
+                    ),
+                    ..title_opts
+                };
+                let title = fit_title_to_width(
+                    sugarloaf,
+                    &raw_title,
+                    max_text_width,
+                    &title_opts,
+                );
+                #[cfg(not(target_os = "windows"))]
+                let text_width = sugarloaf.text_mut().measure(&title, &title_opts);
+                #[cfg(not(target_os = "windows"))]
                 let text_x = floating_x + (tab_width - text_width) / 2.0;
+                #[cfg(target_os = "windows")]
+                let text_x = floating_x + TAB_PADDING_X;
+                #[cfg(not(target_os = "windows"))]
                 let text_y = (ISLAND_HEIGHT / 2.0) - (TITLE_FONT_SIZE / 2.);
-                ui.draw(text_x, text_y, &title, &title_opts);
+                #[cfg(target_os = "windows")]
+                let (text_x, text_y) = (
+                    crate::renderer::windows_chrome::snap(text_x, scale_factor),
+                    crate::renderer::windows_chrome::centered_text_y(
+                        sugarloaf,
+                        "Mg",
+                        ISLAND_HEIGHT / 2.0,
+                        &title_opts,
+                    ),
+                );
+                sugarloaf
+                    .text_mut()
+                    .draw(text_x, text_y, &title, &title_opts);
             }
         }
 
@@ -2234,11 +2689,17 @@ mod tests {
             assert_eq!(layout.tab_width, (500.0 - 8.0 - 76.0) / 4.0);
             assert_eq!(layout.tabs_width, layout.tab_width * 4.0);
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             assert_eq!(layout.left_margin, 0.0);
             assert_eq!(layout.tab_width, 123.0);
             assert_eq!(layout.tabs_width, 492.0);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(layout.left_margin, 6.0);
+            assert_eq!(layout.tab_width, 85.5);
+            assert_eq!(layout.tabs_width, 342.0);
         }
         // Zero tabs clamps the divisor.
         assert!(tab_strip_layout(1000.0, 2.0, 0, 240.0)
@@ -2326,6 +2787,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn close_button_anchors_to_island_right_edge() {
         // Full-width slot: slot 1 spans 180..360, island 183..354, so
         // the button centers at 354 - CLOSE_MARGIN_RIGHT.
@@ -2353,6 +2815,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn close_hit_box_clears_the_title_budget() {
         // A max-width centered title on slot 0 ends at
         // slot_right - TAB_PADDING_X; the close hit box must start at

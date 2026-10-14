@@ -1288,9 +1288,39 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
+                #[cfg(target_os = "windows")]
+                if state == ElementState::Pressed
+                    && button != MouseButton::Left
+                    && route.window.screen.windows_header_action().is_some()
+                {
+                    return;
+                }
+                #[cfg(target_os = "windows")]
+                if state == ElementState::Pressed
+                    && button == MouseButton::Left
+                    && route.window.screen.handle_windows_header_click(
+                        &route.window.winit_window,
+                        &mut self.router.clipboard,
+                    )
+                {
+                    route.request_overlay_redraw();
+                    return;
+                }
                 if route.path != RoutePath::Terminal
                     || route.window.screen.renderer.confirm_quit.is_active()
                 {
+                    #[cfg(target_os = "windows")]
+                    if state == ElementState::Pressed
+                        && button == MouseButton::Left
+                        && !route.window.winit_window.is_decorated()
+                        && route.window.screen.renderer.island.is_some()
+                        && route.window.screen.mouse.y
+                            <= (crate::renderer::island::ISLAND_HEIGHT
+                                * route.window.screen.sugarloaf.scale_factor())
+                                as f64
+                    {
+                        let _ = route.window.winit_window.drag_window();
+                    }
                     #[cfg(target_os = "macos")]
                     if state == ElementState::Pressed
                         && button == MouseButton::Left
@@ -1684,6 +1714,17 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 route.window.screen.mouse.x = x;
                 route.window.screen.mouse.y = y;
                 route.window.screen.mouse.raw_y = position.y;
+
+                #[cfg(target_os = "windows")]
+                {
+                    if route.window.screen.update_windows_header_hover(x, y) {
+                        route.request_overlay_redraw();
+                    }
+                    if route.window.screen.windows_header_action().is_some() {
+                        route.window.winit_window.set_cursor(CursorIcon::Default);
+                        return;
+                    }
+                }
 
                 if route.path != RoutePath::Terminal
                     || route.window.screen.renderer.confirm_quit.is_active()
@@ -2245,6 +2286,15 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
 
             WindowEvent::RedrawRequested => {
                 route.begin_render();
+                #[cfg(target_os = "windows")]
+                if let Some(island) = &mut route.window.screen.renderer.island {
+                    island.window_header.maximized =
+                        route.window.winit_window.is_maximized();
+                    island.window_header.fullscreen =
+                        route.window.winit_window.fullscreen().is_some();
+                    island.window_header.toolbar_enabled =
+                        route.path == RoutePath::Terminal;
+                }
 
                 match route.path {
                     RoutePath::Welcome => {

@@ -94,6 +94,9 @@ features = ["wgpu"]
 [target.'cfg(windows)'.dependencies.rio-backend]
 workspace = true
 features = ["wgpu"]
+[target.'cfg(windows)'.dependencies.rio-fonts]
+workspace = true
+features = ["symbols-nerd-font"]
 [target.'cfg(target_arch = "wasm32")'.dependencies.sugarloaf]
 workspace = true
 features = ["wgpu"]

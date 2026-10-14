@@ -13,9 +13,9 @@ pub fn padding_top_from_config(
 ) -> f32 {
     // When navigation is enabled (Tab mode), start content below island
     if navigation.is_enabled() {
-        // On Linux/Windows, if hide_if_single is true and there's only one tab,
-        // the island is hidden so render from 0 + configured margin
-        #[cfg(not(target_os = "macos"))]
+        // Windows keeps its window controls in this band even when the
+        // single tab is hidden.
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         if navigation.hide_if_single && num_tabs <= 1 {
             return constants::PADDING_Y + padding_y_top;
         }

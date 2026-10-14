@@ -1278,6 +1278,64 @@ unsafe fn public_window_callback_inner(
     // the closure to catch_unwind directly so that the match body indentation wouldn't change and
     // the git blame and history would be preserved.
     let callback = || match msg {
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_NCHITTEST => {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT,
+                HTTOP, HTTOPLEFT, HTTOPRIGHT,
+            };
+            let state = userdata.window_state_lock();
+            let flags = state.window_flags;
+            let border = (6.0 * state.scale_factor).ceil() as i32;
+            drop(state);
+            if flags.contains(WindowFlags::MARKER_DECORATIONS) {
+                result = ProcResult::DefWindowProc(wparam);
+                return;
+            }
+            if !flags.contains(WindowFlags::RESIZABLE)
+                || util::is_maximized(window)
+                || flags.intersects(
+                    WindowFlags::MARKER_EXCLUSIVE_FULLSCREEN
+                        | WindowFlags::MARKER_BORDERLESS_FULLSCREEN,
+                )
+            {
+                result = ProcResult::Value(HTCLIENT as LRESULT);
+                return;
+            }
+            let mut rect = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            if unsafe { GetWindowRect(window, &mut rect) } == 0 {
+                result = ProcResult::DefWindowProc(wparam);
+                return;
+            }
+            // LPARAM coordinates are signed; monitors can sit left or above
+            // the primary display.
+            let x = lparam as i16 as i32;
+            let y = (lparam >> 16) as i16 as i32;
+            let col = if x < rect.left + border {
+                0
+            } else if x >= rect.right - border {
+                2
+            } else {
+                1
+            };
+            let row = if y < rect.top + border {
+                0
+            } else if y >= rect.bottom - border {
+                2
+            } else {
+                1
+            };
+            let hits = [
+                [HTTOPLEFT, HTTOP, HTTOPRIGHT],
+                [HTLEFT, HTCLIENT, HTRIGHT],
+                [HTBOTTOMLEFT, HTBOTTOM, HTBOTTOMRIGHT],
+            ];
+            result = ProcResult::Value(hits[row][col] as LRESULT);
+        }
         WM_NCCALCSIZE => {
             let window_flags = userdata.window_state_lock().window_flags;
             if wparam == 0 || window_flags.contains(WindowFlags::MARKER_DECORATIONS) {

@@ -240,7 +240,7 @@ impl Navigation {
     /// height under the same condition.
     #[inline]
     pub fn chrome_band_reserved(&self, num_tabs: usize) -> bool {
-        if cfg!(target_os = "macos") {
+        if cfg!(any(target_os = "macos", target_os = "windows")) {
             self.is_enabled()
         } else {
             self.island_visible(num_tabs)
@@ -268,7 +268,10 @@ mod tests {
         // other platforms hand it to the terminal, matching
         // padding_top_from_config.
         assert!(!nav.island_visible(1));
-        assert_eq!(nav.chrome_band_reserved(1), cfg!(target_os = "macos"));
+        assert_eq!(
+            nav.chrome_band_reserved(1),
+            cfg!(any(target_os = "macos", target_os = "windows"))
+        );
 
         // Non-Tab modes never reserve the band.
         nav.mode = NavigationMode::Plain;

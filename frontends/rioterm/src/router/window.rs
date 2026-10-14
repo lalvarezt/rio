@@ -86,6 +86,12 @@ pub fn create_window_builder(
     #[cfg(target_os = "windows")]
     {
         use rio_window::platform::windows::WindowAttributesExtWindows;
+        if config.navigation.is_enabled() {
+            window_builder = window_builder.with_decorations(false);
+            if config.window.windows_use_undecorated_shadow.is_none() {
+                window_builder = window_builder.with_undecorated_shadow(true);
+            }
+        }
         if let Some(use_undecorated_shadow) = config.window.windows_use_undecorated_shadow
         {
             window_builder =
@@ -175,7 +181,11 @@ pub fn create_window_builder(
     window_builder
 }
 
-pub fn configure_window(winit_window: &Window, config: &Config) {
+pub fn configure_window(
+    winit_window: &Window,
+    config: &Config,
+    #[allow(unused_variables)] quake: bool,
+) {
     if config.effects.custom_mouse_cursor {
         winit_window.set_cursor_visible(false);
     } else {
@@ -248,7 +258,33 @@ pub fn configure_window(winit_window: &Window, config: &Config) {
     #[cfg(target_os = "windows")]
     {
         use rio_backend::config::window::WindowsCornerPreference;
-        use rio_window::platform::windows::WindowExtWindows;
+        use rio_window::platform::windows::{Color, WindowExtWindows};
+
+        let custom_header = config.navigation.is_enabled();
+        winit_window.set_decorations(
+            !custom_header
+                && !quake
+                && !matches!(config.window.decorations, Decorations::Disabled),
+        );
+        if custom_header && config.window.windows_use_undecorated_shadow.is_none() {
+            winit_window.set_undecorated_shadow(true);
+        }
+
+        let background = config.colors.background.0;
+        let foreground = config.colors.tabs_active;
+        let native_color = |color: [f32; 4]| {
+            Color::from_rgb(
+                (color[0] * 255.0).round() as u8,
+                (color[1] * 255.0).round() as u8,
+                (color[2] * 255.0).round() as u8,
+            )
+        };
+        winit_window.set_title_background_color(Some(native_color(background)));
+        winit_window.set_title_text_color(native_color(foreground));
+        let border = std::array::from_fn(|i| {
+            background[i] + (foreground[i] - background[i]) * 0.12
+        });
+        winit_window.set_border_color(Some(native_color(border)));
 
         if let Some(with_corner_preference) = &config.window.windows_corner_preference {
             let preference = match with_corner_preference {

@@ -809,6 +809,13 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         Some(record)
     }
 
+    #[cfg(target_os = "windows")]
+    pub fn program_and_title_for_tab(&self, index: usize) -> Option<(String, String)> {
+        let context = self.contexts.get(index)?.current();
+        let title = context.terminal.lock().title.clone();
+        Some((context.spawned_program.clone(), title))
+    }
+
     /// A pane can be the focused split of a tab that is not selected.
     pub fn is_route_focused_in_tab(&self, route_id: usize) -> bool {
         self.contexts

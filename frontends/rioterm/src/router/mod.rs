@@ -745,6 +745,7 @@ impl Router<'_> {
 }
 
 pub struct RouteWindow<'a> {
+    quake: bool,
     pub is_focused: bool,
     /// Whether a real Focused event has ever arrived. A window created
     /// in the background starts `is_focused: false` and may never get
@@ -766,7 +767,7 @@ pub struct RouteWindow<'a> {
 
 impl<'a> RouteWindow<'a> {
     pub fn configure_window(&mut self, config: &rio_backend::config::Config) {
-        configure_window(&self.winit_window, config);
+        configure_window(&self.winit_window, config, self.quake);
     }
 
     pub fn wait_until(&self) -> Option<Duration> {
@@ -880,7 +881,7 @@ impl<'a> RouteWindow<'a> {
         }
 
         let winit_window = event_loop.create_window(window_builder).unwrap();
-        configure_window(&winit_window, config);
+        configure_window(&winit_window, config, quake);
 
         let properties = ScreenWindowProperties {
             size: winit_window.inner_size(),
@@ -942,6 +943,7 @@ impl<'a> RouteWindow<'a> {
 
         Self {
             vblank_interval: monitor_vblank_interval,
+            quake,
             render_timestamp: Instant::now(),
             is_focused,
             focus_seen: false,

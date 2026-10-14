@@ -266,6 +266,27 @@ impl Text {
             .unwrap_or(0.0)
     }
 
+    /// Visible glyph top and height, relative to `draw`'s logical y origin.
+    #[cfg(target_os = "windows")]
+    pub fn vertical_bounds(&mut self, text: &str, opts: &DrawOpts) -> Option<(f32, f32)> {
+        let run = self.shape_for(text, opts)?;
+        let mut top = f32::INFINITY;
+        let mut bottom = f32::NEG_INFINITY;
+        for glyph in &run.glyphs {
+            let Some((slot, _)) = self.rasterize_slot(&run, glyph.id) else {
+                continue;
+            };
+            if slot.w == 0 || slot.h == 0 {
+                continue;
+            }
+            let y = glyph.y.max(0.0) + slot.bearing_y as f32;
+            top = top.min(y);
+            bottom = bottom.max(y + slot.h as f32);
+        }
+        top.is_finite()
+            .then_some((top / self.scale_factor, (bottom - top) / self.scale_factor))
+    }
+
     fn shape_for(&mut self, text: &str, opts: &DrawOpts) -> Option<ShapedRun> {
         use crate::{Attributes, SpanStyle, Stretch, Style as FontStyle, Weight};
 
