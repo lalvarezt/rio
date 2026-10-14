@@ -28,7 +28,7 @@ pub fn init() {
             start: Instant::now(),
             ready: None,
             ready_routes: BTreeSet::new(),
-            target_tabs: tab_count(),
+            target_tabs: tab_count() * window_count(),
             first_frame: None,
             shell_frame: None,
             frames: 0,
@@ -129,6 +129,14 @@ pub fn tab_count() -> usize {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1)
         .clamp(1, 16)
+}
+
+pub fn window_count() -> usize {
+    std::env::var("RIO_PROFILE_WINDOWS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .clamp(1, 4)
 }
 
 pub fn shell_title(route: usize, title: Option<&str>) {

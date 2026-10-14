@@ -374,8 +374,17 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
 
         #[cfg(feature = "profiling")]
         if cause == StartCause::Init {
+            for _ in 1..crate::profiling::window_count() {
+                self.router.create_window(
+                    event_loop,
+                    self.event_proxy.clone(),
+                    &self.config,
+                    None,
+                    self.app_id.as_deref(),
+                );
+            }
             let tabs = crate::profiling::tab_count();
-            if let Some(route) = self.router.routes.values_mut().next() {
+            for route in self.router.routes.values_mut() {
                 for _ in 1..tabs {
                     route
                         .window

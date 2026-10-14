@@ -15,6 +15,7 @@ does not provide the same graphics environment.
 ```cmd
 python misc\profiling\run-windows.py target\release\rio-profile.exe --runs 5 --output target\profiles\startup
 python misc\profiling\run-windows.py target\release\rio-profile.exe --runs 5 --frames 180 --tabs 8 --output target\profiles\eight-tabs
+python misc\profiling\run-windows.py target\release\rio-profile.exe --runs 5 --windows 2 --output target\profiles\two-windows
 ```
 
 Python 3 is the only runner dependency. Each launch uses your Rio configuration,
@@ -29,7 +30,8 @@ does not become ready or the workload exceeds the time limit.
 
 `--frames 0` records startup and idle behavior. A positive frame count requests
 overlay redraws through the normal event loop and presentation path. `--tabs`
-accepts 1 through 16. `--backend dx12` and `--backend vulkan` set `WGPU_BACKEND`
+accepts 1 through 16 per window. `--windows` accepts 1 through 4 and waits for
+every shell in every window. `--backend dx12` and `--backend vulkan` set `WGPU_BACKEND`
 for the child process, overriding backend selection for that capture.
 
 The output directory contains each run's JSON capture, its console log, and

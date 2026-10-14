@@ -14,17 +14,19 @@ parser.add_argument("executable", type=Path)
 parser.add_argument("--runs", type=int, default=5)
 parser.add_argument("--frames", type=int, default=0)
 parser.add_argument("--tabs", type=int, default=1)
+parser.add_argument("--windows", type=int, default=1)
 parser.add_argument("--backend", choices=("dx12", "vulkan", "gl"))
 parser.add_argument("--output", type=Path, default=Path("target/profiles/baseline"))
 args = parser.parse_args()
-if args.runs < 1 or args.frames < 0 or not 1 <= args.tabs <= 16:
-    parser.error("runs must be positive, frames nonnegative, and tabs between 1 and 16")
+if args.runs < 1 or args.frames < 0 or not 1 <= args.tabs <= 16 or not 1 <= args.windows <= 4:
+    parser.error("runs must be positive, frames nonnegative, tabs 1 through 16, and windows 1 through 4")
 args.output.mkdir(parents=True, exist_ok=True)
 captures = []
 for index in range(args.runs):
     report = (args.output / f"run-{index + 1}.json").resolve()
     env = dict(os.environ, RIO_PROFILE_OUTPUT=str(report),
-               RIO_PROFILE_FRAMES=str(args.frames), RIO_PROFILE_TABS=str(args.tabs))
+               RIO_PROFILE_FRAMES=str(args.frames), RIO_PROFILE_TABS=str(args.tabs),
+               RIO_PROFILE_WINDOWS=str(args.windows))
     if args.backend:
         env["WGPU_BACKEND"] = args.backend
     start = time.perf_counter()
@@ -38,7 +40,7 @@ for index in range(args.runs):
         raise RuntimeError(f"Shell or renderer did not become ready: {report}")
     if capture.get("frames", 0) < capture.get("target_frames", args.frames):
         raise RuntimeError(f"Frame workload timed out: {report}")
-    if capture.get("ready_tabs") != args.tabs or capture.get("target_tabs") != args.tabs:
+    if capture.get("ready_tabs") != args.tabs * args.windows or capture.get("target_tabs") != args.tabs * args.windows:
         raise RuntimeError(f"Requested tab workload did not become ready: {report}")
     capture["process_ms"] = (time.perf_counter() - start) * 1000
     captures.append(capture)
@@ -58,6 +60,7 @@ with args.executable.open("rb") as executable:
 summary["capture"] = {
     "runs": args.runs,
     "tabs": args.tabs,
+    "windows": args.windows,
     "frames": args.frames,
     "backend_override": args.backend,
     "platform": platform.platform(),
