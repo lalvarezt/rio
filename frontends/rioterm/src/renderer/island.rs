@@ -376,6 +376,7 @@ pub struct Island {
     program_status: Option<ProgramStatusRecord>,
     program_status_source: Option<(usize, u64)>,
     progress_persistent: bool,
+    window_progress_visible: bool,
     /// Progress bar color
     pub progress_bar_color: [f32; 4],
     /// Progress bar error color
@@ -417,6 +418,7 @@ impl Island {
             program_status: None,
             program_status_source: None,
             progress_persistent: false,
+            window_progress_visible: true,
             // Default progress bar color (blue-ish)
             progress_bar_color: [0.3, 0.6, 1.0, 1.0],
             // Default error color (red-ish)
@@ -569,6 +571,12 @@ impl Island {
         }
     }
 
+    fn uses_window_progress(&self, num_tabs: usize) -> bool {
+        // Multiple tabs already draw one status line per tab. A lone title
+        // (or hidden strip) and legacy OSC 9;4 still use the window bar.
+        num_tabs <= 1 || !self.progress_persistent
+    }
+
     fn render_tab_status_line(
         &self,
         sugarloaf: &mut Sugarloaf,
@@ -629,7 +637,8 @@ impl Island {
         // A held drag doesn't need continuous frames: the floating tab
         // only moves on CursorMoved (which requests its own redraws);
         // only the slide springs animate between input events.
-        matches!(self.progress_state, Some(ProgressState::Indeterminate))
+        (self.window_progress_visible
+            && matches!(self.progress_state, Some(ProgressState::Indeterminate)))
             || !self.slide_springs.is_empty()
     }
 
@@ -933,6 +942,7 @@ impl Island {
 
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         self.sync_focused_program_status(context_manager);
+        self.window_progress_visible = self.uses_window_progress(num_tabs);
 
         // Immediate-mode: no cached ids to hide. If we early-return
         // without drawing, the tabs just don't appear this frame.
@@ -1263,8 +1273,15 @@ impl Island {
             }
         }
 
-        // Render the progress bar below the island
-        self.render_progress_bar(sugarloaf, window_width, scale_factor, ISLAND_HEIGHT);
+        // Render the progress bar below the island.
+        if self.window_progress_visible {
+            self.render_progress_bar(
+                sugarloaf,
+                window_width,
+                scale_factor,
+                ISLAND_HEIGHT,
+            );
+        }
     }
 
     /// Toggle the color picker for a given tab index
@@ -1960,6 +1977,61 @@ mod tests {
             b"\x1b]7501;state=clear\x07",
         );
         assert!(island.status_for_tab(&cm, 0).is_none());
+    }
+
+    #[test]
+    fn program_status_tab_underline_does_not_duplicate_window_bar() {
+        use rio_backend::event::{VoidListener, WindowId};
+        use rio_backend::performer::handler::Processor;
+        let cm =
+            ContextManager::start_with_capacity(3, VoidListener {}, WindowId::from(0))
+                .unwrap();
+        let mut parser = Processor::default();
+        parser.advance(
+            &mut *cm.current().terminal.lock(),
+            b"\x1b]7501;state=done\x07",
+        );
+        let mut island = test_island();
+        island.sync_focused_program_status(&cm);
+        assert!(island
+            .program_status
+            .as_ref()
+            .and_then(|r| island.status_color(r))
+            .is_some());
+        assert!(!island.uses_window_progress(2),
+            "the selected tab already has an underline; do not also draw a full-window bar");
+        assert!(
+            island.uses_window_progress(1),
+            "a lone title has no separate tab underline"
+        );
+        island.hide_if_single = true;
+        assert!(
+            island.uses_window_progress(1),
+            "a hidden strip still needs one progress bar"
+        );
+
+        parser.advance(
+            &mut *cm.current().terminal.lock(),
+            b"\x1b]7501;state=working\x07",
+        );
+        island.sync_focused_program_status(&cm);
+        island.window_progress_visible = island.uses_window_progress(2);
+        assert!(
+            !island.needs_redraw(),
+            "a static tab underline must not animate an invisible window bar"
+        );
+
+        parser.advance(&mut *cm.current().terminal.lock(), b"\x1bc\x1b]9;4;3\x07");
+        island.sync_focused_program_status(&cm);
+        island.window_progress_visible = island.uses_window_progress(2);
+        assert!(
+            island.window_progress_visible,
+            "legacy progress still uses the window bar"
+        );
+        assert!(
+            island.needs_redraw(),
+            "visible legacy indeterminate progress must animate"
+        );
     }
 
     #[test]

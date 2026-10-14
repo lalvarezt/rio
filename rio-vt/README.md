@@ -144,8 +144,9 @@ record; alternate-screen changes and soft resets preserve them. No heartbeat is 
 
 On Windows and Linux, each tab shows its own focused pane's status and a colored
 line, including background tabs. Switching splits changes that tab's status.
-The window-wide progress bar follows the pane in the selected tab. Background
-updates refresh their own tab without replacing another tab's status.
+With multiple tabs, OSC 7501 uses only these tab lines. A lone title or hidden
+strip uses one window-wide progress bar instead. Background updates refresh
+their own tab without replacing another tab's status.
 Within a pane, the display prefers `blocked`,
 `error`, `working`, `done`, then `idle`; ties use the most recent update.
 Status text follows the tab strip's visibility settings.
