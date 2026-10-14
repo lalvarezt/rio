@@ -428,6 +428,11 @@ impl<T: 'static> EventLoop<T> {
         // `MsgWaitForMultipleObjectsEx`.
         //
         runner.prepare_wait();
+        // AboutToWait can request exit. In Wait mode there may be no
+        // later message to wake the thread and let the outer loop see it.
+        if runner.exit_code().is_some() {
+            return;
+        }
         wait_for_messages_impl(
             &mut self.high_resolution_timer,
             runner.control_flow(),

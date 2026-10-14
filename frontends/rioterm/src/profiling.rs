@@ -1,9 +1,11 @@
 //! Timings for the opt-in profiling executable. File I/O happens only at exit.
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+#[derive(Clone)]
 struct Capture {
     start: Instant,
     ready: Option<Instant>,
@@ -14,9 +16,11 @@ struct Capture {
     frames: usize,
     target_frames: usize,
     samples: BTreeMap<&'static str, Vec<f64>>,
+    active: Vec<&'static str>,
 }
 
 static CAPTURE: OnceLock<Mutex<Capture>> = OnceLock::new();
+static DIAGNOSTICS: AtomicBool = AtomicBool::new(false);
 
 pub fn init() {
     CAPTURE.get_or_init(|| {
@@ -33,13 +37,22 @@ pub fn init() {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
             samples: BTreeMap::new(),
+            active: Vec::new(),
         })
     });
+    if std::env::var_os("RIO_PROFILE_WATCHDOG").is_some() {
+        DIAGNOSTICS.store(true, Ordering::Relaxed);
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(10));
+            write_report(output_path().with_extension("watchdog.json"));
+        });
+    }
 }
 
 pub struct Span(&'static str, Instant);
 
 pub fn span(name: &'static str) -> Span {
+    active(name, true);
     Span(name, Instant::now())
 }
 
@@ -47,6 +60,19 @@ impl Drop for Span {
     fn drop(&mut self) {
         let elapsed = self.1.elapsed().as_secs_f64() * 1000.0;
         record(self.0, elapsed);
+        active(self.0, false);
+    }
+}
+
+fn active(name: &'static str, entering: bool) {
+    if !DIAGNOSTICS.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut capture = CAPTURE.get().unwrap().lock().unwrap();
+    if entering {
+        capture.active.push(name);
+    } else if let Some(index) = capture.active.iter().rposition(|n| *n == name) {
+        capture.active.remove(index);
     }
 }
 
@@ -75,6 +101,7 @@ where
         ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
         if let Some(span) = ctx.span(id) {
+            active(span.metadata().name(), true);
             span.extensions_mut().insert(Instant::now());
         }
     }
@@ -90,6 +117,7 @@ where
                     span.metadata().name(),
                     start.elapsed().as_secs_f64() * 1000.0,
                 );
+                active(span.metadata().name(), false);
             }
         }
     }
@@ -140,10 +168,18 @@ pub fn finished() -> bool {
             })
 }
 
+fn output_path() -> std::path::PathBuf {
+    std::env::var_os("RIO_PROFILE_OUTPUT")
+        .unwrap_or_else(|| "rio-profile.json".into())
+        .into()
+}
+
 pub fn report() {
-    let mut capture = CAPTURE.get().unwrap().lock().unwrap();
-    let path = std::env::var_os("RIO_PROFILE_OUTPUT")
-        .unwrap_or_else(|| "rio-profile.json".into());
+    write_report(output_path());
+}
+
+fn write_report(path: std::path::PathBuf) {
+    let mut capture = CAPTURE.get().unwrap().lock().unwrap().clone();
     let mut file = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
     let ready = capture
         .ready
@@ -158,7 +194,8 @@ pub fn report() {
         |value: Option<f64>| value.map_or("null".to_owned(), |v| format!("{v:.6}"));
     writeln!(
         file,
-        "{{\"ready_tabs\":{},\"target_tabs\":{},\"frames\":{},\"target_frames\":{},\"shell_ready_ms\":{},\"first_frame_ms\":{},\"shell_frame_ms\":{},\"total_ms\":{:.6},\"metrics\":{{",
+        "{{\"active\":{:?},\"ready_tabs\":{},\"target_tabs\":{},\"frames\":{},\"target_frames\":{},\"shell_ready_ms\":{},\"first_frame_ms\":{},\"shell_frame_ms\":{},\"total_ms\":{:.6},\"metrics\":{{",
+        capture.active,
         capture.ready_routes.len(),
         capture.target_tabs,
         capture.frames,

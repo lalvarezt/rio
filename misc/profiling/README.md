@@ -39,6 +39,11 @@ in milliseconds. Spans nest, so their totals overlap. Frame submission is a CPU
 timing and includes any wait inside presentation; it does not measure GPU
 execution time.
 
+Set `RIO_PROFILE_WATCHDOG=1` to save an additional `run-N.watchdog.json`
+snapshot after ten seconds. It includes active timing scopes and completed
+work, even if the main thread stops progressing. Leave it unset for timing
+comparisons.
+
 The `profiling` feature enables instrumentation and automatic exit. Leave it
 off for normal builds. Timings stay in memory until exit. The targeted
 `rio_profile` tracing spans in Sugarloaf are collected only by the profiling
