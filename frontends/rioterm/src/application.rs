@@ -781,7 +781,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             }
             RioEventType::Rio(RioEvent::ProgramStatusChanged(route_id)) => {
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
-                    if route.window.screen.ctx().current().route_id == route_id {
+                    if route.window.screen.ctx().is_route_focused_in_tab(route_id) {
                         route.request_overlay_redraw();
                     }
                 }

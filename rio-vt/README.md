@@ -142,9 +142,11 @@ characters cause the whole report to be discarded.
 `done`, `error`, and `idle` records survive those events. A full reset removes every
 record; alternate-screen changes and soft resets preserve them. No heartbeat is required.
 
-On Windows and Linux, Rio's tab strip shows the focused pane's status and progress.
-Switching splits or tabs loads the newly focused pane's records. Background updates
-do not replace the visible status. Within a pane, the display prefers `blocked`,
+On Windows and Linux, each tab shows its own focused pane's status and a colored
+line, including background tabs. Switching splits changes that tab's status.
+The window-wide progress bar follows the pane in the selected tab. Background
+updates refresh their own tab without replacing another tab's status.
+Within a pane, the display prefers `blocked`,
 `error`, `working`, `done`, then `idle`; ties use the most recent update.
 Status text follows the tab strip's visibility settings.
 

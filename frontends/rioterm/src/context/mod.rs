@@ -793,6 +793,29 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             .and_then(|grid| grid.custom_title.as_deref())
     }
 
+    /// Each tab displays the status of its own focused split, even while
+    /// another tab is selected. Other splits in that tab do not contribute.
+    pub fn program_status_for_tab(
+        &self,
+        index: usize,
+    ) -> Option<rio_backend::program_status::ProgramStatusRecord> {
+        let context = self.contexts.get(index)?.current();
+        let terminal = context.terminal.lock();
+        let mut record = terminal.program_status.current()?.clone();
+        record.app = terminal
+            .program_status
+            .app_for(&record.id)
+            .map(str::to_owned);
+        Some(record)
+    }
+
+    /// A pane can be the focused split of a tab that is not selected.
+    pub fn is_route_focused_in_tab(&self, route_id: usize) -> bool {
+        self.contexts
+            .iter()
+            .any(|grid| grid.current().route_id == route_id)
+    }
+
     #[inline]
     /// A rename changes what `displayed_title_for_tab` returns, so the
     /// native titlebar gets the same convergence poke every other

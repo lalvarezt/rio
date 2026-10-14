@@ -539,8 +539,61 @@ impl Island {
         }
     }
 
+    #[cfg(test)]
     fn program_status_title(&self, fallback: &str) -> String {
-        let Some(record) = &self.program_status else {
+        Self::status_title(self.program_status.as_ref(), fallback)
+    }
+
+    fn status_for_tab<T: rio_backend::event::EventListener + Clone + Send + 'static>(
+        &self,
+        context_manager: &ContextManager<T>,
+        tab_index: usize,
+    ) -> Option<ProgramStatusRecord> {
+        if tab_index == context_manager.current_index() {
+            self.program_status.clone()
+        } else {
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            return context_manager.program_status_for_tab(tab_index);
+            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+            None
+        }
+    }
+
+    fn status_color(&self, record: &ProgramStatusRecord) -> Option<[f32; 4]> {
+        match record.state {
+            ProgramState::Working => Some(self.progress_bar_color),
+            ProgramState::Blocked => Some([0.90, 0.57, 0.22, 1.0]),
+            ProgramState::Done => Some([0.34, 0.70, 0.38, 1.0]),
+            ProgramState::Error => Some(self.progress_bar_error_color),
+            ProgramState::Idle | ProgramState::Clear => None,
+        }
+    }
+
+    fn render_tab_status_line(
+        &self,
+        sugarloaf: &mut Sugarloaf,
+        record: Option<&ProgramStatusRecord>,
+        x: f32,
+        width: f32,
+        order: u8,
+    ) {
+        if let Some(color) = record.and_then(|r| self.status_color(r)) {
+            sugarloaf.rounded_rect(
+                None,
+                x,
+                ISLAND_HEIGHT - PROGRESS_BAR_HEIGHT,
+                width,
+                PROGRESS_BAR_HEIGHT,
+                color,
+                0.0,
+                PROGRESS_BAR_HEIGHT / 2.0,
+                order,
+            );
+        }
+    }
+
+    fn status_title(record: Option<&ProgramStatusRecord>, fallback: &str) -> String {
+        let Some(record) = record else {
             return fallback.to_owned();
         };
         let state = match (record.state, record.kind) {
@@ -969,11 +1022,8 @@ impl Island {
             // ellipsis so overflowing titles can't bleed into the next
             // tab or past the left edge (issue #1508).
             let raw_title = self.get_title_for_tab(context_manager, tab_index);
-            let raw_title = if is_active {
-                self.program_status_title(&raw_title)
-            } else {
-                raw_title
-            };
+            let program_status = self.status_for_tab(context_manager, tab_index);
+            let raw_title = Self::status_title(program_status.as_ref(), &raw_title);
             if raw_title.is_empty() {
                 x_position += tab_width;
                 continue;
@@ -1107,6 +1157,7 @@ impl Island {
                 Some(bg_color),
                 0,
             );
+            self.render_tab_status_line(sugarloaf, program_status.as_ref(), ix, iw, 1);
 
             if is_active && num_tabs > 1 {
                 if let Some(cx) = close_button_center(ix, iw) {
@@ -1183,7 +1234,10 @@ impl Island {
                 draw_close_button(sugarloaf, cx, self.active_text_color, false, 12);
             }
 
+            let program_status = self.status_for_tab(context_manager, drag_idx);
+            self.render_tab_status_line(sugarloaf, program_status.as_ref(), ix, iw, 12);
             let raw_title = self.get_title_for_tab(context_manager, drag_idx);
+            let raw_title = Self::status_title(program_status.as_ref(), &raw_title);
             if !raw_title.is_empty() {
                 let max_text_width = (tab_width - TAB_PADDING_X * 2.0).max(0.0);
                 let title = fit_title_to_width(sugarloaf, &raw_title, max_text_width);
@@ -1844,6 +1898,68 @@ mod tests {
         island.sync_program_status(1, &terminal.program_status);
         assert_eq!(island.progress_started_at, started);
         assert_eq!(status_display_text("a\u{202e}b\u{2066}c\u{200b}d"), "abcd");
+    }
+
+    #[test]
+    fn program_status_background_tab_keeps_its_own_status() {
+        use rio_backend::event::{VoidListener, WindowId};
+        use rio_backend::performer::handler::Processor;
+        let mut cm =
+            ContextManager::start_with_capacity(3, VoidListener {}, WindowId::from(0))
+                .unwrap();
+        let mut parser = Processor::default();
+        parser.advance(
+            &mut *cm.current().terminal.lock(),
+            b"\x1b]7501;state=done:app=build\x07",
+        );
+        let mut island = test_island();
+        island.sync_focused_program_status(&cm);
+        cm.add_context(true, 0);
+        parser.advance(
+            &mut *cm.current().terminal.lock(),
+            b"\x1b]7501;state=working:progress=20:app=test\x07",
+        );
+        island.sync_focused_program_status(&cm);
+        let background = island.status_for_tab(&cm, 0);
+        assert_eq!(
+            background.as_ref().map(|r| r.state),
+            Some(ProgramState::Done)
+        );
+        assert_eq!(
+            Island::status_title(background.as_ref(), "shell"),
+            "[Done] build"
+        );
+        assert_eq!(
+            background.as_ref().and_then(|r| island.status_color(r)),
+            Some([0.34, 0.70, 0.38, 1.0])
+        );
+        assert_eq!(island.progress_value, Some(20));
+        let background_route = cm.contexts_mut()[0].current().route_id;
+        assert!(cm.is_route_focused_in_tab(background_route));
+        assert!(!cm.is_route_focused_in_tab(usize::MAX));
+
+        // Reports that arrive while the tab is in the background must be
+        // visible immediately, without selecting it to refresh its cache.
+        let background_terminal = cm.contexts_mut()[0].current().terminal.clone();
+        parser.advance(
+            &mut *background_terminal.lock(),
+            b"\x1b]7501;state=blocked:kind=question:app=build\x07",
+        );
+        let background = island.status_for_tab(&cm, 0);
+        assert_eq!(
+            background.as_ref().map(|r| r.state),
+            Some(ProgramState::Blocked)
+        );
+        assert_eq!(
+            background.as_ref().and_then(|r| island.status_color(r)),
+            Some([0.90, 0.57, 0.22, 1.0])
+        );
+        assert_eq!(island.progress_value, Some(20));
+        parser.advance(
+            &mut *background_terminal.lock(),
+            b"\x1b]7501;state=clear\x07",
+        );
+        assert!(island.status_for_tab(&cm, 0).is_none());
     }
 
     #[test]
