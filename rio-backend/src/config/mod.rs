@@ -613,6 +613,12 @@ impl Config {
             if let Some(max_tab_width) = navigation_overwrite.max_tab_width {
                 self.navigation.max_tab_width = max_tab_width;
             }
+            if let Some(min_tab_width) = navigation_overwrite.min_tab_width {
+                self.navigation.min_tab_width = min_tab_width;
+            }
+            if let Some(tab_icon_size) = navigation_overwrite.tab_icon_size {
+                self.navigation.tab_icon_size = tab_icon_size;
+            }
         }
 
         // Clamp after platform merge so both the base and any override go
@@ -623,6 +629,12 @@ impl Config {
             );
         self.navigation.max_tab_width =
             crate::config::navigation::clamp_max_tab_width(self.navigation.max_tab_width);
+        self.navigation.min_tab_width = crate::config::navigation::clamp_min_tab_width(
+            self.navigation.min_tab_width,
+            self.navigation.max_tab_width,
+        );
+        self.navigation.tab_icon_size =
+            crate::config::navigation::clamp_tab_icon_size(self.navigation.tab_icon_size);
 
         // Merge renderer fields individually
         if let Some(renderer_overwrite) = &platform_config.renderer {

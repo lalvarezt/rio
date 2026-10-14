@@ -556,7 +556,7 @@ impl Screen<'_> {
         self.renderer.is_window_focused = was_focused;
         if let Some(mut island) = old_island {
             island.update_colors(config.colors.tabs, config.colors.tabs_active);
-            island.max_tab_width = config.navigation.max_tab_width;
+            island.configure(&config.navigation);
             self.renderer.island = Some(island);
         }
 
@@ -1570,10 +1570,11 @@ impl Screen<'_> {
                             old_index,
                             new_index,
                         );
-                        let tab_width =
-                            self.island_tab_layout(self.context_manager.len()).tab_width;
+                        let layout = self.island_tab_layout(self.context_manager.len());
                         if let Some(ref mut island) = self.renderer.island {
-                            island.remap_tab_swap(old_index, new_index, tab_width);
+                            island.remap_tab_swap_with_layout(
+                                old_index, new_index, &layout,
+                            );
                         }
                         self.mark_dirty();
                     }
@@ -1588,10 +1589,11 @@ impl Screen<'_> {
                             old_index,
                             new_index,
                         );
-                        let tab_width =
-                            self.island_tab_layout(self.context_manager.len()).tab_width;
+                        let layout = self.island_tab_layout(self.context_manager.len());
                         if let Some(ref mut island) = self.renderer.island {
-                            island.remap_tab_swap(old_index, new_index, tab_width);
+                            island.remap_tab_swap_with_layout(
+                                old_index, new_index, &layout,
+                            );
                         }
                         self.mark_dirty();
                     }
@@ -2822,17 +2824,18 @@ impl Screen<'_> {
 
     #[inline]
     fn island_tab_layout(&self, num_tabs: usize) -> TabStripLayout {
-        let max_tab_width = self
-            .renderer
-            .island
-            .as_ref()
-            .map(|island| island.max_tab_width)
-            .unwrap_or_else(rio_backend::config::navigation::default_max_tab_width);
+        if let Some(island) = &self.renderer.island {
+            return island.tab_layout(
+                self.sugarloaf.window_size().width,
+                self.sugarloaf.scale_factor(),
+                num_tabs,
+            );
+        }
         island::tab_strip_layout(
             self.sugarloaf.window_size().width,
             self.sugarloaf.scale_factor(),
             num_tabs,
-            max_tab_width,
+            rio_backend::config::navigation::default_max_tab_width(),
         )
     }
 
@@ -2950,14 +2953,12 @@ impl Screen<'_> {
         #[cfg(target_os = "windows")]
         let tab_changed = {
             let layout = self.island_tab_layout(num_tabs);
-            let x = mouse_x as f32 / scale_factor - layout.left_margin;
+            let x = mouse_x as f32 / scale_factor;
             let hovered_tab = (self.renderer.navigation.island_visible(num_tabs)
                 && mouse_y >= 0.0
-                && mouse_y <= (ISLAND_HEIGHT * scale_factor) as f64
-                && x >= 0.0
-                && x < layout.tabs_width
-                && layout.tab_width > 0.0)
-                .then(|| ((x / layout.tab_width) as usize).min(num_tabs - 1));
+                && mouse_y <= (ISLAND_HEIGHT * scale_factor) as f64)
+                .then(|| layout.tab_at(x))
+                .flatten();
             let changed = self
                 .renderer
                 .island
@@ -3109,7 +3110,8 @@ impl Screen<'_> {
         // an island in the first slot, so the whole strip belongs to it and a
         // right-click anywhere on it should reach that tab. The left margin
         // (traffic lights on macOS) stays outside either way.
-        let past_last_tab = num_tabs > 1 && x_in_tabs >= layout.tabs_width;
+        let past_last_tab = (num_tabs > 1 || cfg!(target_os = "windows"))
+            && x_in_tabs >= layout.tabs_width;
         if x_in_tabs < 0.0 || past_last_tab {
             if !is_right_click {
                 self.on_chrome_press(window, chrome_press);
@@ -3117,9 +3119,10 @@ impl Screen<'_> {
             return true;
         }
 
-        // `.min` guards the float edge where x_in_tabs / tab_width
-        // lands exactly on num_tabs despite x_in_tabs < tabs_width.
-        let clicked_tab = ((x_in_tabs / layout.tab_width) as usize).min(num_tabs - 1);
+        let clicked_tab = layout
+            .tab_at(mouse_x_unscaled)
+            .unwrap_or(0)
+            .min(num_tabs - 1);
 
         #[cfg(target_os = "macos")]
         if !is_right_click && self.modifiers.state().super_key() {
@@ -3187,7 +3190,7 @@ impl Screen<'_> {
         let can_reorder = true;
         if num_tabs > 1 && can_reorder {
             if let Some(ref mut island) = self.renderer.island {
-                let tab_left = layout.left_margin + clicked_tab as f32 * layout.tab_width;
+                let tab_left = layout.left(clicked_tab);
                 island.start_drag(
                     clicked_tab,
                     mouse_x_unscaled - tab_left,
@@ -3235,8 +3238,19 @@ impl Screen<'_> {
             return;
         }
 
-        let target = (((center - layout.left_margin) / layout.tab_width) as usize)
-            .min(num_tabs - 1);
+        // Cross neighboring centers so unequal widths do not make a tab
+        // oscillate between slots after reordering.
+        let mut target = old_index;
+        while target > 0
+            && center < layout.left(target - 1) + layout.width(target - 1) / 2.0
+        {
+            target -= 1;
+        }
+        while target + 1 < num_tabs
+            && center > layout.left(target + 1) + layout.width(target + 1) / 2.0
+        {
+            target += 1;
+        }
         if target != old_index {
             self.context_manager.move_current_tab_to(target);
             let new_index = self.context_manager.current_index();
@@ -3246,7 +3260,7 @@ impl Screen<'_> {
                 new_index,
             );
             if let Some(ref mut island) = self.renderer.island {
-                island.remap_tab_move(old_index, new_index, layout.tab_width);
+                island.remap_tab_move(old_index, new_index, layout.width(old_index));
             }
         }
         self.mark_dirty();

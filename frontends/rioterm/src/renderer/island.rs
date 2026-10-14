@@ -35,9 +35,11 @@ const TITLE_FONT_SIZE: f32 = 15.0;
 #[cfg(not(target_os = "windows"))]
 const TAB_PADDING_X: f32 = 27.0;
 #[cfg(target_os = "windows")]
-const TAB_PADDING_X: f32 = 40.0;
+const TAB_PADDING_X: f32 = 47.0;
 #[cfg(target_os = "windows")]
 const TAB_TITLE_PADDING_RIGHT: f32 = 14.0;
+#[cfg(target_os = "windows")]
+const TAB_ICON_INSET_X: f32 = 12.0;
 const TAB_GAP: f32 = 6.0;
 #[cfg(not(target_os = "windows"))]
 const TAB_INSET_Y: f32 = 7.0;
@@ -96,8 +98,10 @@ const PICKER_COLORS: [[f32; 4]; 6] = [
 #[cfg(target_os = "macos")]
 const ISLAND_MARGIN_LEFT_MACOS: f32 = 76.0;
 
+#[cfg(not(target_os = "windows"))]
 const CLOSE_MARGIN_RIGHT: f32 = 14.0;
 const CLOSE_GLYPH_HALF: f32 = 3.5;
+#[cfg(not(target_os = "windows"))]
 const CLOSE_MIN_ISLAND_WIDTH: f32 = 64.0;
 const CLOSE_HOVER_HALF: f32 = 10.0;
 const CLOSE_HOVER_CORNER_RADIUS: f32 = 5.0;
@@ -202,11 +206,44 @@ fn fit_title_with_widths<'a>(
     Cow::Borrowed(title)
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct TabStripLayout {
     pub left_margin: f32,
     pub tab_width: f32,
     pub tabs_width: f32,
+    widths: Vec<f32>,
+}
+
+impl TabStripLayout {
+    pub fn width(&self, index: usize) -> f32 {
+        self.widths.get(index).copied().unwrap_or(self.tab_width)
+    }
+
+    pub fn left(&self, index: usize) -> f32 {
+        self.left_margin
+            + if self.widths.is_empty() {
+                index as f32 * self.tab_width
+            } else {
+                self.widths.iter().take(index).sum::<f32>()
+            }
+    }
+
+    pub fn tab_at(&self, x: f32) -> Option<usize> {
+        let mut remaining = x - self.left_margin;
+        if remaining < 0.0 || remaining >= self.tabs_width || self.tab_width <= 0.0 {
+            return None;
+        }
+        if self.widths.is_empty() {
+            return Some((remaining / self.tab_width) as usize);
+        }
+        for (index, width) in self.widths.iter().enumerate() {
+            if remaining < *width {
+                return Some(index);
+            }
+            remaining -= width;
+        }
+        None
+    }
 }
 
 /// Compute the tab strip layout from the physical window width.
@@ -238,6 +275,7 @@ pub fn tab_strip_layout(
         left_margin,
         tab_width,
         tabs_width: tab_width * num_tabs as f32,
+        widths: Vec::new(),
     }
 }
 
@@ -299,50 +337,59 @@ fn draw_tab_icon(
     x: f32,
     color: [f32; 4],
     order: u8,
-    icon: &str,
+    icon: super::app_icons::Icon,
     font_id: Option<usize>,
+    size: f32,
 ) {
     let cy = ISLAND_HEIGHT / 2.0;
-    sugarloaf.rounded_rect(
-        None,
-        x,
-        cy - 11.0,
-        24.0,
-        22.0,
-        [color[0], color[1], color[2], color[3] * 0.08],
-        0.05,
-        5.0,
+    if super::app_icons::draw(
+        sugarloaf,
+        icon,
+        x + size / 2.0,
+        cy,
+        size,
+        color,
+        font_id,
         order,
-    );
-    if let Some(font_id) = font_id {
-        crate::renderer::windows_chrome::draw_font_icon(
-            sugarloaf,
-            icon,
-            x + 12.0,
-            cy,
-            18.0,
-            color,
-            font_id,
-        );
+    ) {
         return;
     }
     if crate::renderer::windows_chrome::draw_icon(
         sugarloaf,
         "\u{e756}",
-        x + 12.0,
+        x + size / 2.0,
         cy,
-        18.0,
+        size,
         color,
     ) {
         return;
     }
-    sugarloaf.line(x + 5.0, cy - 3.0, x + 8.0, cy, 1.2, 0.0, color, order);
-    sugarloaf.line(x + 8.0, cy, x + 5.0, cy + 3.0, 1.2, 0.0, color, order);
+    let unit = size / 24.0;
     sugarloaf.line(
-        x + 11.0,
-        cy + 3.0,
-        x + 15.0,
-        cy + 3.0,
+        x + 5.0 * unit,
+        cy - 3.0 * unit,
+        x + 8.0 * unit,
+        cy,
+        1.2,
+        0.0,
+        color,
+        order,
+    );
+    sugarloaf.line(
+        x + 8.0 * unit,
+        cy,
+        x + 5.0 * unit,
+        cy + 3.0 * unit,
+        1.2,
+        0.0,
+        color,
+        order,
+    );
+    sugarloaf.line(
+        x + 11.0 * unit,
+        cy + 3.0 * unit,
+        x + 15.0 * unit,
+        cy + 3.0 * unit,
         1.2,
         0.0,
         color,
@@ -472,8 +519,8 @@ fn close_button_center(island_x: f32, island_w: f32) -> Option<f32> {
 
 #[inline]
 fn close_button_center_x(layout: &TabStripLayout, tab_index: usize) -> Option<f32> {
-    let slot_x = layout.left_margin + tab_index as f32 * layout.tab_width;
-    let (ix, _, iw, _, _) = island_rect(slot_x, layout.tab_width);
+    let slot_x = layout.left(tab_index);
+    let (ix, _, iw, _, _) = island_rect(slot_x, layout.width(tab_index));
     close_button_center(ix, iw)
 }
 
@@ -536,6 +583,10 @@ pub struct Island {
     pub hide_if_single: bool,
     /// Cap on tab width in logical px (`navigation.max-tab-width`).
     pub max_tab_width: f32,
+    pub min_tab_width: f32,
+    pub tab_icon_size: f32,
+    #[cfg(target_os = "windows")]
+    preferred_tab_widths: Vec<f32>,
     pub inactive_text_color: [f32; 4],
     pub active_text_color: [f32; 4],
     /// Current progress bar state
@@ -597,6 +648,10 @@ impl Island {
             window_header: crate::renderer::windows_chrome::Header::new(),
             hide_if_single,
             max_tab_width,
+            min_tab_width: rio_backend::config::navigation::default_min_tab_width(),
+            tab_icon_size: rio_backend::config::navigation::default_tab_icon_size(),
+            #[cfg(target_os = "windows")]
+            preferred_tab_widths: Vec::new(),
             inactive_text_color,
             active_text_color,
             progress_state: None,
@@ -626,6 +681,108 @@ impl Island {
             tab_appearance: FxHashMap::default(),
             #[cfg(target_os = "windows")]
             close_hover_opacity: 0.0,
+        }
+    }
+
+    pub fn configure(
+        &mut self,
+        navigation: &rio_backend::config::navigation::Navigation,
+    ) {
+        self.max_tab_width = rio_backend::config::navigation::clamp_max_tab_width(
+            navigation.max_tab_width,
+        );
+        self.min_tab_width = rio_backend::config::navigation::clamp_min_tab_width(
+            navigation.min_tab_width,
+            self.max_tab_width,
+        );
+        self.tab_icon_size = rio_backend::config::navigation::clamp_tab_icon_size(
+            navigation.tab_icon_size,
+        );
+    }
+
+    /// Share per-tab geometry between rendering, dragging, and hit testing.
+    pub fn tab_layout(
+        &self,
+        window_width: f32,
+        scale_factor: f32,
+        num_tabs: usize,
+    ) -> TabStripLayout {
+        #[cfg(target_os = "windows")]
+        {
+            let mut layout =
+                tab_strip_layout(window_width, scale_factor, num_tabs, f32::MAX);
+            let available = layout.tabs_width;
+            layout.widths = (0..num_tabs)
+                .map(|index| {
+                    self.preferred_tab_widths
+                        .get(index)
+                        .copied()
+                        .unwrap_or(self.max_tab_width)
+                        .clamp(self.min_tab_width, self.max_tab_width)
+                })
+                .collect();
+            let desired: f32 = layout.widths.iter().sum();
+            if desired > available {
+                let minimum = self.min_tab_width * num_tabs as f32;
+                if minimum < available {
+                    let shrink = (desired - available) / (desired - minimum);
+                    for width in &mut layout.widths {
+                        *width -= (*width - self.min_tab_width) * shrink;
+                    }
+                } else {
+                    layout.widths.fill(available / num_tabs.max(1) as f32);
+                }
+            }
+            layout.tabs_width = layout.widths.iter().sum();
+            layout.tab_width = layout.tabs_width / num_tabs.max(1) as f32;
+            layout
+        }
+        #[cfg(not(target_os = "windows"))]
+        tab_strip_layout(window_width, scale_factor, num_tabs, self.max_tab_width)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn title_padding(&self) -> f32 {
+        TAB_GAP / 2.0 + TAB_ICON_INSET_X + self.tab_icon_size + 8.0
+    }
+
+    #[cfg(target_os = "windows")]
+    fn measure_tab_width(
+        &mut self,
+        sugarloaf: &mut Sugarloaf,
+        context_manager: &ContextManager<EventProxy>,
+    ) {
+        let opts = DrawOpts {
+            font_size: crate::renderer::windows_chrome::snap(
+                TITLE_FONT_SIZE,
+                sugarloaf.scale_factor(),
+            ),
+            font_id: Some(rio_backend::sugarloaf::font::FONT_ID_REGULAR),
+            ..DrawOpts::default()
+        };
+        self.preferred_tab_widths.clear();
+        for index in 0..context_manager.len() {
+            let raw_title = self.get_title_for_tab(context_manager, index);
+            let status = self.status_for_tab(context_manager, index);
+            let title = Self::status_title(status.as_ref(), &raw_title);
+            let remote = context_manager
+                .application_for_tab(index)
+                .is_some_and(|app| app.remote);
+            let padding = self.title_padding()
+                + TAB_TITLE_PADDING_RIGHT
+                + if remote {
+                    self.tab_icon_size + 4.0
+                } else {
+                    0.0
+                }
+                + if context_manager.bell(index) {
+                    BELL_DOT_SIZE + BELL_GAP
+                } else {
+                    0.0
+                };
+            let width = sugarloaf.text_mut().measure(&title, &opts) + padding;
+            self.preferred_tab_widths
+                .push(width.clamp(self.min_tab_width, self.max_tab_width));
         }
     }
 
@@ -906,8 +1063,8 @@ impl Island {
         let left = drag.current_x - drag.grab_offset;
         // `.max(0.0)` keeps the clamp range valid (min ≤ max) even if a
         // pathologically narrow window makes tabs_width < tab_width.
-        let max_left =
-            layout.left_margin + (layout.tabs_width - layout.tab_width).max(0.0);
+        let max_left = layout.left_margin
+            + (layout.tabs_width - layout.width(drag.tab_index)).max(0.0);
         Some(left.clamp(layout.left_margin, max_left))
     }
 
@@ -915,7 +1072,7 @@ impl Island {
     /// which slot the drag targets.
     pub fn drag_center(&self, layout: &TabStripLayout) -> Option<f32> {
         self.drag_floating_left(layout)
-            .map(|left| left + layout.tab_width / 2.0)
+            .map(|left| left + layout.width(self.drag_index().unwrap_or(0)) / 2.0)
     }
 
     /// Finish a drag: seed a settle spring from the floating position
@@ -925,7 +1082,7 @@ impl Island {
             self.drag_floating_left(layout),
             self.drag.as_ref().filter(|d| d.started),
         ) {
-            let slot_x = layout.left_margin + drag.tab_index as f32 * layout.tab_width;
+            let slot_x = layout.left(drag.tab_index);
             let offset = floating_left - slot_x;
             if offset.abs() > 0.01 {
                 let spring = self
@@ -972,6 +1129,12 @@ impl Island {
             .collect();
         #[cfg(target_os = "windows")]
         {
+            if from < self.preferred_tab_widths.len()
+                && to < self.preferred_tab_widths.len()
+            {
+                let width = self.preferred_tab_widths.remove(from);
+                self.preferred_tab_widths.insert(to, width);
+            }
             self.tab_appearance = self
                 .tab_appearance
                 .drain()
@@ -1031,6 +1194,10 @@ impl Island {
             .collect();
         #[cfg(target_os = "windows")]
         {
+            if a < self.preferred_tab_widths.len() && b < self.preferred_tab_widths.len()
+            {
+                self.preferred_tab_widths.swap(a, b);
+            }
             self.tab_appearance = self
                 .tab_appearance
                 .drain()
@@ -1048,6 +1215,27 @@ impl Island {
             spring.position += delta;
             let spring = self.slide_springs.entry(b).or_insert_with(Spring::new);
             spring.position -= delta;
+        }
+    }
+
+    pub fn remap_tab_swap_with_layout(
+        &mut self,
+        a: usize,
+        b: usize,
+        layout: &TabStripLayout,
+    ) {
+        self.remap_tab_swap(a, b, 0.0);
+        if a.abs_diff(b) == 1 {
+            let low = a.min(b);
+            let high = a.max(b);
+            self.slide_springs
+                .entry(low)
+                .or_insert_with(Spring::new)
+                .position += layout.width(low);
+            self.slide_springs
+                .entry(high)
+                .or_insert_with(Spring::new)
+                .position -= layout.width(high);
         }
     }
 
@@ -1254,13 +1442,14 @@ impl Island {
             );
         }
 
-        let layout =
-            tab_strip_layout(window_width, scale_factor, num_tabs, self.max_tab_width);
-        let TabStripLayout {
-            left_margin,
-            tab_width,
-            ..
-        } = layout;
+        #[cfg(target_os = "windows")]
+        self.measure_tab_width(sugarloaf, context_manager);
+        #[cfg(target_os = "windows")]
+        let tab_padding_x = self.title_padding();
+        #[cfg(not(target_os = "windows"))]
+        let tab_padding_x = TAB_PADDING_X;
+        let layout = self.tab_layout(window_width, scale_factor, num_tabs);
+        let TabStripLayout { left_margin, .. } = layout;
 
         // Starting from left edge (with margin on macOS for traffic lights)
         let mut x_position = left_margin;
@@ -1311,6 +1500,7 @@ impl Island {
 
         // Render each tab
         for tab_index in 0..num_tabs {
+            let tab_width = layout.width(tab_index);
             // The dragged tab floats — drawn after the loop instead.
             if Some(tab_index) == drag_index {
                 x_position += tab_width;
@@ -1333,16 +1523,26 @@ impl Island {
             let raw_title = self.get_title_for_tab(context_manager, tab_index);
             let program_status = self.status_for_tab(context_manager, tab_index);
             #[cfg(target_os = "windows")]
-            let app_icon = context_manager
-                .program_and_title_for_tab(tab_index)
-                .map(|(program, title)| {
-                    super::app_icons::for_program(
-                        &program,
-                        &title,
-                        program_status.as_ref(),
+            let (app_icon, remote) = context_manager
+                .application_for_tab(tab_index)
+                .map(|app| {
+                    (
+                        super::app_icons::for_program(
+                            &app.program,
+                            &app.title,
+                            program_status.as_ref(),
+                            app.reported,
+                        ),
+                        app.remote,
                     )
                 })
-                .unwrap_or(super::app_icons::DEFAULT_ICON);
+                .unwrap_or((super::app_icons::DEFAULT_ICON, false));
+            #[cfg(target_os = "windows")]
+            let remote_padding = if remote {
+                self.tab_icon_size + 4.0
+            } else {
+                0.0
+            };
             let raw_title = Self::status_title(program_status.as_ref(), &raw_title);
             if raw_title.is_empty() {
                 x_position += tab_width;
@@ -1402,7 +1602,9 @@ impl Island {
                 let right_padding = TAB_TITLE_PADDING_RIGHT;
                 #[cfg(not(target_os = "windows"))]
                 let right_padding = TAB_PADDING_X;
-                tab_width - TAB_PADDING_X - right_padding - bell_width
+                #[cfg(target_os = "windows")]
+                let right_padding = right_padding + remote_padding;
+                tab_width - tab_padding_x - right_padding - bell_width
             }
             .max(0.0);
             let title =
@@ -1414,8 +1616,10 @@ impl Island {
             // floating tab intrudes past the slot's text padding (the
             // widest a centered title can reach).
             let hidden_by_drag = floating_left.is_some_and(|fl| {
-                let overlap = (tab_x + tab_width).min(fl + tab_width) - tab_x.max(fl);
-                overlap > TAB_PADDING_X
+                let floating_width = layout.width(drag_index.unwrap_or(tab_index));
+                let overlap =
+                    (tab_x + tab_width).min(fl + floating_width) - tab_x.max(fl);
+                overlap > tab_padding_x
             });
 
             let show_title = !hidden_by_drag;
@@ -1435,7 +1639,7 @@ impl Island {
                     tab_x + (tab_width - text_width) / 2.0
                 };
                 #[cfg(target_os = "windows")]
-                let text_x = tab_x + TAB_PADDING_X;
+                let text_x = tab_x + tab_padding_x + remote_padding;
                 #[cfg(not(target_os = "windows"))]
                 let text_y = (ISLAND_HEIGHT / 2.0) - (TITLE_FONT_SIZE / 2.);
                 #[cfg(target_os = "windows")]
@@ -1444,7 +1648,7 @@ impl Island {
                     crate::renderer::windows_chrome::centered_text_y(
                         sugarloaf,
                         "Mg",
-                        ISLAND_HEIGHT / 2.0,
+                        ISLAND_HEIGHT / 2.0 + 2.0,
                         &title_opts,
                     ),
                 );
@@ -1549,14 +1753,28 @@ impl Island {
             self.render_tab_status_line(sugarloaf, program_status.as_ref(), ix, iw, 1);
 
             #[cfg(target_os = "windows")]
-            if !hidden_by_drag && iw >= CLOSE_MIN_ISLAND_WIDTH {
+            if !hidden_by_drag
+                && iw >= TAB_ICON_INSET_X + self.tab_icon_size + remote_padding + 4.0
+            {
+                if remote {
+                    draw_tab_icon(
+                        sugarloaf,
+                        ix + TAB_ICON_INSET_X,
+                        text_color,
+                        1,
+                        super::app_icons::SSH_ICON,
+                        self.window_header.app_font,
+                        self.tab_icon_size,
+                    );
+                }
                 draw_tab_icon(
                     sugarloaf,
-                    ix + 8.0,
+                    ix + TAB_ICON_INSET_X + remote_padding,
                     text_color,
                     1,
                     app_icon,
                     self.window_header.app_font,
+                    self.tab_icon_size,
                 );
             }
 
@@ -1597,6 +1815,7 @@ impl Island {
 
         // Draw the floating (dragged) tab above the slot tabs.
         if let (Some(drag_idx), Some(floating_x)) = (drag_index, floating_left) {
+            let tab_width = layout.width(drag_idx);
             let (ix, iy, iw, ih, radius) = island_rect(floating_x, tab_width);
 
             // Soft elevation: a slightly inflated dark halo behind the
@@ -1643,26 +1862,48 @@ impl Island {
 
             let program_status = self.status_for_tab(context_manager, drag_idx);
             #[cfg(target_os = "windows")]
-            let app_icon = context_manager
-                .program_and_title_for_tab(drag_idx)
-                .map(|(program, title)| {
-                    super::app_icons::for_program(
-                        &program,
-                        &title,
-                        program_status.as_ref(),
+            let (app_icon, remote) = context_manager
+                .application_for_tab(drag_idx)
+                .map(|app| {
+                    (
+                        super::app_icons::for_program(
+                            &app.program,
+                            &app.title,
+                            program_status.as_ref(),
+                            app.reported,
+                        ),
+                        app.remote,
                     )
                 })
-                .unwrap_or(super::app_icons::DEFAULT_ICON);
+                .unwrap_or((super::app_icons::DEFAULT_ICON, false));
+            #[cfg(target_os = "windows")]
+            let remote_padding = if remote {
+                self.tab_icon_size + 4.0
+            } else {
+                0.0
+            };
             self.render_tab_status_line(sugarloaf, program_status.as_ref(), ix, iw, 12);
             #[cfg(target_os = "windows")]
-            if iw >= CLOSE_MIN_ISLAND_WIDTH {
+            if iw >= TAB_ICON_INSET_X + self.tab_icon_size + remote_padding + 4.0 {
+                if remote {
+                    draw_tab_icon(
+                        sugarloaf,
+                        ix + TAB_ICON_INSET_X,
+                        self.active_text_color,
+                        12,
+                        super::app_icons::SSH_ICON,
+                        self.window_header.app_font,
+                        self.tab_icon_size,
+                    );
+                }
                 draw_tab_icon(
                     sugarloaf,
-                    ix + 8.0,
+                    ix + TAB_ICON_INSET_X + remote_padding,
                     self.active_text_color,
                     12,
                     app_icon,
                     self.window_header.app_font,
+                    self.tab_icon_size,
                 );
             }
 
@@ -1671,9 +1912,11 @@ impl Island {
             if !raw_title.is_empty() {
                 #[cfg(target_os = "windows")]
                 let right_padding = TAB_TITLE_PADDING_RIGHT;
+                #[cfg(target_os = "windows")]
+                let right_padding = right_padding + remote_padding;
                 #[cfg(not(target_os = "windows"))]
                 let right_padding = TAB_PADDING_X;
-                let max_text_width = (tab_width - TAB_PADDING_X - right_padding).max(0.0);
+                let max_text_width = (tab_width - tab_padding_x - right_padding).max(0.0);
                 let title_opts = DrawOpts {
                     font_size: TITLE_FONT_SIZE,
                     color: color_u8(self.active_text_color),
@@ -1700,7 +1943,7 @@ impl Island {
                 #[cfg(not(target_os = "windows"))]
                 let text_x = floating_x + (tab_width - text_width) / 2.0;
                 #[cfg(target_os = "windows")]
-                let text_x = floating_x + TAB_PADDING_X;
+                let text_x = floating_x + tab_padding_x + remote_padding;
                 #[cfg(not(target_os = "windows"))]
                 let text_y = (ISLAND_HEIGHT / 2.0) - (TITLE_FONT_SIZE / 2.);
                 #[cfg(target_os = "windows")]
@@ -1709,7 +1952,7 @@ impl Island {
                     crate::renderer::windows_chrome::centered_text_y(
                         sugarloaf,
                         "Mg",
-                        ISLAND_HEIGHT / 2.0,
+                        ISLAND_HEIGHT / 2.0 + 2.0,
                         &title_opts,
                     ),
                 );
@@ -1722,7 +1965,8 @@ impl Island {
         // Render color picker if open
         if let Some(picker_tab) = self.color_picker_tab {
             if picker_tab < num_tabs {
-                let picker_tab_x = left_margin + picker_tab as f32 * tab_width;
+                let picker_tab_x = layout.left(picker_tab);
+                let tab_width = layout.width(picker_tab);
                 let selected = context_manager.custom_color(picker_tab);
                 self.render_color_picker(sugarloaf, picker_tab_x, tab_width, selected);
             }
@@ -1861,12 +2105,9 @@ impl Island {
         let mouse_y_unscaled = mouse_y / scale_factor;
 
         // Compute the same tab layout as render()
-        let TabStripLayout {
-            left_margin,
-            tab_width,
-            ..
-        } = tab_strip_layout(window_width, scale_factor, num_tabs, self.max_tab_width);
-        let tab_x = left_margin + picker_tab as f32 * tab_width;
+        let layout = self.tab_layout(window_width, scale_factor, num_tabs);
+        let tab_x = layout.left(picker_tab);
+        let tab_width = layout.width(picker_tab);
 
         // Picker is rendered just below the island
         let picker_y = ISLAND_HEIGHT;
@@ -2783,6 +3024,7 @@ mod tests {
             left_margin: 0.0,
             tab_width: 100.0,
             tabs_width: 400.0,
+            widths: Vec::new(),
         }
     }
 
@@ -2795,6 +3037,7 @@ mod tests {
             left_margin: 0.0,
             tab_width: 180.0,
             tabs_width: 360.0,
+            widths: Vec::new(),
         };
         let cx = close_button_center_x(&layout, 1).unwrap();
         assert_eq!(
@@ -2810,6 +3053,7 @@ mod tests {
             left_margin: 0.0,
             tab_width: 60.0,
             tabs_width: 600.0,
+            widths: Vec::new(),
         };
         assert_eq!(close_button_center_x(&narrow, 3), None);
     }
@@ -2825,6 +3069,7 @@ mod tests {
             left_margin: 0.0,
             tab_width: 180.0,
             tabs_width: 360.0,
+            widths: Vec::new(),
         };
         let cx = close_button_center_x(&layout, 0).unwrap();
         let title_max_right = layout.tab_width - TAB_PADDING_X;

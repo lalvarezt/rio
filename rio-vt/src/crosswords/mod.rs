@@ -3537,7 +3537,11 @@ impl<U: EventListener> Handler for Crosswords<U> {
     }
 
     fn set_user_var(&mut self, name: String, value: String) {
-        self.user_vars.insert(name, value);
+        if self.user_vars.get(&name) != Some(&value) {
+            self.user_vars.insert(name, value);
+            self.event_proxy
+                .send_event(RioEvent::Render, self.window_id);
+        }
     }
 
     #[inline]

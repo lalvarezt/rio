@@ -13,10 +13,10 @@ use windows_sys::Win32::Foundation::{
     RPC_E_CHANGED_MODE, S_OK, TRUE, WPARAM,
 };
 use windows_sys::Win32::Graphics::Dwm::{
-    DwmEnableBlurBehindWindow, DwmSetWindowAttribute, DWMWA_BORDER_COLOR,
-    DWMWA_CAPTION_COLOR, DWMWA_CLOAK, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_TEXT_COLOR,
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWM_BB_BLURREGION, DWM_BB_ENABLE, DWM_BLURBEHIND,
-    DWM_SYSTEMBACKDROP_TYPE, DWM_WINDOW_CORNER_PREFERENCE,
+    DwmEnableBlurBehindWindow, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
+    DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_CLOAK, DWMWA_SYSTEMBACKDROP_TYPE,
+    DWMWA_TEXT_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWM_BB_BLURREGION, DWM_BB_ENABLE,
+    DWM_BLURBEHIND, DWM_SYSTEMBACKDROP_TYPE, DWM_WINDOW_CORNER_PREFERENCE,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     ChangeDisplaySettingsExW, ClientToScreen, CreateRectRgn, DeleteObject, InvalidateRgn,
@@ -28,6 +28,7 @@ use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED,
 };
 use windows_sys::Win32::System::Ole::{OleInitialize, RegisterDragDrop};
+use windows_sys::Win32::UI::Controls::MARGINS;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetActiveWindow, MapVirtualKeyW, ReleaseCapture, SendInput, ToUnicode,
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
@@ -1116,12 +1117,29 @@ impl Window {
     #[inline]
     pub fn set_system_backdrop(&self, backdrop_type: BackdropType) {
         unsafe {
-            DwmSetWindowAttribute(
+            let result = DwmSetWindowAttribute(
                 self.hwnd(),
                 DWMWA_SYSTEMBACKDROP_TYPE as u32,
                 &(backdrop_type as i32) as *const _ as _,
                 mem::size_of::<DWM_SYSTEMBACKDROP_TYPE>() as _,
             );
+            if result >= 0 {
+                // Extend Acrylic/Mica over the client surface, including
+                // undecorated windows. Negative margins follow window resizes.
+                let inset =
+                    if matches!(backdrop_type, BackdropType::Auto | BackdropType::None) {
+                        0
+                    } else {
+                        -1
+                    };
+                let margins = MARGINS {
+                    cxLeftWidth: inset,
+                    cxRightWidth: inset,
+                    cyTopHeight: inset,
+                    cyBottomHeight: inset,
+                };
+                DwmExtendFrameIntoClientArea(self.hwnd(), &margins);
+            }
         }
     }
 

@@ -232,12 +232,14 @@ impl Renderer {
         }
 
         let island = if config.navigation.is_enabled() {
-            Some(island::Island::new(
+            let mut island = island::Island::new(
                 named_colors.tabs,
                 named_colors.tabs_active,
                 config.navigation.hide_if_single,
                 config.navigation.max_tab_width,
-            ))
+            );
+            island.configure(&config.navigation);
+            Some(island)
         } else {
             None
         };

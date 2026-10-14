@@ -42,6 +42,14 @@ use teletypewriter::create_pty;
 #[cfg(not(target_os = "windows"))]
 use teletypewriter::{create_pty_with_fork, create_pty_with_spawn};
 
+#[cfg(target_os = "windows")]
+pub struct TabApplication {
+    pub program: String,
+    pub title: String,
+    pub remote: bool,
+    pub reported: bool,
+}
+
 pub struct Context<T: EventListener> {
     pub route_id: usize,
     pub terminal: Arc<FairMutex<Crosswords<T>>>,
@@ -810,10 +818,35 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     }
 
     #[cfg(target_os = "windows")]
-    pub fn program_and_title_for_tab(&self, index: usize) -> Option<(String, String)> {
+    pub fn application_for_tab(&self, index: usize) -> Option<TabApplication> {
         let context = self.contexts.get(index)?.current();
-        let title = context.terminal.lock().title.clone();
-        Some((context.spawned_program.clone(), title))
+        let terminal = context.terminal.lock();
+        let reported_app = terminal
+            .user_vars
+            .get("RIO_APP")
+            .filter(|name| !name.is_empty());
+        let program = reported_app
+            .cloned()
+            .unwrap_or_else(|| context.spawned_program.clone());
+        let remote = terminal
+            .user_vars
+            .get("RIO_SSH")
+            .is_some_and(|value| value == "1");
+        let transport = program
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&program)
+            .to_ascii_lowercase();
+        Some(TabApplication {
+            program,
+            title: terminal.title.clone(),
+            remote: remote
+                || matches!(
+                    transport.strip_suffix(".exe").unwrap_or(&transport),
+                    "ssh" | "mosh"
+                ),
+            reported: reported_app.is_some(),
+        })
     }
 
     /// A pane can be the focused split of a tab that is not selected.

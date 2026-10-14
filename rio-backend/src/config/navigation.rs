@@ -19,15 +19,43 @@ pub fn default_max_tab_width() -> f32 {
     240.0
 }
 
-/// Clamp `max_tab_width` to `[80.0, 280.0]`.
-///
-/// Below the lower bound the close button and title no longer fit.
+#[inline]
+pub fn default_min_tab_width() -> f32 {
+    120.0
+}
+
+#[inline]
+pub fn default_tab_icon_size() -> f32 {
+    24.0
+}
+
+/// Clamp tab widths to a finite, usable range in logical pixels.
 #[inline]
 pub fn clamp_max_tab_width(v: f32) -> f32 {
     if !v.is_finite() {
         return default_max_tab_width();
     }
-    v.clamp(80.0, 280.0)
+    v.clamp(80.0, 1024.0)
+}
+
+#[inline]
+pub fn clamp_min_tab_width(v: f32, max: f32) -> f32 {
+    let v = if v.is_finite() {
+        v
+    } else {
+        default_min_tab_width()
+    };
+    v.clamp(80.0, max)
+}
+
+#[inline]
+pub fn clamp_tab_icon_size(v: f32) -> f32 {
+    let v = if v.is_finite() {
+        v
+    } else {
+        default_tab_icon_size()
+    };
+    v.clamp(8.0, 32.0)
 }
 
 /// Clamp `unfocused_split_opacity` to `[0.15, 1.0]`.
@@ -173,11 +201,17 @@ pub struct Navigation {
         rename = "unfocused-split-fill"
     )]
     pub unfocused_split_fill: Option<ColorArray>,
-    /// Maximum width of a tab in logical pixels. Tabs shrink below
-    /// this as more open; the cap only limits how wide a tab grows
-    /// when few are open. Clamped to `[80.0, 280.0]` at load time.
+    /// Maximum tab width in logical pixels, clamped to `[80.0, 1024.0]`.
+    /// Windows tabs size to their titles between the configured bounds.
+    /// Tabs shrink further when necessary to fit the window.
     #[serde(default = "default_max_tab_width", rename = "max-tab-width")]
     pub max_tab_width: f32,
+    /// Minimum preferred Windows tab width, bounded by `max-tab-width`.
+    #[serde(default = "default_min_tab_width", rename = "min-tab-width")]
+    pub min_tab_width: f32,
+    /// Windows tab icon size in logical pixels, clamped to `[8.0, 32.0]`.
+    #[serde(default = "default_tab_icon_size", rename = "tab-icon-size")]
+    pub tab_icon_size: f32,
 }
 
 impl Default for Navigation {
@@ -194,6 +228,8 @@ impl Default for Navigation {
             unfocused_split_fill: None,
             open_config_with_split: true,
             max_tab_width: default_max_tab_width(),
+            min_tab_width: default_min_tab_width(),
+            tab_icon_size: default_tab_icon_size(),
         }
     }
 }
