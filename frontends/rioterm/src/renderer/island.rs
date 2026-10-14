@@ -137,6 +137,15 @@ struct TabDrag {
     started: bool,
 }
 
+#[cfg(target_os = "windows")]
+struct TabPresentation {
+    title: String,
+    status: Option<ProgramStatusRecord>,
+    icon: super::app_icons::Icon,
+    remote: bool,
+    bell: bool,
+}
+
 fn fit_title_to_width<'a>(
     sugarloaf: &mut Sugarloaf,
     title: &'a str,
@@ -749,11 +758,7 @@ impl Island {
     }
 
     #[cfg(target_os = "windows")]
-    fn measure_tab_width(
-        &mut self,
-        sugarloaf: &mut Sugarloaf,
-        context_manager: &ContextManager<EventProxy>,
-    ) {
+    fn measure_tab_width(&mut self, sugarloaf: &mut Sugarloaf, tabs: &[TabPresentation]) {
         #[cfg(feature = "profiling")]
         let _timing = crate::profiling::span("tabs.measure_widths");
         let opts = DrawOpts {
@@ -765,26 +770,20 @@ impl Island {
             ..DrawOpts::default()
         };
         self.preferred_tab_widths.clear();
-        for index in 0..context_manager.len() {
-            let raw_title = self.get_title_for_tab(context_manager, index);
-            let status = self.status_for_tab(context_manager, index);
-            let title = Self::status_title(status.as_ref(), &raw_title);
-            let remote = context_manager
-                .application_for_tab(index)
-                .is_some_and(|app| app.remote);
+        for tab in tabs {
             let padding = self.title_padding()
                 + TAB_TITLE_PADDING_RIGHT
-                + if remote {
+                + if tab.remote {
                     self.tab_icon_size + 4.0
                 } else {
                     0.0
                 }
-                + if context_manager.bell(index) {
+                + if tab.bell {
                     BELL_DOT_SIZE + BELL_GAP
                 } else {
                     0.0
                 };
-            let width = sugarloaf.text_mut().measure(&title, &opts) + padding;
+            let width = sugarloaf.text_mut().measure(&tab.title, &opts) + padding;
             self.preferred_tab_widths
                 .push(width.clamp(self.min_tab_width, self.max_tab_width));
         }
@@ -1449,7 +1448,49 @@ impl Island {
         }
 
         #[cfg(target_os = "windows")]
-        self.measure_tab_width(sugarloaf, context_manager);
+        let tabs: Vec<_> = (0..num_tabs)
+            .map(|index| {
+                let raw_title = self.get_title_for_tab(context_manager, index);
+                let status = self.status_for_tab(context_manager, index);
+                let (icon, remote) = context_manager
+                    .application_for_tab(index)
+                    .map(|app| {
+                        (
+                            super::app_icons::for_program(
+                                &app.program,
+                                &app.title,
+                                status.as_ref(),
+                                app.reported,
+                            ),
+                            app.remote,
+                        )
+                    })
+                    .unwrap_or((super::app_icons::DEFAULT_ICON, false));
+                TabPresentation {
+                    title: Self::status_title(status.as_ref(), &raw_title),
+                    status,
+                    icon,
+                    remote,
+                    bell: context_manager.bell(index),
+                }
+            })
+            .collect();
+        #[cfg(target_os = "windows")]
+        self.measure_tab_width(sugarloaf, &tabs);
+        #[cfg(target_os = "windows")]
+        let tab_title_y = crate::renderer::windows_chrome::centered_text_y(
+            sugarloaf,
+            "Mg",
+            ISLAND_HEIGHT / 2.0 + 2.0,
+            &DrawOpts {
+                font_size: crate::renderer::windows_chrome::snap(
+                    TITLE_FONT_SIZE,
+                    scale_factor,
+                ),
+                font_id: Some(rio_backend::sugarloaf::font::FONT_ID_REGULAR),
+                ..DrawOpts::default()
+            },
+        );
         #[cfg(target_os = "windows")]
         let tab_padding_x = self.title_padding();
         #[cfg(not(target_os = "windows"))]
@@ -1526,30 +1567,26 @@ impl Island {
             // Get title for this tab, then truncate with a trailing
             // ellipsis so overflowing titles can't bleed into the next
             // tab or past the left edge (issue #1508).
+            #[cfg(not(target_os = "windows"))]
             let raw_title = self.get_title_for_tab(context_manager, tab_index);
+            #[cfg(not(target_os = "windows"))]
             let program_status = self.status_for_tab(context_manager, tab_index);
             #[cfg(target_os = "windows")]
-            let (app_icon, remote) = context_manager
-                .application_for_tab(tab_index)
-                .map(|app| {
-                    (
-                        super::app_icons::for_program(
-                            &app.program,
-                            &app.title,
-                            program_status.as_ref(),
-                            app.reported,
-                        ),
-                        app.remote,
-                    )
-                })
-                .unwrap_or((super::app_icons::DEFAULT_ICON, false));
+            let tab = &tabs[tab_index];
+            #[cfg(target_os = "windows")]
+            let (app_icon, remote) = (tab.icon, tab.remote);
+            #[cfg(target_os = "windows")]
+            let program_status = &tab.status;
             #[cfg(target_os = "windows")]
             let remote_padding = if remote {
                 self.tab_icon_size + 4.0
             } else {
                 0.0
             };
+            #[cfg(not(target_os = "windows"))]
             let raw_title = Self::status_title(program_status.as_ref(), &raw_title);
+            #[cfg(target_os = "windows")]
+            let raw_title = &tab.title;
             if raw_title.is_empty() {
                 x_position += tab_width;
                 continue;
@@ -1598,7 +1635,10 @@ impl Island {
             // The bell mark is its own text run: the UI text layer resolves
             // a single font per draw from the run's first char, so gluing it
             // onto the title would shape the whole title in the emoji font.
+            #[cfg(not(target_os = "windows"))]
             let bell = context_manager.bell(tab_index);
+            #[cfg(target_os = "windows")]
+            let bell = tab.bell;
             let bell_width = if bell { BELL_DOT_SIZE + BELL_GAP } else { 0.0 };
 
             let max_text_width = if single {
@@ -1651,12 +1691,7 @@ impl Island {
                 #[cfg(target_os = "windows")]
                 let (text_x, text_y) = (
                     crate::renderer::windows_chrome::snap(text_x, scale_factor),
-                    crate::renderer::windows_chrome::centered_text_y(
-                        sugarloaf,
-                        "Mg",
-                        ISLAND_HEIGHT / 2.0 + 2.0,
-                        &title_opts,
-                    ),
+                    tab_title_y,
                 );
                 if bell {
                     // Centered on the title's lowercase body, not the strip:
@@ -1866,22 +1901,14 @@ impl Island {
                 draw_close_button(sugarloaf, cx, self.active_text_color, false, 12);
             }
 
+            #[cfg(not(target_os = "windows"))]
             let program_status = self.status_for_tab(context_manager, drag_idx);
             #[cfg(target_os = "windows")]
-            let (app_icon, remote) = context_manager
-                .application_for_tab(drag_idx)
-                .map(|app| {
-                    (
-                        super::app_icons::for_program(
-                            &app.program,
-                            &app.title,
-                            program_status.as_ref(),
-                            app.reported,
-                        ),
-                        app.remote,
-                    )
-                })
-                .unwrap_or((super::app_icons::DEFAULT_ICON, false));
+            let tab = &tabs[drag_idx];
+            #[cfg(target_os = "windows")]
+            let (app_icon, remote) = (tab.icon, tab.remote);
+            #[cfg(target_os = "windows")]
+            let program_status = &tab.status;
             #[cfg(target_os = "windows")]
             let remote_padding = if remote {
                 self.tab_icon_size + 4.0
@@ -1913,8 +1940,12 @@ impl Island {
                 );
             }
 
+            #[cfg(not(target_os = "windows"))]
             let raw_title = self.get_title_for_tab(context_manager, drag_idx);
+            #[cfg(not(target_os = "windows"))]
             let raw_title = Self::status_title(program_status.as_ref(), &raw_title);
+            #[cfg(target_os = "windows")]
+            let raw_title = &tab.title;
             if !raw_title.is_empty() {
                 #[cfg(target_os = "windows")]
                 let right_padding = TAB_TITLE_PADDING_RIGHT;
@@ -1955,12 +1986,7 @@ impl Island {
                 #[cfg(target_os = "windows")]
                 let (text_x, text_y) = (
                     crate::renderer::windows_chrome::snap(text_x, scale_factor),
-                    crate::renderer::windows_chrome::centered_text_y(
-                        sugarloaf,
-                        "Mg",
-                        ISLAND_HEIGHT / 2.0 + 2.0,
-                        &title_opts,
-                    ),
+                    tab_title_y,
                 );
                 sugarloaf
                     .text_mut()

@@ -5,6 +5,7 @@
 
 use crate::font::FontLibrary;
 use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
 // `pos` is **pixel-space top-left** of the glyph's text bounding box.
 // `bearings.x` shifts it right to the glyph bitmap's left edge;
@@ -157,7 +158,7 @@ pub struct Text {
     #[cfg(not(target_os = "macos"))]
     wght_variation_cache: FxHashMap<u32, Option<f32>>,
     ascent_cache: FxHashMap<(u32, u16), i16>,
-    shape_cache: FxHashMap<u64, ShapedRun>,
+    shape_cache: FxHashMap<u64, Arc<ShapedRun>>,
 
     #[cfg(target_os = "macos")]
     handle_cache: FxHashMap<u32, crate::font::macos::FontHandle>,
@@ -287,7 +288,7 @@ impl Text {
             .then_some((top / self.scale_factor, (bottom - top) / self.scale_factor))
     }
 
-    fn shape_for(&mut self, text: &str, opts: &DrawOpts) -> Option<ShapedRun> {
+    fn shape_for(&mut self, text: &str, opts: &DrawOpts) -> Option<Arc<ShapedRun>> {
         use crate::{Attributes, SpanStyle, Stretch, Style as FontStyle, Weight};
 
         let scaled = opts.font_size * self.scale_factor;
@@ -297,33 +298,36 @@ impl Text {
             (if opts.bold { 1u8 } else { 0 }) | (if opts.italic { 2u8 } else { 0 });
 
         let first_ch = text.chars().next()?;
-        let (font_id, _is_emoji) = match self.font_resolve.entry((first_ch, style_flags))
-        {
-            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                let _timing =
-                    tracing::debug_span!(target: "rio_profile", "ui.font_fallback")
-                        .entered();
-                let mut ss = SpanStyle::default();
-                let weight = if opts.bold {
-                    Weight::BOLD
-                } else {
-                    Weight::NORMAL
-                };
-                let fstyle = if opts.italic {
-                    FontStyle::Italic
-                } else {
-                    FontStyle::Normal
-                };
-                ss.font_attrs = Attributes::new(Stretch::NORMAL, weight, fstyle);
-                let resolved =
-                    self.font_library.resolve_font_for_char(first_ch, &ss, None);
-                let v = (resolved.0 as u32, resolved.1);
-                e.insert(v);
-                v
+        let font_id = if let Some(id) = opts.font_id {
+            id as u32
+        } else {
+            match self.font_resolve.entry((first_ch, style_flags)) {
+                std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let _timing =
+                        tracing::debug_span!(target: "rio_profile", "ui.font_fallback")
+                            .entered();
+                    let mut ss = SpanStyle::default();
+                    let weight = if opts.bold {
+                        Weight::BOLD
+                    } else {
+                        Weight::NORMAL
+                    };
+                    let fstyle = if opts.italic {
+                        FontStyle::Italic
+                    } else {
+                        FontStyle::Normal
+                    };
+                    ss.font_attrs = Attributes::new(Stretch::NORMAL, weight, fstyle);
+                    let resolved =
+                        self.font_library.resolve_font_for_char(first_ch, &ss, None);
+                    let v = (resolved.0 as u32, resolved.1);
+                    e.insert(v);
+                    v
+                }
             }
+            .0
         };
-        let font_id = opts.font_id.map(|id| id as u32).unwrap_or(font_id);
 
         let hash = shape_hash(font_id, size_bucket, style_flags, text);
         if let Some(entry) = self.shape_cache.get(&hash) {
@@ -450,7 +454,7 @@ impl Text {
             (glyphs, ascent_px, wght)
         };
 
-        let run = ShapedRun {
+        let run = Arc::new(ShapedRun {
             font_id,
             size_u16,
             size_bucket,
@@ -460,7 +464,7 @@ impl Text {
             wght_variation,
             ascent_px,
             glyphs,
-        };
+        });
         self.shape_cache.insert(hash, run.clone());
         Some(run)
     }
