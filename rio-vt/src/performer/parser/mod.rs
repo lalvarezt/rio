@@ -41,6 +41,8 @@ pub struct Parser {
     osc_raw: OscBuffer,
     osc_params: [(usize, usize); MAX_OSC_PARAMS],
     osc_num_params: usize,
+    osc_program_status: bool,
+    osc_discarded: bool,
     ignoring: bool,
     partial_utf8: [u8; 4],
     partial_utf8_len: usize,
@@ -509,7 +511,7 @@ impl Parser {
     ) -> usize {
         let n = find_osc_boundary(bytes);
         if n != 0 {
-            self.osc_raw.extend_from_slice(&bytes[..n]);
+            self.osc_extend(&bytes[..n]);
         }
         if n == bytes.len() {
             return n;
@@ -777,6 +779,9 @@ impl Parser {
     /// Add OSC param separator.
     #[inline]
     fn action_osc_put_param(&mut self) {
+        if self.osc_discarded {
+            return;
+        }
         let idx = self.osc_raw.len();
 
         let param_idx = self.osc_num_params;
@@ -796,18 +801,48 @@ impl Parser {
         }
 
         self.osc_num_params += 1;
+        if param_idx == 0 {
+            self.osc_program_status = self.osc_raw.slice(0, idx) == b"7501";
+        }
+    }
+
+    fn osc_extend(&mut self, bytes: &[u8]) {
+        if self.osc_discarded {
+            return;
+        }
+        if self.osc_program_status
+            && self.osc_raw.len().saturating_add(bytes.len())
+                > crate::program_status::MAX_SEQUENCE_BYTES
+        {
+            self.osc_discarded = true;
+            return;
+        }
+        self.osc_raw.extend_from_slice(bytes);
     }
 
     #[inline(always)]
     fn action_osc_put(&mut self, byte: u8) {
+        if self.osc_discarded {
+            return;
+        }
+        if self.osc_program_status
+            && self.osc_raw.len() >= crate::program_status::MAX_SEQUENCE_BYTES
+        {
+            self.osc_discarded = true;
+            return;
+        }
         self.osc_raw.push(byte);
     }
 
     fn osc_end<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         self.action_osc_put_param();
-        self.osc_dispatch(performer, byte);
+        if !self.osc_discarded {
+            self.osc_dispatch(performer, byte);
+        }
         self.osc_raw.clear();
         self.osc_num_params = 0;
+        self.osc_program_status = false;
+        self.osc_discarded = false;
     }
 
     /// Reset escape sequence parameters and intermediates.
@@ -1563,6 +1598,26 @@ pub trait Perform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn program_status_accumulation_is_bounded_and_recovers_after_oversize() {
+        for chunk_size in [1, 17, 8192] {
+            let mut parser = Parser::new();
+            let mut dispatcher = Dispatcher::default();
+            parser.advance(&mut dispatcher, b"\x1b]7501;");
+            for chunk in vec![b'a'; 16 * 1024].chunks(chunk_size) {
+                parser.advance(&mut dispatcher, chunk);
+                assert!(
+                    parser.osc_raw.len() <= crate::program_status::MAX_SEQUENCE_BYTES
+                );
+            }
+            assert!(parser.osc_discarded);
+            parser.advance(&mut dispatcher, b"\x07");
+            assert!(dispatcher.dispatched.is_empty());
+            parser.advance(&mut dispatcher, b"\x1b]7501;state=done\x07");
+            assert_eq!(dispatcher.dispatched.len(), 1);
+        }
+    }
 
     /// The scalar and simdutf decoders implement the maximal-subpart /
     /// U+FFFD / lone-C1 contract independently; with short runs routed

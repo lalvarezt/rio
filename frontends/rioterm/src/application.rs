@@ -770,10 +770,18 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     }
                 }
             }
-            RioEventType::Rio(RioEvent::ProgressReport(report)) => {
+            RioEventType::Rio(RioEvent::ProgressReport(_report)) => {
+                #[cfg(not(any(target_os = "windows", target_os = "linux")))]
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
                     if let Some(island) = &mut route.window.screen.renderer.island {
-                        island.set_progress_report(report);
+                        island.set_progress_report(_report);
+                        route.request_overlay_redraw();
+                    }
+                }
+            }
+            RioEventType::Rio(RioEvent::ProgramStatusChanged(route_id)) => {
+                if let Some(route) = self.router.routes.get_mut(&window_id) {
+                    if route.window.screen.ctx().is_route_focused_in_tab(route_id) {
                         route.request_overlay_redraw();
                     }
                 }

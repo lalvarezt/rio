@@ -1,5 +1,79 @@
 use super::*;
 
+#[test]
+fn program_status_each_tab_uses_only_its_own_focused_split() {
+    use crate::context::{create_dead_context, ContextManager};
+    use rio_backend::event::{VoidListener, WindowId};
+    use rio_backend::performer::handler::Processor;
+    use rio_backend::program_status::ProgramState;
+
+    let mut cm =
+        ContextManager::start_with_capacity(3, VoidListener {}, WindowId::from(0))
+            .unwrap();
+    let mut parser = Processor::default();
+    let first_node = cm.current_grid().current;
+    let first_route = cm.current().route_id;
+    parser.advance(
+        &mut *cm.current().terminal.lock(),
+        b"\x1b]7501;state=blocked:app=first\x07",
+    );
+
+    // Construct a real split tree without a renderer; geometry is unrelated
+    // to which pane's status the tab selects.
+    let second_route = usize::MAX - 1;
+    let second = create_dead_context(
+        VoidListener {},
+        WindowId::from(0),
+        second_route,
+        0,
+        cm.current().dimension,
+    );
+    let grid = cm.current_grid_mut();
+    let second_node = grid.try_split_right().unwrap();
+    grid.inner.insert(second_node, ContextGridItem::new(second));
+    grid.current = second_node;
+    parser.advance(
+        &mut *cm.current().terminal.lock(),
+        b"\x1b]7501;state=working:app=second:progress=40\x07",
+    );
+    assert_eq!(
+        cm.program_status_for_tab(0).unwrap().state,
+        ProgramState::Working
+    );
+    assert!(!cm.is_route_focused_in_tab(first_route));
+    assert!(cm.is_route_focused_in_tab(second_route));
+
+    cm.add_context(true, 0);
+    parser.advance(
+        &mut *cm.current().terminal.lock(),
+        b"\x1b]7501;state=done:app=third\x07",
+    );
+    assert_eq!(
+        cm.program_status_for_tab(0).unwrap().app.as_deref(),
+        Some("second")
+    );
+    assert_eq!(
+        cm.program_status_for_tab(1).unwrap().state,
+        ProgramState::Done
+    );
+    cm.contexts_mut()[0].current = first_node;
+    assert_eq!(
+        cm.program_status_for_tab(0).unwrap().state,
+        ProgramState::Blocked
+    );
+    assert!(cm.is_route_focused_in_tab(first_route));
+    assert!(!cm.is_route_focused_in_tab(second_route));
+    cm.contexts_mut()[0].current = second_node;
+    let second_terminal = cm.contexts_mut()[0].current().terminal.clone();
+    parser.advance(&mut *second_terminal.lock(), b"\x1b]7501;state=clear\x07");
+    assert!(cm.program_status_for_tab(0).is_none());
+    assert!(cm.program_status_for_tab(usize::MAX).is_none());
+    assert_eq!(
+        cm.program_status_for_tab(1).unwrap().state,
+        ProgramState::Done
+    );
+}
+
 // This file tests compute function on different layouts.
 // I've added some real scenarios so I can make sure it doesn't go off again.
 

@@ -111,6 +111,9 @@ pub trait Handler {
     /// OSC 133: mark the cursor row as a semantic prompt row.
     fn set_semantic_prompt(&mut self, _: crate::crosswords::grid::row::SemanticPrompt) {}
 
+    /// OSC 133 A begins a new command lifetime, independently of row marks.
+    fn shell_prompt_start(&mut self) {}
+
     /// OSC 1337 SetUserVar: record a shell-provided variable.
     fn set_user_var(&mut self, _name: String, _value: String) {}
 
@@ -414,6 +417,10 @@ pub trait Handler {
 
     /// Set progress bar report (OSC 9;4).
     fn set_progress_report(&mut self, _: crate::event::ProgressReport) {}
+
+    fn set_program_status(&mut self, _: crate::program_status::ProgramStatusRecord) {}
+
+    fn query_program_status(&mut self, _terminator: &str) {}
 
     /// Report current keyboard mode.
     fn report_keyboard_mode(&mut self) {}
@@ -1180,8 +1187,26 @@ impl<U: Handler> Perform for Performer<'_, U> {
 
             // OSC 133 - semantic prompt zones (shell integration).
             b"133" => {
+                if params.get(1) == Some(&b"A".as_slice()) {
+                    self.handler.shell_prompt_start();
+                }
                 if let Some(mark) = osc::parse_semantic_prompt(params) {
                     self.handler.set_semantic_prompt(mark);
+                }
+            }
+
+            b"7501" if params.len() == 2 => {
+                // Include OSC, the separator, and the actual terminator.
+                if params[1].len() + 7 + terminator.len()
+                    <= crate::program_status::MAX_SEQUENCE_BYTES
+                {
+                    if params[1] == b"?" {
+                        self.handler.query_program_status(terminator);
+                    } else if let Some(report) =
+                        crate::program_status::parse_report(params[1])
+                    {
+                        self.handler.set_program_status(report);
+                    }
                 }
             }
 
