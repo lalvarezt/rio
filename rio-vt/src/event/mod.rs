@@ -259,6 +259,9 @@ pub enum RioEvent {
     /// Progress bar report from OSC 9;4 sequence
     ProgressReport(ProgressReport),
 
+    /// Program status or legacy progress changed in the identified pane.
+    ProgramStatusChanged(usize),
+
     /// Terminal bell ring, from the PTY identified by `route_id`.
     Bell(usize),
 
@@ -334,6 +337,9 @@ impl Debug for RioEvent {
             }
             RioEvent::ProgressReport(report) => {
                 write!(f, "ProgressReport({:?})", report)
+            }
+            RioEvent::ProgramStatusChanged(route_id) => {
+                write!(f, "ProgramStatusChanged route {route_id}")
             }
             RioEvent::MouseCursorDirty => write!(f, "MouseCursorDirty"),
             RioEvent::ResetTitle => write!(f, "ResetTitle"),

@@ -440,6 +440,7 @@ where
     pub selection: Option<Selection>,
     pub colors: TermColors,
     pub title: String,
+    pub program_status: crate::program_status::ProgramStatusStore,
     damage: TermDamageState,
     pub graphics: Graphics,
     /// Per-session registry of glyphs registered over Glyph Protocol
@@ -513,6 +514,7 @@ impl<U: EventListener> Crosswords<U> {
             event_proxy,
             colors: term_colors,
             title: String::from(""),
+            program_status: Default::default(),
             tabs: TabStops::new(cols),
             mode: Mode::SHOW_CURSOR
                 | Mode::LINE_WRAP
@@ -754,8 +756,22 @@ impl<U: EventListener> Crosswords<U> {
     where
         U: EventListener,
     {
+        self.end_program_activity();
         self.event_proxy
             .send_event(RioEvent::CloseTerminal(self.route_id), self.window_id);
+    }
+
+    fn program_status_changed(&self) {
+        self.event_proxy.send_event(
+            RioEvent::ProgramStatusChanged(self.route_id),
+            self.window_id,
+        );
+    }
+
+    fn end_program_activity(&mut self) {
+        if self.program_status.end_activity() {
+            self.program_status_changed();
+        }
     }
 
     pub fn resize<S: Dimensions>(&mut self, size: S) {
@@ -3335,6 +3351,8 @@ impl<U: EventListener> Handler for Crosswords<U> {
 
     #[inline]
     fn reset_state(&mut self) {
+        self.program_status.reset();
+        self.program_status_changed();
         if self.mode.contains(Mode::ALT_SCREEN) {
             std::mem::swap(&mut self.grid, &mut self.inactive_grid);
         }
@@ -3474,8 +3492,28 @@ impl<U: EventListener> Handler for Crosswords<U> {
     }
 
     fn set_progress_report(&mut self, report: crate::event::ProgressReport) {
-        self.event_proxy
-            .send_event(RioEvent::ProgressReport(report), self.window_id);
+        if self.program_status.set_legacy_progress(report) {
+            // Preserve the legacy event for embedders; Rio's frontend uses
+            // the pane-scoped change event to select the visible report.
+            self.event_proxy
+                .send_event(RioEvent::ProgressReport(report), self.window_id);
+            self.program_status_changed();
+        }
+    }
+
+    fn set_program_status(&mut self, report: crate::program_status::ProgramStatusRecord) {
+        self.program_status.apply(report);
+        self.program_status_changed();
+    }
+
+    fn query_program_status(&mut self, terminator: &str) {
+        self.event_proxy.send_event(RioEvent::PtyWrite(self.route_id,
+            format!("\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth{terminator}")),
+            self.window_id);
+    }
+
+    fn shell_prompt_start(&mut self) {
+        self.end_program_activity();
     }
 
     fn set_current_directory(&mut self, path: std::path::PathBuf) {
@@ -5848,6 +5886,142 @@ mod tests {
         let size = CrosswordsSize::new(4, 4);
         let window_id = crate::event::WindowId::from(0);
         Crosswords::new(size, CursorShape::Block, VoidListener {}, window_id, 0, 10)
+    }
+
+    #[test]
+    fn program_status_protocol_replies_route_and_validates_atomically() {
+        use crate::performer::handler::Processor;
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut terminal = Crosswords::new(
+            CrosswordsSize::new(10, 10),
+            CursorShape::Block,
+            TestListener {
+                events: events.clone(),
+            },
+            WindowId::from(0),
+            42,
+            10,
+        );
+        let mut parser = Processor::default();
+        for terminator in ["\x07", "\x1b\\"] {
+            parser.advance(&mut terminal, format!("\x1b]7501;?{terminator}").as_bytes());
+            assert!(events.borrow().iter().any(|e| matches!(e,
+                RioEvent::PtyWrite(42, text) if text == &format!(
+                    "\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth{terminator}"))));
+        }
+        assert!(!terminal.program_status.received_report());
+        for chunk in b"\x1b]7501;state=blocked:kind=question:msg=aGk=\x1b\\".chunks(3) {
+            parser.advance(&mut terminal, chunk);
+        }
+        assert_eq!(
+            terminal.program_status.current().unwrap().msg.as_deref(),
+            Some("hi")
+        );
+        assert!(events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, RioEvent::ProgramStatusChanged(42))));
+        let revision = terminal.program_status.revision();
+        for body in [
+            "state=error:msg=AA==".to_owned(),
+            "state=clear:id=bad//id".to_owned(),
+            "state=done;app=cargo".to_owned(),
+            format!("state=done:unknown={}", "a".repeat(4096)),
+        ] {
+            parser.advance(&mut terminal, format!("\x1b]7501;{body}\x07").as_bytes());
+            assert_eq!(terminal.program_status.revision(), revision);
+        }
+        // Detection never resets existing records.
+        parser.advance(&mut terminal, b"\x1b]7501;?\x07");
+        assert_eq!(terminal.program_status.revision(), revision);
+    }
+
+    #[test]
+    fn program_status_lifetime_is_independent_of_screen_and_soft_reset() {
+        use crate::performer::handler::Processor;
+        use crate::program_status::ProgramState;
+        let mut terminal = make_crosswords();
+        let mut parser = Processor::default();
+        parser.advance(
+            &mut terminal,
+            b"\x1b]7501;state=working\x07\x1b]7501;state=done:id=result\x07",
+        );
+        parser.advance(&mut terminal, b"\x1b[?1049h\x1b[!p\x1b[?1049l");
+        assert_eq!(terminal.program_status.records().len(), 2);
+        // Continuation markers do not finish the program's lifetime.
+        parser.advance(&mut terminal, b"\x1b]133;P;k=c\x07");
+        assert_eq!(terminal.program_status.records().len(), 2);
+        parser.advance(&mut terminal, b"\x1b]133;A\x07");
+        assert_eq!(terminal.program_status.records().len(), 1);
+        assert_eq!(
+            terminal.program_status.current().unwrap().state,
+            ProgramState::Done
+        );
+        parser.advance(&mut terminal, b"\x1b]7501;state=blocked:id=child\x07");
+        terminal.exit();
+        assert_eq!(terminal.program_status.records().len(), 1);
+        parser.advance(&mut terminal, b"\x1bc");
+        assert!(terminal.program_status.records().is_empty());
+        assert!(!terminal.program_status.received_report());
+    }
+
+    #[test]
+    fn program_status_reports_take_precedence_over_legacy_progress_until_reset() {
+        use crate::performer::handler::Processor;
+        let mut terminal = make_crosswords();
+        let mut parser = Processor::default();
+        parser.advance(&mut terminal, b"\x1b]9;4;1;20\x07");
+        assert_eq!(
+            terminal
+                .program_status
+                .legacy_progress()
+                .unwrap()
+                .0
+                .progress,
+            Some(20)
+        );
+        parser.advance(
+            &mut terminal,
+            b"\x1b]7501;state=working:msg=aGk=\x07\x1b]9;4;1;90\x07",
+        );
+        assert!(terminal.program_status.legacy_progress().is_none());
+        assert_eq!(
+            terminal.program_status.current().unwrap().msg.as_deref(),
+            Some("hi")
+        );
+        parser.advance(&mut terminal, b"\x1b]7501;state=clear\x07\x1b]9;4;1;90\x07");
+        assert!(terminal.program_status.records().is_empty());
+        assert!(terminal.program_status.legacy_progress().is_none());
+        parser.advance(&mut terminal, b"\x1bc\x1b]9;4;1;30\x07");
+        assert_eq!(
+            terminal
+                .program_status
+                .legacy_progress()
+                .unwrap()
+                .0
+                .progress,
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn program_status_sequence_limit_includes_actual_terminator() {
+        use crate::performer::handler::Processor;
+        let mut terminal = make_crosswords();
+        let mut parser = Processor::default();
+        for terminator in ["\x07", "\x1b\\"] {
+            let header = "\x1b]7501;state=working:unknown=";
+            let padding = crate::program_status::MAX_SEQUENCE_BYTES
+                - header.len()
+                - terminator.len();
+            let sequence = format!("{header}{}{terminator}", "a".repeat(padding));
+            let before = terminal.program_status.revision();
+            parser.advance(&mut terminal, sequence.as_bytes());
+            assert_eq!(terminal.program_status.revision(), before + 1);
+            let oversized = format!("{header}{}{terminator}", "a".repeat(padding + 1));
+            parser.advance(&mut terminal, oversized.as_bytes());
+            assert_eq!(terminal.program_status.revision(), before + 1);
+        }
     }
 
     #[test]

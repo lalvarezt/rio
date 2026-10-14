@@ -126,6 +126,41 @@ impl EventListener for MyListener {
 }
 ```
 
+## Program status
+
+The core supports the [Program Status Protocol, OSC 7501](https://www.superlogical.com/rex/docs/build/program-status).
+Each `Crosswords` owns its records in `program_status`, independently of the active screen.
+`RioEvent::ProgramStatusChanged(route_id)` identifies the pane whose status changed.
+Capability replies use `RioEvent::PtyWrite(route_id, text)` to reach the requesting pane.
+
+Reports replace the addressed record. IDs support child records, inherited `app` values,
+and subtree clearing. The store holds up to 256 records and evicts the least recently
+updated record when full. Oversized reports, invalid base64, and decoded control
+characters cause the whole report to be discarded.
+
+`OSC 133 A` and terminal process exit remove `working` and `blocked` records.
+`done`, `error`, and `idle` records survive those events. A full reset removes every
+record; alternate-screen changes and soft resets preserve them. No heartbeat is required.
+
+On Windows and Linux, Rio's tab strip shows the focused pane's status and progress.
+Switching splits or tabs loads the newly focused pane's records. Background updates
+do not replace the visible status. Within a pane, the display prefers `blocked`,
+`error`, `working`, `done`, then `idle`; ties use the most recent update.
+Status text follows the tab strip's visibility settings.
+
+For example, these shell commands report progress, request approval, and clear the status:
+
+```sh
+printf '\033]7501;state=working:app=build:progress=40\007'
+printf '\033]7501;state=blocked:kind=permission:app=build:msg=QXBwcm92ZT8=\007'
+printf '\033]7501;state=clear\007'
+```
+
+OSC 9;4 progress remains available per pane until that pane receives an OSC 7501
+report. Further OSC 9;4 reports are ignored until a full reset, so legacy progress
+cannot overwrite program status. Legacy progress keeps its existing 15-second
+display timeout; OSC 7501 status remains until its protocol lifetime ends.
+
 ## Driving a real PTY
 
 `performer::Machine` wires a spawned PTY to the parser and the grid on a
