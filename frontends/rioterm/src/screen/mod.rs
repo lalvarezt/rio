@@ -3244,18 +3244,26 @@ impl Screen<'_> {
             return;
         }
 
-        // Cross neighboring centers so unequal widths do not make a tab
-        // oscillate between slots after reordering.
+        // Cross a neighbor's center with the leading edge. The floating tab
+        // is clamped to the strip, so its center cannot pass the final slot's
+        // center, especially when the dragged tab is wider than its neighbor.
         let mut target = old_index;
-        while target > 0
-            && center < layout.left(target - 1) + layout.width(target - 1) / 2.0
-        {
-            target -= 1;
-        }
-        while target + 1 < num_tabs
-            && center > layout.left(target + 1) + layout.width(target + 1) / 2.0
-        {
-            target += 1;
+        let left = center - layout.width(drag_idx) / 2.0;
+        let right = left + layout.width(drag_idx);
+        // Choose one direction from the current slot so a wide tab spanning
+        // both neighbors cannot trigger opposing moves in the same event.
+        if left < layout.left(old_index) {
+            while target > 0
+                && left < layout.left(target - 1) + layout.width(target - 1) / 2.0
+            {
+                target -= 1;
+            }
+        } else {
+            while target + 1 < num_tabs
+                && right > layout.left(target + 1) + layout.width(target + 1) / 2.0
+            {
+                target += 1;
+            }
         }
         if target != old_index {
             self.context_manager.move_current_tab_to(target);
