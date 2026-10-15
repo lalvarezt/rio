@@ -103,10 +103,10 @@ pass caused eight failed cache attempts and a ninth rasterization on the next
 frame in the eight-tab workload. Native profiling confirms one rasterization
 after the move. Upload itself takes less than 0.5 ms in those runs.
 
-The fixed WGPU atlas still falls back when full. Repeated uncached requests can
-then rasterize again, as with the existing glyph-atlas capacity limitation. No
-eviction or extra presentation-invalidation system was added without evidence
-that normal use needs it. Application lookup and title fitting cost about
+The fixed WGPU atlas still falls back when full. Failed icon uploads are now
+cached until atlas initialization, as verified by the repeat-work pass below.
+No atlas eviction or extra presentation-invalidation system was added without
+evidence that normal use needs it. Application lookup and title fitting cost about
 1 microsecond and 0.5 microseconds per call respectively in this workload.
 
 ### Behavior
@@ -252,3 +252,44 @@ The clean profiling build completes another 600-frame hold. The normal Windows
 debug build passes, and native captures retain ordinary selection, both wrap
 directions, reversal, rounded closing edges and three-tab wraparound. Those
 captures are under `target/profiles/tab-regression-held-navigation`.
+
+## Other repeated work
+
+The follow-up checks tab reordering, dragging and release, title width debounce,
+hover and fullscreen controls, cursor trails, render timers, and UI caches.
+Reordering in both directions passes the held-input backlog check with 180
+events per run. Position springs retarget absolute destinations; fade state and
+cursor trails have fixed size; closing tab presentations are removed after their
+fade. Render scheduling call sites already guard against duplicate timers.
+No further animation or timer queue was found in those inspected paths.
+
+Two cache paths did accumulate work:
+
+- UI shaping retained every historical title. An isolated native probe measures
+  20,000 unique titles through the real `Text::measure` implementation. Tracked
+  live Rust allocations grow from 13.8 MB after the first batch of 10,000 to
+  27.5 MB after the second. The cache now keeps at most 2,048 shaped runs,
+  evicting one oldest run per miss. Hits keep their existing lookup path, and
+  eviction avoids a whole-cache drop in one frame. The same probe now grows
+  from 2.88 MB to 2.95 MB. These are allocator measurements for this workload,
+  not process RSS or a shaping-throughput improvement.
+- An exhausted color atlas retried rasterization on every icon draw. After
+  filling the real CPU atlas, 100 requests for one missing slot invoke its
+  rasterizer 100 times before the fix and once afterward. Failed uploads are
+  stored in the existing icon map alongside successful slots. Atlas
+  initialization clears both, allowing an early failure to recover.
+
+The native probe also verifies identical text width after eviction, zero
+allocations across 10,000 cached measurements and 10,000 cached failed icon
+draws, and successful retry after atlas initialization. The command is:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File target/rio-ui-cache-build.ps1
+```
+
+The probe and its temporary binary declaration remain under ignored `target/`.
+The build helper restores the manifest afterward. The normal Windows debug
+build and the existing catalog, 38-logo asset and CPU tint/clipping checks pass.
+Native captures also pass after 32 rapid create/close cycles, followed by
+ordinary selection, wraparound, reversal and closing. Captures are under
+`target/profiles/tab-regression-repeat-cache-final`.

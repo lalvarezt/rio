@@ -5,7 +5,10 @@
 
 use crate::font::FontLibrary;
 use rustc_hash::FxHashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
+
+const MAX_SHAPED_RUNS: usize = 2048;
 
 // `pos` is **pixel-space top-left** of the glyph's text bounding box.
 // `bearings.x` shifts it right to the glyph bitmap's left edge;
@@ -159,8 +162,9 @@ pub struct Text {
     wght_variation_cache: FxHashMap<u32, Option<f32>>,
     ascent_cache: FxHashMap<(u32, u16), i16>,
     shape_cache: FxHashMap<u64, Arc<ShapedRun>>,
+    shape_cache_order: VecDeque<u64>,
     #[cfg(target_os = "windows")]
-    icons: FxHashMap<(&'static str, u16), crate::grid::atlas::AtlasSlot>,
+    icons: FxHashMap<(&'static str, u16), Option<crate::grid::atlas::AtlasSlot>>,
 
     #[cfg(target_os = "macos")]
     handle_cache: FxHashMap<u32, crate::font::macos::FontHandle>,
@@ -192,6 +196,7 @@ impl Text {
             wght_variation_cache: FxHashMap::default(),
             ascent_cache: FxHashMap::default(),
             shape_cache: FxHashMap::default(),
+            shape_cache_order: VecDeque::new(),
             #[cfg(target_os = "windows")]
             icons: FxHashMap::default(),
             #[cfg(target_os = "macos")]
@@ -288,6 +293,7 @@ impl Text {
                 rasterize(size)
             };
             if bytes.len() != size as usize * size as usize * 4 {
+                self.icons.insert(key, None);
                 return false;
             }
             let raster = crate::grid::RasterizedGlyph {
@@ -318,10 +324,13 @@ impl Text {
                     None
                 }
             };
-            let Some(slot) = slot else { return false };
+            // A full atlas cannot accept this immutable artwork on a later
+            // frame either. Atlas initialization clears successful and failed
+            // entries together.
             self.icons.insert(key, slot);
             slot
         };
+        let Some(slot) = slot else { return false };
         self.instances.push(TextInstance {
             pos: [
                 (cx * scale - size as f32 / 2.0).round(),
@@ -585,6 +594,15 @@ impl Text {
             ascent_px,
             glyphs,
         });
+        // Changing titles should not retain every historical label. Evict one
+        // oldest entry per miss so cache hits need no recency bookkeeping and
+        // eviction never drops the whole cache in one frame.
+        if self.shape_cache_order.len() == MAX_SHAPED_RUNS {
+            if let Some(oldest) = self.shape_cache_order.pop_front() {
+                self.shape_cache.remove(&oldest);
+            }
+        }
+        self.shape_cache_order.push_back(hash);
         self.shape_cache.insert(hash, run.clone());
         Some(run)
     }
