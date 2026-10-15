@@ -233,42 +233,12 @@ impl<'a> WgpuContext<'a> {
             wgpu::CompositeAlphaMode::Auto
         };
 
-        // Configure view formats for wide color gamut support
-        let view_formats = match renderer_config.colorspace {
-            Colorspace::DisplayP3 | Colorspace::Rec2020 => {
-                // For wide color gamut, we may want to support additional view formats
-                // This allows the surface to be viewed in different formats
-                vec![format]
-            }
-            Colorspace::Srgb => {
-                vec![]
-            }
-        };
-
-        let configure_timing =
-            tracing::debug_span!(target: "rio_profile", "gpu.configure").entered();
-        surface.configure(
-            &device,
-            &wgpu::SurfaceConfiguration {
-                usage: Self::get_texture_usage(&surface_caps),
-                format,
-                width: size.width as u32,
-                height: size.height as u32,
-                view_formats,
-                alpha_mode,
-                color_space: wgpu::SurfaceColorSpace::Auto,
-                present_mode: wgpu::PresentMode::Fifo,
-                desired_maximum_frame_latency: 2,
-            },
-        );
-        drop(configure_timing);
-
         let max_texture_dimension_2d = device.limits().max_texture_dimension_2d;
 
         tracing::info!("Configured colorspace: {:?}", renderer_config.colorspace);
         tracing::info!("Surface format: {:?}", format);
 
-        WgpuContext {
+        let mut context = WgpuContext {
             device,
             queue,
             surface,
@@ -285,7 +255,12 @@ impl<'a> WgpuContext<'a> {
             supports_f16: false,
             colorspace: renderer_config.colorspace,
             max_texture_dimension_2d,
-        }
+        };
+        let configure_timing =
+            tracing::debug_span!(target: "rio_profile", "gpu.configure").entered();
+        context.resize(size.width as u32, size.height as u32);
+        drop(configure_timing);
+        context
     }
 
     fn get_texture_usage(caps: &wgpu::SurfaceCapabilities) -> wgpu::TextureUsages {
@@ -335,7 +310,17 @@ impl<'a> WgpuContext<'a> {
                 view_formats,
                 alpha_mode: self.alpha_mode,
                 color_space: wgpu::SurfaceColorSpace::Auto,
-                present_mode: wgpu::PresentMode::Fifo,
+                // Animation must not queue stale terminal frames ahead of input.
+                present_mode: if cfg!(target_os = "windows")
+                    && self
+                        .surface_caps
+                        .present_modes
+                        .contains(&wgpu::PresentMode::Mailbox)
+                {
+                    wgpu::PresentMode::Mailbox
+                } else {
+                    wgpu::PresentMode::Fifo
+                },
                 desired_maximum_frame_latency: 2,
             },
         );
