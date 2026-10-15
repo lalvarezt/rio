@@ -2209,15 +2209,12 @@ impl<U: EventListener> Crosswords<U> {
         // holds no style ids at all: sweeps reusing ids, table growth,
         // and grid swaps can't affect rows copied on earlier frames.
         if needs_full {
-            dst.clear();
-            dst.reserve(count);
+            self.fill_visible_rows(dst);
             row_styles.resize_with(count, Vec::new);
             extras.clear();
             for (i, row_idx) in (start..end).enumerate() {
                 let src = &self.grid[Line(row_idx)];
-                let mut copied = src.clone();
-                copied.dirty = true;
-                dst.push(copied);
+                dst[i].dirty = true;
                 self.grid.resolve_row_styles(src, &mut row_styles[i]);
                 self.refresh_row_extras(src, extras);
             }
