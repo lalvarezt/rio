@@ -62,6 +62,27 @@ workloads. Full/sparse frame distributions differ between runs, so those
 allocation medians are not used for a whole-frame speed claim. Artifacts:
 `target/profiles/terminal-render-pipeline-screen-{before,after}`.
 
+## 3. Row construction and shaping keys
+
+The cache now hashes its completed platform text buffer and source-cell boundary
+buffer in bulk, together with font and size. This removes the retained hasher,
+per-character/position writes, separate combining-character hash walk and IME
+hash namespace. Grid and IME shapes share the same complete key definition.
+Source-cell boundaries remain part of the key: identical text split into
+different cells must not reuse an incompatible mapping. Absolute screen columns
+remain outside the key, so moving identical text can reuse its shape.
+
+Three interleaved rounds of the sustained row benchmark give 6.408/6.283 µs
+before/after for short cache hits and 50.131/38.627 µs for long hits, about 23%
+less time in the latter case. Changing long rows measure 131.911/139.434 µs;
+individual runs vary from 121 to 143 µs after the change, so these batches do
+not establish a cold-row gain. No font features or shaping steps are disabled.
+The change removes about 90 Rust lines rather than introducing another cache.
+
+All 20 stream hashes match in each of three rounds, including Unicode cell
+mapping, hover, selection, IME and repeated warm emissions. Artifacts:
+`target/profiles/pipeline-hash`.
+
 ## Remaining stages
 
 Overlays, background emission, font resolution, shaping keys, glyph

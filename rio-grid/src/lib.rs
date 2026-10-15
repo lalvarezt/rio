@@ -26,7 +26,7 @@
 //!
 //! `font::shaper::run::RunIterator`.
 
-use core::hash::Hasher;
+use core::hash::{Hash, Hasher};
 use rio_backend::config::colors::term::TermColors;
 use rio_backend::config::colors::{AnsiColor, NamedColor};
 use rio_backend::crosswords::grid::row::Row;
@@ -1299,7 +1299,7 @@ struct ShapedRun {
 }
 
 struct RunCacheEntry {
-    /// Hash of the run text, relative cell positions, font and size.
+    /// Hash of the run text, source-cell boundaries, font and size.
     /// We key on the hash alone — no stored run string, no equality
     /// check on lookup. `CellCacheTable` pattern
     ///: rapidhash / wyhash pass
@@ -1332,14 +1332,6 @@ pub struct GridGlyphRasterizer {
     /// convention.
     synthesis_cache: FxHashMap<u32, (bool, bool)>,
     run_cache: Vec<Vec<RunCacheEntry>>,
-
-    /// Per-run hasher rebuilt at every run-start. Hashed incrementally
-    /// across the run-extension loop with `(codepoint, cluster)` pairs
-    /// per cell, then finalized after the loop with `(cell_count,
-    /// font_id, size_bucket, style_flags)`. Position-independent within
-    /// a row: identical run text at different starting columns shares
-    /// the same hash.
-    run_hasher: rapidhash::fast::RapidHasher<'static>,
 
     // macOS: stage the run in UTF-16 (what CoreText wants natively)
     // so the shaper call can hand the buffer straight to
@@ -1412,7 +1404,6 @@ impl GridGlyphRasterizer {
             run_cache: (0..RUN_BUCKET_COUNT)
                 .map(|_| Vec::with_capacity(RUN_BUCKET_SIZE))
                 .collect(),
-            run_hasher: rapidhash::fast::RapidHasher::default(),
             #[cfg(target_os = "macos")]
             run_utf16_scratch: Vec::new(),
             run_cell_starts: Vec::new(),
@@ -1539,40 +1530,10 @@ fn span_style_for_flags(style_flags: u8) -> rio_backend::sugarloaf::SpanStyle {
     s
 }
 
-/// Hash the cell's zero-width combining codepoints into the per-run
-/// hasher. Each combining codepoint is stamped as `(cp, cluster)` with
-/// the same cluster as the base cell. Variation Selectors (VS-15 /
-/// VS-16) only steer presentation form, not glyph identity, so they're
-/// skipped to keep the cache key stable across presentation toggles.
-#[inline]
-fn hash_combining(
-    rasterizer: &mut GridGlyphRasterizer,
-    extras_table: &ExtrasMap,
-    sq: Square,
-    cluster: u32,
-) {
-    if !sq.has_grapheme() {
-        return;
-    }
-    let Some(id) = sq.extras_id() else {
-        return;
-    };
-    let Some(extras) = extras_table.get(&id) else {
-        return;
-    };
-    for &cp in &extras.zerowidth {
-        if cp == '\u{FE0E}' || cp == '\u{FE0F}' {
-            continue;
-        }
-        rasterizer.run_hasher.write_u32(cp as u32);
-        rasterizer.run_hasher.write_u32(cluster);
-    }
-}
-
 /// Append a cell's attached combining codepoints to the shaping
 /// buffer, so the shaper composes them with the base glyph (`e` +
-/// U+0301 renders as `é` instead of a bare `e`). Mirrors
-/// [`hash_combining`]: VS15/VS16 are skipped — presentation is
+/// U+0301 renders as `é` instead of a bare `e`).
+/// VS15/VS16 are skipped — presentation is
 /// already resolved into `font_id`, and feeding a selector to a text
 /// font's shaper can only produce a notdef.
 fn push_cluster_text(
@@ -1813,12 +1774,21 @@ fn shape_run_swash(
 /// handle is unavailable.
 fn shape_cached(
     rasterizer: &mut GridGlyphRasterizer,
-    hash: u64,
     font_id: u32,
     size_u16: u16,
     size_bucket: u16,
     font_library: &FontLibrary,
 ) -> Option<Arc<ShapedRun>> {
+    // The text alone does not identify how clusters map back to source cells.
+    let mut hasher = rapidhash::fast::RapidHasher::default();
+    font_id.hash(&mut hasher);
+    size_bucket.hash(&mut hasher);
+    #[cfg(target_os = "macos")]
+    rasterizer.run_utf16_scratch.hash(&mut hasher);
+    #[cfg(not(target_os = "macos"))]
+    rasterizer.run_str_scratch.hash(&mut hasher);
+    rasterizer.run_cell_starts.hash(&mut hasher);
+    let hash = hasher.finish();
     if let Some(entry) = run_cache_get(&mut rasterizer.run_cache, hash) {
         return Some(entry.run.clone());
     }
@@ -2158,18 +2128,6 @@ pub fn build_row_fg<P: GridPalette>(
         }
         rasterizer.run_cell_columns.clear();
         rasterizer.run_cell_columns.push(x as u16);
-        // Reset the per-run hasher and stamp the run-start cell as
-        // `(codepoint, cluster=0)`. Subsequent cells append themselves
-        // in the run-extension loop below.
-        rasterizer.run_hasher = rapidhash::fast::RapidHasher::default();
-        rasterizer.run_hasher.write_u32(shape_ch as u32);
-        rasterizer.run_hasher.write_u32(0);
-        // Hash the cell's zero-width combining codepoints too — without
-        // this, `(e, U+0301)` and `(e, U+0302)` would alias in the run
-        // cache. Variation Selectors (VS-15 / VS-16) don't change the
-        // glyph identity, so skip them.
-        hash_combining(rasterizer, extras_table, sq, 0);
-
         // Extend the run while (font_id, style_flags) match.
         let mut end = x + 1;
         while end < cols {
@@ -2288,37 +2246,14 @@ pub fn build_row_fg<P: GridPalette>(
             if ch2 != rio_backend::ansi::kitty_virtual::PLACEHOLDER {
                 push_cluster_text(rasterizer, extras_table, sq2);
             }
-            // Stamp the cell into the per-run hasher with its relative
-            // cluster offset (`end - run_start`, captured *before* the
-            // increment below).
-            let cluster = (end - run_start) as u32;
-            rasterizer.run_hasher.write_u32(shape_ch2 as u32);
-            rasterizer.run_hasher.write_u32(cluster);
-            hash_combining(rasterizer, extras_table, sq2, cluster);
             rasterizer.run_cell_columns.push(end as u16);
             end += 1;
         }
 
-        // Finalize the per-run hash: append `(cell_count, font_id,
-        // size_bucket)`. `style_flags` are not included separately
-        // because `font_id` already varies with style (`resolve_font`
-        // factors style_flags into the resolution key); adding them
-        // a second time would just be redundant work.
-        let cell_count = (end - run_start) as u32;
-        rasterizer.run_hasher.write_u32(cell_count);
-        rasterizer.run_hasher.write_u32(font_id);
-        rasterizer.run_hasher.write_u16(size_bucket);
-        let hash = rasterizer.run_hasher.finish();
-
         // Keep the immutable shape alive while the rasterizer updates its atlases.
-        let Some(run) = shape_cached(
-            rasterizer,
-            hash,
-            font_id,
-            size_u16,
-            size_bucket,
-            font_library,
-        ) else {
+        let Some(run) =
+            shape_cached(rasterizer, font_id, size_u16, size_bucket, font_library)
+        else {
             x = end;
             continue;
         };
@@ -2534,10 +2469,8 @@ pub fn build_row_fg<P: GridPalette>(
     }
 }
 
-/// Fill the run scratch with `text`, hash it into the composition
-/// cache namespace (the leading "PREE" sentinel keeps it disjoint from
-/// the grid's per-cell keys), shape it (cached), and return
-/// shared glyphs and metrics. `None` means no shaping handle.
+/// Fill the run scratch with `text` and return shared glyphs and metrics.
+/// `None` means no shaping handle.
 fn shape_preedit_text(
     rasterizer: &mut GridGlyphRasterizer,
     text: &str,
@@ -2566,24 +2499,7 @@ fn shape_preedit_text(
         rasterizer.run_str_scratch.push_str(text);
     }
 
-    rasterizer.run_hasher = rapidhash::fast::RapidHasher::default();
-    rasterizer.run_hasher.write_u32(0x5052_4545); // "PREE"
-    for (i, ch) in text.chars().enumerate() {
-        rasterizer.run_hasher.write_u32(ch as u32);
-        rasterizer.run_hasher.write_u32(i as u32);
-    }
-    rasterizer.run_hasher.write_u32(font_id);
-    rasterizer.run_hasher.write_u16(size_bucket);
-    let hash = rasterizer.run_hasher.finish();
-
-    shape_cached(
-        rasterizer,
-        hash,
-        font_id,
-        size_u16,
-        size_bucket,
-        font_library,
-    )
+    shape_cached(rasterizer, font_id, size_u16, size_bucket, font_library)
 }
 
 /// Shape one grapheme cluster as a standalone run and emit its glyphs
