@@ -16,5 +16,4 @@ path = "src/lib.rs"
 rio-backend = { workspace = true }
 rio-unicode = { workspace = true }
 rustc-hash = { workspace = true }
-smallvec = { workspace = true }
 rapidhash = { version = "4.4.1", default-features = false }

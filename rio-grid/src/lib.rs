@@ -36,7 +36,7 @@ use rio_backend::crosswords::square::{ContentTag, Extras, Square, Wide};
 use rio_backend::crosswords::style::{Style, StyleFlags, UnderlineKind};
 use rio_backend::selection::SelectionRange;
 use rustc_hash::FxHashMap;
-use smallvec::SmallVec;
+use std::sync::Arc;
 
 /// Snapshot's per-frame extras map. Keyed by the cell's `extras_id`,
 /// populated by `Crosswords::snapshot_visible` from a walk of visible
@@ -1064,6 +1064,12 @@ fn underline_style_from_flags(flags: StyleFlags) -> Option<DecorationStyle> {
     })
 }
 
+fn combined_style_flags(styles: &[Style]) -> StyleFlags {
+    styles
+        .iter()
+        .fold(StyleFlags::empty(), |flags, style| flags | style.flags)
+}
+
 /// Decoration color: SGR 58 `underline_color` if set, else the cell's
 /// computed fg. `generic.zig:2968`.
 #[inline]
@@ -1277,25 +1283,23 @@ const SHAPING_FLAG_MASK: u16 = StyleFlags::BOLD.bits() | StyleFlags::ITALIC.bits
 const RUN_BUCKET_COUNT: usize = 256;
 const RUN_BUCKET_SIZE: usize = 8;
 
-/// One shaped glyph. Same shape from both CoreText (macOS) and swash
-/// (non-macOS). `cluster` is the shaping-buffer offset of the source
-/// cell: UTF-16 code units on macOS (CoreText string indices), UTF-8
-/// bytes elsewhere (swash `cluster.source.start`).
+/// A glyph and its source-cell index within a cached run.
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // `x` / `y` / `advance` kept for future kerning-aware layout
 struct ShapedGlyph {
     id: u16,
-    x: f32,
-    y: f32,
-    advance: f32,
-    cluster: u32,
+    cell: u16,
 }
 
-struct RunCacheEntry {
+struct ShapedRun {
     /// Summed glyph advance, computed once at insert so per-frame
     /// consumers (the preedit overflow check) never re-walk glyphs.
     advance: f32,
-    /// 64-bit rapidhash of (font_id, size_bucket, style_flags, run bytes).
+    ascent_px: i16,
+    glyphs: Vec<ShapedGlyph>,
+}
+
+struct RunCacheEntry {
+    /// Hash of the run text, relative cell positions, font and size.
     /// We key on the hash alone — no stored run string, no equality
     /// check on lookup. `CellCacheTable` pattern
     ///: rapidhash / wyhash pass
@@ -1303,7 +1307,14 @@ struct RunCacheEntry {
     /// until the next row rebuild but never corrupts state. Birthday
     /// bound at N=10k concurrent cache entries ≈ 2.7×10⁻¹².
     hash: u64,
-    glyphs: Vec<ShapedGlyph>,
+    run: Arc<ShapedRun>,
+}
+
+fn source_cell(starts: &[u32], cell: &mut u16, cluster: u32) -> u16 {
+    while (*cell as usize + 1) < starts.len() && starts[*cell as usize + 1] <= cluster {
+        *cell = cell.saturating_add(1);
+    }
+    *cell
 }
 
 pub struct GridGlyphRasterizer {
@@ -1662,9 +1673,7 @@ fn run_cache_put(buckets: &mut [Vec<RunCacheEntry>], entry: RunCacheEntry) {
 
 // Platform-specific shape + ascent helpers
 
-/// Shape a single run on macOS via CoreText and populate
-/// `out.ascent_px` as a side effect via the rasterizer's cache.
-/// Returns the glyph list if the handle is available.
+/// Shape a run with CoreText, including its source cells and font metrics.
 #[cfg(target_os = "macos")]
 fn shape_run_ct(
     rasterizer: &mut GridGlyphRasterizer,
@@ -1672,7 +1681,7 @@ fn shape_run_ct(
     size_u16: u16,
     size_bucket: u16,
     font_library: &FontLibrary,
-) -> Option<(Vec<ShapedGlyph>, i16)> {
+) -> Option<ShapedRun> {
     let (_, features) = rasterizer.library_settings(font_library);
     let handle = match rasterizer.handle_cache.entry(font_id) {
         std::collections::hash_map::Entry::Occupied(e) => e.into_mut().clone(),
@@ -1706,22 +1715,25 @@ fn shape_run_ct(
         &rasterizer.run_utf16_scratch,
         size_u16 as f32,
     );
-    let glyphs: Vec<ShapedGlyph> = ct_glyphs
+    let mut cell = 0;
+    let mut advance = 0.0;
+    let glyphs = ct_glyphs
         .iter()
-        .map(|g| ShapedGlyph {
-            id: g.id,
-            x: g.x,
-            y: g.y,
-            advance: g.advance,
-            cluster: g.cluster,
+        .map(|g| {
+            advance += g.advance;
+            ShapedGlyph {
+                id: g.id,
+                cell: source_cell(&rasterizer.run_cell_starts, &mut cell, g.cluster),
+            }
         })
         .collect();
-    Some((glyphs, ascent_px))
+    Some(ShapedRun {
+        glyphs,
+        ascent_px,
+        advance,
+    })
 }
 
-/// Shape a single run on non-macOS via swash. Populates
-/// `rasterizer.ascent_cache` + `rasterizer.font_data_cache` as a side
-/// effect.
 #[cfg(not(target_os = "macos"))]
 fn shape_run_swash(
     rasterizer: &mut GridGlyphRasterizer,
@@ -1729,7 +1741,7 @@ fn shape_run_swash(
     size_u16: u16,
     size_bucket: u16,
     font_library: &FontLibrary,
-) -> Option<(Vec<ShapedGlyph>, i16)> {
+) -> Option<ShapedRun> {
     use rio_backend::sugarloaf::swash::{FontRef, Setting};
 
     let (_, features) = rasterizer.library_settings(font_library);
@@ -1774,30 +1786,31 @@ fn shape_run_swash(
         .variations(wght_var.iter().copied())
         .build();
     shaper.add_str(&rasterizer.run_str_scratch);
-    let mut glyphs: Vec<ShapedGlyph> = Vec::new();
+    let mut glyphs = Vec::new();
+    let mut cell = 0;
+    let mut advance = 0.0;
     shaper.shape_with(|cluster| {
         let byte_offset = cluster.source.start;
         for g in cluster.glyphs {
+            advance += g.advance;
             glyphs.push(ShapedGlyph {
                 id: g.id,
-                x: g.x,
-                y: g.y,
-                advance: g.advance,
-                cluster: byte_offset,
+                cell: source_cell(&rasterizer.run_cell_starts, &mut cell, byte_offset),
             });
         }
     });
-    Some((glyphs, ascent_px))
+    Some(ShapedRun {
+        glyphs,
+        ascent_px,
+        advance,
+    })
 }
 
 // Emission
 
-/// Shape the rasterizer's current run scratch, keyed in the run cache
-/// by `hash`, and return `(ascent, summed advance)` for
-/// `(font_id, size_bucket)`; on a miss the shaped glyphs are stored
-/// under `hash` with their advance. `None` means shaping failed (no
-/// font handle). The one shaping-cache protocol, shared by the grid
-/// run path and the preedit path.
+/// Return a shared shape for the current run scratch, inserting it on a miss.
+/// Grid text and preedit text use the same cache. `None` means the font
+/// handle is unavailable.
 fn shape_cached(
     rasterizer: &mut GridGlyphRasterizer,
     hash: u64,
@@ -1805,18 +1818,9 @@ fn shape_cached(
     size_u16: u16,
     size_bucket: u16,
     font_library: &FontLibrary,
-) -> Option<(i16, f32)> {
+) -> Option<Arc<ShapedRun>> {
     if let Some(entry) = run_cache_get(&mut rasterizer.run_cache, hash) {
-        // Cache hit: advance stored, ascent in its own cache.
-        let advance = entry.advance;
-        return Some((
-            rasterizer
-                .ascent_cache
-                .get(&(font_id, size_bucket))
-                .copied()
-                .unwrap_or(0),
-            advance,
-        ));
+        return Some(entry.run.clone());
     }
     #[cfg(target_os = "macos")]
     let shaped_opt =
@@ -1824,17 +1828,15 @@ fn shape_cached(
     #[cfg(not(target_os = "macos"))]
     let shaped_opt =
         shape_run_swash(rasterizer, font_id, size_u16, size_bucket, font_library);
-    let (glyphs, ascent_px) = shaped_opt?;
-    let advance: f32 = glyphs.iter().map(|g| g.advance).sum();
+    let run = Arc::new(shaped_opt?);
     run_cache_put(
         &mut rasterizer.run_cache,
         RunCacheEntry {
             hash,
-            glyphs,
-            advance,
+            run: run.clone(),
         },
     );
-    Some((ascent_px, advance))
+    Some(run)
 }
 
 /// Run-level fg emission. Shapes once per run, emits one CellText per
@@ -1872,6 +1874,7 @@ pub fn build_row_fg<P: GridPalette>(
     fg_scratch: &mut Vec<CellText>,
 ) {
     fg_scratch.clear();
+    let row_flags = combined_style_flags(row_styles);
 
     let size_bucket = (size_px * 4.0).round().clamp(0.0, u16::MAX as f32) as u16;
     let size_u16 = size_px.round().clamp(1.0, u16::MAX as f32) as u16;
@@ -1901,23 +1904,29 @@ pub fn build_row_fg<P: GridPalette>(
 
     // Phase 1: underline pass. Emit before glyphs so grayscale quads
     // draw under the characters.
-    emit_underlines(
-        row,
-        cols,
-        y,
-        row_styles,
-        palette,
-        term_colors,
-        grid,
-        cell_w_u32,
-        cell_h_u32,
-        thickness,
-        row_sel,
-        row_hints,
-        preedit,
-        glyph_registry.as_ref(),
-        fg_scratch,
-    );
+    if row_flags.intersects(StyleFlags::ALL_UNDERLINES)
+        || row_hints
+            .iter()
+            .any(|hint| hint.tag == HintTag::HyperlinkHover)
+    {
+        emit_underlines(
+            row,
+            cols,
+            y,
+            row_styles,
+            palette,
+            term_colors,
+            grid,
+            cell_w_u32,
+            cell_h_u32,
+            thickness,
+            row_sel,
+            row_hints,
+            preedit,
+            glyph_registry.as_ref(),
+            fg_scratch,
+        );
+    }
 
     // Trim the row from the right: walk back to the last non-breaker
     // cell so the outer loop doesn't iterate the (typically large)
@@ -2298,8 +2307,8 @@ pub fn build_row_fg<P: GridPalette>(
         rasterizer.run_hasher.write_u16(size_bucket);
         let hash = rasterizer.run_hasher.finish();
 
-        // Shape (cached) and capture ascent for this (font_id, size).
-        let Some((ascent_px, _)) = shape_cached(
+        // Keep the immutable shape alive while the rasterizer updates its atlases.
+        let Some(run) = shape_cached(
             rasterizer,
             hash,
             font_id,
@@ -2314,53 +2323,18 @@ pub fn build_row_fg<P: GridPalette>(
         let (synthetic_bold, synthetic_italic) =
             rasterizer.get_synthesis(font_id, font_library);
 
-        // Collect (glyph_id, cell_offset) pairs by walking the shape
-        // result alongside a monotonic cluster → cell-offset cursor.
-        // Done up-front so we can release borrows on `rasterizer`
-        // before the emit loop (which takes `&mut rasterizer` for the
-        // rasterize + atlas-insert step).
-        //
-        // Cluster space differs by platform: macOS CoreText reports
-        // UTF-16 code-unit offsets, swash reports UTF-8 byte offsets.
-        // Each backend walks its own cell-position table.
-        //
-        // SmallVec inline capacity 64 covers terminal-typical runs
-        // (ASCII identifiers, short bursts of non-ligature text)
-        // entirely on the stack — no heap touch. Ligature-heavy or
-        // shaped emoji runs that outgrow 64 slots spill to heap once.
-        let mut glyph_emits: SmallVec<[(u16, u16); 64]> = SmallVec::new();
-        {
-            let glyphs = &run_cache_get(&mut rasterizer.run_cache, hash)
-                .expect("just inserted")
-                .glyphs;
-            let mut cell_idx_in_run: u16 = 0;
-            // Both platforms record explicit per-cell starts into the
-            // shaping buffer (UTF-16 units on macOS, UTF-8 bytes on
-            // swash), so one walk serves both. A per-char cursor would
-            // miscount: cells with combining marks contribute several
-            // chars each.
-            let cell_starts = &rasterizer.run_cell_starts;
-            for g in glyphs {
-                while (cell_idx_in_run as usize + 1) < cell_starts.len()
-                    && cell_starts[cell_idx_in_run as usize + 1] <= g.cluster
-                {
-                    cell_idx_in_run = cell_idx_in_run.saturating_add(1);
-                }
-                glyph_emits.push((g.id, cell_idx_in_run));
-            }
-        }
-
-        for &(glyph_id, cell_idx_in_run) in &glyph_emits {
+        let ascent_px = run.ascent_px;
+        for glyph in &run.glyphs {
             // Map the appended-cell index back to its actual grid
             // column. Spacer cells were skipped from the run text so
-            // `cell_idx_in_run` no longer equals `column - run_start`;
+            // the cached cell index no longer equals `column - run_start`;
             // the parallel `run_cell_columns` table records the source
             // column for each appended cell.
             let grid_col = rasterizer
                 .run_cell_columns
-                .get(cell_idx_in_run as usize)
+                .get(glyph.cell as usize)
                 .copied()
-                .unwrap_or((run_start as u16).saturating_add(cell_idx_in_run));
+                .unwrap_or((run_start as u16).saturating_add(glyph.cell));
             if (grid_col as usize) >= cols {
                 continue;
             }
@@ -2369,7 +2343,7 @@ pub fn build_row_fg<P: GridPalette>(
                 rasterizer,
                 grid,
                 font_id,
-                glyph_id,
+                glyph.id,
                 size_bucket,
                 size_u16,
                 cell_h,
@@ -2482,23 +2456,25 @@ pub fn build_row_fg<P: GridPalette>(
 
     // Phase 3: strikethrough pass. Emitted last so the strike overlays
     // the glyph.
-    emit_strikethroughs(
-        row,
-        cols,
-        y,
-        row_styles,
-        palette,
-        term_colors,
-        grid,
-        cell_w_u32,
-        cell_h_u32,
-        thickness,
-        row_sel,
-        row_hints,
-        preedit,
-        glyph_registry.as_ref(),
-        fg_scratch,
-    );
+    if row_flags.contains(StyleFlags::STRIKEOUT) {
+        emit_strikethroughs(
+            row,
+            cols,
+            y,
+            row_styles,
+            palette,
+            term_colors,
+            grid,
+            cell_w_u32,
+            cell_h_u32,
+            thickness,
+            row_sel,
+            row_hints,
+            preedit,
+            glyph_registry.as_ref(),
+            fg_scratch,
+        );
+    }
 
     // Phase 4: the IME caret, topmost element of the composition.
     // On a composition cell it must not be a beam — cursor color on
@@ -2551,7 +2527,7 @@ pub fn build_row_fg<P: GridPalette>(
 /// Fill the run scratch with `text`, hash it into the composition
 /// cache namespace (the leading "PREE" sentinel keeps it disjoint from
 /// the grid's per-cell keys), shape it (cached), and return
-/// `(hash, ascent, summed advance)`. `None` means no shaping handle.
+/// shared glyphs and metrics. `None` means no shaping handle.
 fn shape_preedit_text(
     rasterizer: &mut GridGlyphRasterizer,
     text: &str,
@@ -2559,11 +2535,11 @@ fn shape_preedit_text(
     size_u16: u16,
     size_bucket: u16,
     font_library: &FontLibrary,
-) -> Option<(u64, i16, f32)> {
+) -> Option<Arc<ShapedRun>> {
+    rasterizer.run_cell_starts.clear();
     #[cfg(target_os = "macos")]
     {
         rasterizer.run_utf16_scratch.clear();
-        rasterizer.run_cell_starts.clear();
         rasterizer
             .run_cell_starts
             .push(rasterizer.run_utf16_scratch.len() as u32);
@@ -2590,15 +2566,14 @@ fn shape_preedit_text(
     rasterizer.run_hasher.write_u16(size_bucket);
     let hash = rasterizer.run_hasher.finish();
 
-    let (ascent_px, advance) = shape_cached(
+    shape_cached(
         rasterizer,
         hash,
         font_id,
         size_u16,
         size_bucket,
         font_library,
-    )?;
-    Some((hash, ascent_px, advance))
+    )
 }
 
 /// Shape one grapheme cluster as a standalone run and emit its glyphs
@@ -2641,7 +2616,7 @@ fn emit_preedit_cluster(
     // half-cell slack absorbs color-font advance quirks.
     let max_advance = reserved_cells as f32 * cell_w + cell_w * 0.5;
     let base_str = &cluster[..base.len_utf8()];
-    let Some((hash, ascent_px, advance)) = shape_preedit_text(
+    let Some(run) = shape_preedit_text(
         rasterizer,
         cluster,
         font_id,
@@ -2651,10 +2626,10 @@ fn emit_preedit_cluster(
     ) else {
         return;
     };
-    let (hash, ascent_px) = if advance <= max_advance || base_str.len() == cluster.len() {
-        (hash, ascent_px)
+    let run = if run.advance <= max_advance || base_str.len() == cluster.len() {
+        run
     } else {
-        let Some((hash, ascent_px, _)) = shape_preedit_text(
+        let Some(run) = shape_preedit_text(
             rasterizer,
             base_str,
             font_id,
@@ -2664,28 +2639,19 @@ fn emit_preedit_cluster(
         ) else {
             return;
         };
-        (hash, ascent_px)
+        run
     };
 
     let (synthetic_bold, synthetic_italic) =
         rasterizer.get_synthesis(font_id, font_library);
 
-    let mut glyph_ids: SmallVec<[u16; 4]> = SmallVec::new();
-    {
-        let glyphs = &run_cache_get(&mut rasterizer.run_cache, hash)
-            .expect("just inserted")
-            .glyphs;
-        for g in glyphs {
-            glyph_ids.push(g.id);
-        }
-    }
-
-    for glyph_id in glyph_ids {
+    let ascent_px = run.ascent_px;
+    for glyph in &run.glyphs {
         let Some((_, slot, is_color)) = ensure_glyph_by_id(
             rasterizer,
             grid,
             font_id,
-            glyph_id,
+            glyph.id,
             size_bucket,
             size_u16,
             cell_h,
@@ -3331,8 +3297,7 @@ mod preedit_suppression_tests {
     ) -> Option<f32> {
         let base = text.chars().next()?;
         let (font_id, _) = r.resolve_font(base, 0, lib, 0);
-        shape_preedit_text(r, text, font_id, size, size, lib)
-            .map(|(_, _, advance)| advance)
+        shape_preedit_text(r, text, font_id, size, size, lib).map(|run| run.advance)
     }
 
     /// A ZWJ emoji must fit its 2 reserved cells under the shaped-
