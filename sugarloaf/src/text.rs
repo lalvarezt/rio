@@ -256,6 +256,45 @@ impl Text {
         width_px / self.scale_factor
     }
 
+    /// Exclude a logical horizontal interval from glyphs recorded since `first`.
+    /// Crop the atlas rectangles so a moving overlay can cover part of a label
+    /// without hiding the whole run or requiring a separate text render pass.
+    pub fn exclude_horizontal_range_since(&mut self, first: usize, range: [f32; 2]) {
+        let [left, right] = range.map(|x| x * self.scale_factor);
+        if left >= right || first >= self.instances.len() {
+            return;
+        }
+        let mut write = first;
+        let mut fragments = Vec::new();
+        for read in first..self.instances.len() {
+            let instance = self.instances[read];
+            let x = instance.pos[0] + instance.bearings[0] as f32;
+            let width = instance.glyph_size[0];
+            let keep_left = (left - x).floor().clamp(0.0, width as f32) as u32;
+            let skip_right = (right - x).ceil().clamp(0.0, width as f32) as u32;
+            if keep_left > 0 {
+                let mut visible = instance;
+                visible.glyph_size[0] = keep_left;
+                self.instances[write] = visible;
+                write += 1;
+            }
+            if skip_right < width {
+                let mut visible = instance;
+                visible.pos[0] += skip_right as f32;
+                visible.glyph_pos[0] += skip_right;
+                visible.glyph_size[0] -= skip_right;
+                if keep_left > 0 {
+                    fragments.push(visible);
+                } else {
+                    self.instances[write] = visible;
+                    write += 1;
+                }
+            }
+        }
+        self.instances.truncate(write);
+        self.instances.extend(fragments);
+    }
+
     /// Measure `text` under `opts` without recording a draw. Returns
     /// logical-pixel width.
     pub fn measure(&mut self, text: &str, opts: &DrawOpts) -> f32 {

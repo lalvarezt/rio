@@ -117,10 +117,11 @@ pub fn draw(
     color: [f32; 4],
     font_id: Option<usize>,
     order: u8,
+    occlusion: Option<[f32; 2]>,
 ) -> bool {
     match icon {
         Icon::Neovim => {
-            neovim::draw(sugarloaf, cx, cy, size, color[3], order);
+            neovim::draw(sugarloaf, cx, cy, size, color[3], order, occlusion);
             true
         }
         Icon::Glyph(glyph) => font_id.is_some_and(|id| {

@@ -68,7 +68,10 @@ const BELL_DOT_SIZE: f32 = 6.0;
 const BELL_DOT_ORDER: u8 = 1;
 const BELL_GAP: f32 = 4.0;
 const DRAG_THRESHOLD: f32 = 4.0;
+#[cfg(not(target_os = "windows"))]
 const DRAG_ANIMATION_LENGTH: f32 = 0.15;
+#[cfg(target_os = "windows")]
+const DRAG_ANIMATION_LENGTH: f32 = 0.20;
 const DRAG_MAX_DT: f32 = 0.05;
 const ISLAND_MARGIN_RIGHT: f32 = 8.0;
 
@@ -345,6 +348,7 @@ fn mix_color(from: [f32; 4], to: [f32; 4], amount: f32) -> [f32; 4] {
 }
 
 #[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
 fn draw_tab_icon(
     sugarloaf: &mut Sugarloaf,
     x: f32,
@@ -353,6 +357,7 @@ fn draw_tab_icon(
     icon: super::app_icons::Icon,
     font_id: Option<usize>,
     size: f32,
+    occlusion: Option<[f32; 2]>,
 ) {
     let cy = TAB_CENTER_Y;
     if super::app_icons::draw(
@@ -364,6 +369,7 @@ fn draw_tab_icon(
         color,
         font_id,
         order,
+        occlusion,
     ) {
         return;
     }
@@ -653,6 +659,8 @@ pub struct Island {
     tab_appearance: FxHashMap<usize, (f32, f32)>,
     #[cfg(target_os = "windows")]
     close_hover_opacity: f32,
+    #[cfg(target_os = "windows")]
+    drag_elevation: f32,
 }
 
 impl Island {
@@ -703,6 +711,8 @@ impl Island {
             tab_appearance: FxHashMap::default(),
             #[cfg(target_os = "windows")]
             close_hover_opacity: 0.0,
+            #[cfg(target_os = "windows")]
+            drag_elevation: 0.0,
         }
     }
 
@@ -777,6 +787,7 @@ impl Island {
     }
 
     #[cfg(target_os = "windows")]
+    #[allow(clippy::too_many_arguments)]
     fn render_tab_icons(
         &self,
         sugarloaf: &mut Sugarloaf,
@@ -785,6 +796,7 @@ impl Island {
         width: f32,
         color: [f32; 4],
         order: u8,
+        occlusion: Option<[f32; 2]>,
     ) {
         if width < self.title_padding(tab.remote) - TAB_GAP / 2.0 {
             return;
@@ -799,6 +811,7 @@ impl Island {
                 super::app_icons::SSH_ICON,
                 self.window_header.app_font,
                 self.tab_icon_size,
+                occlusion,
             );
             x += self.tab_icon_size + TAB_ICON_GAP;
         }
@@ -810,6 +823,7 @@ impl Island {
             tab.icon,
             self.window_header.app_font,
             self.tab_icon_size,
+            occlusion,
         );
     }
 
@@ -1053,6 +1067,7 @@ impl Island {
         }
         #[cfg(target_os = "windows")]
         if self.close_hover_opacity != u8::from(self.close_hover) as f32
+            || self.drag_elevation != u8::from(self.drag_index().is_some()) as f32
             || self.tab_appearance.iter().any(|(&i, &(active, hover))| {
                 active != u8::from(i == self.selected_tab) as f32
                     || hover != u8::from(Some(i) == self.hovered_tab) as f32
@@ -1439,6 +1454,7 @@ impl Island {
             {
                 self.tab_appearance.clear();
                 self.close_hover_opacity = u8::from(self.close_hover) as f32;
+                self.drag_elevation = 0.0;
             }
             let progress_y = if cfg!(target_os = "windows") {
                 ISLAND_HEIGHT
@@ -1454,6 +1470,10 @@ impl Island {
         if num_tabs == 1 {
             self.drag = None;
             self.slide_springs.clear();
+            #[cfg(target_os = "windows")]
+            {
+                self.drag_elevation = 0.0;
+            }
         }
 
         // A reorder that didn't come from this drag (tab closed via
@@ -1476,11 +1496,22 @@ impl Island {
             .as_secs_f32()
             .min(DRAG_MAX_DT);
         self.last_anim_frame = now;
-        self.slide_springs
-            .retain(|_, s| s.update(dt, DRAG_ANIMATION_LENGTH));
+        self.slide_springs.retain(|&_index, s| {
+            #[cfg(target_os = "windows")]
+            let duration = if _index == current_tab_index {
+                DRAG_ANIMATION_LENGTH
+            } else {
+                0.12
+            };
+            #[cfg(not(target_os = "windows"))]
+            let duration = DRAG_ANIMATION_LENGTH;
+            s.update(dt, duration)
+        });
 
         #[cfg(target_os = "windows")]
         {
+            let lifted = u8::from(self.drag_index().is_some()) as f32;
+            super::windows_chrome::fade(&mut self.drag_elevation, lifted, dt);
             self.selected_tab = current_tab_index;
             self.tab_appearance.retain(|&i, _| i < num_tabs);
             for i in 0..num_tabs {
@@ -1551,8 +1582,26 @@ impl Island {
 
         // Active drag: the dragged tab is skipped in the slot loop and
         // drawn floating (after the loop, on a higher layer) instead.
+        #[cfg(not(target_os = "windows"))]
         let drag_index = self.drag_index();
+        #[cfg(target_os = "windows")]
+        let drag_index = self.drag_index().or_else(|| {
+            (self.drag_elevation > 0.0
+                || self.slide_springs.contains_key(&current_tab_index))
+            .then_some(current_tab_index)
+        });
         let floating_left = self.drag_floating_left(&layout);
+        #[cfg(target_os = "windows")]
+        let floating_left = floating_left.or_else(|| {
+            drag_index.map(|i| {
+                layout.left(i) + self.slide_springs.get(&i).map_or(0.0, |s| s.position)
+            })
+        });
+        #[cfg(target_os = "windows")]
+        let occlusion = floating_left.map(|left| {
+            let (x, _, width, _, _) = island_rect(left, layout.width(current_tab_index));
+            [x, x + width]
+        });
 
         // Derive the chrome from the effective background so OSC 11 and
         // theme changes keep the tab strip coherent with the terminal.
@@ -1613,6 +1662,8 @@ impl Island {
                     .slide_springs
                     .get(&tab_index)
                     .map_or(0.0, |s| s.position);
+            #[cfg(target_os = "windows")]
+            let text_start = sugarloaf.text_mut().instances().len();
 
             // Get title for this tab, then truncate with a trailing
             // ellipsis so overflowing titles can't bleed into the next
@@ -1698,11 +1749,10 @@ impl Island {
             let title =
                 fit_title_to_width(sugarloaf, &raw_title, max_text_width, &title_opts);
 
-            // UI text always paints in a final pass above every rect,
-            // so the floating tab's opaque background can't occlude
-            // titles passing underneath it — skip a title once the
-            // floating tab intrudes past the slot's text padding (the
-            // widest a centered title can reach).
+            // UI text paints above every rect. Windows crops the covered
+            // glyphs after recording this tab, preserving the exposed label.
+            // Other platforms retain their whole-title overlap guard.
+            #[cfg(not(target_os = "windows"))]
             let hidden_by_drag = floating_left.is_some_and(|fl| {
                 let floating_width = layout.width(drag_index.unwrap_or(tab_index));
                 let overlap =
@@ -1710,9 +1760,10 @@ impl Island {
                 overlap > tab_padding_x
             });
 
+            #[cfg(not(target_os = "windows"))]
             let show_title = !hidden_by_drag;
             #[cfg(target_os = "windows")]
-            let show_title = show_title && max_text_width >= TITLE_FONT_SIZE;
+            let show_title = max_text_width >= TITLE_FONT_SIZE;
             if show_title {
                 // Measure → centre → draw. Immediate mode, no cached
                 // text_id bookkeeping. The bell mark and the title are
@@ -1838,8 +1889,13 @@ impl Island {
             self.render_tab_status_line(sugarloaf, program_status.as_ref(), ix, iw, 1);
 
             #[cfg(target_os = "windows")]
-            if !hidden_by_drag {
-                self.render_tab_icons(sugarloaf, tab, ix, iw, text_color, 1);
+            {
+                self.render_tab_icons(sugarloaf, tab, ix, iw, text_color, 1, occlusion);
+                if let Some(range) = occlusion {
+                    sugarloaf
+                        .text_mut()
+                        .exclude_horizontal_range_since(text_start, range);
+                }
             }
 
             if is_active && num_tabs > 1 {
@@ -1884,13 +1940,17 @@ impl Island {
 
             // Soft elevation: a slightly inflated dark halo behind the
             // lifted island so it reads as floating over the strip.
+            #[cfg(target_os = "windows")]
+            let shadow_alpha = 0.18 * self.drag_elevation;
+            #[cfg(not(target_os = "windows"))]
+            let shadow_alpha = 0.18;
             sugarloaf.rounded_rect(
                 None,
                 ix - 2.0,
                 iy - 1.0,
                 iw + 4.0,
                 ih + 3.0,
-                [0.0, 0.0, 0.0, 0.18],
+                [0.0, 0.0, 0.0, shadow_alpha],
                 0.05,
                 radius + 2.0,
                 11,
@@ -1941,7 +2001,15 @@ impl Island {
             let program_status = &tab.status;
             self.render_tab_status_line(sugarloaf, program_status.as_ref(), ix, iw, 12);
             #[cfg(target_os = "windows")]
-            self.render_tab_icons(sugarloaf, tab, ix, iw, self.active_text_color, 12);
+            self.render_tab_icons(
+                sugarloaf,
+                tab,
+                ix,
+                iw,
+                self.active_text_color,
+                12,
+                None,
+            );
 
             #[cfg(not(target_os = "windows"))]
             let raw_title = self.get_title_for_tab(context_manager, drag_idx);

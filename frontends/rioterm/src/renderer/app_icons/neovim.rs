@@ -109,6 +109,7 @@ pub fn draw(
     size: f32,
     opacity: f32,
     order: u8,
+    occlusion: Option<[f32; 2]>,
 ) {
     let scale = sugarloaf.scale_factor();
     let height = (size * scale).round().clamp(1.0, 256.0) as u16;
@@ -122,15 +123,25 @@ pub fn draw(
     for pixel in cache.entry(height).or_insert_with(|| raster(height)) {
         let mut color = pixel.color;
         color[3] *= opacity;
-        sugarloaf.rect(
-            None,
-            x + pixel.x as f32 / scale,
-            y + pixel.y as f32 / scale,
-            pixel.width as f32 / scale,
-            1.0 / scale,
-            color,
-            0.0,
-            order,
-        );
+        let left = x + pixel.x as f32 / scale;
+        let right = left + pixel.width as f32 / scale;
+        let spans = match occlusion {
+            Some([start, end]) => [[left, right.min(start)], [left.max(end), right]],
+            None => [[left, right], [right, right]],
+        };
+        for [start, end] in spans {
+            if end > start {
+                sugarloaf.rect(
+                    None,
+                    start,
+                    y + pixel.y as f32 / scale,
+                    end - start,
+                    1.0 / scale,
+                    color,
+                    0.0,
+                    order,
+                );
+            }
+        }
     }
 }
