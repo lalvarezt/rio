@@ -253,6 +253,10 @@ impl Sugarloaf<'_> {
         if matches!(ctx.inner, crate::context::ContextType::Cpu(_)) {
             text.init_cpu();
         }
+        #[cfg(all(feature = "wgpu", not(target_os = "macos")))]
+        if let crate::context::ContextType::Wgpu(ctx) = &ctx.inner {
+            text.init_wgpu(&ctx.device, &ctx.queue, ctx.format);
+        }
 
         let instance = Sugarloaf {
             state,
@@ -1250,7 +1254,6 @@ impl Sugarloaf<'_> {
             // Metal branch).
             #[cfg(not(target_os = "macos"))]
             {
-                self.text.init_wgpu(&ctx.device, &ctx.queue, ctx.format);
                 self.text
                     .render_wgpu(&mut rpass, [ctx.size.width, ctx.size.height]);
             }

@@ -92,6 +92,13 @@ impl WgpuGlyphAtlas {
         key: GlyphKey,
         glyph: RasterizedGlyph<'_>,
     ) -> Option<AtlasSlot> {
+        let slot = self.upload(glyph)?;
+        self.slots.insert(key, slot);
+        Some(slot)
+    }
+
+    /// Upload pixels without adding a font-glyph cache entry.
+    pub(crate) fn upload(&mut self, glyph: RasterizedGlyph<'_>) -> Option<AtlasSlot> {
         if glyph.width == 0 || glyph.height == 0 {
             let slot = AtlasSlot {
                 x: 0,
@@ -102,7 +109,6 @@ impl WgpuGlyphAtlas {
                 bearing_y: glyph.bearing_y,
                 page: 0,
             };
-            self.slots.insert(key, slot);
             return Some(slot);
         }
 
@@ -116,8 +122,6 @@ impl WgpuGlyphAtlas {
             bearing_y: glyph.bearing_y,
             page: 0,
         };
-        self.slots.insert(key, slot);
-
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.texture,

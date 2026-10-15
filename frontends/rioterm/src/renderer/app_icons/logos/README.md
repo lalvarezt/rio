@@ -45,4 +45,4 @@ The table pins each additional vector to its source revision. Upstream SVGs are 
 
 Neovim and Git logos by Jason Long, [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/). Neovim attribution: [Neovim store](https://store.neovim.io/products/neovim-sticker-logo-only). Git attribution: [Git logos](https://git-scm.com/community/logos). Helix, Superfile, Television, Goose, and Jujutsu license texts are included beside the assets. Simple Icons' [source metadata](https://github.com/simple-icons/simple-icons/blob/4d29a35c954699b389a834aacc97dd6e7e74143c/data/simple-icons.json) links the original brand artwork and additional license details.
 
-SVG parsing and rasterization run once per logo and physical size. Cached spans retain color, opacity, drawing order, and drag clipping.
+SVG parsing and rasterization run once per logo and physical size in each window. Each logo uses one instance in the existing UI color atlas, retaining color, opacity, and drag clipping.

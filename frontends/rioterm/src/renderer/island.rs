@@ -159,6 +159,12 @@ struct TabPresentation {
     bell: bool,
 }
 
+#[cfg(target_os = "windows")]
+fn tab_title_padding(remote: bool, icon_size: f32) -> f32 {
+    let icons = if remote { 2.0 } else { 1.0 };
+    TAB_GAP / 2.0 + TAB_ICON_INSET_X + icons * (icon_size + TAB_ICON_GAP)
+}
+
 fn fit_title_to_width<'a>(
     sugarloaf: &mut Sugarloaf,
     title: &'a str,
@@ -238,6 +244,8 @@ pub struct TabStripLayout {
     widths: Vec<f32>,
     #[cfg(target_os = "windows")]
     positions: Vec<f32>,
+    #[cfg(target_os = "windows")]
+    topmost: Option<usize>,
 }
 
 impl TabStripLayout {
@@ -261,6 +269,11 @@ impl TabStripLayout {
     pub fn tab_at(&self, x: f32) -> Option<usize> {
         #[cfg(target_os = "windows")]
         if !self.positions.is_empty() {
+            if let Some(index) = self.topmost {
+                if x >= self.left(index) && x < self.left(index) + self.width(index) {
+                    return Some(index);
+                }
+            }
             return self
                 .positions
                 .iter()
@@ -319,6 +332,8 @@ pub fn tab_strip_layout(
         widths: Vec::new(),
         #[cfg(target_os = "windows")]
         positions: Vec::new(),
+        #[cfg(target_os = "windows")]
+        topmost: None,
     }
 }
 
@@ -365,7 +380,6 @@ fn windows_island_fills(bg: [f32; 4]) -> IslandFills {
 }
 
 #[cfg(target_os = "windows")]
-#[allow(clippy::too_many_arguments)]
 fn draw_tab_icon(
     sugarloaf: &mut Sugarloaf,
     x: f32,
@@ -374,20 +388,9 @@ fn draw_tab_icon(
     icon: super::app_icons::Icon,
     font_id: Option<usize>,
     size: f32,
-    occlusion: Option<[f32; 2]>,
 ) {
     let cy = TAB_CENTER_Y;
-    if super::app_icons::draw(
-        sugarloaf,
-        icon,
-        x + size / 2.0,
-        cy,
-        size,
-        color,
-        font_id,
-        order,
-        occlusion,
-    ) {
+    if super::app_icons::draw(sugarloaf, icon, x + size / 2.0, cy, size, color, font_id) {
         return;
     }
     if crate::renderer::windows_chrome::draw_icon(
@@ -565,6 +568,10 @@ pub fn close_button_hit(
     tab_index: usize,
     x_unscaled: f32,
 ) -> bool {
+    #[cfg(target_os = "windows")]
+    if layout.topmost == Some(tab_index) {
+        return false;
+    }
     close_button_center_x(layout, tab_index)
         .is_some_and(|cx| (x_unscaled - cx).abs() <= CLOSE_HIT_HALF_WIDTH)
 }
@@ -761,13 +768,6 @@ impl Island {
     }
 
     #[cfg(target_os = "windows")]
-    fn title_padding(&self, remote: bool) -> f32 {
-        let icons = if remote { 2.0 } else { 1.0 };
-        TAB_GAP / 2.0 + TAB_ICON_INSET_X + icons * (self.tab_icon_size + TAB_ICON_GAP)
-    }
-
-    #[cfg(target_os = "windows")]
-    #[allow(clippy::too_many_arguments)]
     fn render_tab_icons(
         &self,
         sugarloaf: &mut Sugarloaf,
@@ -776,9 +776,8 @@ impl Island {
         width: f32,
         color: [f32; 4],
         order: u8,
-        occlusion: Option<[f32; 2]>,
     ) {
-        if width < self.title_padding(tab.remote) - TAB_GAP / 2.0 {
+        if width < tab_title_padding(tab.remote, self.tab_icon_size) - TAB_GAP / 2.0 {
             return;
         }
         let mut x = x + TAB_ICON_INSET_X;
@@ -791,7 +790,6 @@ impl Island {
                 super::app_icons::SSH_ICON,
                 self.window_header.app_font,
                 self.tab_icon_size,
-                occlusion,
             );
             x += self.tab_icon_size + TAB_ICON_GAP;
         }
@@ -803,7 +801,6 @@ impl Island {
             tab.icon,
             self.window_header.app_font,
             self.tab_icon_size,
-            occlusion,
         );
     }
 
@@ -2862,6 +2859,8 @@ mod tests {
             widths: Vec::new(),
             #[cfg(target_os = "windows")]
             positions: Vec::new(),
+            #[cfg(target_os = "windows")]
+            topmost: None,
         }
     }
 
@@ -2877,6 +2876,8 @@ mod tests {
             widths: Vec::new(),
             #[cfg(target_os = "windows")]
             positions: Vec::new(),
+            #[cfg(target_os = "windows")]
+            topmost: None,
         };
         let cx = close_button_center_x(&layout, 1).unwrap();
         assert_eq!(
@@ -2895,6 +2896,8 @@ mod tests {
             widths: Vec::new(),
             #[cfg(target_os = "windows")]
             positions: Vec::new(),
+            #[cfg(target_os = "windows")]
+            topmost: None,
         };
         assert_eq!(close_button_center_x(&narrow, 3), None);
     }
@@ -2913,6 +2916,8 @@ mod tests {
             widths: Vec::new(),
             #[cfg(target_os = "windows")]
             positions: Vec::new(),
+            #[cfg(target_os = "windows")]
+            topmost: None,
         };
         let cx = close_button_center_x(&layout, 0).unwrap();
         let title_max_right = layout.tab_width - TAB_PADDING_X;

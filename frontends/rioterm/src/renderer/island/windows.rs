@@ -84,17 +84,22 @@ impl Tabs {
     }
     pub(super) fn pointer_target(&self, x: Option<f32>) -> Option<(usize, bool)> {
         let x = x?;
-        self.order.iter().rev().find_map(|id| {
-            let tab = &self.tabs[id];
-            let left = tab.left.value();
-            let width = tab.width.value();
-            (x >= left && x < left + width).then(|| {
-                let (ix, _, iw, _, _) = island_rect(left, width);
-                let close = close_button_center(ix, iw)
-                    .is_some_and(|cx| (x - cx).abs() <= CLOSE_HIT_HALF_WIDTH);
-                (*id, close)
+        let floating = self.floating.filter(|id| self.order.contains(id));
+        floating
+            .iter()
+            .chain(self.order.iter().rev().filter(|id| Some(**id) != floating))
+            .find_map(|id| {
+                let tab = &self.tabs[id];
+                let left = tab.left.value();
+                let width = tab.width.value();
+                (x >= left && x < left + width).then(|| {
+                    let (ix, _, iw, _, _) = island_rect(left, width);
+                    let close = floating != Some(*id)
+                        && close_button_center(ix, iw)
+                            .is_some_and(|cx| (x - cx).abs() <= CLOSE_HIT_HALF_WIDTH);
+                    (*id, close)
+                })
             })
-        })
     }
     pub(super) fn needs_redraw(&self) -> bool {
         self.animating
@@ -170,6 +175,9 @@ impl Tabs {
     ) -> TabStripLayout {
         let count = context_manager.len();
         let mut layout = tab_strip_layout(width, scale, count, max);
+        layout.topmost = self
+            .floating
+            .and_then(|id| (0..count).find(|&index| context_manager.tab_id(index) == id));
         let mut right = layout.left_margin;
         for index in 0..count {
             let tab = self.tabs.get(&context_manager.tab_id(index));
@@ -238,10 +246,7 @@ impl Tabs {
                     || tab.content.bell != content.bell
             });
             let measured = if changed {
-                let icons = if content.remote { 2.0 } else { 1.0 };
-                let padding = TAB_GAP / 2.0
-                    + TAB_ICON_INSET_X
-                    + icons * (icon_size + TAB_ICON_GAP)
+                let padding = tab_title_padding(content.remote, icon_size)
                     + TAB_TITLE_PADDING_RIGHT
                     + if content.bell {
                         BELL_DOT_SIZE + BELL_GAP
@@ -721,7 +726,7 @@ impl Island {
                 order + 1,
             );
         }
-        let padding = self.title_padding(tab.content.remote);
+        let padding = tab_title_padding(tab.content.remote, self.tab_icon_size);
         let bell_width = if tab.content.bell {
             BELL_DOT_SIZE + BELL_GAP
         } else {
@@ -763,7 +768,7 @@ impl Island {
                 .text_mut()
                 .draw(text_x + bell_width, title_y, &title, &opts);
         }
-        self.render_tab_icons(sugarloaf, &tab.content, x, w, color, order + 1, occlusion);
+        self.render_tab_icons(sugarloaf, &tab.content, x, w, color, order + 1);
         if count > 1 && tab.live && floating.is_none() && tab.hover > 0.0 {
             if let Some(cx) = close_button_center(x, w) {
                 let cx = snap(cx, sugarloaf.scale_factor());

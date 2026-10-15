@@ -2871,6 +2871,18 @@ impl Screen<'_> {
         )
     }
 
+    fn island_drag_layout(&self, num_tabs: usize) -> TabStripLayout {
+        #[cfg(target_os = "windows")]
+        if let Some(island) = &self.renderer.island {
+            return island.drag_layout(
+                self.sugarloaf.window_size().width,
+                self.sugarloaf.scale_factor(),
+                num_tabs,
+            );
+        }
+        self.island_tab_layout(num_tabs)
+    }
+
     #[cfg(target_os = "macos")]
     pub fn start_window_drag(&mut self, window: &rio_window::window::Window) {
         self.mouse.left_button_state = ElementState::Released;
@@ -3272,19 +3284,7 @@ impl Screen<'_> {
             return;
         }
 
-        #[cfg(not(target_os = "windows"))]
-        let layout = self.island_tab_layout(num_tabs);
-        #[cfg(target_os = "windows")]
-        let layout = self.renderer.island.as_ref().map_or_else(
-            || self.island_tab_layout(num_tabs),
-            |island| {
-                island.drag_layout(
-                    self.sugarloaf.window_size().width,
-                    self.sugarloaf.scale_factor(),
-                    num_tabs,
-                )
-            },
-        );
+        let layout = self.island_drag_layout(num_tabs);
 
         let (drag_idx, center) = match self.renderer.island.as_mut() {
             Some(island) => {
@@ -3347,19 +3347,7 @@ impl Screen<'_> {
 
     pub fn handle_tab_drag_release(&mut self) -> bool {
         let num_tabs = self.context_manager.len();
-        #[cfg(not(target_os = "windows"))]
-        let layout = self.island_tab_layout(num_tabs);
-        #[cfg(target_os = "windows")]
-        let layout = self.renderer.island.as_ref().map_or_else(
-            || self.island_tab_layout(num_tabs),
-            |island| {
-                island.drag_layout(
-                    self.sugarloaf.window_size().width,
-                    self.sugarloaf.scale_factor(),
-                    num_tabs,
-                )
-            },
-        );
+        let layout = self.island_drag_layout(num_tabs);
 
         if let Some(ref mut island) = self.renderer.island {
             let started = island.drag_index().is_some();

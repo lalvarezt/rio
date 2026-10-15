@@ -159,6 +159,8 @@ pub struct Text {
     wght_variation_cache: FxHashMap<u32, Option<f32>>,
     ascent_cache: FxHashMap<(u32, u16), i16>,
     shape_cache: FxHashMap<u64, Arc<ShapedRun>>,
+    #[cfg(target_os = "windows")]
+    icons: FxHashMap<(&'static str, u16), crate::grid::atlas::AtlasSlot>,
 
     #[cfg(target_os = "macos")]
     handle_cache: FxHashMap<u32, crate::font::macos::FontHandle>,
@@ -190,6 +192,8 @@ impl Text {
             wght_variation_cache: FxHashMap::default(),
             ascent_cache: FxHashMap::default(),
             shape_cache: FxHashMap::default(),
+            #[cfg(target_os = "windows")]
+            icons: FxHashMap::default(),
             #[cfg(target_os = "macos")]
             handle_cache: FxHashMap::default(),
             #[cfg(target_os = "macos")]
@@ -214,6 +218,8 @@ impl Text {
         if self.cpu.is_some() {
             return;
         }
+        #[cfg(target_os = "windows")]
+        self.icons.clear();
         self.cpu = Some(TextCpuState {
             atlas_grayscale: crate::grid::cpu::CpuGridAtlas::new_grayscale(),
             atlas_color: crate::grid::cpu::CpuGridAtlas::new_color(),
@@ -254,6 +260,81 @@ impl Text {
         let width_px = shaped_width(&shaped);
         self.emit_instances(x, y, &shaped, opts);
         width_px / self.scale_factor
+    }
+
+    /// Draw a cached icon centered at logical `(cx, cy)`, using the UI color
+    /// atlas. `key` identifies immutable artwork. Rasterization runs only on
+    /// a cache miss and returns square premultiplied RGBA pixels at `size`.
+    #[cfg(target_os = "windows")]
+    pub fn draw_icon(
+        &mut self,
+        key: &'static str,
+        cx: f32,
+        cy: f32,
+        size: f32,
+        color: [u8; 4],
+        rasterize: impl FnOnce(u16) -> Vec<u8>,
+    ) -> bool {
+        let scale = self.scale_factor;
+        let size = (size * scale).round().clamp(1.0, 256.0) as u16;
+        let key = (key, size);
+        let slot = if let Some(slot) = self.icons.get(&key) {
+            *slot
+        } else {
+            let bytes = {
+                let _timing =
+                    tracing::debug_span!(target: "rio_profile", "ui.icon_raster")
+                        .entered();
+                rasterize(size)
+            };
+            if bytes.len() != size as usize * size as usize * 4 {
+                return false;
+            }
+            let raster = crate::grid::RasterizedGlyph {
+                width: size,
+                height: size,
+                bearing_x: 0,
+                bearing_y: 0,
+                bytes: &bytes,
+            };
+            let _timing =
+                tracing::debug_span!(target: "rio_profile", "ui.icon_upload").entered();
+            let slot = if let Some(cpu) = self.cpu.as_mut() {
+                cpu.atlas_color.upload(raster).or_else(|| {
+                    cpu.atlas_color
+                        .grow()
+                        .then(|| cpu.atlas_color.upload(raster))
+                        .flatten()
+                })
+            } else {
+                #[cfg(feature = "wgpu")]
+                {
+                    self.wgpu
+                        .as_mut()
+                        .and_then(|gpu| gpu.atlas_color.upload(raster))
+                }
+                #[cfg(not(feature = "wgpu"))]
+                {
+                    None
+                }
+            };
+            let Some(slot) = slot else { return false };
+            self.icons.insert(key, slot);
+            slot
+        };
+        self.instances.push(TextInstance {
+            pos: [
+                (cx * scale - size as f32 / 2.0).round(),
+                (cy * scale - size as f32 / 2.0).round(),
+            ],
+            glyph_pos: [slot.x as u32, slot.y as u32],
+            glyph_size: [slot.w as u32, slot.h as u32],
+            color,
+            atlas: 1,
+            page: slot.page,
+            ..TextInstance::default()
+        });
+        true
     }
 
     /// Exclude a logical horizontal interval from glyphs recorded since `first`.
@@ -876,6 +957,7 @@ impl Text {
                     color_side,
                     ax,
                     ay,
+                    inst.color,
                 );
             } else {
                 blit_text_mask(
@@ -1037,6 +1119,8 @@ impl Text {
             instance_buffer,
             instance_capacity,
         });
+        #[cfg(target_os = "windows")]
+        self.icons.clear();
     }
 
     /// Record the UI text pass into `render_pass`. No-op if wgpu state
@@ -2042,6 +2126,7 @@ fn blit_text_color(
     atlas_side: usize,
     ax: usize,
     ay: usize,
+    color: [u8; 4],
 ) {
     let stride = buf_w as usize;
     let x_start = glyph_x.max(0);
@@ -2071,7 +2156,20 @@ fn blit_text_color(
             if a == 0 {
                 continue;
             }
-            let src = [r, g, b, a];
+            let src = if color == [255; 4] {
+                [r, g, b, a]
+            } else {
+                let alpha = color[3] as u32;
+                let tint = |value: u8, channel: u8| {
+                    ((value as u32 * channel as u32 * alpha + 32_512) / 65_025) as u8
+                };
+                [
+                    tint(r, color[0]),
+                    tint(g, color[1]),
+                    tint(b, color[2]),
+                    ((a as u32 * alpha + 127) / 255) as u8,
+                ]
+            };
             let idx = buf_row + (dst_x as usize);
             buf[idx] = blend_premul_over(src, buf[idx]);
         }

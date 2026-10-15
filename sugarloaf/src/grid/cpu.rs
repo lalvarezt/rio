@@ -81,6 +81,13 @@ impl CpuGridAtlas {
         key: GlyphKey,
         glyph: RasterizedGlyph<'_>,
     ) -> Option<AtlasSlot> {
+        let slot = self.upload(glyph)?;
+        self.slots.insert(key, slot);
+        Some(slot)
+    }
+
+    /// Upload pixels without adding a font-glyph cache entry.
+    pub(crate) fn upload(&mut self, glyph: RasterizedGlyph<'_>) -> Option<AtlasSlot> {
         if glyph.width == 0 || glyph.height == 0 {
             // Zero-sized glyphs (e.g. spaces) still need a cache entry
             // so the rasterizer doesn't keep producing them, but they
@@ -94,7 +101,6 @@ impl CpuGridAtlas {
                 bearing_y: glyph.bearing_y,
                 page: 0,
             };
-            self.slots.insert(key, slot);
             return Some(slot);
         }
 
@@ -108,7 +114,6 @@ impl CpuGridAtlas {
             bearing_y: glyph.bearing_y,
             page: 0,
         };
-        self.slots.insert(key, slot);
         self.write_pixels(
             x as usize,
             y as usize,

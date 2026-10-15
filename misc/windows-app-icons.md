@@ -74,9 +74,10 @@ shared renderer supports multiple paths, fills, gradients, transforms, and
 non-square view boxes. It preserves the original aspect ratio and brand colors;
 dark monochrome marks can use the header tint for contrast.
 
-SVG parsing and rasterization happen once per logo and physical size. Cached
-colored spans preserve opacity, drawing order, and partial clipping during tab
-dragging. Neovim uses this same path; it has no separate renderer or cache.
+SVG parsing and rasterization happen once per logo and physical size in each
+window. Pixels share the existing UI color atlas, and each logo draws as one
+instance. Header tint, opacity, and partial clipping use the same path as tab
+text. Neovim has no separate renderer or cache.
 No system fonts, SVG text shaping, raster-image decoders, or network access are
 enabled in the SVG renderer.
 
