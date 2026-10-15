@@ -16,10 +16,10 @@ add-zsh-hook precmd _rio_report_pwd
 _rio_report_pwd
 
 _rio_report_app() {
-    local remote=0 app="${1:t}"
-    [[ -n "${SSH_CONNECTION-}${SSH_CLIENT-}${SSH_TTY-}" ]] && remote=1
-    local encoded="$(builtin printf '%s' "$app" | base64 | tr -d '\n')"
-    local transport="$(builtin printf '%s' "$remote" | base64 | tr -d '\n')"
+    local app="${1:t}" transport=MA==
+    [[ -n "${SSH_CONNECTION-}${SSH_CLIENT-}${SSH_TTY-}" ]] && transport=MQ==
+    local encoded="$(builtin printf '%s' "$app" | base64)"
+    encoded=${encoded//$'\n'/}
     builtin printf '\e]1337;SetUserVar=RIO_SSH=%s\a\e]1337;SetUserVar=RIO_APP=%s\a' "$transport" "$encoded"
 }
 _rio_preexec() {

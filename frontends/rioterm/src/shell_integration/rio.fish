@@ -23,12 +23,11 @@ end
 __rio_report_pwd
 
 function __rio_report_app --argument-names app
-    set -l remote 0
+    set -l transport MA==
     if set -q SSH_CONNECTION; or set -q SSH_CLIENT; or set -q SSH_TTY
-        set remote 1
+        set transport MQ==
     end
     set -l encoded (printf '%s' "$app" | base64 | string join '')
-    set -l transport (printf '%s' "$remote" | base64 | string join '')
     printf '\e]1337;SetUserVar=RIO_SSH=%s\a\e]1337;SetUserVar=RIO_APP=%s\a' "$transport" "$encoded"
 end
 
