@@ -599,6 +599,15 @@ impl Sugarloaf<'_> {
         );
     }
 
+    /// Clip shapes recorded by `draw` to a rectangle in logical pixels.
+    /// UI text uses its own clipping and is not affected by this scope.
+    pub fn with_shape_clip(&mut self, clip: [f32; 4], draw: impl FnOnce(&mut Self)) {
+        let scale = self.scale_factor();
+        let previous = self.renderer.set_shape_clip(clip.map(|v| v * scale));
+        draw(self);
+        self.renderer.set_shape_clip(previous);
+    }
+
     /// Add a rounded rectangle. Always immediate-mode now — see `rect`.
     #[inline]
     #[allow(clippy::too_many_arguments)]

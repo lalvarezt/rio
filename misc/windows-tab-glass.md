@@ -30,3 +30,21 @@ blur = true
 Glass intensity changes the border's reflections, not the window opacity or the
 Windows Acrylic material. It does not refract the desktop or use Apple's native
 Liquid Glass renderer. Other operating systems keep their existing tab style.
+
+## Tab motion and controls
+
+Windows tabs animate into place when opened, closed, reordered, or resized by
+a title change. Rapid changes retarget the current motion. Title widths are
+cached, and shrinking waits briefly for transient title updates to stop.
+Creating, selecting, or closing a tab moves the selection capsule while terminal
+focus changes immediately. Keyboard selection wraps through the strip's edges
+in the direction of navigation.
+
+Mouse dragging tracks the pointer directly. Adjacent keyboard moves slide the
+selected tab above its neighbors. Moving between the first and last positions
+wraps the selection capsule through the strip's edges. Hover follows the tab currently beneath the pointer, including
+while tabs move.
+
+With multiple tabs, hovering a tab reveals its close button. Closing an inactive
+tab preserves the selected tab. The close button uses the existing tab width and
+shortens the visible title when needed, without moving neighboring tabs.

@@ -1708,6 +1708,11 @@ impl Renderer {
         );
     }
 
+    /// Set the shape clip in physical pixels and return the previous clip.
+    pub(crate) fn set_shape_clip(&mut self, clip: [f32; 4]) -> [f32; 4] {
+        std::mem::replace(&mut self.comp.batches.clip_rect, clip)
+    }
+
     /// Add a rounded rectangle with the specified border radius
     #[inline]
     #[allow(clippy::too_many_arguments)]

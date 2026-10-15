@@ -793,6 +793,11 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         self.contexts.len()
     }
 
+    #[cfg(target_os = "windows")]
+    pub fn tab_id(&self, index: usize) -> usize {
+        self.contexts[index].tab_id
+    }
+
     #[cfg(test)]
     pub fn title(&self, index: usize) -> Option<&ContextTitle> {
         self.contexts.get(index).map(|grid| &grid.current().title)
@@ -1180,6 +1185,19 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             self.set_current(0);
         }
 
+        self.keep_only_active_context_visible(sugarloaf);
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn close_unfocused_tab(&mut self, index: usize, sugarloaf: &mut Sugarloaf) {
+        if index >= self.contexts.len() || index == self.current_index {
+            return;
+        }
+        self.contexts[index].remove_from_sugarloaf(sugarloaf);
+        self.contexts.remove(index);
+        if index < self.current_index {
+            self.current_index -= 1;
+        }
         self.keep_only_active_context_visible(sugarloaf);
     }
 
