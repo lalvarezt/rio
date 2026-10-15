@@ -74,7 +74,6 @@ pub(super) struct Tabs {
     animating: bool,
     snap_reorder: bool,
     navigation: Option<(usize, usize, i8)>,
-    strip_width: f32,
 }
 
 impl Tabs {
@@ -202,11 +201,13 @@ impl Tabs {
         let (min, max) = limits;
         let initial = self.order.is_empty();
         let navigation = self.navigation.take();
+        // With two tabs, either move reaches an endpoint. Only crossing the
+        // edge in the requested direction is a circular move.
         let wrap_direction = navigation
-            .filter(|(from, to, _)| {
+            .filter(|(from, to, direction)| {
                 self.order.len() > 1
-                    && ((*from == 0 && *to + 1 == self.order.len())
-                        || (*from + 1 == self.order.len() && *to == 0))
+                    && ((*direction < 0 && *from == 0 && *to + 1 == self.order.len())
+                        || (*direction > 0 && *from + 1 == self.order.len() && *to == 0))
             })
             .map_or(0, |(_, _, direction)| direction);
         if wrap_direction != 0
@@ -295,7 +296,6 @@ impl Tabs {
             }
         }
         let target = self.target_layout(window_width, scale, min, max);
-        self.strip_width = target.tabs_width;
         let mut moving = false;
         let drag_id = drag.and_then(|i| self.order.get(i)).copied();
         let mut left = target.left_margin;
@@ -552,10 +552,16 @@ impl Island {
                     .unwrap_or(fills.active);
                 let period = selection.wrap_period;
                 let copies = [0.0, -period, period];
+                // A closing strip contracts before the pill settles. Clip to
+                // its width only for circular copies, preserving rounded ends.
                 let clip = [
                     bounds.left_margin,
                     0.0,
-                    self.windows_tabs.strip_width.min(bounds.tabs_width),
+                    if period > 0.0 {
+                        period.min(bounds.tabs_width)
+                    } else {
+                        bounds.tabs_width
+                    },
                     ISLAND_HEIGHT,
                 ];
                 sugarloaf.with_shape_clip(clip, |sugarloaf| {

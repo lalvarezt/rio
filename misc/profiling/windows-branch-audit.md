@@ -76,3 +76,68 @@ no repository tests and makes no frame-rate or GPU throughput claim.
 Standards: three findings, with transport duplication fixed and lookup allocation
 reduced; presentation rebuilding and SVG shape emission remain profiling targets.
 Spec: one pipeline-reporting gap remains documented.
+
+## Two-tab navigation and closing follow-up
+
+Native Windows captures reproduced two separate visual regressions after
+`d2ac829557`. With two tabs, ordinary next/previous selection produced duplicate
+pill fragments and discontinuous movement. Closing either tab cut the pill's
+right edge into a vertical rectangle.
+
+The wrap check tested endpoint indices without considering direction. With two
+tabs every selection change reaches the other endpoint. It now requires an
+actual crossing in the requested direction: next from last to first, or previous
+from first to last. Ordinary moves use the existing direct transition.
+
+Selection clipping used the new target strip width while the pill was still
+moving and shrinking. Circular copies still clip to their wrap period; other
+transitions clip to the available header width, preserving the rounded edge.
+This also removes the duplicate stored strip width.
+
+The native capture loop exercises two-tab ordinary moves, both wrap directions,
+rapid reversal, closing the first and last tabs, mouse closing and three-tab
+wraparound. An ignored image-analysis command distinguishes split ordinary
+transitions and flat closing edges:
+
+```sh
+node target/analyze-tab-regression.js target/profiles/tab-regression-before --check
+```
+
+The original capture fails both checks. A navigation-only build passes the
+ordinary-move check while closing still fails. The combined fix passes both.
+Additional captures and temporary geometry traces retain all three tab
+presentations through wraparound. Diagnostic helpers and captures remain under
+ignored `target/`; tracing is removed from the application source.
+
+### Timing comparison
+
+Three static and three animated runs per build each complete 240 frames with
+two cmd tabs: 2,880 measured frames across both builds. Animated runs repeatedly
+select next/previous tabs, including reversals. Readiness and frame-count checks
+pass. These are fast debug builds using the existing opt-in profiler, with no
+compilation or screenshot capture during timing runs. The table reports medians
+of the three per-run statistics, except the final row, which is the largest
+observed gap.
+
+| Animated workload, ms | Before | After |
+| --- | ---: | ---: |
+| Tab drawing median | 0.254 | 0.402 |
+| Tab drawing p95 | 0.574 | 0.789 |
+| Frame interval median | 16.696 | 16.710 |
+| Frame interval p95 | 18.436 | 18.907 |
+| Largest frame interval | 76.210 | 86.389 |
+
+These batches show no throughput improvement and do not establish a sustained
+tab-rendering bottleneck. Both builds usually present at about 60 Hz, but both
+have occasional long frame gaps. One updated run records a 64.195 ms surface
+acquisition scope. These are CPU wall-clock timings, which include driver waits
+and OS descheduling; they do not identify GPU execution time or prove system
+load is the cause. Overall system CPU load varies from 6.8% to 27.9% across runs.
+The intermittent stalls remain a separate performance investigation.
+
+Timing artifacts are under `target/profiles/tab-timing-before` and
+`target/profiles/tab-timing-after`. Visual captures are under
+`target/profiles/tab-regression-before`, `tab-regression-after-nav` and
+`tab-regression-after`. The normal inspection executable is
+`target/debug/rio-tab-inspect.exe`. No repository tests or runtime logging are
+added by these fixes.
