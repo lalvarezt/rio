@@ -388,48 +388,43 @@ fn draw_copy_icon(
 /// Fuzzy match: checks if all query chars appear in order in the target.
 /// Returns a score (higher = better match), or None if no match.
 fn fuzzy_score(query: &str, target: &str) -> Option<i32> {
-    let query_lower: Vec<char> = query.to_lowercase().chars().collect();
-    let target_lower: Vec<char> = target.to_lowercase().chars().collect();
-
-    if query_lower.is_empty() {
+    if query.is_empty() {
         return Some(0);
     }
 
-    let mut qi = 0;
+    let query_lower = query.to_lowercase();
+    let mut query_chars = query_lower.chars();
+    let mut query_char = query_chars.next()?;
+    let target_lower = target.to_lowercase();
     let mut score: i32 = 0;
     let mut prev_match = false;
     let mut first_match_pos = None;
+    let mut previous = ' ';
 
-    for (ti, &tc) in target_lower.iter().enumerate() {
-        if qi < query_lower.len() && tc == query_lower[qi] {
-            if first_match_pos.is_none() {
-                first_match_pos = Some(ti);
-            }
+    for (ti, tc) in target_lower.chars().enumerate() {
+        if tc == query_char {
+            let first = *first_match_pos.get_or_insert(ti);
             // Consecutive match bonus
             if prev_match {
                 score += 5;
             }
             // Word boundary bonus (start of string or after space/punctuation)
-            if ti == 0 || !target_lower[ti - 1].is_alphanumeric() {
+            if !previous.is_alphanumeric() {
                 score += 10;
             }
             prev_match = true;
-            qi += 1;
+            if let Some(next) = query_chars.next() {
+                query_char = next;
+            } else {
+                return Some(score + (20_i32).saturating_sub(first as i32));
+            }
         } else {
             prev_match = false;
         }
+        previous = tc;
     }
 
-    if qi < query_lower.len() {
-        return None; // Not all query chars matched
-    }
-
-    // Bonus for matching near the start
-    if let Some(pos) = first_match_pos {
-        score += (20_i32).saturating_sub(pos as i32);
-    }
-
-    Some(score)
+    None
 }
 
 /// Command palette UI component (Raycast-style)
