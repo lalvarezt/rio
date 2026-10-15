@@ -42,10 +42,30 @@ including full 64-bit hashes, warm emissions, selection, hover and IME. Snapshot
 probes also pass scrolling, shrinking/growing, metadata, styles and extras
 comparisons. Artifacts: `target/profiles/pipeline-default-final`.
 
+## 2. Screen preparation
+
+Background, foreground and hint scratch vectors now belong to the screen and
+are reused across panels and frames. They retain capacity, contain no cached
+rendering decisions, and are cleared before use. Grid dimensions, styles,
+selection and IME retain their existing invalidation behavior.
+
+A temporary thread-local allocator probe counts allocations inside the actual
+`Screen::render`, excluding the first ten calls. At 224 columns, clean frames
+fall from 211 allocations / 39,381 requested bytes to 209 / 31,317. Scrolling
+medians similarly fall from 229 / 41,190 to 227 / 33,126. The exact scratch
+saving is two allocations and 8,064 bytes per frame in this fixture. Other
+window UI work is included in these totals; this is not a claim that terminal
+rendering itself needs 209 allocations.
+
+The native profiling build completes idle, sparse, scrolling and dense
+workloads. Full/sparse frame distributions differ between runs, so those
+allocation medians are not used for a whole-frame speed claim. Artifacts:
+`target/profiles/terminal-render-pipeline-screen-{before,after}`.
+
 ## Remaining stages
 
-Screen preparation and scratch buffers, overlays, background emission, font
-resolution, shaping keys, glyph rasterization/atlases, foreground emission,
+Overlays, background emission, font resolution, shaping keys, glyph
+rasterization/atlases, foreground emission,
 cursor streams, GPU uploads/uniforms, draw encoding, presentation and resize
 lifetime are being inspected in order. Changes require measured benefit and
 output validation; an inspected stage does not require a speculative rewrite.

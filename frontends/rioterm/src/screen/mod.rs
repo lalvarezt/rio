@@ -105,6 +105,9 @@ pub struct Screen<'screen> {
     last_close_press: Option<(std::time::Instant, f32)>,
     pub grids: rustc_hash::FxHashMap<usize, rio_backend::sugarloaf::grid::GridRenderer>,
     pub grid_rasterizer: rio_grid::GridGlyphRasterizer,
+    grid_bg_scratch: Vec<rio_backend::sugarloaf::grid::CellBg>,
+    grid_fg_scratch: Vec<rio_backend::sugarloaf::grid::CellText>,
+    grid_hint_scratch: Vec<rio_grid::RowHint>,
 }
 
 pub struct ChromePress {
@@ -361,6 +364,9 @@ impl Screen<'_> {
             last_close_press: None,
             grids: rustc_hash::FxHashMap::default(),
             grid_rasterizer: rio_grid::GridGlyphRasterizer::new(),
+            grid_bg_scratch: Vec::new(),
+            grid_fg_scratch: Vec::new(),
+            grid_hint_scratch: Vec::new(),
         })
     }
 
@@ -4459,6 +4465,9 @@ impl Screen<'_> {
 
             let rasterizer = &mut self.grid_rasterizer;
             let renderer_ref = &self.renderer;
+            let bg_scratch = &mut self.grid_bg_scratch;
+            let fg_scratch = &mut self.grid_fg_scratch;
+            let hint_scratch = &mut self.grid_hint_scratch;
             for (route_id, grid) in self.grids.iter_mut() {
                 let Some(p) = panels.iter_mut().find(|p| p.route_id == *route_id) else {
                     continue;
@@ -4500,11 +4509,10 @@ impl Screen<'_> {
                 };
 
                 let cols = p.cols as usize;
-                let mut bg_scratch: Vec<rio_backend::sugarloaf::grid::CellBg> =
-                    Vec::with_capacity(cols);
-                let mut fg_scratch: Vec<rio_backend::sugarloaf::grid::CellText> =
-                    Vec::with_capacity(cols);
-                let mut hint_scratch: Vec<rio_grid::RowHint> = Vec::new();
+                bg_scratch.clear();
+                bg_scratch.reserve(cols);
+                fg_scratch.clear();
+                fg_scratch.reserve(cols);
 
                 let label_styles_pair = rio_grid::hint_label_styles(
                     self.renderer.named_colors.hint_foreground,
@@ -4558,7 +4566,7 @@ impl Screen<'_> {
                             y,
                             cols,
                             p.display_offset,
-                            &mut hint_scratch,
+                            hint_scratch,
                         );
                         let label_row;
                         let label_styles;
@@ -4571,7 +4579,7 @@ impl Screen<'_> {
                                     y,
                                     p.display_offset,
                                     label_styles_pair,
-                                    &mut hint_scratch,
+                                    hint_scratch,
                                 ) {
                                     Some((r, styles)) => {
                                         label_row = r;
@@ -4599,9 +4607,9 @@ impl Screen<'_> {
                             renderer_ref,
                             &p.term_colors,
                             row_sel,
-                            &hint_scratch,
+                            hint_scratch,
                             preedit_row.as_ref(),
-                            &mut bg_scratch,
+                            bg_scratch,
                         );
                         let cursor_col_for_row = if p.cursor_visible
                             && (y as u16) == p.cursor_row
@@ -4625,14 +4633,14 @@ impl Screen<'_> {
                             p.cell_w,
                             p.cell_h,
                             row_sel,
-                            &hint_scratch,
+                            hint_scratch,
                             preedit_row.as_ref(),
                             &font_library,
                             p.route_id,
                             cursor_col_for_row,
-                            &mut fg_scratch,
+                            fg_scratch,
                         );
-                        grid.write_row(y as u32, &bg_scratch, &fg_scratch);
+                        grid.write_row(y as u32, bg_scratch, fg_scratch);
                     };
 
                 match rows_to_rebuild {
