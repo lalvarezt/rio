@@ -44,9 +44,14 @@ const TAB_ICON_INSET_X: f32 = 12.0;
 const TAB_ICON_GAP: f32 = 8.0;
 const TAB_GAP: f32 = 6.0;
 #[cfg(not(target_os = "windows"))]
-const TAB_INSET_Y: f32 = 7.0;
+const TAB_INSET_BOTTOM: f32 = 7.0;
 #[cfg(target_os = "windows")]
-const TAB_INSET_Y: f32 = 8.0;
+const TAB_INSET_BOTTOM: f32 = 8.0;
+#[cfg(not(target_os = "windows"))]
+const TAB_INSET_TOP: f32 = TAB_INSET_BOTTOM;
+#[cfg(target_os = "windows")]
+const TAB_INSET_TOP: f32 = 6.0;
+const TAB_CENTER_Y: f32 = (TAB_INSET_TOP + ISLAND_HEIGHT - TAB_INSET_BOTTOM) / 2.0;
 #[cfg(not(target_os = "windows"))]
 const TAB_RADIUS: f32 = 6.0;
 #[cfg(target_os = "windows")]
@@ -346,7 +351,7 @@ fn draw_tab_icon(
     font_id: Option<usize>,
     size: f32,
 ) {
-    let cy = ISLAND_HEIGHT / 2.0;
+    let cy = TAB_CENTER_Y;
     if super::app_icons::draw(
         sugarloaf,
         icon,
@@ -477,8 +482,8 @@ fn draw_island(
 fn island_rect(slot_x: f32, tab_width: f32) -> (f32, f32, f32, f32, f32) {
     let x = slot_x + TAB_GAP / 2.0;
     let w = (tab_width - TAB_GAP).max(0.0);
-    let y = TAB_INSET_Y;
-    let h = ISLAND_HEIGHT - TAB_INSET_Y * 2.0;
+    let y = TAB_INSET_TOP;
+    let h = ISLAND_HEIGHT - TAB_INSET_TOP - TAB_INSET_BOTTOM;
     let radius = TAB_RADIUS.min(w / 2.0).min(h / 2.0);
     (x, y, w, h, radius)
 }
@@ -546,7 +551,7 @@ fn draw_close_button(
     hover: bool,
     order: u8,
 ) {
-    let cy = ISLAND_HEIGHT / 2.0;
+    let cy = TAB_CENTER_Y;
     let r = CLOSE_GLYPH_HALF;
     let alpha = if hover {
         CLOSE_ALPHA_HOVER
@@ -1507,7 +1512,7 @@ impl Island {
         let tab_title_y = crate::renderer::windows_chrome::centered_text_y(
             sugarloaf,
             "Mg",
-            ISLAND_HEIGHT / 2.0 + 2.0,
+            TAB_CENTER_Y + 2.0,
             &DrawOpts {
                 font_size: crate::renderer::windows_chrome::snap(
                     TITLE_FONT_SIZE,
@@ -1544,15 +1549,17 @@ impl Island {
         };
         #[cfg(target_os = "windows")]
         {
+            let (_, tab_y, _, tab_height, _) = island_rect(0.0, layout.tabs_width);
+            let group_height = tab_height + 4.0;
             sugarloaf.rounded_rect(
                 None,
                 left_margin,
-                6.0,
+                tab_y - 2.0,
                 layout.tabs_width,
-                ISLAND_HEIGHT - 12.0,
+                group_height,
                 group_fill,
                 0.05,
-                ((ISLAND_HEIGHT - 12.0) / 2.0).min(layout.tabs_width / 2.0),
+                (group_height / 2.0).min(layout.tabs_width / 2.0),
                 0,
             );
             let mut divider = fills.outline.unwrap_or(fills.active);
@@ -1826,7 +1833,7 @@ impl Island {
                         sugarloaf.rounded_rect(
                             None,
                             cx - CLOSE_HOVER_HALF,
-                            ISLAND_HEIGHT / 2.0 - CLOSE_HOVER_HALF,
+                            TAB_CENTER_Y - CLOSE_HOVER_HALF,
                             CLOSE_HOVER_HALF * 2.0,
                             CLOSE_HOVER_HALF * 2.0,
                             hover_fill,
@@ -2394,9 +2401,12 @@ mod tests {
     #[test]
     fn island_geometry_invariants() {
         const {
-            assert!(TAB_INSET_Y * 2.0 < ISLAND_HEIGHT);
+            assert!(TAB_INSET_TOP + TAB_INSET_BOTTOM < ISLAND_HEIGHT);
             assert!(CLOSE_MARGIN_RIGHT + CLOSE_HIT_HALF_WIDTH < CLOSE_MIN_ISLAND_WIDTH);
-            assert!(CLOSE_HOVER_HALF * 2.0 <= ISLAND_HEIGHT - TAB_INSET_Y * 2.0);
+            assert!(
+                CLOSE_HOVER_HALF * 2.0
+                    <= ISLAND_HEIGHT - TAB_INSET_TOP - TAB_INSET_BOTTOM
+            );
         }
     }
 
@@ -2457,12 +2467,12 @@ mod tests {
     #[test]
     fn island_rect_insets_slot_and_clamps_radius() {
         // Slot at x=100, width 180 → island inset by half the gap on
-        // each side and TAB_INSET_Y vertically.
+        // each side and the configured top and bottom insets.
         let (x, y, w, h, radius) = island_rect(100.0, 180.0);
         assert_eq!(x, 100.0 + TAB_GAP / 2.0);
-        assert_eq!(y, TAB_INSET_Y);
+        assert_eq!(y, TAB_INSET_TOP);
         assert_eq!(w, 180.0 - TAB_GAP);
-        assert_eq!(h, ISLAND_HEIGHT - TAB_INSET_Y * 2.0);
+        assert_eq!(h, ISLAND_HEIGHT - TAB_INSET_TOP - TAB_INSET_BOTTOM);
         assert_eq!(radius, TAB_RADIUS);
 
         let (_, _, w, h, radius) = island_rect(0.0, 4.0);
