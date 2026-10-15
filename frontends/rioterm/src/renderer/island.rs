@@ -611,6 +611,8 @@ pub struct Island {
     #[cfg(target_os = "windows")]
     tab_glass_intensity: f32,
     #[cfg(target_os = "windows")]
+    app_icons: super::app_icons::Library,
+    #[cfg(target_os = "windows")]
     preferred_tab_widths: Vec<f32>,
     pub inactive_text_color: [f32; 4],
     pub active_text_color: [f32; 4],
@@ -681,6 +683,8 @@ impl Island {
             tab_glass_intensity:
                 rio_backend::config::navigation::default_tab_glass_intensity(),
             #[cfg(target_os = "windows")]
+            app_icons: super::app_icons::Library::default(),
+            #[cfg(target_os = "windows")]
             preferred_tab_widths: Vec::new(),
             inactive_text_color,
             active_text_color,
@@ -732,6 +736,7 @@ impl Island {
         );
         #[cfg(target_os = "windows")]
         {
+            self.app_icons.configure(&navigation.app_icons);
             self.tab_glass_intensity =
                 rio_backend::config::navigation::clamp_tab_glass_intensity(
                     navigation.tab_glass_intensity,
@@ -1537,7 +1542,7 @@ impl Island {
                     .application_for_tab(index)
                     .map(|app| {
                         (
-                            super::app_icons::for_program(
+                            self.app_icons.for_program(
                                 &app.program,
                                 &app.title,
                                 status.as_ref(),

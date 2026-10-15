@@ -232,6 +232,9 @@ pub struct Navigation {
         rename = "tab-glass-intensity"
     )]
     pub tab_glass_intensity: f32,
+    /// Map command names to a bundled app or named icon (Windows tab pills).
+    #[serde(default, rename = "app-icons")]
+    pub app_icons: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Navigation {
@@ -251,6 +254,7 @@ impl Default for Navigation {
             min_tab_width: default_min_tab_width(),
             tab_icon_size: default_tab_icon_size(),
             tab_glass_intensity: default_tab_glass_intensity(),
+            app_icons: std::collections::BTreeMap::new(),
         }
     }
 }

@@ -110,6 +110,8 @@ pub struct PlatformNavigation {
     pub tab_icon_size: Option<f32>,
     #[serde(default = "Option::default", rename = "tab-glass-intensity")]
     pub tab_glass_intensity: Option<f32>,
+    #[serde(default, rename = "app-icons")]
+    pub app_icons: Option<std::collections::BTreeMap<String, String>>,
     #[serde(
         default = "Option::default",
         deserialize_with = "crate::config::colors::deserialize_to_arr_opt",

@@ -1,0 +1,188 @@
+# App identities and aliases, independent of detection and rendering.
+# Glyph names use the bundled Symbols Nerd Font. Brand marks live in logos/.
+apps = [
+    # Shells and transports
+    { id = "bash", icon = "shell", kind = "shell" },
+    { id = "zsh", icon = "shell", kind = "shell" },
+    { id = "fish", icon = "shell", kind = "shell" },
+    { id = "sh", icon = "shell", kind = "shell", aliases = ["dash", "ash", "ksh", "mksh"] },
+    { id = "nu", icon = "shell", kind = "shell", aliases = ["nushell"] },
+    { id = "xonsh", icon = "shell", kind = "shell", aliases = ["elvish", "oil", "osh"] },
+    { id = "powershell", icon = "powershell", kind = "shell", aliases = ["pwsh", "pwsh-preview"] },
+    { id = "cmd", icon = "cmd", kind = "shell" },
+    { id = "ssh", icon = "ssh", kind = "transport", aliases = ["mosh", "mosh-client"] },
+    { id = "wsl", icon = "linux", aliases = ["wslhost"] },
+
+    # AI tools
+    { id = "codex", icon = "openai", aliases = ["codex-acp", "openai codex"] },
+    { id = "claude", icon = "claude", aliases = ["claude-code", "claude code"] },
+    { id = "gemini", icon = "sparkle", aliases = ["gemini-cli"] },
+    { id = "opencode", icon = "code" },
+    { id = "aider", icon = "ai" },
+    { id = "goose", icon = "ai" },
+    { id = "copilot", icon = "github" },
+    { id = "crush", icon = "ai" },
+    { id = "amp", icon = "sparkle" },
+    { id = "pi", icon = "ai" },
+    { id = "q", icon = "ai", aliases = ["qchat", "kiro-cli"] },
+
+    # Editors
+    { id = "nvim", icon = "neovim", aliases = ["neovim", "nvim-qt", "neovide"] },
+    { id = "vim", icon = "vim", aliases = ["vi", "gvim", "vimdiff", "view", "rview"] },
+    { id = "emacs", icon = "emacs", aliases = ["emacsclient"] },
+    { id = "helix", icon = "code", aliases = ["hx"] },
+    { id = "kakoune", icon = "code", aliases = ["kak"] },
+    { id = "micro", icon = "code" },
+    { id = "nano", icon = "document", aliases = ["pico"] },
+    { id = "vis", icon = "code" },
+    { id = "code", icon = "vscode", aliases = ["code-insiders", "codium", "vscodium"] },
+    { id = "zed", icon = "code" },
+
+    # File managers and fuzzy selectors
+    { id = "yazi", icon = "duck", aliases = ["ya"] },
+    { id = "ranger", icon = "folder" },
+    { id = "lf", icon = "folder" },
+    { id = "nnn", icon = "folder" },
+    { id = "vifm", icon = "folder" },
+    { id = "mc", icon = "folder", aliases = ["midnight-commander"] },
+    { id = "broot", icon = "folder", aliases = ["br"] },
+    { id = "superfile", icon = "folder", aliases = ["spf"] },
+    { id = "xplr", icon = "folder" },
+    { id = "joshuto", icon = "folder" },
+    { id = "clifm", icon = "folder" },
+    { id = "fzf", icon = "filter" },
+    { id = "skim", icon = "filter", aliases = ["sk"] },
+    { id = "television", icon = "search", aliases = ["tv"] },
+    { id = "peco", icon = "filter", aliases = ["percol", "pick"] },
+    { id = "ripgrep", icon = "search", aliases = ["rg", "rga"] },
+    { id = "fd", icon = "search", aliases = ["fdfind"] },
+
+    # Process, disk and network monitors
+    { id = "htop", icon = "monitor" },
+    { id = "btop", icon = "monitor", aliases = ["bpytop", "bashtop"] },
+    { id = "bottom", icon = "monitor", aliases = ["btm"] },
+    { id = "top", icon = "monitor", aliases = ["atop", "nmon", "glances", "procs"] },
+    { id = "nvtop", icon = "monitor" },
+    { id = "s-tui", icon = "monitor" },
+    { id = "ncdu", icon = "disk" },
+    { id = "gdu", icon = "disk", aliases = ["dua", "dust", "duf"] },
+    { id = "iftop", icon = "network", aliases = ["nethogs", "bandwhich", "bmon", "nload"] },
+    { id = "fastfetch", icon = "monitor", aliases = ["neofetch", "hyfetch"] },
+
+    # Version control
+    { id = "git", icon = "git" },
+    { id = "lazygit", icon = "git" },
+    { id = "tig", icon = "git" },
+    { id = "gitui", icon = "git" },
+    { id = "gh", icon = "github" },
+    { id = "glab", icon = "git" },
+    { id = "jj", icon = "git", aliases = ["jujutsu", "lazyjj", "jjui"] },
+    { id = "git-absorb", icon = "git" },
+
+    # Containers, clusters and infrastructure
+    { id = "docker", icon = "docker", aliases = ["docker-compose"] },
+    { id = "podman", icon = "docker" },
+    { id = "lazydocker", icon = "docker" },
+    { id = "kubectl", icon = "kubernetes", aliases = ["kubectx", "kubens"] },
+    { id = "k9s", icon = "kubernetes" },
+    { id = "kube-linter", icon = "kubernetes", aliases = ["ktop", "kdash"] },
+    { id = "helm", icon = "kubernetes" },
+    { id = "terraform", icon = "infra", aliases = ["tofu", "opentofu", "terragrunt"] },
+    { id = "ansible", icon = "server", aliases = ["ansible-playbook"] },
+    { id = "nix", icon = "package", aliases = ["nix-shell", "nix-build"] },
+    { id = "systemctl", icon = "server", aliases = ["journalctl", "systemd-cgtop"] },
+
+    # Databases
+    { id = "psql", icon = "postgres", aliases = ["pgcli", "postgres"] },
+    { id = "mysql", icon = "mysql", aliases = ["mycli", "mariadb"] },
+    { id = "sqlite3", icon = "database", aliases = ["sqlite", "litecli"] },
+    { id = "redis-cli", icon = "redis", aliases = ["iredis"] },
+    { id = "mongosh", icon = "database", aliases = ["mongo"] },
+    { id = "usql", icon = "database" },
+    { id = "lazysql", icon = "database", aliases = ["dblab", "gobang"] },
+    { id = "clickhouse-client", icon = "database", aliases = ["clickhouse"] },
+
+    # Pagers, structured data and HTTP clients
+    { id = "less", icon = "document", aliases = ["more", "most", "moar"] },
+    { id = "bat", icon = "document", aliases = ["batcat"] },
+    { id = "delta", icon = "git", aliases = ["diff-so-fancy"] },
+    { id = "hexyl", icon = "hex", aliases = ["hexedit", "bvi"] },
+    { id = "jq", icon = "code", aliases = ["yq", "fq", "fx", "jless", "gron"] },
+    { id = "visidata", icon = "database", aliases = ["vd", "sc-im"] },
+    { id = "curl", icon = "network", aliases = ["wget", "xh", "http", "https", "httpie"] },
+    { id = "posting", icon = "network" },
+    { id = "trippy", icon = "network", aliases = ["trip", "mtr", "nmap"] },
+    { id = "lnav", icon = "document", aliases = ["angle-grinder", "tailspin"] },
+    { id = "chafa", icon = "image", aliases = ["viu", "timg"] },
+
+    # Media, chat and terminal browsers
+    { id = "spotify_player", icon = "spotify", aliases = ["spotify-player", "ncspot", "spt", "spotatui"] },
+    { id = "ncmpcpp", icon = "music", aliases = ["cmus", "musikcube", "mpd", "mpc"] },
+    { id = "cava", icon = "monitor" },
+    { id = "weechat", icon = "chat", aliases = ["irssi", "gomuks", "gurk"] },
+    { id = "aerc", icon = "mail", aliases = ["mutt", "neomutt", "alpine", "himalaya"] },
+    { id = "lynx", icon = "browser", aliases = ["links", "elinks", "w3m", "browsh"] },
+    { id = "newsboat", icon = "document", aliases = ["tuir"] },
+    { id = "task", icon = "document", aliases = ["taskwarrior", "taskwarrior-tui", "timew"] },
+
+    # Language runtimes and package tools
+    { id = "python", icon = "python", kind = "runtime", versioned = true, aliases = ["python2", "python3", "pypy", "pypy3", "ipython", "bpython", "ptpython", "pip", "pip3", "uv", "uvx", "poetry", "pipenv"] },
+    { id = "node", icon = "node", kind = "runtime", aliases = ["nodejs", "npm", "npx", "pnpm", "pnpx", "yarn", "bun", "bunx", "deno", "tsx", "ts-node"] },
+    { id = "rust", icon = "rust", kind = "runtime", aliases = ["cargo", "rustc", "rustup", "evcxr"] },
+    { id = "go", icon = "go", kind = "runtime", aliases = ["gopls", "gore"] },
+    { id = "lua", icon = "lua", kind = "runtime", versioned = true, aliases = ["luajit"] },
+    { id = "ruby", icon = "ruby", kind = "runtime", versioned = true, aliases = ["irb", "pry", "gem", "bundle", "bundler"] },
+    { id = "php", icon = "php", kind = "runtime", versioned = true, aliases = ["psysh", "composer"] },
+    { id = "java", icon = "java", kind = "runtime", aliases = ["jshell", "javac", "mvn", "gradle"] },
+    { id = "julia", icon = "code", kind = "runtime", versioned = true },
+    { id = "dotnet", icon = "code", kind = "runtime", aliases = ["csi", "fsharpi"] },
+]
+
+# Names are also available to navigation.app-icons configuration mappings.
+[icons]
+terminal = "\uea85"
+shell = "\uebca"
+powershell = "\uebc7"
+cmd = "\uebc4"
+ssh = "\U000f08c0"
+linux = "\ue712"
+ai = "\U000f06a9"
+sparkle = "\U000f0ae2"
+code = "\U000f022e"
+vim = "\ue7c5"
+emacs = "\ue632"
+vscode = "\ue70c"
+duck = "\U000f01e5"
+folder = "\U000f024b"
+filter = "\U000f0236"
+search = "\U000f0349"
+monitor = "\U000f0128"
+disk = "\U000f02ca"
+network = "\U000f06f3"
+git = "\ue702"
+github = "\uea84"
+docker = "\ue7b0"
+kubernetes = "\U000f10fe"
+infra = "\U000f01a6"
+server = "\U000f048b"
+package = "\U000f03d6"
+database = "\U000f01bc"
+postgres = "\ue76e"
+mysql = "\ue704"
+redis = "\ue76d"
+document = "\U000f0219"
+hex = "\U000f12a7"
+image = "\U000f02e9"
+spotify = "\uf1bc"
+music = "\U000f075a"
+chat = "\U000f0b79"
+mail = "\U000f01ee"
+browser = "\U000f059f"
+python = "\ue73c"
+node = "\ue718"
+rust = "\ue7a8"
+go = "\ue724"
+lua = "\U000f08b1"
+ruby = "\ue739"
+php = "\U000f031f"
+java = "\U000f0b37"
