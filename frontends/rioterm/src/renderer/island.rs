@@ -40,6 +40,8 @@ const TAB_PADDING_X: f32 = 47.0;
 const TAB_TITLE_PADDING_RIGHT: f32 = 14.0;
 #[cfg(target_os = "windows")]
 const TAB_ICON_INSET_X: f32 = 12.0;
+#[cfg(target_os = "windows")]
+const TAB_ICON_GAP: f32 = 8.0;
 const TAB_GAP: f32 = 6.0;
 #[cfg(not(target_os = "windows"))]
 const TAB_INSET_Y: f32 = 7.0;
@@ -332,14 +334,6 @@ fn windows_island_fills(bg: [f32; 4]) -> IslandFills {
 #[cfg(target_os = "windows")]
 fn mix_color(from: [f32; 4], to: [f32; 4], amount: f32) -> [f32; 4] {
     std::array::from_fn(|i| from[i] + (to[i] - from[i]) * amount)
-}
-
-#[cfg(target_os = "windows")]
-fn fade_toward(value: &mut f32, target: f32, dt: f32) {
-    *value += (target - *value) * (1.0 - (-dt / 0.045).exp());
-    if (*value - target).abs() < 0.005 {
-        *value = target;
-    }
 }
 
 #[cfg(target_os = "windows")]
@@ -753,37 +747,69 @@ impl Island {
     }
 
     #[cfg(target_os = "windows")]
-    fn title_padding(&self) -> f32 {
-        TAB_GAP / 2.0 + TAB_ICON_INSET_X + self.tab_icon_size + 8.0
+    fn title_padding(&self, remote: bool) -> f32 {
+        let icons = if remote { 2.0 } else { 1.0 };
+        TAB_GAP / 2.0 + TAB_ICON_INSET_X + icons * (self.tab_icon_size + TAB_ICON_GAP)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn render_tab_icons(
+        &self,
+        sugarloaf: &mut Sugarloaf,
+        tab: &TabPresentation,
+        x: f32,
+        width: f32,
+        color: [f32; 4],
+        order: u8,
+    ) {
+        if width < self.title_padding(tab.remote) - TAB_GAP / 2.0 {
+            return;
+        }
+        let mut x = x + TAB_ICON_INSET_X;
+        if tab.remote {
+            draw_tab_icon(
+                sugarloaf,
+                x,
+                color,
+                order,
+                super::app_icons::SSH_ICON,
+                self.window_header.app_font,
+                self.tab_icon_size,
+            );
+            x += self.tab_icon_size + TAB_ICON_GAP;
+        }
+        draw_tab_icon(
+            sugarloaf,
+            x,
+            color,
+            order,
+            tab.icon,
+            self.window_header.app_font,
+            self.tab_icon_size,
+        );
     }
 
     #[cfg(target_os = "windows")]
     fn measure_tab_width(&mut self, sugarloaf: &mut Sugarloaf, tabs: &[TabPresentation]) {
         #[cfg(feature = "profiling")]
         let _timing = crate::profiling::span("tabs.measure_widths");
+        let scale = sugarloaf.scale_factor();
         let opts = DrawOpts {
-            font_size: crate::renderer::windows_chrome::snap(
-                TITLE_FONT_SIZE,
-                sugarloaf.scale_factor(),
-            ),
+            font_size: crate::renderer::windows_chrome::snap(TITLE_FONT_SIZE, scale),
             font_id: Some(rio_backend::sugarloaf::font::FONT_ID_REGULAR),
             ..DrawOpts::default()
         };
         self.preferred_tab_widths.clear();
         for tab in tabs {
-            let padding = self.title_padding()
+            let padding = self.title_padding(tab.remote)
                 + TAB_TITLE_PADDING_RIGHT
-                + if tab.remote {
-                    self.tab_icon_size + 4.0
-                } else {
-                    0.0
-                }
                 + if tab.bell {
                     BELL_DOT_SIZE + BELL_GAP
                 } else {
                     0.0
                 };
             let width = sugarloaf.text_mut().measure(&tab.title, &opts) + padding;
+            let width = (width * scale).ceil() / scale;
             self.preferred_tab_widths
                 .push(width.clamp(self.min_tab_width, self.max_tab_width));
         }
@@ -1437,10 +1463,10 @@ impl Island {
                 let active = u8::from(i == current_tab_index) as f32;
                 let hover = u8::from(Some(i) == self.hovered_tab) as f32;
                 let appearance = self.tab_appearance.entry(i).or_insert((active, 0.0));
-                fade_toward(&mut appearance.0, active, dt);
-                fade_toward(&mut appearance.1, hover, dt);
+                super::windows_chrome::fade(&mut appearance.0, active, dt);
+                super::windows_chrome::fade(&mut appearance.1, hover, dt);
             }
-            fade_toward(
+            super::windows_chrome::fade(
                 &mut self.close_hover_opacity,
                 u8::from(self.close_hover) as f32,
                 dt,
@@ -1491,8 +1517,6 @@ impl Island {
                 ..DrawOpts::default()
             },
         );
-        #[cfg(target_os = "windows")]
-        let tab_padding_x = self.title_padding();
         #[cfg(not(target_os = "windows"))]
         let tab_padding_x = TAB_PADDING_X;
         let layout = self.tab_layout(window_width, scale_factor, num_tabs);
@@ -1574,15 +1598,9 @@ impl Island {
             #[cfg(target_os = "windows")]
             let tab = &tabs[tab_index];
             #[cfg(target_os = "windows")]
-            let (app_icon, remote) = (tab.icon, tab.remote);
+            let tab_padding_x = self.title_padding(tab.remote);
             #[cfg(target_os = "windows")]
             let program_status = &tab.status;
-            #[cfg(target_os = "windows")]
-            let remote_padding = if remote {
-                self.tab_icon_size + 4.0
-            } else {
-                0.0
-            };
             #[cfg(not(target_os = "windows"))]
             let raw_title = Self::status_title(program_status.as_ref(), &raw_title);
             #[cfg(target_os = "windows")]
@@ -1648,8 +1666,6 @@ impl Island {
                 let right_padding = TAB_TITLE_PADDING_RIGHT;
                 #[cfg(not(target_os = "windows"))]
                 let right_padding = TAB_PADDING_X;
-                #[cfg(target_os = "windows")]
-                let right_padding = right_padding + remote_padding;
                 tab_width - tab_padding_x - right_padding - bell_width
             }
             .max(0.0);
@@ -1685,7 +1701,7 @@ impl Island {
                     tab_x + (tab_width - text_width) / 2.0
                 };
                 #[cfg(target_os = "windows")]
-                let text_x = tab_x + tab_padding_x + remote_padding;
+                let text_x = tab_x + tab_padding_x;
                 #[cfg(not(target_os = "windows"))]
                 let text_y = (ISLAND_HEIGHT / 2.0) - (TITLE_FONT_SIZE / 2.);
                 #[cfg(target_os = "windows")]
@@ -1794,29 +1810,8 @@ impl Island {
             self.render_tab_status_line(sugarloaf, program_status.as_ref(), ix, iw, 1);
 
             #[cfg(target_os = "windows")]
-            if !hidden_by_drag
-                && iw >= TAB_ICON_INSET_X + self.tab_icon_size + remote_padding + 4.0
-            {
-                if remote {
-                    draw_tab_icon(
-                        sugarloaf,
-                        ix + TAB_ICON_INSET_X,
-                        text_color,
-                        1,
-                        super::app_icons::SSH_ICON,
-                        self.window_header.app_font,
-                        self.tab_icon_size,
-                    );
-                }
-                draw_tab_icon(
-                    sugarloaf,
-                    ix + TAB_ICON_INSET_X + remote_padding,
-                    text_color,
-                    1,
-                    app_icon,
-                    self.window_header.app_font,
-                    self.tab_icon_size,
-                );
+            if !hidden_by_drag {
+                self.render_tab_icons(sugarloaf, tab, ix, iw, text_color, 1);
             }
 
             if is_active && num_tabs > 1 {
@@ -1906,39 +1901,12 @@ impl Island {
             #[cfg(target_os = "windows")]
             let tab = &tabs[drag_idx];
             #[cfg(target_os = "windows")]
-            let (app_icon, remote) = (tab.icon, tab.remote);
+            let tab_padding_x = self.title_padding(tab.remote);
             #[cfg(target_os = "windows")]
             let program_status = &tab.status;
-            #[cfg(target_os = "windows")]
-            let remote_padding = if remote {
-                self.tab_icon_size + 4.0
-            } else {
-                0.0
-            };
             self.render_tab_status_line(sugarloaf, program_status.as_ref(), ix, iw, 12);
             #[cfg(target_os = "windows")]
-            if iw >= TAB_ICON_INSET_X + self.tab_icon_size + remote_padding + 4.0 {
-                if remote {
-                    draw_tab_icon(
-                        sugarloaf,
-                        ix + TAB_ICON_INSET_X,
-                        self.active_text_color,
-                        12,
-                        super::app_icons::SSH_ICON,
-                        self.window_header.app_font,
-                        self.tab_icon_size,
-                    );
-                }
-                draw_tab_icon(
-                    sugarloaf,
-                    ix + TAB_ICON_INSET_X + remote_padding,
-                    self.active_text_color,
-                    12,
-                    app_icon,
-                    self.window_header.app_font,
-                    self.tab_icon_size,
-                );
-            }
+            self.render_tab_icons(sugarloaf, tab, ix, iw, self.active_text_color, 12);
 
             #[cfg(not(target_os = "windows"))]
             let raw_title = self.get_title_for_tab(context_manager, drag_idx);
@@ -1949,8 +1917,6 @@ impl Island {
             if !raw_title.is_empty() {
                 #[cfg(target_os = "windows")]
                 let right_padding = TAB_TITLE_PADDING_RIGHT;
-                #[cfg(target_os = "windows")]
-                let right_padding = right_padding + remote_padding;
                 #[cfg(not(target_os = "windows"))]
                 let right_padding = TAB_PADDING_X;
                 let max_text_width = (tab_width - tab_padding_x - right_padding).max(0.0);
@@ -1980,7 +1946,7 @@ impl Island {
                 #[cfg(not(target_os = "windows"))]
                 let text_x = floating_x + (tab_width - text_width) / 2.0;
                 #[cfg(target_os = "windows")]
-                let text_x = floating_x + tab_padding_x + remote_padding;
+                let text_x = floating_x + tab_padding_x;
                 #[cfg(not(target_os = "windows"))]
                 let text_y = (ISLAND_HEIGHT / 2.0) - (TITLE_FONT_SIZE / 2.);
                 #[cfg(target_os = "windows")]
