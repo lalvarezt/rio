@@ -29,6 +29,20 @@ pub fn default_tab_icon_size() -> f32 {
     24.0
 }
 
+#[inline]
+pub fn default_tab_glass_intensity() -> f32 {
+    0.5
+}
+
+#[inline]
+pub fn clamp_tab_glass_intensity(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        default_tab_glass_intensity()
+    }
+}
+
 /// Clamp tab widths to a finite, usable range in logical pixels.
 #[inline]
 pub fn clamp_max_tab_width(v: f32) -> f32 {
@@ -212,6 +226,12 @@ pub struct Navigation {
     /// Windows tab icon size in logical pixels, clamped to `[8.0, 32.0]`.
     #[serde(default = "default_tab_icon_size", rename = "tab-icon-size")]
     pub tab_icon_size: f32,
+    /// Windows tab pill border reflections, from `0.0` (off) to `1.0`.
+    #[serde(
+        default = "default_tab_glass_intensity",
+        rename = "tab-glass-intensity"
+    )]
+    pub tab_glass_intensity: f32,
 }
 
 impl Default for Navigation {
@@ -230,6 +250,7 @@ impl Default for Navigation {
             max_tab_width: default_max_tab_width(),
             min_tab_width: default_min_tab_width(),
             tab_icon_size: default_tab_icon_size(),
+            tab_glass_intensity: default_tab_glass_intensity(),
         }
     }
 }

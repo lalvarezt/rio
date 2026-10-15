@@ -16,6 +16,8 @@ pub mod helpers;
 pub mod island;
 pub mod scrollbar;
 pub mod search;
+#[cfg(target_os = "windows")]
+mod tab_glass;
 pub mod trail_cursor;
 pub mod utils;
 #[cfg(target_os = "windows")]

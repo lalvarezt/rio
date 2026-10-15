@@ -108,6 +108,8 @@ pub struct PlatformNavigation {
     pub min_tab_width: Option<f32>,
     #[serde(default = "Option::default", rename = "tab-icon-size")]
     pub tab_icon_size: Option<f32>,
+    #[serde(default = "Option::default", rename = "tab-glass-intensity")]
+    pub tab_glass_intensity: Option<f32>,
     #[serde(
         default = "Option::default",
         deserialize_with = "crate::config::colors::deserialize_to_arr_opt",

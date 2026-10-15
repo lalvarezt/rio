@@ -619,6 +619,9 @@ impl Config {
             if let Some(tab_icon_size) = navigation_overwrite.tab_icon_size {
                 self.navigation.tab_icon_size = tab_icon_size;
             }
+            if let Some(intensity) = navigation_overwrite.tab_glass_intensity {
+                self.navigation.tab_glass_intensity = intensity;
+            }
         }
 
         // Clamp after platform merge so both the base and any override go
@@ -635,6 +638,10 @@ impl Config {
         );
         self.navigation.tab_icon_size =
             crate::config::navigation::clamp_tab_icon_size(self.navigation.tab_icon_size);
+        self.navigation.tab_glass_intensity =
+            crate::config::navigation::clamp_tab_glass_intensity(
+                self.navigation.tab_glass_intensity,
+            );
 
         // Merge renderer fields individually
         if let Some(renderer_overwrite) = &platform_config.renderer {

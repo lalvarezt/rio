@@ -433,6 +433,7 @@ fn draw_island(
     fill: [f32; 4],
     outline: Option<[f32; 4]>,
     punch: Option<[f32; 4]>,
+    #[cfg(target_os = "windows")] glass_intensity: f32,
     order: u8,
 ) {
     #[cfg(target_os = "windows")]
@@ -480,6 +481,8 @@ fn draw_island(
         }
         None => sugarloaf.rounded_rect(None, x, y, w, h, fill, 0.05, radius, order),
     }
+    #[cfg(target_os = "windows")]
+    super::tab_glass::draw(sugarloaf, [x, y, w, h], radius, glass_intensity, order);
 }
 
 #[inline]
@@ -600,6 +603,8 @@ pub struct Island {
     pub min_tab_width: f32,
     pub tab_icon_size: f32,
     #[cfg(target_os = "windows")]
+    tab_glass_intensity: f32,
+    #[cfg(target_os = "windows")]
     preferred_tab_widths: Vec<f32>,
     pub inactive_text_color: [f32; 4],
     pub active_text_color: [f32; 4],
@@ -665,6 +670,9 @@ impl Island {
             min_tab_width: rio_backend::config::navigation::default_min_tab_width(),
             tab_icon_size: rio_backend::config::navigation::default_tab_icon_size(),
             #[cfg(target_os = "windows")]
+            tab_glass_intensity:
+                rio_backend::config::navigation::default_tab_glass_intensity(),
+            #[cfg(target_os = "windows")]
             preferred_tab_widths: Vec::new(),
             inactive_text_color,
             active_text_color,
@@ -712,6 +720,13 @@ impl Island {
         self.tab_icon_size = rio_backend::config::navigation::clamp_tab_icon_size(
             navigation.tab_icon_size,
         );
+        #[cfg(target_os = "windows")]
+        {
+            self.tab_glass_intensity =
+                rio_backend::config::navigation::clamp_tab_glass_intensity(
+                    navigation.tab_glass_intensity,
+                );
+        }
     }
 
     /// Share per-tab geometry between rendering, dragging, and hit testing.
@@ -1813,6 +1828,11 @@ impl Island {
                 fill,
                 outline,
                 Some(tab_background),
+                #[cfg(target_os = "windows")]
+                {
+                    let (active, hover) = self.tab_appearance[&tab_index];
+                    self.tab_glass_intensity * (active + (1.0 - active) * hover * 0.3)
+                },
                 0,
             );
             self.render_tab_status_line(sugarloaf, program_status.as_ref(), ix, iw, 1);
@@ -1902,6 +1922,8 @@ impl Island {
                 fill,
                 fills.outline,
                 None,
+                #[cfg(target_os = "windows")]
+                self.tab_glass_intensity,
                 11,
             );
 
