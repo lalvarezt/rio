@@ -63,6 +63,9 @@ backend capture series also completed without that stall.
 
 ## Backend startup
 
+The later [renderer comparison](windows-renderer-selection.md) adds full terminal
+redraws, OpenGL, integrated graphics, and GPU-residency measurements.
+
 | Backend selection | Median shell frame |
 | --- | ---: |
 | Automatic, optimized one-tab workload | 2169.78 |
