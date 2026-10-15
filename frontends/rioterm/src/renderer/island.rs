@@ -46,11 +46,11 @@ const TAB_GAP: f32 = 6.0;
 #[cfg(not(target_os = "windows"))]
 const TAB_INSET_BOTTOM: f32 = 7.0;
 #[cfg(target_os = "windows")]
-const TAB_INSET_BOTTOM: f32 = 8.0;
+const TAB_INSET_BOTTOM: f32 = 6.0;
 #[cfg(not(target_os = "windows"))]
 const TAB_INSET_TOP: f32 = TAB_INSET_BOTTOM;
 #[cfg(target_os = "windows")]
-const TAB_INSET_TOP: f32 = 6.0;
+const TAB_INSET_TOP: f32 = TAB_INSET_BOTTOM;
 const TAB_CENTER_Y: f32 = (TAB_INSET_TOP + ISLAND_HEIGHT - TAB_INSET_BOTTOM) / 2.0;
 #[cfg(not(target_os = "windows"))]
 const TAB_RADIUS: f32 = 6.0;
@@ -327,11 +327,14 @@ fn island_fills(bg: [f32; 4]) -> IslandFills {
 fn windows_island_fills(bg: [f32; 4]) -> IslandFills {
     let mut fills = island_fills(bg);
     fills.inactive[3] = 0.0;
+    // The outlined style punches its interior out with the theme background.
+    // On a transparent window that adds another background layer, changing the
+    // tint and opacity inside the pill. Use one translucent highlight instead.
+    fills.outline = None;
     if 0.2126 * bg[0] + 0.7152 * bg[1] + 0.0722 * bg[2] > 0.5 {
-        fills.outline = Some([0.0, 0.0, 0.0, 0.12]);
+        fills.active = [0.0, 0.0, 0.0, 0.08];
     } else {
         fills.active = [1.0, 1.0, 1.0, 0.11];
-        fills.outline = Some([1.0, 1.0, 1.0, 0.16]);
     }
     fills
 }
@@ -407,6 +410,7 @@ fn draw_tab_icon(
     );
 }
 
+#[cfg(any(test, not(target_os = "windows")))]
 #[inline]
 fn over(dst: [f32; 4], src: [f32; 4]) -> [f32; 4] {
     let a = src[3];
@@ -1798,10 +1802,7 @@ impl Island {
                     color[3] *= self.tab_appearance[&tab_index].0;
                     color
                 });
-            #[cfg(not(target_os = "windows"))]
             let tab_background = bg_color;
-            #[cfg(target_os = "windows")]
-            let tab_background = over(bg_color, group_fill);
             draw_island(
                 sugarloaf,
                 ix,
@@ -1875,6 +1876,7 @@ impl Island {
                 11,
             );
 
+            #[cfg(not(target_os = "windows"))]
             let fill = match context_manager.custom_color(drag_idx) {
                 Some(mut custom) => {
                     custom[3] = 1.0;
@@ -1886,6 +1888,10 @@ impl Island {
                     over(base, fills.active)
                 }
             };
+            #[cfg(target_os = "windows")]
+            let fill = context_manager
+                .custom_color(drag_idx)
+                .unwrap_or(fills.active);
             draw_island(
                 sugarloaf,
                 ix,
