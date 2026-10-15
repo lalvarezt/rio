@@ -221,3 +221,34 @@ Timing artifacts are under `target/profiles/tab-timing-before` and
 `tab-regression-after`. The normal inspection executable is
 `target/debug/rio-tab-inspect.exe`. No repository tests or runtime logging are
 added by these fixes.
+
+## Held two-tab navigation
+
+Holding Ctrl+Shift+L reproduced a separate motion backlog after `936c8e7dac`.
+The native replay sends 180 repeated `SelectNextTab` events, 33 ms apart, with
+two cmd tabs. The fixture maps that action to F9 and sets the Windows key-repeat
+bit; it does not inject global Ctrl or Shift state. Temporary geometry tracing
+records the actual rendered selection spring.
+
+Unfinished wraps previously added another strip width to the destination.
+The trace reached 1.36 strip widths of remaining travel and 10,323 logical
+pixels per second. Repeated input now targets the nearest circular copy of
+the latest selected tab, preserving the current position and spring velocity.
+Completed transitions still wrap in the requested direction.
+
+The same replay reaches at most 0.38 strip widths of remaining travel and
+2,055 logical pixels per second after the change. Reverse navigation also
+passes, reaching 0.42 strip widths. The ignored check is:
+
+```sh
+node target/check-held-tabs.js target/profiles/held-tabs-trace-after --check
+```
+
+The baseline fails its one-strip backlog limit; both updated directions pass.
+Frame interval medians remain about 16.7 ms. These traces establish bounded
+animation travel, not a GPU throughput improvement. Captures and traces live
+under `target/profiles/held-tabs-*`; tracing is removed from application source.
+The clean profiling build completes another 600-frame hold. The normal Windows
+debug build passes, and native captures retain ordinary selection, both wrap
+directions, reversal, rounded closing edges and three-tab wraparound. Those
+captures are under `target/profiles/tab-regression-held-navigation`.

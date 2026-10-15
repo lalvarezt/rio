@@ -348,6 +348,7 @@ impl Tabs {
             wrap_period: 0.0,
             target_offset: 0.0,
         });
+        let interrupted = selection.travelling;
         if selection.id != selected || wrap_direction != 0 {
             if selection.wrap_period > 0.0 {
                 let cycles = ((selection.left.value() - target.left_margin)
@@ -368,6 +369,15 @@ impl Tabs {
             }
         }
         if selection.travelling {
+            if interrupted && navigation.is_some() && selection.wrap_period > 0.0 {
+                // Repeated input replaces unfinished circular travel. Aim at
+                // the nearest copy of the latest tab instead of queuing laps.
+                selection.target_offset = ((selection.left.value()
+                    - selected_tab.left.target)
+                    / selection.wrap_period)
+                    .round()
+                    * selection.wrap_period;
+            }
             selection
                 .left
                 .target(selected_tab.left.target + selection.target_offset);

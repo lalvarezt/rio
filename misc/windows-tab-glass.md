@@ -39,6 +39,8 @@ cached, and shrinking waits briefly for transient title updates to stop.
 Creating, selecting, or closing a tab moves the selection capsule while terminal
 focus changes immediately. Keyboard selection wraps through the strip's edges
 in the direction of navigation.
+Holding a navigation shortcut retargets unfinished circular motion to the nearest
+copy of the latest selected tab, preventing extra laps from building up.
 
 Mouse dragging tracks the pointer directly. Adjacent keyboard moves slide the
 selected tab above its neighbors. Moving between the first and last positions
