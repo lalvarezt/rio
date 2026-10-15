@@ -69,3 +69,6 @@ To launch through Task Scheduler from SSH, create an interactive task that calls
 The wrapper changes to the repository directory and writes its exit code to
 `target\rio-profile-run.exitcode`. Use a task name specific to profiling and
 delete that task when finished.
+
+Native transparency and close-transition measurements are recorded in
+[Windows composition captures](windows-composition.md).

@@ -1124,14 +1124,16 @@ impl Window {
                 mem::size_of::<DWM_SYSTEMBACKDROP_TYPE>() as _,
             );
             if result >= 0 {
-                // Extend Acrylic/Mica over the client surface, including
-                // undecorated windows. Negative margins follow window resizes.
-                let inset =
-                    if matches!(backdrop_type, BackdropType::Auto | BackdropType::None) {
-                        0
-                    } else {
-                        -1
-                    };
+                // Undecorated windows draw their own frame. Extending the
+                // native frame across them also paints native caption buttons
+                // underneath transparent client content.
+                let inset = if !self.is_decorated()
+                    || matches!(backdrop_type, BackdropType::Auto | BackdropType::None)
+                {
+                    0
+                } else {
+                    -1
+                };
                 let margins = MARGINS {
                     cxLeftWidth: inset,
                     cxRightWidth: inset,

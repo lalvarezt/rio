@@ -98,13 +98,21 @@ pub fn create_window_builder(
                 window_builder.with_undecorated_shadow(use_undecorated_shadow);
         }
 
-        if let Some(use_no_redirection_bitmap) =
-            config.window.windows_use_no_redirection_bitmap
-        {
-            // This sets WS_EX_NOREDIRECTIONBITMAP.
-            window_builder =
-                window_builder.with_no_redirection_bitmap(use_no_redirection_bitmap);
-        }
+        use rio_backend::sugarloaf::wgpu::Backends;
+
+        // Vulkan/DX12 present independently of GDI. Its backing bitmap can
+        // remain opaque beneath their surface and flash during teardown.
+        // CPU and OpenGL presentation still need that bitmap.
+        let native_gpu = !config.renderer.use_cpu
+            && Backends::from_env().map_or(true, |backends| {
+                backends.intersects(Backends::VULKAN | Backends::DX12)
+            });
+        window_builder = window_builder.with_no_redirection_bitmap(
+            config
+                .window
+                .windows_use_no_redirection_bitmap
+                .unwrap_or(native_gpu),
+        );
     }
 
     #[cfg(target_os = "macos")]
