@@ -117,6 +117,13 @@ pub struct Style {
 }
 
 impl Style {
+    pub const DEFAULT: Self = Self {
+        fg: AnsiColor::Named(NamedColor::Foreground),
+        bg: AnsiColor::Named(NamedColor::Background),
+        underline_color: None,
+        flags: StyleFlags::empty(),
+    };
+
     /// Whether this style renders anything on a BLANK cell: a
     /// non-default background, an underline, a strikeout, or inverse
     /// (which paints the fg color as the cell's ground). Fg-only
@@ -138,12 +145,7 @@ impl Style {
 impl Default for Style {
     #[inline]
     fn default() -> Self {
-        Self {
-            fg: AnsiColor::Named(NamedColor::Foreground),
-            bg: AnsiColor::Named(NamedColor::Background),
-            underline_color: None,
-            flags: StyleFlags::empty(),
-        }
+        Self::DEFAULT
     }
 }
 

@@ -77,6 +77,7 @@ pub struct RenderableContent {
     /// Per-row resolved cell styles, index-parallel to `visible_rows`.
     /// Values, not ids: rows copied on earlier frames can't be
     /// retinted by later style-table mutations.
+    /// Empty inner vectors represent rows of default styles.
     pub row_styles: Vec<Vec<rio_backend::crosswords::style::Style>>,
     /// Per-frame snapshot of extras (zero-width chars, hyperlinks,
     /// sixel/iterm graphics) actually referenced by visible cells —

@@ -722,10 +722,10 @@ impl Grid<Square> {
     /// style; their color travels inline in the cell itself. Snapshots
     /// carry these resolved values instead of ids, so id reuse by the
     /// sweep can never affect rows copied on earlier frames.
+    /// An empty output represents a row of default styles.
     pub fn resolve_row_styles(&self, src: &Row<Square>, out: &mut Vec<Style>) {
         out.clear();
         if !src.has_styles {
-            out.resize(src.inner.len(), Style::default());
             return;
         }
         out.extend(src.inner.iter().map(|sq| {

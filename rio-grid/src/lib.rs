@@ -132,7 +132,7 @@ pub struct HintLabel {
 /// default here (their color travels inline in the cell).
 #[inline(always)]
 pub fn resolve_style(row_styles: &[Style], x: usize) -> Style {
-    row_styles.get(x).copied().unwrap_or_default()
+    row_styles.get(x).copied().unwrap_or(Style::DEFAULT)
 }
 
 /// Per-row selection interval, in column indices. `None` = row is
@@ -1936,6 +1936,9 @@ pub fn build_row_fg<P: GridPalette>(
         .find(|&i| !is_run_breaker(row[Column(i)]))
         .map(|i| i + 1)
         .unwrap_or(0);
+    let default_fg = row_styles
+        .is_empty()
+        .then(|| cell_fg(Square::from_char(' '), Style::DEFAULT, palette, term_colors));
 
     let mut x: usize = 0;
     while x < max {
@@ -2364,8 +2367,6 @@ pub fn build_row_fg<P: GridPalette>(
             // through `run_cell_columns` for the same reason as
             // `grid_col` above.
             let src_col = (grid_col as usize).min(cols.saturating_sub(1));
-            let src_sq = row[Column(src_col)];
-            let src_style = resolve_style(row_styles, src_col);
             let (atlas, color) = if is_color {
                 // Colour glyphs (emoji) don't take the selection-fg /
                 // hint-fg swap — behaviour for
@@ -2376,9 +2377,18 @@ pub fn build_row_fg<P: GridPalette>(
                 // this row.
                 (
                     CellText::ATLAS_GRAYSCALE,
-                    cell_fg(src_sq, src_style, palette, term_colors),
+                    default_fg.unwrap_or_else(|| {
+                        cell_fg(
+                            row[Column(src_col)],
+                            resolve_style(row_styles, src_col),
+                            palette,
+                            term_colors,
+                        )
+                    }),
                 )
             } else {
+                let src_sq = row[Column(src_col)];
+                let src_style = resolve_style(row_styles, src_col);
                 let is_sel = cell_in_row_sel(row_sel, src_col as u16);
                 let hint_tag = if is_sel {
                     None
