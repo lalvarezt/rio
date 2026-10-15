@@ -13,6 +13,7 @@ struct Capture {
     target_tabs: usize,
     first_frame: Option<Instant>,
     shell_frame: Option<Instant>,
+    last_frame: Option<Instant>,
     frames: usize,
     target_frames: usize,
     samples: BTreeMap<&'static str, Vec<f64>>,
@@ -31,6 +32,7 @@ pub fn init() {
             target_tabs: tab_count() * window_count(),
             first_frame: None,
             shell_frame: None,
+            last_frame: None,
             frames: 0,
             target_frames: std::env::var("RIO_PROFILE_FRAMES")
                 .ok()
@@ -139,6 +141,11 @@ pub fn window_count() -> usize {
         .clamp(1, 4)
 }
 
+pub fn full_redraw() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RIO_PROFILE_FULL_REDRAW").is_some())
+}
+
 pub fn shell_title(route: usize, title: Option<&str>) {
     if title.is_some_and(|title| title.contains("RIO_PROFILE_READY")) {
         let mut capture = CAPTURE.get().unwrap().lock().unwrap();
@@ -151,9 +158,18 @@ pub fn shell_title(route: usize, title: Option<&str>) {
 
 pub fn frame() {
     let mut capture = CAPTURE.get().unwrap().lock().unwrap();
-    capture.first_frame.get_or_insert_with(Instant::now);
+    let now = Instant::now();
+    capture.first_frame.get_or_insert(now);
     if capture.ready.is_some() {
-        capture.shell_frame.get_or_insert_with(Instant::now);
+        capture.shell_frame.get_or_insert(now);
+        if let Some(last) = capture.last_frame {
+            capture
+                .samples
+                .entry("frame.interval")
+                .or_default()
+                .push((now - last).as_secs_f64() * 1000.0);
+        }
+        capture.last_frame = Some(now);
         capture.frames += 1;
     }
 }

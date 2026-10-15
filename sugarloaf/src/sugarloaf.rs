@@ -1146,6 +1146,8 @@ impl Sugarloaf<'_> {
             _ => return,
         };
 
+        let acquire_timing =
+            tracing::debug_span!(target: "rio_profile", "gpu.acquire").entered();
         let frame = match ctx.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -1154,6 +1156,7 @@ impl Sugarloaf<'_> {
                 return;
             }
         };
+        drop(acquire_timing);
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -1260,8 +1263,16 @@ impl Sugarloaf<'_> {
             }
             filters_brush.render(ctx, &mut encoder, &frame.texture, &frame.texture);
         }
-        ctx.queue.submit(Some(encoder.finish()));
-        ctx.queue.present(frame);
+        {
+            let _timing =
+                tracing::debug_span!(target: "rio_profile", "gpu.submit").entered();
+            ctx.queue.submit(Some(encoder.finish()));
+        }
+        {
+            let _timing =
+                tracing::debug_span!(target: "rio_profile", "gpu.present").entered();
+            ctx.queue.present(frame);
+        }
         self.reset();
     }
 }

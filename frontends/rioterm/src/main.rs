@@ -249,7 +249,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/d".into(),
             "/q".into(),
             "/k".into(),
-            "title RIO_PROFILE_READY".into(),
+            if profiling::full_redraw() {
+                "(for /l %i in (1,1,100) do @echo 0123456789 abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ) & title RIO_PROFILE_READY".into()
+            } else {
+                "title RIO_PROFILE_READY".into()
+            },
         ];
         config.navigation.hide_if_single = false;
         config.confirm_before_quit = false;

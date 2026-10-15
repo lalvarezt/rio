@@ -2425,6 +2425,16 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
         #[cfg(feature = "profiling")]
         if crate::profiling::needs_frame() {
             for route in self.router.routes.values_mut() {
+                if crate::profiling::full_redraw() {
+                    route
+                        .window
+                        .screen
+                        .ctx_mut()
+                        .current_mut()
+                        .renderable_content
+                        .pending_update
+                        .set_terminal_damage(rio_backend::event::TerminalDamage::Full);
+                }
                 route.request_overlay_redraw();
             }
         }
