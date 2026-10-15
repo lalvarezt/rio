@@ -7,14 +7,12 @@ use rio_backend::sugarloaf::font::{FontData, FontLibrary};
 
 mod catalog;
 mod logos;
-mod neovim;
 pub(super) use catalog::Library;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Icon {
     Glyph(char),
     Logo(&'static logos::Logo),
-    Neovim,
 }
 
 pub const DEFAULT_ICON: Icon = Icon::Glyph('\u{ea85}');
@@ -46,10 +44,6 @@ pub fn draw(
     occlusion: Option<[f32; 2]>,
 ) -> bool {
     match icon {
-        Icon::Neovim => {
-            neovim::draw(sugarloaf, cx, cy, size, color[3], order, occlusion);
-            true
-        }
         Icon::Logo(logo) => {
             logos::draw(sugarloaf, logo, cx, cy, size, color, order, occlusion);
             true

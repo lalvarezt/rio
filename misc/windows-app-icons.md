@@ -63,11 +63,18 @@ the `[icons]` table or a registered logo. Adding a command or alias needs no
 renderer change. The catalog loads once, and duplicate aliases or missing icon
 references are rejected.
 
-Glyphs come from the existing bundled Symbols Nerd Font. Check that a new glyph
-exists in that font, rather than relying on a newer Nerd Fonts release. For
-additional monochrome brand marks, add a single-path 16x16 SVG and register it
-in `app_icons/logos.rs`. The shared rasterizer caches each physical size and
-preserves partial clipping during tab dragging. Neovim retains its colored mark.
+Glyph fallbacks come from the existing bundled Symbols Nerd Font. Check that a
+new glyph exists in that font, rather than relying on a newer Nerd Fonts release.
+For a brand mark, vendor its SVG and register it in `app_icons/logos.rs`. The
+shared renderer supports multiple paths, fills, gradients, transforms, and
+non-square view boxes. It preserves the original aspect ratio and brand colors;
+dark monochrome marks can use the header tint for contrast.
+
+SVG parsing and rasterization happen once per logo and physical size. Cached
+colored spans preserve opacity, drawing order, and partial clipping during tab
+dragging. Neovim uses this same path; it has no separate renderer or cache.
+No system fonts, SVG text shaping, raster-image decoders, or network access are
+enabled in the SVG renderer.
 
 ## Icon sources
 
@@ -80,4 +87,13 @@ Runtime rendering scales and tints these marks to match the tab.
 
 Glyph names and codepoints follow the
 [Nerd Fonts glyph catalog](https://github.com/ryanoasis/nerd-fonts/blob/master/glyphnames.json).
-The Neovim mark's existing source attribution remains in `app_icons/neovim.rs`.
+The [bundled-logo source list](../frontends/rioterm/src/renderer/app_icons/logos/README.md)
+pins the additional SVG files to upstream revisions and records their licenses.
+Neovim uses Jason Long's original gradient mark. Other project marks include
+Helix, Goose, Jujutsu, Superfile, and Television. Simple Icons supplies brand
+silhouettes for htop, Nushell, Gemini, Copilot, Podman, and other catalog entries.
+
+Tools without a bundled vector keep their glyph fallback. Name matches are
+checked against the actual project identity; similarly named products are not
+interchangeable. Yazi and fzf currently publish raster logos, so their existing
+glyphs remain in use.

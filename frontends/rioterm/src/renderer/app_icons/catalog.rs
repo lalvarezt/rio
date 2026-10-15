@@ -54,7 +54,6 @@ static CATALOG: LazyLock<Catalog> = LazyLock::new(|| {
         .into_iter()
         .map(|(name, glyph)| (name, Icon::Glyph(glyph)))
         .collect();
-    icons.insert("neovim".into(), Icon::Neovim);
     for logo in logos::LOGOS {
         icons.insert(logo.name.into(), Icon::Logo(logo));
     }
