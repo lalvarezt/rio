@@ -54,6 +54,10 @@ report their identity nor set a recognizable title retain the default icon.
 This also applies to shells without pre-execution reporting, including cmd.
 The renderer does not poll process lists or run subprocesses to guess an app.
 
+Shell hooks can report a pipeline's producer instead of its interactive consumer.
+For example, `printf ... | fzf` or `Get-Content list | fzf` may retain the producer's
+icon. The catalog cannot correct a reported command identity by itself.
+
 ## Extending the bundled catalog
 
 Add an app record to

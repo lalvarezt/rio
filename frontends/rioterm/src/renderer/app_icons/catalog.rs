@@ -1,6 +1,7 @@
 use super::{logos, Icon, DEFAULT_ICON};
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
@@ -66,7 +67,7 @@ static CATALOG: LazyLock<Catalog> = LazyLock::new(|| {
         };
         for name in std::iter::once(definition.id).chain(definition.aliases) {
             assert!(
-                apps.insert(normalize(&name), app).is_none(),
+                apps.insert(normalize(&name).into_owned(), app).is_none(),
                 "duplicate app alias: {name}"
             );
         }
@@ -74,20 +75,27 @@ static CATALOG: LazyLock<Catalog> = LazyLock::new(|| {
     Catalog { apps, icons }
 });
 
-fn normalize(program: &str) -> String {
+fn normalize(program: &str) -> Cow<'_, str> {
     let name = program
         .trim()
         .trim_matches(['\'', '"'])
         .rsplit(['/', '\\'])
         .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    for extension in [".exe", ".cmd", ".bat", ".ps1", ".com"] {
-        if let Some(name) = name.strip_suffix(extension) {
-            return name.to_owned();
-        }
+        .unwrap_or_default();
+    let name = [".exe", ".cmd", ".bat", ".ps1", ".com"]
+        .into_iter()
+        .find_map(|extension| {
+            let end = name.len().checked_sub(extension.len())?;
+            name.get(end..)?
+                .eq_ignore_ascii_case(extension)
+                .then(|| &name[..end])
+        })
+        .unwrap_or(name);
+    if name.bytes().any(|c| c.is_ascii_uppercase()) {
+        Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(name)
     }
-    name
 }
 
 #[derive(Default)]
@@ -102,9 +110,9 @@ impl Library {
             let target = normalize(target);
             let app = CATALOG
                 .apps
-                .get(&target)
+                .get(target.as_ref())
                 .map(|app| app.icon)
-                .or_else(|| CATALOG.icons.get(&target).copied())
+                .or_else(|| CATALOG.icons.get(target.as_ref()).copied())
                 .map(|icon| App {
                     icon,
                     kind: Kind::App,
@@ -112,7 +120,7 @@ impl Library {
                 });
             match app {
                 Some(app) => {
-                    self.overrides.insert(normalize(command), app);
+                    self.overrides.insert(normalize(command).into_owned(), app);
                 }
                 None => {
                     tracing::warn!("Unknown tab icon mapping for {command}: {target}")
@@ -122,10 +130,13 @@ impl Library {
     }
 
     fn lookup(&self, program: &str) -> Option<App> {
-        let name = normalize(program);
+        self.lookup_name(normalize(program).as_ref())
+    }
+
+    fn lookup_name(&self, name: &str) -> Option<App> {
         self.overrides
-            .get(&name)
-            .or_else(|| CATALOG.apps.get(&name))
+            .get(name)
+            .or_else(|| CATALOG.apps.get(name))
             .copied()
             .or_else(|| {
                 let base =
@@ -139,6 +150,11 @@ impl Library {
     }
 
     fn title_hint(&self, title: &str) -> Option<Icon> {
+        let icon_for = |candidate: &str| {
+            self.lookup(candidate.trim_matches(['[', ']', ':']))
+                .filter(|app| matches!(app.kind, Kind::App | Kind::Runtime))
+                .map(|app| app.icon)
+        };
         for segment in title.split(" - ") {
             let segment = segment.trim().trim_matches(['[', ']', '*']);
             // Paths and project names are not evidence of a running app.
@@ -147,51 +163,61 @@ impl Library {
             {
                 continue;
             }
-            let words: Vec<_> = segment.split_whitespace().take(2).collect();
-            let candidates = [
-                Some(segment.to_owned()),
-                (!words.is_empty()).then(|| words.join(" ")),
-                words.first().map(|word| word.to_string()),
-            ];
-            for candidate in candidates.into_iter().flatten() {
-                if let Some(app) = self.lookup(candidate.trim_matches(['[', ']', ':'])) {
-                    if matches!(app.kind, Kind::App | Kind::Runtime) {
-                        return Some(app.icon);
-                    }
+            if let Some(icon) = icon_for(segment) {
+                return Some(icon);
+            }
+            let mut words = segment.split_whitespace();
+            let Some(first) = words.next() else { continue };
+            if let Some(second) = words.next() {
+                if let Some(icon) = icon_for(&format!("{first} {second}")) {
+                    return Some(icon);
                 }
+            }
+            if let Some(icon) = icon_for(first) {
+                return Some(icon);
             }
         }
         None
     }
 
-    pub fn for_program(
+    pub fn resolve(
         &self,
         program: &str,
         title: &str,
         status: Option<&rio_backend::program_status::ProgramStatusRecord>,
         reported: bool,
-    ) -> Icon {
+    ) -> (Icon, bool) {
         use rio_backend::program_status::ProgramState;
+        let name = normalize(program);
+        // Transport identity belongs to the command, independently of any
+        // user-selected icon. Keep badges and aliases in the same catalog.
+        let remote = CATALOG
+            .apps
+            .get(name.as_ref())
+            .is_some_and(|app| app.kind == Kind::Transport);
         if let Some(record) = status {
             if matches!(record.state, ProgramState::Working | ProgramState::Blocked) {
                 if let Some(app) = record.app.as_deref().and_then(|app| self.lookup(app))
                 {
-                    return app.icon;
+                    return (app.icon, remote);
                 }
             }
         }
-        let app = self.lookup(program);
+        let app = self.lookup_name(&name);
         // App reports are authoritative, including at a shell prompt. Do not
         // resurrect a previous app from a stale title or duplicate the SSH badge.
         if reported {
-            return app
+            let icon = app
                 .filter(|app| app.kind != Kind::Transport)
                 .map_or(DEFAULT_ICON, |app| app.icon);
+            return (icon, remote);
         }
         if let Some(icon) = self.title_hint(title) {
-            return icon;
+            return (icon, remote);
         }
-        app.filter(|app| app.kind != Kind::Transport)
-            .map_or(DEFAULT_ICON, |app| app.icon)
+        let icon = app
+            .filter(|app| app.kind != Kind::Transport)
+            .map_or(DEFAULT_ICON, |app| app.icon);
+        (icon, remote)
     }
 }

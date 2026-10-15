@@ -475,15 +475,13 @@ impl Island {
                 let (icon, remote) = context_manager
                     .application_for_tab(index)
                     .map(|app| {
-                        (
-                            self.app_icons.for_program(
-                                &app.program,
-                                &app.title,
-                                status.as_ref(),
-                                app.reported,
-                            ),
-                            app.remote,
-                        )
+                        let (icon, transport) = self.app_icons.resolve(
+                            &app.program,
+                            &app.title,
+                            status.as_ref(),
+                            app.reported,
+                        );
+                        (icon, app.remote || transport)
                     })
                     .unwrap_or((super::super::app_icons::DEFAULT_ICON, false));
                 TabPresentation {

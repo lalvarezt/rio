@@ -843,19 +843,10 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             .user_vars
             .get("RIO_SSH")
             .is_some_and(|value| value == "1");
-        let transport = program
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(&program)
-            .to_ascii_lowercase();
         Some(TabApplication {
             program,
             title: terminal.title.clone(),
-            remote: remote
-                || matches!(
-                    transport.strip_suffix(".exe").unwrap_or(&transport),
-                    "ssh" | "mosh"
-                ),
+            remote,
             reported: reported_app.is_some(),
         })
     }
