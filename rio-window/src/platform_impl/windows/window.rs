@@ -3,7 +3,6 @@
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::mem::{self, MaybeUninit};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::{io, panic, ptr};
@@ -20,8 +19,8 @@ use windows_sys::Win32::Graphics::Dwm::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     ChangeDisplaySettingsExW, ClientToScreen, CreateRectRgn, DeleteObject, InvalidateRgn,
-    CDS_FULLSCREEN, DISP_CHANGE_BADFLAGS, DISP_CHANGE_BADMODE, DISP_CHANGE_BADPARAM,
-    DISP_CHANGE_FAILED, DISP_CHANGE_SUCCESSFUL,
+    RedrawWindow, CDS_FULLSCREEN, DISP_CHANGE_BADFLAGS, DISP_CHANGE_BADMODE,
+    DISP_CHANGE_BADPARAM, DISP_CHANGE_FAILED, DISP_CHANGE_SUCCESSFUL, RDW_INVALIDATE,
 };
 use windows_sys::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL,
@@ -105,11 +104,6 @@ pub(crate) struct Window {
 
     // The events loop proxy.
     thread_executor: event_loop::EventLoopThreadExecutor,
-
-    /// Per-window dirty flag set by `request_redraw`. The
-    /// DwmFlush worker reads/clears this each tick to decide
-    /// whether to invalidate this window.
-    redraw_pending: Arc<AtomicBool>,
 
     /// Shared registry; `Drop` removes our HWND.
     vsync_state: Arc<event_loop::vsync::VSyncSharedState>,
@@ -200,12 +194,22 @@ impl Window {
 
     #[inline]
     pub fn request_redraw(&self) {
-        // Defer the actual `RedrawWindow` to the DwmFlush worker;
-        // we just flag the window as dirty here. Mirrors macOS's
-        // `needs_redraw` flag consumed by the CVDisplayLink
-        // callback.
-        self.window_state.lock().unwrap().redraw_requested = true;
-        self.redraw_pending.store(true, Ordering::Release);
+        let mut state = self.window_state.lock().unwrap();
+        if let Some(requested) = state.redraw_requested.as_mut() {
+            // Continuations are rearmed on the display clock after this paint.
+            *requested = true;
+        } else {
+            // Fresh input must not wait for an extra composition cycle.
+            drop(state);
+            unsafe {
+                RedrawWindow(
+                    self.window.hwnd(),
+                    ptr::null(),
+                    ptr::null_mut(),
+                    RDW_INVALIDATE,
+                );
+            }
+        }
     }
 
     #[inline]
@@ -1325,13 +1329,12 @@ impl InitData<'_> {
         unsafe { ImeContext::set_ime_allowed(window, false) };
 
         let vsync_state = self.event_loop.vsync_state.clone();
-        let redraw_pending = vsync_state.register_window(window);
+        vsync_state.register_window(window);
 
         Window {
             window: SyncWindowHandle(window),
             window_state,
             thread_executor: self.event_loop.create_thread_executor(),
-            redraw_pending,
             vsync_state,
         }
     }

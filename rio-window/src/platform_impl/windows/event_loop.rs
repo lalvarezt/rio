@@ -1447,12 +1447,11 @@ unsafe fn public_window_callback_inner(
         }
 
         WM_PAINT => {
-            userdata.window_state_lock().redraw_requested =
-                userdata.event_loop_runner.should_buffer();
+            let previous_redraw = userdata
+                .window_state_lock()
+                .redraw_requested
+                .replace(userdata.event_loop_runner.should_buffer());
 
-            // We'll buffer only in response to `UpdateWindow`, if win32 decides to redraw the
-            // window outside the normal flow of the event loop. This way mark event as handled
-            // and request a normal redraw with `RedrawWindow`.
             if !userdata.event_loop_runner.should_buffer() {
                 userdata.send_event(Event::WindowEvent {
                     window_id: RootWindowId(WindowId(window)),
@@ -1460,16 +1459,19 @@ unsafe fn public_window_callback_inner(
                 });
             }
 
-            // NOTE: calling `RedrawWindow` during `WM_PAINT` does nothing, since to mark
-            // `WM_PAINT` as handled we should call the `DefWindowProcW`. Call it and check whether
-            // user asked for redraw during `RedrawRequested` event handling and request it again
-            // after marking `WM_PAINT` as handled.
             result =
                 ProcResult::Value(unsafe { DefWindowProcW(window, msg, wparam, lparam) });
-            if std::mem::take(&mut userdata.window_state_lock().redraw_requested) {
-                unsafe {
-                    RedrawWindow(window, ptr::null(), ptr::null_mut(), RDW_INTERNALPAINT)
-                };
+            // Rearm after clearing this paint, including requests made while rendering.
+            // Immediate invalidation here would bypass the display clock.
+            let requested = {
+                let mut state = userdata.window_state_lock();
+                let requested = state.redraw_requested.take().unwrap_or(false);
+                state.redraw_requested =
+                    previous_redraw.map(|before| before || requested);
+                requested
+            };
+            if requested {
+                userdata.vsync_state.request_redraw(window);
             }
         }
         WM_WINDOWPOSCHANGING => {

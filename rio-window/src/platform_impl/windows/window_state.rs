@@ -52,8 +52,8 @@ pub(crate) struct WindowState {
     pub is_active: bool,
     pub is_focused: bool,
 
-    // Flag whether redraw was requested.
-    pub redraw_requested: bool,
+    // None outside WM_PAINT; Some tracks requests made while painting.
+    pub redraw_requested: Option<bool>,
 
     pub dragging: bool,
 
@@ -173,7 +173,7 @@ impl WindowState {
 
             is_active: false,
             is_focused: false,
-            redraw_requested: false,
+            redraw_requested: None,
 
             dragging: false,
 

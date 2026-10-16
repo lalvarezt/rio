@@ -1,8 +1,8 @@
-//! DwmFlush-driven vsync worker that drives all window repaints.
+//! DwmFlush-driven vsync worker for window repaint continuations.
 //!
-//! Mirrors the macOS CVDisplayLink model: `Window::request_redraw`
-//! sets a per-window `Arc<AtomicBool>` dirty flag, and the worker
-//! is the single source of frame timing. Per composition cycle it
+//! Requests made during WM_PAINT rearm a per-window dirty flag after the
+//! paint completes. Fresh input invalidates immediately; continuations use
+//! this worker as their frame clock. Per composition cycle it
 //! iterates the window registry and, for each window where
 //! `dirty || should_present_after_input`, fires
 //! `RedrawWindow(.., RDW_INVALIDATE)`. The app's `WM_PAINT` /
@@ -45,7 +45,7 @@ const DEFAULT_VSYNC_INTERVAL: Duration = Duration::from_micros(16_666); // ~60Hz
 /// registry plus the rate-gated post-input sustain tracker.
 pub(crate) struct VSyncSharedState {
     /// HWND (as `usize` for `Hash`/`Eq`) → per-window dirty flag.
-    /// `Window::request_redraw` sets the flag; the worker reads
+    /// WM_PAINT continuations set the flag; the worker reads
     /// and clears it on each tick.
     windows: RwLock<HashMap<usize, Arc<AtomicBool>>>,
     /// Rate-gated post-input sustain. Only sustained high-rate
@@ -64,21 +64,19 @@ impl VSyncSharedState {
         })
     }
 
-    /// Insert a window and return its dirty-flag handle. The
-    /// caller (the `Window` constructor) keeps the returned `Arc`
-    /// so `request_redraw` can flip it without taking the registry
-    /// lock.
-    pub(crate) fn register_window(&self, hwnd: HWND) -> Arc<AtomicBool> {
+    pub(crate) fn register_window(&self, hwnd: HWND) {
         let flag = Arc::new(AtomicBool::new(false));
-        self.windows
-            .write()
-            .unwrap()
-            .insert(hwnd as usize, flag.clone());
-        flag
+        self.windows.write().unwrap().insert(hwnd as usize, flag);
     }
 
     pub(crate) fn unregister_window(&self, hwnd: HWND) {
         self.windows.write().unwrap().remove(&(hwnd as usize));
+    }
+
+    pub(crate) fn request_redraw(&self, hwnd: HWND) {
+        if let Some(flag) = self.windows.read().unwrap().get(&(hwnd as usize)) {
+            flag.store(true, Ordering::Release);
+        }
     }
 
     pub(crate) fn window_count(&self) -> usize {
