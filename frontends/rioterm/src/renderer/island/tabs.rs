@@ -2,7 +2,7 @@
 // Licensed under the MIT license in the root of this source tree.
 
 use super::*;
-use crate::renderer::window_chrome::{alpha, fade, snap};
+use crate::renderer::window_chrome::{alpha, fade, fit_text, snap};
 use rio_backend::config::navigation::Animation;
 use std::time::Duration;
 
@@ -504,13 +504,8 @@ impl Island {
         {
             self.window_header.toolbar_enabled = !(self.hide_if_single && count == 1);
         }
-        self.window_header.render(
-            sugarloaf,
-            window_width / scale,
-            self.active_text_color,
-            self.animation,
-        );
-        self.window_progress_visible = self.uses_window_progress(count);
+        self.window_header
+            .render(sugarloaf, window_width / scale, self.animation);
         if self.hide_if_single && count == 1 {
             self.tabs = Tabs::default();
             self.drag = None;
@@ -623,10 +618,9 @@ impl Island {
         }
         if floating.is_none() {
             if let Some(selection) = &self.tabs.selection {
-                let fill = self.tabs.tabs[&selection.id]
-                    .content
-                    .custom_color
-                    .unwrap_or(fills.active);
+                let tab = &self.tabs.tabs[&selection.id];
+                let fill = tab.content.custom_color.unwrap_or(fills.active);
+                let status = self.status_rim(tab.content.status.as_ref(), tab.opacity);
                 let period = selection.wrap_period;
                 let copies = [0.0, -period, period];
                 // A closing strip contracts before the pill settles. Clip to
@@ -657,6 +651,7 @@ impl Island {
                                 radius,
                                 fill,
                                 self.tab_glass_intensity,
+                                status,
                                 0,
                             );
                         }
@@ -701,9 +696,7 @@ impl Island {
                 context_manager.custom_color(index),
             );
         }
-        if self.window_progress_visible {
-            self.render_progress_bar(sugarloaf, window_width, scale, ISLAND_HEIGHT);
-        }
+        self.render_progress_bar(sugarloaf, window_width, scale, ISLAND_HEIGHT);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -758,7 +751,7 @@ impl Island {
         } else {
             None
         };
-        if let Some(fill) = fill.filter(|f| f[3] > 0.0) {
+        if let Some(fill) = fill {
             draw_island(
                 sugarloaf,
                 x,
@@ -768,30 +761,14 @@ impl Island {
                 radius,
                 alpha(fill, tab.opacity),
                 self.tab_glass_intensity
+                    * tab.opacity
                     * if floating.is_some() {
                         1.0
                     } else {
                         tab.hover * 0.3
                     },
+                self.status_rim(tab.content.status.as_ref(), tab.opacity),
                 order,
-            );
-        }
-        if let Some(color) = tab
-            .content
-            .status
-            .as_ref()
-            .and_then(|s| self.status_color(s))
-        {
-            sugarloaf.rounded_rect(
-                None,
-                x,
-                ISLAND_HEIGHT - PROGRESS_BAR_HEIGHT,
-                w,
-                PROGRESS_BAR_HEIGHT,
-                alpha(color, tab.opacity),
-                0.0,
-                PROGRESS_BAR_HEIGHT / 2.0,
-                order + 1,
             );
         }
         let padding = tab_title_padding(tab.content.remote, self.tab_icon_size);
@@ -813,7 +790,7 @@ impl Island {
                 color: color_u8(color),
                 ..DrawOpts::default()
             };
-            let title = fit_title_to_width(sugarloaf, &tab.content.title, budget, &opts);
+            let title = fit_text(sugarloaf, &tab.content.title, budget, &opts);
             let text_x = snap(left + padding, sugarloaf.scale_factor());
             if tab.content.bell
                 && !occlusion.is_some_and(|[start, end]| {

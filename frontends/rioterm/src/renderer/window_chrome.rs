@@ -1,5 +1,5 @@
+use rio_backend::config::colors::Colors;
 use rio_backend::config::navigation::Animation;
-#[cfg(target_os = "windows")]
 use rio_backend::sugarloaf::font::FontData;
 use rio_backend::sugarloaf::font::FontLibrary;
 use rio_backend::sugarloaf::text::DrawOpts;
@@ -7,7 +7,14 @@ use rio_backend::sugarloaf::Sugarloaf;
 use std::time::Instant;
 
 pub const HEADER_HEIGHT: f32 = 54.0;
-const BUTTON_WIDTH: f32 = 32.0;
+const BUTTON_WIDTH: f32 = 36.0;
+const CONTROL_GAP: f32 = 10.0;
+const CONTROL_MARGIN: f32 = 8.0;
+const CONTROL_INSET: f32 = 2.0;
+const CONTROL_ORDER: u8 = 16;
+const GLYPH_HALF_SIZE: f32 = 5.0;
+const GLYPH_STROKE: f32 = 1.2;
+const RESTORE_OFFSET: f32 = 3.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeaderAction {
@@ -43,11 +50,131 @@ fn window_actions() -> &'static [HeaderAction] {
     &[]
 }
 
+fn group_width(list: &[HeaderAction]) -> f32 {
+    list.len() as f32 * BUTTON_WIDTH
+        + if list.len() > 1 && list[0] == HeaderAction::NewTab {
+            CONTROL_GAP
+        } else {
+            0.0
+        }
+}
+
+fn button_x(list: &[HeaderAction], index: usize, width: f32) -> f32 {
+    width - CONTROL_MARGIN - group_width(list)
+        + index as f32 * BUTTON_WIDTH
+        + if index > 0 && list[0] == HeaderAction::NewTab {
+            CONTROL_GAP
+        } else {
+            0.0
+        }
+}
+
 pub fn controls_width(width: f32) -> f32 {
-    actions(width).len() as f32 * BUTTON_WIDTH + 8.0
+    group_width(actions(width)) + CONTROL_MARGIN
+}
+
+/// Shared colors for application chrome and overlays.
+#[derive(Clone, Copy)]
+pub struct Theme {
+    pub surface: [f32; 4],
+    pub foreground: [f32; 4],
+    pub muted: [f32; 4],
+    pub border: [f32; 4],
+    pub hover: [f32; 4],
+    pub accent: [f32; 4],
+    pub on_accent: [f32; 4],
+    pub danger: [f32; 4],
+}
+
+fn mix(a: [f32; 4], b: [f32; 4], amount: f32) -> [f32; 4] {
+    [
+        a[0] + (b[0] - a[0]) * amount,
+        a[1] + (b[1] - a[1]) * amount,
+        a[2] + (b[2] - a[2]) * amount,
+        1.0,
+    ]
+}
+
+impl Theme {
+    pub fn new(colors: &Colors) -> Self {
+        let foreground = colors.foreground;
+        let surface = mix(colors.background.0, foreground, 0.045);
+        let accent = colors.cyan;
+        let light = accent[0] * 0.2126 + accent[1] * 0.7152 + accent[2] * 0.0722;
+        Self {
+            surface,
+            foreground,
+            muted: mix(surface, foreground, 0.58),
+            border: mix(surface, foreground, 0.20),
+            hover: mix(surface, foreground, 0.09),
+            accent,
+            on_accent: if light > 0.45 {
+                [0.04, 0.04, 0.04, 1.0]
+            } else {
+                [1.0; 4]
+            },
+            danger: colors.red,
+        }
+    }
+}
+
+/// Resolve a proportional UI face once per font library, outside the draw loop.
+pub fn load_ui_font(library: &FontLibrary) -> Option<usize> {
+    #[cfg(feature = "profiling")]
+    let _timing = crate::profiling::span("chrome.load_ui_font");
+    use rio_backend::sugarloaf::font::loader::{Database, Family, Query, Source};
+    use rio_backend::sugarloaf::font::Slot;
+    let preferred = if cfg!(target_os = "windows") {
+        "Segoe UI"
+    } else if cfg!(target_os = "macos") {
+        "Helvetica Neue"
+    } else {
+        "Noto Sans"
+    };
+    let database = Database::new();
+    let id = database.query(&Query {
+        families: &[Family::Name(preferred), Family::SansSerif],
+        ..Query::default()
+    })?;
+    let (source, index) = database.face_source(id)?;
+    let font = match source {
+        Source::File(path) => {
+            #[cfg(target_os = "macos")]
+            {
+                FontData::from_path_macos(path, Slot::Regular, &Default::default())
+                    .ok()?
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                FontData::from_discovered_path(path, index).ok()?
+            }
+        }
+        Source::Binary(data) => FontData::from_data(
+            data,
+            std::path::PathBuf::new(),
+            false,
+            Slot::Regular,
+            &Default::default(),
+            index,
+        )
+        .ok()?,
+    };
+    if let Some(id) = font
+        .postscript_name()
+        .and_then(|name| library.font_id_for_postscript_name(name))
+    {
+        return Some(id);
+    }
+    let mut fonts = library.inner.write();
+    let id = fonts.len();
+    fonts.insert(font);
+    Some(id)
 }
 
 pub fn fade(value: &mut f32, target: f32, dt: f32, animation: Animation) {
+    if *value == target {
+        return;
+    }
     if animation != Animation::Full {
         *value = target;
         return;
@@ -80,6 +207,39 @@ pub fn centered_text_y(
         .vertical_bounds(text, opts)
         .unwrap_or((0.0, opts.font_size));
     snap(cy - top - height / 2.0, sugarloaf.scale_factor())
+}
+
+pub fn fit_text<'a>(
+    sugarloaf: &mut Sugarloaf,
+    text: &'a str,
+    max_width: f32,
+    opts: &DrawOpts,
+) -> std::borrow::Cow<'a, str> {
+    use std::borrow::Cow;
+    #[cfg(feature = "profiling")]
+    let _timing = crate::profiling::span("chrome.fit_text");
+    let ui = sugarloaf.text_mut();
+    if ui.measure(text, opts) <= max_width {
+        return Cow::Borrowed(text);
+    }
+    const ELLIPSIS: &str = "…";
+    if ui.measure(ELLIPSIS, opts) > max_width {
+        return Cow::Borrowed("");
+    }
+    let boundaries: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    let mut low = 0;
+    let mut high = boundaries.len();
+    while low < high {
+        let mid = (low + high) / 2;
+        let candidate = format!("{}{ELLIPSIS}", &text[..boundaries[mid]]);
+        if ui.measure(&candidate, opts) <= max_width {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    let end = low.checked_sub(1).map_or(0, |i| boundaries[i]);
+    Cow::Owned(format!("{}{ELLIPSIS}", &text[..end]))
 }
 
 #[cfg(target_os = "windows")]
@@ -145,6 +305,7 @@ pub struct Header {
     last_frame: Instant,
     font_library: Option<FontLibrary>,
     pub app_font: Option<usize>,
+    pub theme: Theme,
     pub maximized: bool,
     pub fullscreen: bool,
     pub toolbar_enabled: bool,
@@ -158,6 +319,7 @@ impl Header {
             last_frame: Instant::now(),
             font_library: None,
             app_font: None,
+            theme: Theme::new(&Colors::default()),
             maximized: false,
             fullscreen: false,
             toolbar_enabled: true,
@@ -173,11 +335,10 @@ impl Header {
         } else {
             window_actions()
         };
-        let left = width - list.len() as f32 * BUTTON_WIDTH - 8.0;
-        if x < left || x >= left + list.len() as f32 * BUTTON_WIDTH {
-            return None;
-        }
-        list.get(((x - left) / BUTTON_WIDTH) as usize).copied()
+        list.iter().enumerate().find_map(|(index, action)| {
+            let left = button_x(list, index, width);
+            (x >= left && x < left + BUTTON_WIDTH).then_some(*action)
+        })
     }
 
     pub fn hover(&mut self, x: f32, y: f32, width: f32) -> bool {
@@ -204,11 +365,11 @@ impl Header {
         &mut self,
         sugarloaf: &mut Sugarloaf,
         width: f32,
-        color: [f32; 4],
         animation: Animation,
     ) {
         #[cfg(feature = "profiling")]
         let _timing = crate::profiling::span("header.render");
+        let color = self.theme.foreground;
         let library = sugarloaf.font_library();
         if self.font_library.as_ref().is_none_or(|previous| {
             !std::sync::Arc::ptr_eq(&previous.inner, &library.inner)
@@ -239,78 +400,114 @@ impl Header {
         } else {
             window_actions()
         };
-        let left = width - list.len() as f32 * BUTTON_WIDTH - 8.0;
+        let base = alpha(color, 0.055);
         for (i, action) in list.iter().enumerate() {
-            let x = left + i as f32 * BUTTON_WIDTH;
+            let x = button_x(list, i, width);
             let index = ACTIONS.iter().position(|a| a == action).unwrap();
             let hover = self.opacity[index];
-            let backdrop = if *action == HeaderAction::Close {
-                [0.88, 0.24, 0.29, hover * 0.85]
+            // New-tab has its own pill; Windows caption actions share one.
+            if *action == HeaderAction::NewTab
+                || i == 0
+                || list[i - 1] == HeaderAction::NewTab
+            {
+                let group = if *action == HeaderAction::NewTab {
+                    BUTTON_WIDTH
+                } else {
+                    (list.len() - i) as f32 * BUTTON_WIDTH
+                };
+                sugarloaf.rounded_rect(
+                    None,
+                    x,
+                    (HEADER_HEIGHT - BUTTON_WIDTH) / 2.0,
+                    group,
+                    BUTTON_WIDTH,
+                    base,
+                    0.05,
+                    BUTTON_WIDTH / 2.0,
+                    CONTROL_ORDER,
+                );
+            }
+            if hover > 0.0 {
+                let tint = if *action == HeaderAction::Close {
+                    self.theme.danger
+                } else {
+                    color
+                };
+                sugarloaf.rounded_rect(
+                    None,
+                    x + CONTROL_INSET,
+                    (HEADER_HEIGHT - BUTTON_WIDTH) / 2.0 + CONTROL_INSET,
+                    BUTTON_WIDTH - CONTROL_INSET * 2.0,
+                    BUTTON_WIDTH - CONTROL_INSET * 2.0,
+                    alpha(
+                        tint,
+                        hover
+                            * if *action == HeaderAction::Close {
+                                0.22
+                            } else {
+                                0.10
+                            },
+                    ),
+                    0.05,
+                    BUTTON_WIDTH / 2.0 - CONTROL_INSET * 2.0,
+                    CONTROL_ORDER + 1,
+                );
+            }
+            // An opaque secondary tint keeps intersecting strokes uniform.
+            let glyph = mix(self.theme.surface, color, 0.72 + hover * 0.28);
+            let glyph = if *action == HeaderAction::Close {
+                mix(glyph, self.theme.danger, hover)
             } else {
-                [color[0], color[1], color[2], hover * 0.10]
-            };
-            sugarloaf.rounded_rect(
-                None,
-                x + 2.0,
-                8.0,
-                28.0,
-                HEADER_HEIGHT - 16.0,
-                backdrop,
-                0.05,
-                7.0,
-                16,
-            );
-            let glyph = if *action == HeaderAction::Close && hover > 0.5 {
-                [1.0, 1.0, 1.0, 1.0]
-            } else {
-                alpha(color, 0.60 + hover * 0.35)
+                glyph
             };
             let cx = x + BUTTON_WIDTH / 2.0;
             let cy = HEADER_HEIGHT / 2.0;
-            #[cfg(target_os = "windows")]
-            let icon = match action {
-                HeaderAction::NewTab => "\u{e710}",
-                HeaderAction::Minimize => "\u{e921}",
-                HeaderAction::Maximize if self.maximized => "\u{e923}",
-                HeaderAction::Maximize => "\u{e922}",
-                HeaderAction::Close => "\u{e8bb}",
+            // Caption geometry avoids font discovery, shaping, and platform
+            // glyph bearings on every frame.
+            let scale = sugarloaf.scale_factor();
+            let stroke = (GLYPH_STROKE * scale).round().max(1.0) / scale;
+            let align = |v| {
+                snap(v, scale)
+                    + if (stroke * scale) as u32 % 2 == 1 {
+                        0.5 / scale
+                    } else {
+                        0.0
+                    }
             };
-            #[cfg(target_os = "windows")]
-            if draw_icon(sugarloaf, icon, cx, cy, 12.0, glyph) {
-                continue;
-            }
             let mut line = |x1, y1, x2, y2| {
-                sugarloaf.line(x1, y1, x2, y2, 1.2, 0.0, glyph, 17);
+                sugarloaf.line(
+                    align(x1),
+                    align(y1),
+                    align(x2),
+                    align(y2),
+                    stroke,
+                    0.0,
+                    glyph,
+                    CONTROL_ORDER + 2,
+                );
             };
+            let half = GLYPH_HALF_SIZE;
             match action {
-                HeaderAction::Minimize => line(cx - 5.0, cy + 2.0, cx + 5.0, cy + 2.0),
+                HeaderAction::Minimize => line(cx - half, cy, cx + half, cy),
                 HeaderAction::Close => {
-                    line(cx - 4.0, cy - 4.0, cx + 4.0, cy + 4.0);
-                    line(cx - 4.0, cy + 4.0, cx + 4.0, cy - 4.0);
+                    line(cx - half, cy - half, cx + half, cy + half);
+                    line(cx - half, cy + half, cx + half, cy - half);
                 }
                 HeaderAction::NewTab => {
-                    line(cx - 5.0, cy, cx + 5.0, cy);
-                    line(cx, cy - 5.0, cx, cy + 5.0);
+                    line(cx - half, cy, cx + half, cy);
+                    line(cx, cy - half, cx, cy + half);
                 }
                 HeaderAction::Maximize => {
-                    let inset = if self.maximized { 2.0 } else { 0.0 };
-                    line(
-                        cx - 5.0,
-                        cy - 4.0 + inset,
-                        cx + 4.0 - inset,
-                        cy - 4.0 + inset,
-                    );
-                    line(
-                        cx + 4.0 - inset,
-                        cy - 4.0 + inset,
-                        cx + 4.0 - inset,
-                        cy + 5.0,
-                    );
-                    line(cx + 4.0 - inset, cy + 5.0, cx - 5.0, cy + 5.0);
-                    line(cx - 5.0, cy + 5.0, cx - 5.0, cy - 4.0 + inset);
+                    let edge = half - if self.maximized { RESTORE_OFFSET } else { 0.0 };
+                    let right = cx + edge;
+                    let top = cy - edge;
+                    line(cx - half, top, right, top);
+                    line(right, top, right, cy + half);
+                    line(right, cy + half, cx - half, cy + half);
+                    line(cx - half, cy + half, cx - half, top);
                     if self.maximized {
-                        line(cx - 2.0, cy - 5.0, cx + 5.0, cy - 5.0);
-                        line(cx + 5.0, cy - 5.0, cx + 5.0, cy + 2.0);
+                        line(cx - edge, cy - half, cx + half, cy - half);
+                        line(cx + half, cy - half, cx + half, cy + edge);
                     }
                 }
             }

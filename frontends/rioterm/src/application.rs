@@ -610,11 +610,14 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 }
             }
             RioEventType::Rio(RioEvent::UpdateConfig) => {
-                let (config, config_error) = match rio_backend::config::Config::try_load()
-                {
-                    Ok(config) => (config, None),
-                    Err(error) => (rio_backend::config::Config::default(), Some(error)),
-                };
+                let (mut config, config_error) =
+                    match rio_backend::config::Config::try_load() {
+                        Ok(config) => (config, None),
+                        Err(error) => {
+                            (rio_backend::config::Config::default(), Some(error))
+                        }
+                    };
+                config.overwrite_based_on_platform();
 
                 let has_font_updates = self.config.fonts != config.fonts;
                 let has_binding_updates = self.config.bindings != config.bindings;
@@ -796,15 +799,8 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     }
                 }
             }
-            RioEventType::Rio(RioEvent::ProgressReport(_report)) => {
-                #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-                if let Some(route) = self.router.routes.get_mut(&window_id) {
-                    if let Some(island) = &mut route.window.screen.renderer.island {
-                        island.set_progress_report(_report);
-                        route.request_overlay_redraw();
-                    }
-                }
-            }
+            // The pane-scoped ProgramStatusChanged event also covers OSC 9;4.
+            RioEventType::Rio(RioEvent::ProgressReport(_)) => {}
             RioEventType::Rio(RioEvent::ProgramStatusChanged(route_id)) => {
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
                     if route.window.screen.ctx().is_route_focused_in_tab(route_id) {
@@ -2050,6 +2046,24 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
 
                 if self.config.hide_cursor_when_typing {
                     route.window.winit_window.set_cursor_visible(true);
+                }
+
+                let palette = &mut route.window.screen.renderer.command_palette;
+                if palette.is_enabled() {
+                    let changed = match delta {
+                        MouseScrollDelta::LineDelta(_, lines) => palette.scroll(
+                            lines as f64,
+                            route.window.winit_window.scale_factor() as f32,
+                        ),
+                        MouseScrollDelta::PixelDelta(position) => palette.scroll_pixels(
+                            position.y,
+                            route.window.winit_window.scale_factor(),
+                        ),
+                    };
+                    if changed {
+                        route.request_overlay_redraw();
+                    }
+                    return;
                 }
 
                 match delta {

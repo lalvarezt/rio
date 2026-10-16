@@ -32,6 +32,55 @@ Glass intensity changes the border's reflections, not the window opacity or the
 Windows Acrylic material. It does not refract the desktop or use Apple's native
 Liquid Glass renderer.
 
+## Program status
+
+[OSC 7501 reports](https://www.superlogical.com/rex/docs/build/program-status)
+color the pill's border using the terminal theme: green for working or done,
+yellow for blocked, and red for errors. Idle and cleared reports restore the
+ordinary glass border.
+
+A working or blocked report with `progress=0` through `progress=100` fills the
+contour clockwise from the top center. The remaining contour is a faint track.
+Without a percentage, the whole border carries the status color. The glass
+reflection remains over the color; setting `tab-glass-intensity = 0` removes
+only the reflection.
+
+Set the status border thickness in physical pixels:
+
+```toml
+[navigation]
+tab-status-width = 2.0
+```
+
+The default is `1.0`. Values are clamped to `0.0` through `6.0`; `0.0` hides
+the status border. Thickness grows inward and leaves the pill size unchanged.
+The setting reloads with the configuration and supports platform navigation
+overrides. Tabs without a status retain their ordinary glass border.
+
+Each tab shows its focused split's status, including background tabs. The
+status border is static between reports and does not need heartbeat updates.
+It replaces the OSC 7501 underline and window bar. Hiding the tab strip also
+hides its status border. Legacy OSC 9;4 reports keep the window progress bar.
+
+## Window controls and command palette
+
+Windows groups minimize, maximize or restore, and close controls at the right
+of the bar. The new-tab button has a separate pill. macOS keeps its native
+traffic lights on the left, and Linux keeps its window-manager controls.
+
+The command palette uses the terminal theme, a proportional system UI font,
+and grouped commands. Its height follows the results and available window
+space. Keyboard and mouse selection share the same actions, including opening
+the font browser and copying a font family name. The result viewport keeps its
+height while navigating or scrolling. Group headings share that space; very
+short windows omit headings to keep commands accessible.
+
+Search results update when the query or list changes. Pointer movement and
+repaints reuse those results. The search caret follows `cursor.blinking` and
+`cursor.blinking-interval`; a steady caret schedules no idle frames. The
+scrollbar stays visible whenever results overflow and schedules no idle frames.
+Mouse-wheel and trackpad scrolling stay inside the palette while it is open.
+
 ## Tab motion and controls
 
 Set the amount of tab motion in `config.toml`:

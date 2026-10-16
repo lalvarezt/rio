@@ -622,6 +622,9 @@ impl Config {
             if let Some(intensity) = navigation_overwrite.tab_glass_intensity {
                 self.navigation.tab_glass_intensity = intensity;
             }
+            if let Some(width) = navigation_overwrite.tab_status_width {
+                self.navigation.tab_status_width = width;
+            }
             if let Some(animation) = navigation_overwrite.animation {
                 self.navigation.animation = animation;
             }
@@ -647,6 +650,10 @@ impl Config {
         self.navigation.tab_glass_intensity =
             crate::config::navigation::clamp_tab_glass_intensity(
                 self.navigation.tab_glass_intensity,
+            );
+        self.navigation.tab_status_width =
+            crate::config::navigation::clamp_tab_status_width(
+                self.navigation.tab_status_width,
             );
 
         // Merge renderer fields individually

@@ -567,7 +567,7 @@ impl Screen<'_> {
         self.renderer = Renderer::new(config);
         self.renderer.is_window_focused = was_focused;
         if let Some(mut island) = old_island {
-            island.update_colors(config.colors.tabs, config.colors.tabs_active);
+            island.update_colors(&config.colors);
             island.configure(&config.navigation);
             self.renderer.island = Some(island);
         }
@@ -2598,15 +2598,8 @@ impl Screen<'_> {
             scale_factor,
         ) {
             Ok(Some(index)) => {
-                // Clicked a result row — select and execute
-                if let Some(action) = {
-                    // Temporarily set selected index to the clicked row
-                    self.renderer.command_palette.selected_index = index;
-                    self.renderer.command_palette.get_selected_action()
-                } {
-                    self.renderer.command_palette.set_enabled(false);
-                    self.execute_palette_action(action, clipboard);
-                }
+                self.renderer.command_palette.selected_index = index;
+                self.activate_palette_selection(clipboard);
                 self.mark_dirty();
                 true
             }
@@ -3883,14 +3876,29 @@ impl Screen<'_> {
         if let Some(island) = &mut self.renderer.island {
             let width =
                 self.sugarloaf.window_size().width / self.sugarloaf.scale_factor();
-            island.window_header.render(
-                &mut self.sugarloaf,
-                width,
-                self.renderer.named_colors.foreground,
-                island.animation,
-            );
+            island
+                .window_header
+                .render(&mut self.sugarloaf, width, island.animation);
         }
         self.sugarloaf.render();
+    }
+
+    /// Keyboard and pointer activation share font browsing, clipboard, and
+    /// dismissal behavior.
+    pub fn activate_palette_selection(&mut self, clipboard: &mut Clipboard) {
+        use crate::renderer::command_palette::PaletteAction;
+        if let Some(font) = self.renderer.command_palette.get_selected_font() {
+            clipboard.set(ClipboardType::Clipboard, font);
+            self.renderer.command_palette.set_enabled(false);
+            return;
+        }
+        let action = self.renderer.command_palette.get_selected_action();
+        if action != Some(PaletteAction::ListFonts) {
+            self.renderer.command_palette.set_enabled(false);
+        }
+        if let Some(action) = action {
+            self.execute_palette_action(action, clipboard);
+        }
     }
 
     pub fn execute_palette_action(
@@ -3992,11 +4000,8 @@ impl Screen<'_> {
                 terminal.clear_saved_history();
             }
             PaletteAction::ListFonts => {
-                // Handled in the router: switches the palette into fonts
-                // mode and keeps it open. If we land here it's either a
-                // bug (router should have intercepted) or an external
-                // caller firing the action directly — do nothing so the
-                // palette just closes without side effects.
+                let fonts = self.sugarloaf.font_family_names();
+                self.renderer.command_palette.enter_fonts_mode(fonts);
             }
             PaletteAction::Quit => {
                 self.context_manager.quit();

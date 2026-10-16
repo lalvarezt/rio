@@ -208,6 +208,70 @@ fn parse_quad(chunk: &[Vertex]) -> ParsedQuad {
     }
 }
 
+/// Rasterize the rotated rectangle emitted by Batch::add_line. Treating its
+/// axis-aligned bounds as a fill turns diagonal strokes into solid squares.
+fn draw_line_quad(
+    buf: &mut [u32],
+    stride: i32,
+    bounds: (i32, i32, i32, i32),
+    vertices: &[Vertex],
+    color: [u8; 4],
+) {
+    let origin = vertices[0].pos;
+    let along = [
+        vertices[1].pos[0] - origin[0],
+        vertices[1].pos[1] - origin[1],
+    ];
+    let across = [
+        vertices[4].pos[0] - origin[0],
+        vertices[4].pos[1] - origin[1],
+    ];
+    let length = along[0].hypot(along[1]);
+    let width = across[0].hypot(across[1]);
+    if length <= f32::EPSILON || width <= f32::EPSILON {
+        return;
+    }
+    let along = [along[0] / length, along[1] / length];
+    let across = [across[0] / width, across[1] / width];
+    let [r, g, b, a] = color;
+    let (x0, y0, x1, y1) = bounds;
+    let inv_along_x = 1.0 / along[0];
+    let inv_across_x = 1.0 / across[0];
+    for y in y0..y1 {
+        let py = y as f32 + 0.5 - origin[1];
+        // Intersect this scanline with both edge pairs, including the AA
+        // fringe. Long thin diagonals visit their stroke, not their full box.
+        let u0 = (-0.5 - py * along[1]) * inv_along_x;
+        let u1 = (length + 0.5 - py * along[1]) * inv_along_x;
+        let v0 = (-0.5 - py * across[1]) * inv_across_x;
+        let v1 = (width + 0.5 - py * across[1]) * inv_across_x;
+        let first = x0.max((origin[0] + u0.min(u1).max(v0.min(v1))).floor() as i32);
+        let end = x1.min((origin[0] + u0.max(u1).min(v0.max(v1))).ceil() as i32);
+        for x in first..end {
+            let px = x as f32 + 0.5 - origin[0];
+            let u = px * along[0] + py * along[1];
+            let v = px * across[0] + py * across[1];
+            let coverage = (u + 0.5)
+                .min(length - u + 0.5)
+                .min(v + 0.5)
+                .min(width - v + 0.5)
+                .clamp(0.0, 1.0);
+            let alpha = (f32::from(a) * coverage).round() as u32;
+            if alpha == 0 {
+                continue;
+            }
+            let src = pack_premul(
+                ((u32::from(r) * alpha + 127) / 255) as u8,
+                ((u32::from(g) * alpha + 127) / 255) as u8,
+                ((u32::from(b) * alpha + 127) / 255) as u8,
+                alpha as u8,
+            );
+            let index = (y * stride + x) as usize;
+            buf[index] = blend_over_swar(src, buf[index]);
+        }
+    }
+}
+
 /// Snap quad bounds to integer pixels and clip to (clip_rect ∩ buffer).
 /// Returns Some((x0,y0,x1,y1)) or None if fully clipped.
 #[inline(always)]
@@ -487,7 +551,24 @@ pub fn render_cpu(
                 continue;
             }
 
-            let snapped = match snap_and_clip(&q, buf_w, buf_h) {
+            let diagonal_line = q.mask_layer == 0
+                && q.color_layer == 0
+                && chunk[0].pos[0] != chunk[1].pos[0]
+                && chunk[0].pos[1] != chunk[1].pos[1]
+                && chunk[0].pos == chunk[5].pos
+                && chunk[2].pos == chunk[3].pos;
+            let bounds = if diagonal_line {
+                ParsedQuad {
+                    min_x: q.min_x.floor(),
+                    min_y: q.min_y.floor(),
+                    max_x: q.max_x.ceil(),
+                    max_y: q.max_y.ceil(),
+                    ..q
+                }
+            } else {
+                q
+            };
+            let snapped = match snap_and_clip(&bounds, buf_w, buf_h) {
                 Some(r) => r,
                 None => continue,
             };
@@ -519,6 +600,14 @@ pub fn render_cpu(
             let b = (q.color[2].clamp(0.0, 1.0) * 255.0) as u8;
             let a = (q.color[3].clamp(0.0, 1.0) * 255.0) as u8;
             if a == 0 {
+                continue;
+            }
+
+            if diagonal_line {
+                if let Some(p) = pending.take() {
+                    flush_fill(buf_slice, buf_w, &p);
+                }
+                draw_line_quad(buf_slice, buf_w, snapped, chunk, [r, g, b, a]);
                 continue;
             }
 

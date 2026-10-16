@@ -35,6 +35,20 @@ pub fn default_tab_glass_intensity() -> f32 {
 }
 
 #[inline]
+pub fn default_tab_status_width() -> f32 {
+    1.0
+}
+
+#[inline]
+pub fn clamp_tab_status_width(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(0.0, 6.0)
+    } else {
+        default_tab_status_width()
+    }
+}
+
+#[inline]
 pub fn clamp_tab_glass_intensity(v: f32) -> f32 {
     if v.is_finite() {
         v.clamp(0.0, 1.0)
@@ -241,6 +255,10 @@ pub struct Navigation {
         rename = "tab-glass-intensity"
     )]
     pub tab_glass_intensity: f32,
+    /// Program status border thickness in physical pixels, from `0.0` to `6.0`.
+    /// Zero hides the status border, preserving the ordinary glass reflection.
+    #[serde(default = "default_tab_status_width", rename = "tab-status-width")]
+    pub tab_status_width: f32,
     /// Tab motion and header hover transitions. Defaults to the full effect.
     #[serde(default)]
     pub animation: Animation,
@@ -266,6 +284,7 @@ impl Default for Navigation {
             min_tab_width: default_min_tab_width(),
             tab_icon_size: default_tab_icon_size(),
             tab_glass_intensity: default_tab_glass_intensity(),
+            tab_status_width: default_tab_status_width(),
             animation: Animation::default(),
             app_icons: std::collections::BTreeMap::new(),
         }

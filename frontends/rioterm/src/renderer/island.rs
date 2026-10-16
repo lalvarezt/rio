@@ -10,6 +10,8 @@ mod tabs;
 
 use crate::context::ContextManager;
 use crate::renderer::helpers::spring::Spring;
+use crate::renderer::tab_glass::Status;
+use rio_backend::config::colors::Colors;
 use rio_backend::event::{EventProxy, ProgressReport, ProgressState};
 use rio_backend::program_status::{
     BlockedKind, ProgramState, ProgramStatusRecord, ProgramStatusStore,
@@ -17,7 +19,6 @@ use rio_backend::program_status::{
 use rio_backend::sugarloaf::text::DrawOpts;
 use rio_backend::sugarloaf::Sugarloaf;
 use rustc_hash::FxHashMap;
-use std::borrow::Cow;
 use std::time::Instant;
 
 pub const ISLAND_HEIGHT: f32 = crate::renderer::window_chrome::HEADER_HEIGHT;
@@ -34,7 +35,6 @@ const TAB_INSET_BOTTOM: f32 = 6.0;
 const TAB_INSET_TOP: f32 = TAB_INSET_BOTTOM;
 const TAB_CENTER_Y: f32 = (TAB_INSET_TOP + ISLAND_HEIGHT - TAB_INSET_BOTTOM) / 2.0;
 const TAB_RADIUS: f32 = 19.0;
-const TITLE_ELLIPSIS: char = '…';
 /// Bell dot for tabs that rang while in the background, and the gap
 /// between it and the tab title. A dot, not a glyph: the UI text layer
 /// resolves one font per run, so a bell glyph exists only where an
@@ -131,38 +131,6 @@ struct TabPresentation {
 fn tab_title_padding(remote: bool, icon_size: f32) -> f32 {
     let icons = if remote { 2.0 } else { 1.0 };
     TAB_GAP / 2.0 + TAB_ICON_INSET_X + icons * (icon_size + TAB_ICON_GAP)
-}
-
-fn fit_title_to_width<'a>(
-    sugarloaf: &mut Sugarloaf,
-    title: &'a str,
-    max_width: f32,
-    opts: &DrawOpts,
-) -> Cow<'a, str> {
-    #[cfg(feature = "profiling")]
-    let _timing = crate::profiling::span("tabs.fit_title");
-    let ui = sugarloaf.text_mut();
-    if ui.measure(title, opts) <= max_width {
-        return Cow::Borrowed(title);
-    }
-    let ellipsis = TITLE_ELLIPSIS.to_string();
-    if ui.measure(&ellipsis, opts) > max_width {
-        return Cow::Borrowed("");
-    }
-    let boundaries: Vec<usize> = title.char_indices().map(|(i, _)| i).collect();
-    let mut low = 0;
-    let mut high = boundaries.len();
-    while low < high {
-        let mid = (low + high) / 2;
-        let candidate = format!("{}{}", &title[..boundaries[mid]], ellipsis);
-        if ui.measure(&candidate, opts) <= max_width {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-    let end = low.checked_sub(1).map_or(0, |i| boundaries[i]);
-    Cow::Owned(format!("{}{}", &title[..end], ellipsis))
 }
 
 #[derive(Clone, PartialEq)]
@@ -342,6 +310,7 @@ fn draw_island(
     radius: f32,
     fill: [f32; 4],
     glass_intensity: f32,
+    status: Option<Status>,
     order: u8,
 ) {
     let (x, y, w, h) = {
@@ -351,8 +320,17 @@ fn draw_island(
         let top = snap(y);
         (left, top, snap(x + w) - left, snap(y + h) - top)
     };
-    sugarloaf.rounded_rect(None, x, y, w, h, fill, 0.05, radius, order);
-    super::tab_glass::draw(sugarloaf, [x, y, w, h], radius, glass_intensity, order);
+    if fill[3] > 0.0 {
+        sugarloaf.rounded_rect(None, x, y, w, h, fill, 0.05, radius, order);
+    }
+    super::tab_glass::draw(
+        sugarloaf,
+        [x, y, w, h],
+        radius,
+        glass_intensity,
+        status,
+        order,
+    );
 }
 
 #[inline]
@@ -437,6 +415,7 @@ pub struct Island {
     pub tab_icon_size: f32,
     pub animation: rio_backend::config::navigation::Animation,
     tab_glass_intensity: f32,
+    tab_status_width: f32,
     app_icons: super::app_icons::Library,
     tabs: tabs::Tabs,
     pub inactive_text_color: [f32; 4],
@@ -455,8 +434,7 @@ pub struct Island {
     progress_last_seen: Option<Instant>,
     program_status: Option<ProgramStatusRecord>,
     program_status_source: Option<(usize, u64)>,
-    progress_persistent: bool,
-    window_progress_visible: bool,
+    status_colors: [[f32; 4]; 3],
     /// Progress bar color
     pub progress_bar_color: [f32; 4],
     /// Progress bar error color
@@ -481,6 +459,7 @@ impl Island {
         hide_if_single: bool,
         max_tab_width: f32,
     ) -> Self {
+        let colors = Colors::default();
         Self {
             window_header: crate::renderer::window_chrome::Header::new(),
             hide_if_single,
@@ -490,6 +469,7 @@ impl Island {
             animation: rio_backend::config::navigation::Animation::default(),
             tab_glass_intensity:
                 rio_backend::config::navigation::default_tab_glass_intensity(),
+            tab_status_width: rio_backend::config::navigation::default_tab_status_width(),
             app_icons: super::app_icons::Library::default(),
             tabs: tabs::Tabs::default(),
             inactive_text_color,
@@ -500,12 +480,9 @@ impl Island {
             progress_last_seen: None,
             program_status: None,
             program_status_source: None,
-            progress_persistent: false,
-            window_progress_visible: true,
-            // Default progress bar color (blue-ish)
-            progress_bar_color: [0.3, 0.6, 1.0, 1.0],
-            // Default error color (red-ish)
-            progress_bar_error_color: [1.0, 0.3, 0.3, 1.0],
+            status_colors: [colors.green, colors.yellow, colors.red],
+            progress_bar_color: colors.blue,
+            progress_bar_error_color: colors.red,
             color_picker_tab: None,
             rename_input: String::new(),
             rename_caret_time: Instant::now(),
@@ -529,6 +506,9 @@ impl Island {
         );
         self.tab_icon_size = rio_backend::config::navigation::clamp_tab_icon_size(
             navigation.tab_icon_size,
+        );
+        self.tab_status_width = rio_backend::config::navigation::clamp_tab_status_width(
+            navigation.tab_status_width,
         );
         {
             self.app_icons.configure(&navigation.app_icons);
@@ -603,13 +583,13 @@ impl Island {
         changed
     }
 
-    pub fn update_colors(
-        &mut self,
-        inactive_text_color: [f32; 4],
-        active_text_color: [f32; 4],
-    ) {
-        self.inactive_text_color = inactive_text_color;
-        self.active_text_color = active_text_color;
+    pub fn update_colors(&mut self, colors: &Colors) {
+        self.window_header.theme = super::window_chrome::Theme::new(colors);
+        self.inactive_text_color = colors.tabs;
+        self.active_text_color = colors.tabs_active;
+        self.status_colors = [colors.green, colors.yellow, colors.red];
+        self.progress_bar_color = colors.blue;
+        self.progress_bar_error_color = colors.red;
     }
 
     /// Update the progress bar state from an OSC 9;4 report.
@@ -671,32 +651,17 @@ impl Island {
         if let Some(record) = &mut self.program_status {
             record.app = store.app_for(&record.id).map(str::to_owned);
         }
-        let report = self
-            .program_status
-            .as_ref()
-            .map(|r| ProgressReport {
-                state: match r.state {
-                    ProgramState::Working if r.progress.is_none() => {
-                        ProgressState::Indeterminate
-                    }
-                    ProgramState::Working | ProgramState::Done => ProgressState::Set,
-                    ProgramState::Blocked => ProgressState::Pause,
-                    ProgramState::Error => ProgressState::Error,
-                    ProgramState::Idle | ProgramState::Clear => ProgressState::Remove,
-                },
-                progress: match r.state {
-                    ProgramState::Done | ProgramState::Error => Some(100),
-                    ProgramState::Blocked => Some(r.progress.unwrap_or(100)),
-                    _ => r.progress,
-                },
-            })
-            .or_else(|| store.legacy_progress().map(|(report, _)| report))
-            .unwrap_or(ProgressReport {
-                state: ProgressState::Remove,
-                progress: None,
-            });
+        // OSC 7501 belongs to the pill. Only legacy OSC 9;4 drives the
+        // window bar and its indeterminate animation.
+        let report =
+            store
+                .legacy_progress()
+                .map(|(report, _)| report)
+                .unwrap_or(ProgressReport {
+                    state: ProgressState::Remove,
+                    progress: None,
+                });
         self.set_progress_report(report);
-        self.progress_persistent = store.received_report();
         if let Some((_, updated_at)) = store.legacy_progress() {
             // Returning to a pane must not revive its expired OSC 9;4 bar.
             self.progress_last_seen = Some(updated_at);
@@ -722,18 +687,29 @@ impl Island {
 
     fn status_color(&self, record: &ProgramStatusRecord) -> Option<[f32; 4]> {
         match record.state {
-            ProgramState::Working => Some(self.progress_bar_color),
-            ProgramState::Blocked => Some([0.90, 0.57, 0.22, 1.0]),
-            ProgramState::Done => Some([0.34, 0.70, 0.38, 1.0]),
-            ProgramState::Error => Some(self.progress_bar_error_color),
+            ProgramState::Working | ProgramState::Done => Some(self.status_colors[0]),
+            ProgramState::Blocked => Some(self.status_colors[1]),
+            ProgramState::Error => Some(self.status_colors[2]),
             ProgramState::Idle | ProgramState::Clear => None,
         }
     }
 
-    fn uses_window_progress(&self, num_tabs: usize) -> bool {
-        // Multiple tabs already draw one status line per tab. A lone title
-        // (or hidden strip) and legacy OSC 9;4 still use the window bar.
-        num_tabs <= 1 || !self.progress_persistent
+    fn status_rim(
+        &self,
+        record: Option<&ProgramStatusRecord>,
+        opacity: f32,
+    ) -> Option<Status> {
+        if self.tab_status_width <= 0.0 {
+            return None;
+        }
+        let record = record?;
+        let mut color = self.status_color(record)?;
+        color[3] *= opacity;
+        Some(Status {
+            color,
+            progress: record.progress,
+            width: self.tab_status_width,
+        })
     }
 
     fn status_title(record: Option<&ProgramStatusRecord>, fallback: &str) -> String {
@@ -774,8 +750,7 @@ impl Island {
         frame_interval: std::time::Duration,
     ) -> Option<std::time::Duration> {
         if self.window_header.needs_redraw()
-            || (self.window_progress_visible
-                && matches!(self.progress_state, Some(ProgressState::Indeterminate)))
+            || matches!(self.progress_state, Some(ProgressState::Indeterminate))
         {
             Some(std::time::Duration::ZERO)
         } else {
@@ -921,9 +896,6 @@ impl Island {
     /// Uses `progress_last_seen` (heartbeat), not `progress_started_at`, so
     /// a long-running TUI that keeps reporting stays visible.
     fn check_progress_timeout(&mut self) {
-        if self.progress_persistent {
-            return;
-        }
         if let Some(last_seen) = self.progress_last_seen {
             if last_seen.elapsed().as_secs() >= PROGRESS_BAR_TIMEOUT_SECS {
                 self.progress_state = None;
@@ -955,15 +927,6 @@ impl Island {
         // Determine color based on state
         let color = match state {
             ProgressState::Error => self.progress_bar_error_color,
-            ProgressState::Pause if self.progress_persistent => [0.90, 0.57, 0.22, 1.0],
-            ProgressState::Set
-                if self
-                    .program_status
-                    .as_ref()
-                    .is_some_and(|r| r.state == ProgramState::Done) =>
-            {
-                [0.34, 0.70, 0.38, 1.0]
-            }
             _ => self.progress_bar_color,
         };
 
@@ -1532,9 +1495,9 @@ mod tests {
         );
         let mut island = test_island();
         island.sync_focused_program_status(&cm);
-        assert_eq!(island.progress_value, Some(40));
+        assert_eq!(island.program_status.as_ref().unwrap().progress, Some(40));
+        assert!(island.progress_state.is_none());
         assert_eq!(island.program_status_title("shell"), "[Working 40%] cargo");
-        let animation_start = island.progress_started_at;
 
         cm.add_context(true, 0);
         parser.advance(
@@ -1542,15 +1505,18 @@ mod tests {
             b"\x1b]7501;state=blocked:kind=permission:msg=QXBwcm92ZQ==\x07",
         );
         island.sync_focused_program_status(&cm);
-        assert_eq!(island.progress_state, Some(ProgressState::Pause));
+        assert_eq!(
+            island.program_status.as_ref().unwrap().state,
+            ProgramState::Blocked
+        );
         assert_eq!(
             island.program_status_title("shell"),
             "[Needs permission] shell: Approve"
         );
         cm.set_current(0);
         island.sync_focused_program_status(&cm);
-        assert_eq!(island.progress_value, Some(40));
-        assert!(island.progress_started_at >= animation_start);
+        assert_eq!(island.program_status.as_ref().unwrap().progress, Some(40));
+        assert!(island.progress_state.is_none());
 
         // Update the background terminal while the first remains focused.
         cm.set_current(1);
@@ -1558,7 +1524,8 @@ mod tests {
         cm.set_current(0);
         parser.advance(&mut *background.lock(), b"\x1b]7501;state=done\x07");
         island.sync_focused_program_status(&cm);
-        assert_eq!(island.progress_value, Some(40));
+        assert_eq!(island.program_status.as_ref().unwrap().progress, Some(40));
+        assert!(island.progress_state.is_none());
         cm.set_current(1);
         island.sync_focused_program_status(&cm);
         assert_eq!(
@@ -1588,13 +1555,18 @@ mod tests {
         Processor::default().advance(&mut terminal, b"\x1b]7501;state=working\x07");
         let mut island = test_island();
         island.sync_program_status(1, &terminal.program_status);
-        let started = island.progress_started_at;
         island.progress_last_seen =
             Some(Instant::now() - std::time::Duration::from_secs(60));
         island.check_progress_timeout();
-        assert_eq!(island.progress_state, Some(ProgressState::Indeterminate));
+        assert!(island.progress_state.is_none());
         island.sync_program_status(1, &terminal.program_status);
-        assert_eq!(island.progress_started_at, started);
+        assert_eq!(
+            island.program_status.as_ref().unwrap().state,
+            ProgramState::Working
+        );
+        assert!(island
+            .next_frame_in(1.0, std::time::Duration::ZERO)
+            .is_none());
         assert_eq!(status_display_text("a\u{202e}b\u{2066}c\u{200b}d"), "abcd");
     }
 
@@ -1629,9 +1601,9 @@ mod tests {
         );
         assert_eq!(
             background.as_ref().and_then(|r| island.status_color(r)),
-            Some([0.34, 0.70, 0.38, 1.0])
+            Some(island.status_colors[0])
         );
-        assert_eq!(island.progress_value, Some(20));
+        assert_eq!(island.program_status.as_ref().unwrap().progress, Some(20));
         let background_route = cm.contexts_mut()[0].current().route_id;
         assert!(cm.is_route_focused_in_tab(background_route));
         assert!(!cm.is_route_focused_in_tab(usize::MAX));
@@ -1650,9 +1622,9 @@ mod tests {
         );
         assert_eq!(
             background.as_ref().and_then(|r| island.status_color(r)),
-            Some([0.90, 0.57, 0.22, 1.0])
+            Some(island.status_colors[1])
         );
-        assert_eq!(island.progress_value, Some(20));
+        assert_eq!(island.program_status.as_ref().unwrap().progress, Some(20));
         parser.advance(
             &mut *background_terminal.lock(),
             b"\x1b]7501;state=clear\x07",
@@ -1661,7 +1633,7 @@ mod tests {
     }
 
     #[test]
-    fn program_status_tab_underline_does_not_duplicate_window_bar() {
+    fn program_status_rim_does_not_drive_legacy_window_bar() {
         use rio_backend::event::{VoidListener, WindowId};
         use rio_backend::performer::handler::Processor;
         let cm =
@@ -1679,38 +1651,33 @@ mod tests {
             .as_ref()
             .and_then(|r| island.status_color(r))
             .is_some());
-        assert!(!island.uses_window_progress(2),
-            "the selected tab already has an underline; do not also draw a full-window bar");
-        assert!(
-            island.uses_window_progress(1),
-            "a lone title has no separate tab underline"
-        );
-        island.hide_if_single = true;
-        assert!(
-            island.uses_window_progress(1),
-            "a hidden strip still needs one progress bar"
-        );
+        assert!(island.progress_state.is_none());
+        let mut colors = Colors::default();
+        colors.green = [0.1, 0.8, 0.4, 1.0];
+        colors.yellow = [0.9, 0.8, 0.2, 1.0];
+        colors.red = [0.9, 0.2, 0.3, 1.0];
+        island.update_colors(&colors);
+        let rim = island
+            .status_rim(island.program_status.as_ref(), 1.0)
+            .unwrap();
+        assert_eq!(rim.color, colors.green);
+        assert_eq!(rim.progress, None);
 
         parser.advance(
             &mut *cm.current().terminal.lock(),
             b"\x1b]7501;state=working\x07",
         );
         island.sync_focused_program_status(&cm);
-        island.window_progress_visible = island.uses_window_progress(2);
         assert!(
             island
                 .next_frame_in(1.0, std::time::Duration::ZERO)
                 .is_none(),
-            "a static tab underline must not animate an invisible window bar"
+            "an indeterminate native status must not schedule idle frames"
         );
 
         parser.advance(&mut *cm.current().terminal.lock(), b"\x1bc\x1b]9;4;3\x07");
         island.sync_focused_program_status(&cm);
-        island.window_progress_visible = island.uses_window_progress(2);
-        assert!(
-            island.window_progress_visible,
-            "legacy progress still uses the window bar"
-        );
+        assert!(island.program_status.is_none());
         assert!(
             island
                 .next_frame_in(1.0, std::time::Duration::ZERO)

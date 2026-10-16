@@ -20,50 +20,27 @@ fn color_u8(c: [f32; 4]) -> [u8; 4] {
     ]
 }
 
-// Layout
 const PALETTE_WIDTH: f32 = 480.0;
-const PALETTE_CORNER_RADIUS: f32 = 8.0;
+const PALETTE_CORNER_RADIUS: f32 = 16.0;
 const PALETTE_MARGIN_TOP: f32 = 80.0;
-const PALETTE_PADDING: f32 = 4.0;
-
-const INPUT_HEIGHT: f32 = 40.0;
-const INPUT_FONT_SIZE: f32 = 14.0;
-const INPUT_PADDING_X: f32 = 14.0;
-
-const RESULT_ITEM_HEIGHT: f32 = 32.0;
-const RESULT_FONT_SIZE: f32 = 13.0;
-const SHORTCUT_FONT_SIZE: f32 = 11.0;
-const MAX_VISIBLE_RESULTS: usize = 8;
-
-// Copy icon (two overlapping page outlines with rounded corners,
-// drawn by layering filled + cutout rounded rects). Sized to fit
-// comfortably inside RESULT_ITEM_HEIGHT.
-const COPY_ICON_PAGE_W: f32 = 10.0;
-const COPY_ICON_PAGE_H: f32 = 12.0;
-const COPY_ICON_OFFSET: f32 = 3.0;
-const COPY_ICON_STROKE: f32 = 1.0;
-const COPY_ICON_RADIUS: f32 = 2.0;
-const COPY_ICON_W: f32 = COPY_ICON_PAGE_W + COPY_ICON_OFFSET; // 13
-const COPY_ICON_H: f32 = COPY_ICON_PAGE_H + COPY_ICON_OFFSET; // 15
-
-const SEPARATOR_HEIGHT: f32 = 1.0;
-const RESULTS_MARGIN_TOP: f32 = 2.0;
-const CARET_WIDTH: f32 = 1.5;
-const CARET_BLINK_MS: u128 = 500;
-
-// Colors — dark minimalist
-const BACKDROP_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.50];
-const BG_COLOR: [f32; 4] = [0.08, 0.08, 0.08, 0.98];
-const SELECTED_BG_COLOR: [f32; 4] = [0.15, 0.15, 0.15, 1.0];
-const TEXT_COLOR: [f32; 4] = [0.85, 0.85, 0.85, 1.0];
-const DIM_TEXT_COLOR: [f32; 4] = [0.35, 0.35, 0.35, 1.0];
-const SHORTCUT_TEXT_COLOR: [f32; 4] = [0.30, 0.30, 0.32, 1.0];
-const SEPARATOR_COLOR: [f32; 4] = [0.15, 0.15, 0.15, 1.0];
-
-// Depth / order
-const DEPTH_BACKDROP: f32 = 0.0;
-const DEPTH_BG: f32 = 0.1;
-const DEPTH_ELEMENT: f32 = 0.2;
+const PALETTE_TOP_FRACTION: f32 = 0.125;
+const VIEWPORT_MARGIN: f32 = 16.0;
+const PALETTE_PADDING: f32 = 8.0;
+const INPUT_HEIGHT: f32 = 42.0;
+const INPUT_FONT_SIZE: f32 = 15.0;
+const INPUT_PADDING_X: f32 = 12.0;
+const ICON_SIZE: f32 = 14.0;
+const ICON_STROKE: f32 = 1.2;
+const INPUT_TEXT_INSET: f32 = INPUT_PADDING_X + ICON_SIZE + PALETTE_PADDING;
+const INPUT_RADIUS: f32 = 10.0;
+const RESULT_RADIUS: f32 = 8.0;
+const HINT_GAP: f32 = 20.0;
+const SCROLLBAR_OPACITY: f32 = 0.65;
+const RESULT_ITEM_HEIGHT: f32 = 34.0;
+const RESULT_FONT_SIZE: f32 = 14.0;
+const SHORTCUT_FONT_SIZE: f32 = 12.0;
+const MAX_VISIBLE_RESULTS: usize = 12;
+const GROUP_HEIGHT: f32 = 26.0;
 const ORDER: u8 = 20;
 
 /// Actions that can be triggered from the command palette.
@@ -92,10 +69,7 @@ pub enum PaletteAction {
     SearchBackward,
     ClearHistory,
     CloseCurrentSplitOrTab,
-    /// Browse the family names of every registered font. Does NOT
-    /// execute a one-shot action — the palette stays open with the
-    /// font list as its contents. Handled by `router`, not
-    /// `Screen::execute_palette_action`.
+    /// Browse installed font families while keeping the palette open.
     ListFonts,
     Quit,
 }
@@ -117,12 +91,12 @@ const fn platform_shortcut(macos: &'static str, desktop: &'static str) -> &'stat
 const COMMANDS: &[Command] = &[
     Command {
         title: "New Tab",
-        shortcut: platform_shortcut("Cmd+T", "Ctrl+Shift+T"),
+        shortcut: platform_shortcut("⌘T", "Ctrl+Shift+T"),
         action: PaletteAction::TabCreate,
     },
     Command {
         title: "Close Tab",
-        shortcut: platform_shortcut("Cmd+W", "Ctrl+Shift+W"),
+        shortcut: platform_shortcut("⌘W", "Ctrl+Shift+W"),
         action: PaletteAction::TabClose,
     },
     Command {
@@ -132,22 +106,22 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         title: "Next Tab",
-        shortcut: "Ctrl+Tab",
+        shortcut: platform_shortcut("⌃⇥", "Ctrl+Tab"),
         action: PaletteAction::SelectNextTab,
     },
     Command {
         title: "Previous Tab",
-        shortcut: "Ctrl+Shift+Tab",
+        shortcut: platform_shortcut("⌃⇧⇥", "Ctrl+Shift+Tab"),
         action: PaletteAction::SelectPrevTab,
     },
     Command {
         title: "Split Right",
-        shortcut: platform_shortcut("Cmd+D", "Ctrl+Shift+R"),
+        shortcut: platform_shortcut("⌘D", "Ctrl+Shift+R"),
         action: PaletteAction::SplitRight,
     },
     Command {
         title: "Split Down",
-        shortcut: platform_shortcut("Cmd+Shift+D", "Ctrl+Shift+D"),
+        shortcut: platform_shortcut("⇧⌘D", "Ctrl+Shift+D"),
         action: PaletteAction::SplitDown,
     },
     Command {
@@ -167,27 +141,27 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         title: "Settings",
-        shortcut: platform_shortcut("Cmd+,", "Ctrl+Shift+,"),
+        shortcut: platform_shortcut("⌘,", "Ctrl+Shift+,"),
         action: PaletteAction::ConfigEditor,
     },
     Command {
         title: "New Window",
-        shortcut: platform_shortcut("Cmd+N", "Ctrl+Shift+N"),
+        shortcut: platform_shortcut("⌘N", "Ctrl+Shift+N"),
         action: PaletteAction::WindowCreateNew,
     },
     Command {
         title: "Increase Font Size",
-        shortcut: platform_shortcut("Cmd++", "Ctrl+="),
+        shortcut: platform_shortcut("⌘+", "Ctrl+="),
         action: PaletteAction::IncreaseFontSize,
     },
     Command {
         title: "Decrease Font Size",
-        shortcut: platform_shortcut("Cmd+-", "Ctrl+-"),
+        shortcut: platform_shortcut("⌘-", "Ctrl+-"),
         action: PaletteAction::DecreaseFontSize,
     },
     Command {
         title: "Reset Font Size",
-        shortcut: platform_shortcut("Cmd+0", "Ctrl+0"),
+        shortcut: platform_shortcut("⌘0", "Ctrl+0"),
         action: PaletteAction::ResetFontSize,
     },
     Command {
@@ -207,17 +181,17 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         title: "Copy",
-        shortcut: platform_shortcut("Cmd+C", "Ctrl+Shift+C"),
+        shortcut: platform_shortcut("⌘C", "Ctrl+Shift+C"),
         action: PaletteAction::Copy,
     },
     Command {
         title: "Paste",
-        shortcut: platform_shortcut("Cmd+V", "Ctrl+Shift+V"),
+        shortcut: platform_shortcut("⌘V", "Ctrl+Shift+V"),
         action: PaletteAction::Paste,
     },
     Command {
         title: "Search Forward",
-        shortcut: platform_shortcut("Cmd+F", "Ctrl+Shift+F"),
+        shortcut: platform_shortcut("⌘F", "Ctrl+Shift+F"),
         action: PaletteAction::SearchForward,
     },
     Command {
@@ -237,7 +211,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         title: "Quit",
-        shortcut: platform_shortcut("Cmd+Q", ""),
+        shortcut: platform_shortcut("⌘Q", ""),
         action: PaletteAction::Quit,
     },
 ];
@@ -260,6 +234,7 @@ enum PaletteMode {
 /// One row in the filtered result list. Variants carry exactly the
 /// data the render pass needs — no `&'static Command` vs `&str`
 /// lifetime mixing.
+#[derive(Clone, Copy)]
 enum PaletteRow<'a> {
     Command {
         title: &'a str,
@@ -294,129 +269,68 @@ impl<'a> PaletteRow<'a> {
     }
 }
 
-/// Paint a rounded-rect outline by layering two filled rounded rects:
-/// the outer one in `stroke_color`, then a smaller one in `fill_color`
-/// inset by `stroke` on all sides to carve out the interior. Sugarloaf
-/// has no stroked-rect primitive, so this is how we get a 1px border
-/// effect. Nine params is the irreducible minimum here — grouping them
-/// into a struct would just shuffle the same fields.
-#[allow(clippy::too_many_arguments)]
-fn stroke_rounded_rect(
-    sugarloaf: &mut Sugarloaf,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-    stroke: f32,
-    radius: f32,
-    stroke_color: [f32; 4],
-    fill_color: [f32; 4],
-    depth: f32,
-    order: u8,
-) {
-    sugarloaf.rounded_rect(
-        None,
-        x,
-        y,
-        width,
-        height,
-        stroke_color,
-        depth,
-        radius,
-        order,
-    );
-    let inner_radius = (radius - stroke).max(0.0);
-    // Inset fill carves out the interior. Painted slightly deeper so
-    // it lands on top of the outer rect.
-    sugarloaf.rounded_rect(
-        None,
-        x + stroke,
-        y + stroke,
-        (width - stroke * 2.0).max(0.0),
-        (height - stroke * 2.0).max(0.0),
-        fill_color,
-        depth + 0.001,
-        inner_radius,
-        order,
-    );
+fn draw_copy_icon(sugarloaf: &mut Sugarloaf, x: f32, y: f32, color: [f32; 4]) {
+    for [x1, y1, x2, y2] in [
+        [x, y + 9.0, x, y],
+        [x, y, x + 8.0, y],
+        [x + 3.0, y + 3.0, x + 11.0, y + 3.0],
+        [x + 11.0, y + 3.0, x + 11.0, y + 13.0],
+        [x + 11.0, y + 13.0, x + 3.0, y + 13.0],
+        [x + 3.0, y + 13.0, x + 3.0, y + 3.0],
+    ] {
+        sugarloaf.line(x1, y1, x2, y2, 1.0, 0.2, color, ORDER + 2);
+    }
 }
 
-/// Paint a "copy" icon (two overlapping rounded page outlines)
-/// anchored at `(x, y)`. Drawn from rects only — no font glyph
-/// dependency — so it renders consistently regardless of what the
-/// user's font stack can produce for ⎘ / 📋 / similar.
-///
-/// `row_fill_color` is the background behind the icon (palette BG when
-/// the row is idle, selection highlight when hovered/selected); it's
-/// used to cut out the page interiors so the outlines read as a
-/// proper border rather than two solid blobs. Back page painted
-/// slightly below the front via depth so the front's cutout
-/// correctly hides the overlapping portion of the back's stroke.
-#[allow(clippy::too_many_arguments)]
-fn draw_copy_icon(
-    sugarloaf: &mut Sugarloaf,
-    x: f32,
-    y: f32,
-    stroke_color: [f32; 4],
-    row_fill_color: [f32; 4],
-    depth: f32,
-    order: u8,
-) {
-    // Back page (upper-left).
-    stroke_rounded_rect(
-        sugarloaf,
-        x,
-        y,
-        COPY_ICON_PAGE_W,
-        COPY_ICON_PAGE_H,
-        COPY_ICON_STROKE,
-        COPY_ICON_RADIUS,
-        stroke_color,
-        row_fill_color,
-        depth,
-        order,
-    );
-    // Front page (offset down-right), painted above the back so its
-    // cutout hides the back's overlapping interior.
-    stroke_rounded_rect(
-        sugarloaf,
-        x + COPY_ICON_OFFSET,
-        y + COPY_ICON_OFFSET,
-        COPY_ICON_PAGE_W,
-        COPY_ICON_PAGE_H,
-        COPY_ICON_STROKE,
-        COPY_ICON_RADIUS,
-        stroke_color,
-        row_fill_color,
-        depth + 0.01,
-        order,
-    );
+fn command_group(action: PaletteAction) -> (u8, &'static str) {
+    use PaletteAction::*;
+    match action {
+        SplitRight
+        | SplitDown
+        | SelectNextSplit
+        | SelectPrevSplit
+        | CloseCurrentSplitOrTab => (1, "Pane"),
+        IncreaseFontSize
+        | DecreaseFontSize
+        | ResetFontSize
+        | ToggleViMode
+        | ToggleAppearanceTheme
+        | ListFonts
+        | ConfigEditor => (2, "Appearance"),
+        Copy | Paste => (3, "Clipboard"),
+        SearchForward | SearchBackward | ClearHistory => (4, "Search"),
+        _ => (0, "Terminal"),
+    }
 }
 
-/// Fuzzy match: checks if all query chars appear in order in the target.
-/// Returns a score (higher = better match), or None if no match.
-fn fuzzy_score(query: &str, target: &str) -> Option<i32> {
+/// Normalize the query once per edit and avoid allocations for ASCII targets.
+fn score(query: &str, target: &str) -> Option<i32> {
     if query.is_empty() {
         return Some(0);
     }
+    if target.is_ascii() {
+        score_chars(
+            query,
+            target.bytes().map(|byte| byte.to_ascii_lowercase() as char),
+        )
+    } else {
+        score_chars(query, target.to_lowercase().chars())
+    }
+}
 
-    let query_lower = query.to_lowercase();
-    let mut query_chars = query_lower.chars();
+fn score_chars(query: &str, target: impl Iterator<Item = char>) -> Option<i32> {
+    let mut query_chars = query.chars();
     let mut query_char = query_chars.next()?;
-    let target_lower = target.to_lowercase();
-    let mut score: i32 = 0;
+    let mut score = 0;
     let mut prev_match = false;
     let mut first_match_pos = None;
     let mut previous = ' ';
-
-    for (ti, tc) in target_lower.chars().enumerate() {
+    for (ti, tc) in target.enumerate() {
         if tc == query_char {
             let first = *first_match_pos.get_or_insert(ti);
-            // Consecutive match bonus
             if prev_match {
                 score += 5;
             }
-            // Word boundary bonus (start of string or after space/punctuation)
             if !previous.is_alphanumeric() {
                 score += 10;
             }
@@ -424,54 +338,97 @@ fn fuzzy_score(query: &str, target: &str) -> Option<i32> {
             if let Some(next) = query_chars.next() {
                 query_char = next;
             } else {
-                return Some(score + (20_i32).saturating_sub(first as i32));
+                return Some(score + 20_i32.saturating_sub(first as i32));
             }
         } else {
             prev_match = false;
         }
         previous = tc;
     }
-
     None
 }
 
-/// Command palette UI component (Raycast-style)
+#[cfg(test)]
+fn fuzzy_score(query: &str, target: &str) -> Option<i32> {
+    score(&query.to_lowercase(), target)
+}
+
+struct Match {
+    score: i32,
+    source: usize,
+}
+
+struct Layout {
+    rect: [f32; 4],
+    rows: [(usize, f32); MAX_VISIBLE_RESULTS],
+    headings: [Option<(&'static str, f32)>; MAX_VISIBLE_RESULTS],
+    count: usize,
+    max_scroll_offset: usize,
+}
+
+/// Search results are rebuilt only on edits or mode changes. Rendering,
+/// navigation, and pointer handling share those results and the same layout.
 pub struct CommandPalette {
     enabled: bool,
-    pub query: String,
+    query: String,
     pub selected_index: usize,
     scroll_offset: usize,
-    pub has_adaptive_theme: bool,
-    /// Which list the palette is showing (commands or fonts).
+    has_adaptive_theme: bool,
     mode: PaletteMode,
-    /// Timestamp for caret blinking
+    matches: Vec<Match>,
+    content_height: f32,
+    theme: super::window_chrome::Theme,
+    font_library: Option<rio_backend::sugarloaf::font::FontLibrary>,
+    font_id: Option<usize>,
+    viewport_height: f32,
+    visible_results: usize,
     caret_blink_start: Instant,
-    /// Timestamp of the last event that actually changed `scroll_offset`.
-    /// Drives the scrollbar fade-in/fade-out, sharing the terminal
-    /// scrollbar's 2 s delay + 300 ms fade envelope via
-    /// `scrollbar::opacity_from_last_scroll`. `None` while the palette
-    /// has never scrolled since it opened — scrollbar stays hidden.
-    last_scroll_time: Option<Instant>,
+    caret_interval: Option<std::time::Duration>,
+    wheel_remainder: f64,
 }
 
 impl Default for CommandPalette {
     fn default() -> Self {
-        Self {
+        let mut palette = Self {
             enabled: false,
             query: String::new(),
             selected_index: 0,
             scroll_offset: 0,
             has_adaptive_theme: false,
             mode: PaletteMode::Commands,
+            matches: Vec::with_capacity(COMMANDS.len()),
+            content_height: 0.0,
+            theme: super::window_chrome::Theme::new(&Default::default()),
+            font_library: None,
+            font_id: None,
+            viewport_height: f32::INFINITY,
+            visible_results: MAX_VISIBLE_RESULTS,
             caret_blink_start: Instant::now(),
-            last_scroll_time: None,
-        }
+            caret_interval: None,
+            wheel_remainder: 0.0,
+        };
+        palette.rebuild_matches();
+        palette
     }
 }
 
 impl CommandPalette {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn configure(
+        &mut self,
+        colors: &rio_backend::config::colors::Colors,
+        adaptive: bool,
+        caret_interval: Option<std::time::Duration>,
+    ) {
+        self.caret_interval = caret_interval;
+        self.theme = super::window_chrome::Theme::new(colors);
+        if self.has_adaptive_theme != adaptive {
+            self.has_adaptive_theme = adaptive;
+            self.rebuild_matches();
+        }
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -481,55 +438,45 @@ impl CommandPalette {
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         if enabled {
-            self.query.clear();
-            self.selected_index = 0;
-            self.scroll_offset = 0;
-            self.caret_blink_start = Instant::now();
-            // Clear scrollbar history so reopening the palette never
-            // flashes a leftover scrollbar from the previous session.
-            self.last_scroll_time = None;
-            // Always re-open into Commands mode — a stale Fonts list
-            // from a previous session would be misleading (fonts may
-            // have changed) and surprising (user toggles palette and
-            // finds themselves on the font list).
             self.mode = PaletteMode::Commands;
+            self.set_query(String::new());
         }
     }
 
-    /// Swap the palette into font-browsing mode with the given family
-    /// list. Clears the query so the full list is visible, keeps the
-    /// palette open. Called by the router after the user picks the
-    /// `List Fonts` command.
     pub fn enter_fonts_mode(&mut self, fonts: Vec<String>) {
+        self.enabled = true;
         self.mode = PaletteMode::Fonts(fonts);
-        self.query.clear();
-        self.selected_index = 0;
-        self.scroll_offset = 0;
-        self.caret_blink_start = Instant::now();
-        self.last_scroll_time = None;
+        self.set_query(String::new());
     }
 
-    /// Append committed or typed text to the query, applying the
-    /// shared overlay input policy (`is_printable_text`) so the key
-    /// path and the IME commit path can never drift. Returns whether
-    /// anything was appended.
     pub fn append_query(&mut self, text: &str) -> bool {
         if !crate::renderer::is_printable_text(text) {
             return false;
         }
-        let query = format!("{}{}", self.query, text);
-        self.set_query(query);
+        self.query.push_str(text);
+        self.query_changed();
+        true
+    }
+
+    pub fn backspace(&mut self) -> bool {
+        if self.query.pop().is_none() {
+            return false;
+        }
+        self.query_changed();
         true
     }
 
     pub fn set_query(&mut self, query: String) {
         self.query = query;
+        self.query_changed();
+    }
+
+    fn query_changed(&mut self) {
         self.selected_index = 0;
         self.scroll_offset = 0;
         self.caret_blink_start = Instant::now();
-        // Typing reshapes the list entirely — drop any scrollbar
-        // fade state so the next scroll starts with a clean timer.
-        self.last_scroll_time = None;
+        self.wheel_remainder = 0.0;
+        self.rebuild_matches();
     }
 
     pub fn move_selection_up(&mut self) {
@@ -537,98 +484,219 @@ impl CommandPalette {
             self.selected_index -= 1;
             if self.selected_index < self.scroll_offset {
                 self.scroll_offset = self.selected_index;
-                self.last_scroll_time = Some(Instant::now());
             }
         }
     }
 
     pub fn move_selection_down(&mut self) {
-        let count = self.filtered_rows().len();
-        if self.selected_index < count.saturating_sub(1) {
+        if self.selected_index < self.matches.len().saturating_sub(1) {
             self.selected_index += 1;
-            if self.selected_index >= self.scroll_offset + MAX_VISIBLE_RESULTS {
-                self.scroll_offset = self.selected_index - MAX_VISIBLE_RESULTS + 1;
-                self.last_scroll_time = Some(Instant::now());
+            if self.selected_index >= self.scroll_offset + self.visible_results {
+                self.scroll_offset = self.selected_index + 1 - self.visible_results;
             }
         }
     }
 
     pub fn get_selected_action(&self) -> Option<PaletteAction> {
-        self.filtered_rows()
+        self.matches
             .get(self.selected_index)
-            .and_then(|(_, row)| row.action())
+            .and_then(|m| self.row(m.source).action())
     }
 
-    /// Selected family name if (and only if) the palette is in fonts
-    /// mode and the selection points at a valid row. Owned `String`
-    /// so the caller can mutate the palette state (`set_enabled`) in
-    /// the same statement without fighting the borrow checker.
+    /// Wheel deltas use rows; retain trackpad fractions between events.
+    pub fn scroll(&mut self, lines: f64, scale: f32) -> bool {
+        self.wheel_remainder -= lines;
+        let rows = self.wheel_remainder.trunc() as isize;
+        self.wheel_remainder -= rows as f64;
+        // Horizontal geometry does not affect row capacity.
+        let layout = self.layout(PALETTE_WIDTH * scale, scale);
+        let offset = self
+            .scroll_offset
+            .saturating_add_signed(rows)
+            .min(layout.max_scroll_offset);
+        if offset == self.scroll_offset {
+            return false;
+        }
+        self.scroll_offset = offset;
+        let count = self.layout(PALETTE_WIDTH * scale, scale).count;
+        self.selected_index = self
+            .selected_index
+            .clamp(offset, offset + count.saturating_sub(1));
+        true
+    }
+
+    pub fn scroll_pixels(&mut self, pixels: f64, scale: f64) -> bool {
+        self.scroll(
+            pixels / (f64::from(RESULT_ITEM_HEIGHT) * scale),
+            scale as f32,
+        )
+    }
+
     pub fn get_selected_font(&self) -> Option<String> {
-        self.filtered_rows()
-            .get(self.selected_index)
-            .and_then(|(_, row)| match row {
-                PaletteRow::Font { family } => Some((*family).to_owned()),
-                PaletteRow::Command { .. } => None,
-            })
+        match self.row(self.matches.get(self.selected_index)?.source) {
+            PaletteRow::Font { family } => Some(family.to_owned()),
+            _ => None,
+        }
     }
 
-    /// Filtered list of rows for the current mode. Both modes share
-    /// the same fuzzy-score + sort pipeline so typing behaves
-    /// identically in either view.
-    fn filtered_rows(&self) -> Vec<(i32, PaletteRow<'_>)> {
-        let mut results: Vec<(i32, PaletteRow<'_>)> = match &self.mode {
+    fn row(&self, source: usize) -> PaletteRow<'_> {
+        match &self.mode {
             PaletteMode::Commands => {
-                let has_adaptive = self.has_adaptive_theme;
-                COMMANDS
-                    .iter()
-                    .filter(|cmd| {
-                        if cmd.action == PaletteAction::ToggleAppearanceTheme {
-                            return has_adaptive;
-                        }
-                        true
-                    })
-                    .filter_map(|cmd| {
-                        let score = fuzzy_score(&self.query, cmd.title)?;
-                        Some((
-                            score,
-                            PaletteRow::Command {
-                                title: cmd.title,
-                                shortcut: cmd.shortcut,
-                                action: cmd.action,
-                            },
-                        ))
-                    })
-                    .collect()
+                let command = &COMMANDS[source];
+                PaletteRow::Command {
+                    title: command.title,
+                    shortcut: command.shortcut,
+                    action: command.action,
+                }
             }
-            PaletteMode::Fonts(fonts) => fonts
-                .iter()
-                .filter_map(|family| {
-                    let score = fuzzy_score(&self.query, family)?;
-                    Some((score, PaletteRow::Font { family }))
-                })
-                .collect(),
+            PaletteMode::Fonts(fonts) => PaletteRow::Font {
+                family: &fonts[source],
+            },
+        }
+    }
+
+    fn rebuild_matches(&mut self) {
+        #[cfg(feature = "profiling")]
+        let _timing = crate::profiling::span("palette.filter");
+        let query = self.query.to_lowercase();
+        self.matches.clear();
+        match &self.mode {
+            PaletteMode::Commands => {
+                for (source, command) in COMMANDS.iter().enumerate() {
+                    if command.action == PaletteAction::ToggleAppearanceTheme
+                        && !self.has_adaptive_theme
+                    {
+                        continue;
+                    }
+                    if let Some(score) = score(&query, command.title) {
+                        self.matches.push(Match { score, source });
+                    }
+                }
+            }
+            PaletteMode::Fonts(fonts) => {
+                for (source, family) in fonts.iter().enumerate() {
+                    if let Some(score) = score(&query, family) {
+                        self.matches.push(Match { score, source });
+                    }
+                }
+            }
+        }
+        let grouped = matches!(self.mode, PaletteMode::Commands);
+        self.matches.sort_unstable_by_key(|m| {
+            (
+                if grouped {
+                    command_group(COMMANDS[m.source].action).0
+                } else {
+                    0
+                },
+                std::cmp::Reverse(m.score),
+                m.source,
+            )
+        });
+        let mut previous_group = None;
+        self.content_height = 0.0;
+        for index in 0..self.matches.len() {
+            let group = self.group(index);
+            self.content_height += RESULT_ITEM_HEIGHT;
+            if group.is_some_and(|g| g.0 != 0 && Some(g.0) != previous_group) {
+                self.content_height += GROUP_HEIGHT;
+            }
+            previous_group = group.map(|g| g.0);
+        }
+    }
+
+    fn group(&self, index: usize) -> Option<(u8, &'static str)> {
+        self.row(self.matches[index].source)
+            .action()
+            .map(command_group)
+    }
+
+    #[cfg(test)]
+    fn filtered_rows(&self) -> Vec<(i32, PaletteRow<'_>)> {
+        self.matches
+            .iter()
+            .map(|m| (m.score, self.row(m.source)))
+            .collect()
+    }
+
+    fn layout(&self, window_width: f32, scale: f32) -> Layout {
+        let width =
+            PALETTE_WIDTH.min((window_width / scale - VIEWPORT_MARGIN * 2.0).max(1.0));
+        let x = super::window_chrome::snap((window_width / scale - width) / 2.0, scale);
+        let y = super::window_chrome::snap(
+            PALETTE_MARGIN_TOP.min(self.viewport_height * PALETTE_TOP_FRACTION),
+            scale,
+        );
+        let results_top = y + PALETTE_PADDING + INPUT_HEIGHT + PALETTE_PADDING;
+        // Group headings consume space inside this viewport, never change its
+        // height as selection or the first visible group changes.
+        let results_height = self
+            .content_height
+            .max(RESULT_ITEM_HEIGHT)
+            .min(MAX_VISIBLE_RESULTS as f32 * RESULT_ITEM_HEIGHT)
+            .min(
+                (self.viewport_height - VIEWPORT_MARGIN - results_top - PALETTE_PADDING)
+                    .max(0.0),
+            );
+        let bottom = results_top + results_height;
+        let show_headings = results_height >= GROUP_HEIGHT + RESULT_ITEM_HEIGHT;
+        let mut layout = Layout {
+            rect: [x, y, width, bottom - y + PALETTE_PADDING],
+            rows: [(0, 0.0); MAX_VISIBLE_RESULTS],
+            headings: [None; MAX_VISIBLE_RESULTS],
+            count: 0,
+            max_scroll_offset: self.matches.len().saturating_sub(1),
         };
-
-        results.sort_by_key(|r| std::cmp::Reverse(r.0));
-        results
+        // Fit the last page backwards too, so wheel scrolling cannot leave a
+        // nearly empty page or stop before the final grouped result.
+        let mut used = 0.0;
+        let mut next_group = None;
+        for index in (0..self.matches.len()).rev().take(MAX_VISIBLE_RESULTS) {
+            let group = self.group(index);
+            if show_headings
+                && next_group.is_some_and(|g: (u8, &str)| {
+                    g.0 != 0 && Some(g.0) != group.map(|g| g.0)
+                })
+            {
+                used += GROUP_HEIGHT;
+            }
+            used += RESULT_ITEM_HEIGHT;
+            let heading = if show_headings && group.is_some_and(|g| g.0 != 0) {
+                GROUP_HEIGHT
+            } else {
+                0.0
+            };
+            if used + heading > results_height {
+                break;
+            }
+            layout.max_scroll_offset = index;
+            next_group = group;
+        }
+        let mut cursor = results_top;
+        let mut previous_group = None;
+        for index in self.scroll_offset..self.matches.len() {
+            if layout.count == MAX_VISIBLE_RESULTS {
+                break;
+            }
+            let group = self.group(index);
+            let heading = group
+                .filter(|g| show_headings && g.0 != 0 && Some(g.0) != previous_group);
+            let heading_height = if heading.is_some() { GROUP_HEIGHT } else { 0.0 };
+            if cursor + heading_height + RESULT_ITEM_HEIGHT > bottom {
+                break;
+            }
+            if let Some((_, title)) = heading {
+                layout.headings[layout.count] = Some((title, cursor));
+                cursor += GROUP_HEIGHT;
+            }
+            layout.rows[layout.count] = (index, cursor);
+            layout.count += 1;
+            cursor += RESULT_ITEM_HEIGHT;
+            previous_group = group.map(|g| g.0);
+        }
+        layout
     }
 
-    /// Returns the palette geometry (x, y, width, height) for hit-testing.
-    fn palette_rect(&self, window_width: f32, scale_factor: f32) -> (f32, f32, f32, f32) {
-        let px = (window_width / scale_factor - PALETTE_WIDTH) / 2.0;
-        let py = PALETTE_MARGIN_TOP;
-        let h = PALETTE_PADDING
-            + INPUT_HEIGHT
-            + SEPARATOR_HEIGHT
-            + RESULTS_MARGIN_TOP
-            + RESULT_ITEM_HEIGHT * MAX_VISIBLE_RESULTS as f32
-            + PALETTE_PADDING;
-        (px, py, PALETTE_WIDTH, h)
-    }
-
-    /// Hit-test a mouse click. Returns Some(index) if a result row was clicked,
-    /// or None if clicked outside the palette or on the input area.
-    /// Returns Err(()) if clicked outside the palette entirely (should close).
     pub fn hit_test(
         &self,
         mouse_x: f32,
@@ -636,33 +704,18 @@ impl CommandPalette {
         window_width: f32,
         scale_factor: f32,
     ) -> Result<Option<usize>, ()> {
-        let (px, py, pw, ph) = self.palette_rect(window_width, scale_factor);
-
-        // Outside palette bounds
-        if mouse_x < px || mouse_x > px + pw || mouse_y < py || mouse_y > py + ph {
-            return Err(()); // Close palette
+        let layout = self.layout(window_width, scale_factor);
+        let [x, y, w, h] = layout.rect;
+        if mouse_x < x || mouse_x >= x + w || mouse_y < y || mouse_y >= y + h {
+            return Err(());
         }
-
-        // Results area starts after input + separator
-        let results_y =
-            py + PALETTE_PADDING + INPUT_HEIGHT + SEPARATOR_HEIGHT + RESULTS_MARGIN_TOP;
-        if mouse_y < results_y {
-            return Ok(None); // Clicked on input area
-        }
-
-        let relative_y = mouse_y - results_y;
-        let row = (relative_y / RESULT_ITEM_HEIGHT) as usize;
-        let filtered_count = self.filtered_rows().len();
-        let actual_index = self.scroll_offset + row;
-
-        if actual_index < filtered_count {
-            Ok(Some(actual_index))
-        } else {
-            Ok(None)
-        }
+        Ok(layout.rows[..layout.count]
+            .iter()
+            .find_map(|&(index, top)| {
+                (mouse_y >= top && mouse_y < top + RESULT_ITEM_HEIGHT).then_some(index)
+            }))
     }
 
-    /// Update selection based on mouse position. Returns true if selection changed.
     pub fn hover(
         &mut self,
         mouse_x: f32,
@@ -681,241 +734,305 @@ impl CommandPalette {
         false
     }
 
+    pub fn next_frame_in(&self) -> Option<std::time::Duration> {
+        if !self.enabled {
+            return None;
+        }
+        use std::time::Duration;
+        self.caret_interval.map(|interval| {
+            let interval_ms = interval.as_millis().max(1);
+            Duration::from_millis(
+                (interval_ms - self.caret_blink_start.elapsed().as_millis() % interval_ms)
+                    as u64,
+            )
+        })
+    }
+
     pub fn render(&mut self, sugarloaf: &mut Sugarloaf, dimensions: (f32, f32, f32)) {
         if !self.enabled {
-            // Immediate mode: not drawing == not visible.
             return;
         }
-
-        let (window_width, window_height, scale_factor) = dimensions;
-
-        let (palette_x, palette_y, palette_width, palette_height) =
-            self.palette_rect(window_width, scale_factor);
-
-        sugarloaf.rect(
-            None,
-            0.0,
-            0.0,
-            window_width / scale_factor,
-            window_height / scale_factor,
-            BACKDROP_COLOR,
-            DEPTH_BACKDROP,
-            ORDER,
-        );
-
+        #[cfg(feature = "profiling")]
+        let _timing = crate::profiling::span("palette.render");
+        use super::window_chrome::{alpha, centered_text_y, snap};
+        let (window_width, window_height, scale) = dimensions;
+        self.viewport_height = window_height / scale;
+        let library = sugarloaf.font_library();
+        if self
+            .font_library
+            .as_ref()
+            .is_none_or(|old| !std::sync::Arc::ptr_eq(&old.inner, &library.inner))
+        {
+            self.font_id = super::window_chrome::load_ui_font(library);
+            self.font_library = Some(library.clone());
+        }
+        let mut layout = self.layout(window_width, scale);
+        if self.scroll_offset > layout.max_scroll_offset {
+            self.scroll_offset = layout.max_scroll_offset;
+            layout = self.layout(window_width, scale);
+        }
+        while layout.count > 0 && self.selected_index >= self.scroll_offset + layout.count
+        {
+            self.scroll_offset += 1;
+            layout = self.layout(window_width, scale);
+        }
+        self.visible_results = layout.count.max(1);
+        let [x, y, width, height] = layout.rect;
+        let theme = self.theme;
+        let opts = |size, color| DrawOpts {
+            font_size: snap(size, scale),
+            font_id: self.font_id,
+            color: color_u8(color),
+            ..DrawOpts::default()
+        };
         sugarloaf.rounded_rect(
             None,
-            palette_x,
-            palette_y,
-            palette_width,
-            palette_height,
-            BG_COLOR,
-            DEPTH_BG,
+            x,
+            y,
+            width,
+            height,
+            theme.border,
+            0.1,
             PALETTE_CORNER_RADIUS,
             ORDER,
         );
-
-        let input_x = palette_x + PALETTE_PADDING;
-        let input_y = palette_y + PALETTE_PADDING;
-        let input_width = palette_width - PALETTE_PADDING * 2.0;
-
-        // No separate input background — blends with palette bg for minimalism
-
-        let placeholder = match self.mode {
-            PaletteMode::Commands => "Type a command...",
-            PaletteMode::Fonts(_) => "Type a font name...",
-        };
-        let display_text = if self.query.is_empty() {
-            placeholder
-        } else {
-            self.query.as_str()
-        };
-        let text_color = if self.query.is_empty() {
-            DIM_TEXT_COLOR
-        } else {
-            TEXT_COLOR
-        };
-
-        let text_x = input_x + INPUT_PADDING_X;
-        let text_y = input_y + (INPUT_HEIGHT - INPUT_FONT_SIZE) / 2.0;
-        let input_opts = DrawOpts {
-            font_size: INPUT_FONT_SIZE,
-            color: color_u8(text_color),
-            ..DrawOpts::default()
-        };
-        let input_rendered_width =
-            sugarloaf
-                .text_mut()
-                .draw(text_x, text_y, display_text, &input_opts);
-
-        let elapsed_ms = self.caret_blink_start.elapsed().as_millis();
-        let caret_visible = (elapsed_ms / CARET_BLINK_MS).is_multiple_of(2);
-
-        if caret_visible {
-            let text_width = if self.query.is_empty() {
-                0.0
-            } else {
-                input_rendered_width
-            };
-
-            let caret_x = text_x + text_width;
-            let caret_height = INPUT_FONT_SIZE + 4.0;
-            let caret_y = input_y + (INPUT_HEIGHT - caret_height) / 2.0 + 2.0;
-
-            sugarloaf.rect(
-                None,
-                caret_x,
-                caret_y,
-                CARET_WIDTH,
-                caret_height,
-                TEXT_COLOR,
-                DEPTH_ELEMENT,
-                ORDER,
-            );
-        }
-
-        let sep_y = input_y + INPUT_HEIGHT;
-        sugarloaf.rect(
+        let pixel = 1.0 / scale;
+        sugarloaf.rounded_rect(
             None,
-            palette_x + PALETTE_PADDING,
-            sep_y,
-            palette_width - PALETTE_PADDING * 2.0,
-            SEPARATOR_HEIGHT,
-            SEPARATOR_COLOR,
-            DEPTH_ELEMENT,
+            x + pixel,
+            y + pixel,
+            width - 2.0 * pixel,
+            height - 2.0 * pixel,
+            theme.surface,
+            0.11,
+            PALETTE_CORNER_RADIUS - pixel,
             ORDER,
         );
-
-        let results_y = sep_y + SEPARATOR_HEIGHT + RESULTS_MARGIN_TOP;
-        let filtered = self.filtered_rows();
-
-        let shortcut_opts = DrawOpts {
-            font_size: SHORTCUT_FONT_SIZE,
-            color: color_u8(SHORTCUT_TEXT_COLOR),
-            ..DrawOpts::default()
+        let input_x = x + PALETTE_PADDING;
+        let input_y = y + PALETTE_PADDING;
+        let input_width = width - PALETTE_PADDING * 2.0;
+        sugarloaf.rounded_rect(
+            None,
+            input_x,
+            input_y,
+            input_width,
+            INPUT_HEIGHT,
+            theme.hover,
+            0.2,
+            INPUT_RADIUS,
+            ORDER + 1,
+        );
+        let cy = input_y + INPUT_HEIGHT / 2.0;
+        // Search lens, using the input fill for its transparent-looking center.
+        let lens_radius = (ICON_SIZE - ICON_STROKE) / 2.0 - ICON_STROKE;
+        let lens_x = input_x + INPUT_PADDING_X;
+        sugarloaf.rounded_rect(
+            None,
+            lens_x,
+            cy - ICON_SIZE / 2.0,
+            lens_radius * 2.0,
+            lens_radius * 2.0,
+            theme.muted,
+            0.21,
+            lens_radius,
+            ORDER + 2,
+        );
+        sugarloaf.rounded_rect(
+            None,
+            lens_x + ICON_STROKE,
+            cy - ICON_SIZE / 2.0 + ICON_STROKE,
+            (lens_radius - ICON_STROKE) * 2.0,
+            (lens_radius - ICON_STROKE) * 2.0,
+            theme.hover,
+            0.22,
+            lens_radius - ICON_STROKE,
+            ORDER + 2,
+        );
+        sugarloaf.line(
+            lens_x + lens_radius * (1.0 + std::f32::consts::FRAC_1_SQRT_2),
+            cy - ICON_SIZE / 2.0 + lens_radius * (1.0 + std::f32::consts::FRAC_1_SQRT_2),
+            lens_x + ICON_SIZE,
+            cy + ICON_SIZE / 2.0,
+            ICON_STROKE,
+            0.2,
+            theme.muted,
+            ORDER + 2,
+        );
+        let text_x = input_x + INPUT_TEXT_INSET;
+        let input_opts = opts(
+            INPUT_FONT_SIZE,
+            if self.query.is_empty() {
+                theme.muted
+            } else {
+                theme.foreground
+            },
+        );
+        let placeholder = if matches!(self.mode, PaletteMode::Fonts(_)) {
+            "Search fonts…"
+        } else {
+            "Search commands…"
         };
-
-        for (display_i, (_, row)) in filtered
-            .iter()
-            .skip(self.scroll_offset)
-            .take(MAX_VISIBLE_RESULTS)
-            .enumerate()
-        {
-            let actual_index = self.scroll_offset + display_i;
-            let item_y = results_y + RESULT_ITEM_HEIGHT * display_i as f32;
-            let is_selected = actual_index == self.selected_index;
-
-            // Selection highlight
-            if is_selected {
+        let input_budget = (input_width - INPUT_TEXT_INSET - INPUT_PADDING_X).max(0.0);
+        let text_width = if self.query.is_empty() {
+            0.0
+        } else {
+            sugarloaf.text_mut().measure(&self.query, &input_opts)
+        };
+        let start = sugarloaf.text_mut().instances().len();
+        // Keep the typing baseline fixed to the placeholder's visible bounds.
+        let text_y = centered_text_y(sugarloaf, placeholder, cy, &input_opts);
+        sugarloaf.text_mut().draw(
+            text_x - (text_width - input_budget).max(0.0),
+            text_y,
+            if self.query.is_empty() {
+                placeholder
+            } else {
+                &self.query
+            },
+            &input_opts,
+        );
+        sugarloaf
+            .text_mut()
+            .exclude_horizontal_range_since(start, [f32::MIN, text_x - 1.0]);
+        sugarloaf
+            .text_mut()
+            .exclude_horizontal_range_since(start, [text_x + input_budget, f32::MAX]);
+        if self.caret_interval.is_none_or(|interval| {
+            (self.caret_blink_start.elapsed().as_millis() / interval.as_millis().max(1))
+                .is_multiple_of(2)
+        }) {
+            sugarloaf.rect(
+                None,
+                snap(text_x + text_width.min(input_budget), scale),
+                snap(cy - INPUT_FONT_SIZE / 2.0, scale),
+                pixel,
+                INPUT_FONT_SIZE,
+                theme.foreground,
+                0.2,
+                ORDER + 2,
+            );
+        }
+        let result_opts = opts(RESULT_FONT_SIZE, theme.foreground);
+        let selected_opts = opts(RESULT_FONT_SIZE, theme.on_accent);
+        let shortcut_opts = opts(SHORTCUT_FONT_SIZE, theme.muted);
+        let selected_shortcut_opts =
+            opts(SHORTCUT_FONT_SIZE, alpha(theme.on_accent, 0.75));
+        // A shared cap-height baseline keeps rows aligned without measuring
+        // every label's glyph bounds on each frame.
+        let result_y = centered_text_y(sugarloaf, "H", 0.0, &result_opts);
+        let shortcut_y = centered_text_y(sugarloaf, "H", 0.0, &shortcut_opts);
+        for heading in layout.headings.iter().flatten() {
+            sugarloaf.text_mut().draw(
+                input_x + INPUT_PADDING_X,
+                heading.1 + GROUP_HEIGHT / 2.0 + shortcut_y,
+                heading.0,
+                &shortcut_opts,
+            );
+        }
+        if self.matches.is_empty() {
+            let text_y = centered_text_y(
+                sugarloaf,
+                "No matches found",
+                input_y + INPUT_HEIGHT + PALETTE_PADDING + RESULT_ITEM_HEIGHT / 2.0,
+                &shortcut_opts,
+            );
+            sugarloaf.text_mut().draw(
+                input_x + INPUT_PADDING_X,
+                text_y,
+                "No matches found",
+                &shortcut_opts,
+            );
+        }
+        for &(index, top) in &layout.rows[..layout.count] {
+            let row = self.row(self.matches[index].source);
+            let selected = index == self.selected_index;
+            if selected {
                 sugarloaf.rounded_rect(
                     None,
                     input_x,
-                    item_y,
+                    top,
                     input_width,
                     RESULT_ITEM_HEIGHT,
-                    SELECTED_BG_COLOR,
-                    DEPTH_ELEMENT,
-                    4.0,
-                    ORDER,
+                    theme.accent,
+                    0.2,
+                    RESULT_RADIUS,
+                    ORDER + 1,
                 );
             }
-
-            let result_opts = DrawOpts {
-                font_size: RESULT_FONT_SIZE,
-                color: color_u8(if is_selected {
-                    TEXT_COLOR
-                } else {
-                    [0.55, 0.55, 0.55, 1.0]
-                }),
-                ..DrawOpts::default()
+            let cy = top + RESULT_ITEM_HEIGHT / 2.0;
+            let (text_opts, hint_opts) = if selected {
+                (&selected_opts, &selected_shortcut_opts)
+            } else {
+                (&result_opts, &shortcut_opts)
             };
-            let row_text_x = input_x + INPUT_PADDING_X;
-            let row_text_y = item_y + (RESULT_ITEM_HEIGHT - RESULT_FONT_SIZE) / 2.0;
-            sugarloaf
-                .text_mut()
-                .draw(row_text_x, row_text_y, row.title(), &result_opts);
-
-            // Right-side hint: shortcut for commands, copy icon for
-            // font rows (signals "Enter copies this to clipboard").
             let shortcut = row.shortcut();
-            let is_font_row = matches!(row, PaletteRow::Font { .. });
+            let hint_width = if shortcut.is_empty() {
+                0.0
+            } else {
+                sugarloaf.text_mut().measure(shortcut, hint_opts) + HINT_GAP
+            };
+            let copy_width = if matches!(row, PaletteRow::Font { .. }) {
+                ICON_SIZE + PALETTE_PADDING
+            } else {
+                0.0
+            };
+            let budget =
+                (input_width - INPUT_PADDING_X * 2.0 - hint_width - copy_width).max(0.0);
+            let title =
+                super::window_chrome::fit_text(sugarloaf, row.title(), budget, text_opts);
+            sugarloaf.text_mut().draw(
+                input_x + INPUT_PADDING_X,
+                cy + result_y,
+                &title,
+                text_opts,
+            );
             if !shortcut.is_empty() {
-                let ui = sugarloaf.text_mut();
-                let shortcut_width = ui.measure(shortcut, &shortcut_opts);
-                let shortcut_x = input_x + input_width - INPUT_PADDING_X - shortcut_width;
-                let shortcut_y = item_y + (RESULT_ITEM_HEIGHT - SHORTCUT_FONT_SIZE) / 2.0;
-                ui.draw(shortcut_x, shortcut_y, shortcut, &shortcut_opts);
+                let width = sugarloaf.text_mut().measure(shortcut, hint_opts);
+                if width < input_width - INPUT_PADDING_X * 2.0 {
+                    sugarloaf.text_mut().draw(
+                        input_x + input_width - INPUT_PADDING_X - width,
+                        cy + shortcut_y,
+                        shortcut,
+                        hint_opts,
+                    );
+                }
             }
-
-            if is_font_row {
-                let stroke_color = if is_selected {
-                    TEXT_COLOR
-                } else {
-                    SHORTCUT_TEXT_COLOR
-                };
-                // Cutout inside each page uses the row's own background
-                // so the border reads as a clean outline on either
-                // palette-bg (idle) or selection-highlight-bg (hovered).
-                let row_fill_color = if is_selected {
-                    SELECTED_BG_COLOR
-                } else {
-                    BG_COLOR
-                };
-                let icon_x = input_x + input_width - INPUT_PADDING_X - COPY_ICON_W;
-                let icon_y = item_y + (RESULT_ITEM_HEIGHT - COPY_ICON_H) / 2.0;
+            if matches!(row, PaletteRow::Font { .. }) {
                 draw_copy_icon(
                     sugarloaf,
-                    icon_x,
-                    icon_y,
-                    stroke_color,
-                    row_fill_color,
-                    DEPTH_ELEMENT,
-                    ORDER,
+                    input_x + input_width - INPUT_PADDING_X - ICON_SIZE,
+                    cy - ICON_SIZE / 2.0,
+                    if selected {
+                        theme.on_accent
+                    } else {
+                        theme.muted
+                    },
                 );
             }
         }
-
-        // Scrollbar: shares the terminal scrollbar's visual language
-        // (6 px wide, gray semi-transparent, 2 s visibility + 300 ms
-        // fade after the last scroll event) via `renderer::scrollbar`.
-        // Drawn only when the palette has actually been scrolled —
-        // hidden on first open, faded out 2.3 s after the last scroll.
-        let total = filtered.len();
-        let track_height = MAX_VISIBLE_RESULTS as f32 * RESULT_ITEM_HEIGHT;
-        let normalized = if total > MAX_VISIBLE_RESULTS {
-            self.scroll_offset as f32 / (total - MAX_VISIBLE_RESULTS) as f32
-        } else {
-            0.0
-        };
-        if let Some((thumb_y, thumb_height)) = scrollbar::compute_thumb(
-            MAX_VISIBLE_RESULTS,
-            total,
-            results_y,
-            track_height,
-            normalized,
-        ) {
-            let opacity = scrollbar::opacity_from_last_scroll(
-                self.last_scroll_time,
-                false, // palette has no drag interaction
-            );
-            let bar_x = input_x + input_width
-                - scrollbar::SCROLLBAR_WIDTH
-                - scrollbar::SCROLLBAR_MARGIN;
-            // Palette backdrop + bg rects use ORDER=20; the terminal
-            // scrollbar's default ORDER=5 would land *under* them and
-            // be invisible. Piggy-back on the palette's own order, at
-            // a depth slightly above the selection highlight so a
-            // hovered row doesn't mask the thumb.
-            scrollbar::draw_thumb(
-                sugarloaf,
-                bar_x,
-                thumb_y,
-                thumb_height,
-                opacity,
-                false,
-                DEPTH_ELEMENT + 0.05,
-                ORDER,
-            );
+        if self.matches.len() > layout.count && layout.count > 0 {
+            let top = layout.rows[0].1;
+            let track = y + height - PALETTE_PADDING - top;
+            let normalized =
+                self.scroll_offset as f32 / (self.matches.len() - layout.count) as f32;
+            if let Some((thumb_y, thumb_height)) = scrollbar::compute_thumb(
+                layout.count,
+                self.matches.len(),
+                top,
+                track,
+                normalized,
+            ) {
+                scrollbar::draw_thumb(
+                    sugarloaf,
+                    x + width - (PALETTE_PADDING + scrollbar::SCROLLBAR_WIDTH) / 2.0,
+                    thumb_y,
+                    thumb_height,
+                    SCROLLBAR_OPACITY,
+                    false,
+                    0.3,
+                    ORDER + 2,
+                );
+            }
         }
     }
 }
@@ -949,7 +1066,7 @@ mod tests {
     #[test]
     fn test_filtered_commands_by_title() {
         let mut palette = CommandPalette::new();
-        palette.query = "split".to_string();
+        palette.set_query("split".to_string());
         let filtered = palette.filtered_rows();
         assert!(filtered.len() >= 2);
         for (_, row) in &filtered {
@@ -960,7 +1077,7 @@ mod tests {
     #[test]
     fn test_filtered_commands_case_insensitive() {
         let mut palette = CommandPalette::new();
-        palette.query = "QUIT".to_string();
+        palette.set_query("QUIT".to_string());
         let filtered = palette.filtered_rows();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].1.title(), "Quit");
@@ -969,7 +1086,7 @@ mod tests {
     #[test]
     fn test_fuzzy_matching() {
         let mut palette = CommandPalette::new();
-        palette.query = "nt".to_string(); // Should match "New Tab", "Next Tab", etc.
+        palette.set_query("nt".to_string()); // Should match "New Tab", "Next Tab", etc.
         let filtered = palette.filtered_rows();
         assert!(!filtered.is_empty());
     }
@@ -1169,64 +1286,44 @@ mod tests {
         assert!(palette.get_selected_font().is_none());
     }
 
-    // Scrollbar geometry + fade math live in `renderer::scrollbar` and
-    // are tested there. The tests below cover the palette's own contract:
-    // the scrollbar only surfaces after the user actually scrolls, and
-    // resets when the list reshapes.
-
     #[test]
-    fn scrollbar_hidden_until_first_scroll() {
-        // Long list, palette just opened — no scroll event has happened,
-        // so the fade timer is `None` and the scrollbar stays invisible
-        // despite the list being taller than the visible window.
+    fn overflowing_results_have_a_scrollbar_on_open() {
         let mut palette = CommandPalette::new();
         palette.enter_fonts_mode((0..50).map(|i| format!("Family {i:02}")).collect());
-        assert!(palette.last_scroll_time.is_none());
+        let layout = palette.layout(1200.0, 1.0);
+        assert!(layout.count > 0 && layout.count < palette.matches.len());
+        assert_eq!(palette.scroll_offset, 0);
     }
 
     #[test]
-    fn scrollbar_triggered_only_when_offset_actually_changes() {
-        // The first few `move_selection_down` calls don't change
-        // `scroll_offset` (selection walks within the visible window).
-        // Only when selection crosses the window boundary does
-        // `scroll_offset` bump, and only then does the scrollbar wake.
+    fn scrolling_preserves_viewport_height() {
         let mut palette = CommandPalette::new();
-        palette.enter_fonts_mode((0..50).map(|i| format!("Family {i:02}")).collect());
-        for _ in 0..MAX_VISIBLE_RESULTS {
+        let height = palette.layout(1200.0, 1.0).rect[3];
+        for _ in 0..COMMANDS.len() {
             palette.move_selection_down();
+            assert_eq!(palette.layout(1200.0, 1.0).rect[3], height);
         }
-        // At this point selection has just crossed into scroll territory.
-        assert!(palette.last_scroll_time.is_some());
     }
 
     #[test]
-    fn scrollbar_timer_reset_on_query_change() {
-        // Typing re-filters the list, which can shrink it below the
-        // visible window. Any stale scrollbar timer must clear so a
-        // leftover thumb doesn't linger over the new short list.
+    fn scroll_reset_on_query_change() {
         let mut palette = CommandPalette::new();
         palette.enter_fonts_mode((0..50).map(|i| format!("Family {i:02}")).collect());
-        for _ in 0..MAX_VISIBLE_RESULTS {
-            palette.move_selection_down();
-        }
-        assert!(palette.last_scroll_time.is_some());
+        assert!(palette.scroll(-1.5, 1.0));
         palette.set_query("Family 00".to_string());
-        assert!(palette.last_scroll_time.is_none());
+        assert_eq!(palette.scroll_offset, 0);
+        assert_eq!(palette.wheel_remainder, 0.0);
     }
 
     #[test]
-    fn scrollbar_timer_reset_on_palette_reopen() {
-        // Closing and re-opening the palette must drop any lingering
-        // scrollbar state so the user doesn't see a fading thumb on a
-        // fresh palette.
+    fn scroll_reset_on_palette_reopen() {
         let mut palette = CommandPalette::new();
         palette.enter_fonts_mode((0..50).map(|i| format!("Family {i:02}")).collect());
-        for _ in 0..MAX_VISIBLE_RESULTS {
-            palette.move_selection_down();
-        }
+        assert!(palette.scroll(-1.5, 1.0));
         palette.set_enabled(false);
         palette.set_enabled(true);
-        assert!(palette.last_scroll_time.is_none());
+        assert_eq!(palette.scroll_offset, 0);
+        assert_eq!(palette.wheel_remainder, 0.0);
     }
 
     #[test]

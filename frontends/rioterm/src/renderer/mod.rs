@@ -237,6 +237,7 @@ impl Renderer {
                 config.navigation.hide_if_single,
                 config.navigation.max_tab_width,
             );
+            island.update_colors(&named_colors);
             island.configure(&config.navigation);
             Some(island)
         } else {
@@ -263,7 +264,15 @@ impl Renderer {
             island,
             command_palette: {
                 let mut palette = command_palette::CommandPalette::new();
-                palette.has_adaptive_theme = config.adaptive_colors.is_some();
+                palette.configure(
+                    &named_colors,
+                    config.adaptive_colors.is_some(),
+                    config.cursor.blinking.then(|| {
+                        std::time::Duration::from_millis(
+                            config.cursor.blinking_interval.clamp(350, 1200),
+                        )
+                    }),
+                );
                 palette
             },
             named_colors,
@@ -953,9 +962,14 @@ impl Renderer {
         if self.scrollbar.needs_redraw() {
             return Some(std::time::Duration::ZERO);
         }
-        self.island
+        let chrome = self
+            .island
             .as_ref()
-            .and_then(|island| island.next_frame_in(scale, frame_interval))
+            .and_then(|island| island.next_frame_in(scale, frame_interval));
+        match (chrome, self.command_palette.next_frame_in()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Scan visible rows for kitty Unicode-placeholder cells (U+10EEEE) and

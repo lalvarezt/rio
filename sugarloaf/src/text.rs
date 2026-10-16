@@ -642,7 +642,11 @@ impl Text {
             };
 
             self.instances.push(TextInstance {
-                pos: [pen_x + glyph.x, py + glyph.y.max(0.0)],
+                // Atlas bitmaps use nearest sampling. Fractional physical
+                // origins can repeat an edge texel and drop the opposite row
+                // or column. Keep fractional advances, but place each bitmap
+                // on the pixel grid for every renderer.
+                pos: [(pen_x + glyph.x).round(), (py + glyph.y.max(0.0)).round()],
                 glyph_pos: [slot.x as u32, slot.y as u32],
                 glyph_size: [slot.w as u32, slot.h as u32],
                 bearings: [slot.bearing_x, slot.bearing_y],
