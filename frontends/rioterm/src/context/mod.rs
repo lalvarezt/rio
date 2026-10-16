@@ -42,7 +42,6 @@ use teletypewriter::create_pty;
 #[cfg(not(target_os = "windows"))]
 use teletypewriter::{create_pty_with_fork, create_pty_with_spawn};
 
-#[cfg(target_os = "windows")]
 pub struct TabApplication {
     pub program: String,
     pub title: String,
@@ -802,7 +801,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         self.contexts.len()
     }
 
-    #[cfg(target_os = "windows")]
     pub fn tab_id(&self, index: usize) -> usize {
         self.contexts[index].tab_id
     }
@@ -835,7 +833,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         Some(record)
     }
 
-    #[cfg(target_os = "windows")]
     pub fn application_for_tab(&self, index: usize) -> Option<TabApplication> {
         #[cfg(feature = "profiling")]
         let _timing = crate::profiling::span("tabs.application");
@@ -1188,7 +1185,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         self.keep_only_active_context_visible(sugarloaf);
     }
 
-    #[cfg(target_os = "windows")]
     pub fn close_unfocused_tab(&mut self, index: usize, sugarloaf: &mut Sugarloaf) {
         if index >= self.contexts.len() || index == self.current_index {
             return;

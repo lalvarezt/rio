@@ -26,8 +26,7 @@ impl Default for ContextTitle {
 
 /// Shorten an absolute path for display:
 /// - Replace home directory prefix with `~`
-/// - Outside Windows, if 4+ components deep, show `…/last/three/components`.
-///   Windows tabs fit the complete title to their measured width instead.
+/// The tab renderer fits the result to the measured width.
 fn shorten_path(absolute: &str) -> String {
     // Replace home prefix with ~
     #[cfg(unix)]
@@ -52,14 +51,6 @@ fn shorten_path(absolute: &str) -> String {
     #[cfg(not(unix))]
     let display_path = absolute.to_string();
 
-    #[cfg(not(target_os = "windows"))]
-    {
-        let components: Vec<&str> =
-            display_path.split('/').filter(|s| !s.is_empty()).collect();
-        if components.len() >= 4 {
-            return format!("…/{}", components[components.len() - 3..].join("/"));
-        }
-    }
     display_path
 }
 
@@ -419,14 +410,9 @@ pub mod test {
             "/rio-sandbox-test-dir/sub",
         );
 
-        // Windows leaves truncation to the tab's measured text budget.
-        if cfg!(target_os = "windows") {
-            assert_eq!(shorten_path("/a/b/c/d/e"), "/a/b/c/d/e");
-            assert_eq!(shorten_path("/a/b/c/d"), "/a/b/c/d");
-        } else {
-            assert_eq!(shorten_path("/a/b/c/d/e"), "…/c/d/e");
-            assert_eq!(shorten_path("/a/b/c/d"), "…/b/c/d");
-        }
+        // Shared tabs leave truncation to the measured text budget.
+        assert_eq!(shorten_path("/a/b/c/d/e"), "/a/b/c/d/e");
+        assert_eq!(shorten_path("/a/b/c/d"), "/a/b/c/d");
 
         // 3 components stays as-is
         assert_eq!(shorten_path("/a/b/c"), "/a/b/c");

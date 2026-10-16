@@ -1,4 +1,6 @@
-use rio_backend::sugarloaf::font::{FontData, FontLibrary};
+#[cfg(target_os = "windows")]
+use rio_backend::sugarloaf::font::FontData;
+use rio_backend::sugarloaf::font::FontLibrary;
 use rio_backend::sugarloaf::text::DrawOpts;
 use rio_backend::sugarloaf::Sugarloaf;
 use std::time::Instant;
@@ -23,10 +25,21 @@ const ACTIONS: [HeaderAction; 4] = [
 
 fn actions(width: f32) -> &'static [HeaderAction] {
     if width >= 480.0 {
-        &ACTIONS
-    } else {
+        #[cfg(target_os = "windows")]
+        return &ACTIONS;
+        #[cfg(not(target_os = "windows"))]
+        return &ACTIONS[..1];
+    }
+    window_actions()
+}
+
+fn window_actions() -> &'static [HeaderAction] {
+    #[cfg(target_os = "windows")]
+    {
         &ACTIONS[1..]
     }
+    #[cfg(not(target_os = "windows"))]
+    &[]
 }
 
 pub fn controls_width(width: f32) -> f32 {
@@ -64,6 +77,7 @@ pub fn centered_text_y(
     snap(cy - top - height / 2.0, sugarloaf.scale_factor())
 }
 
+#[cfg(target_os = "windows")]
 fn load_font(library: &FontLibrary, name: &str, file: &str) -> Option<usize> {
     #[cfg(feature = "profiling")]
     let _timing = crate::profiling::span("header.load_font");
@@ -79,6 +93,7 @@ fn load_font(library: &FontLibrary, name: &str, file: &str) -> Option<usize> {
     Some(id)
 }
 
+#[cfg(target_os = "windows")]
 pub fn draw_icon(
     sugarloaf: &mut Sugarloaf,
     icon: &str,
@@ -151,7 +166,7 @@ impl Header {
         let list = if self.toolbar_enabled {
             actions(width)
         } else {
-            &ACTIONS[1..]
+            window_actions()
         };
         let left = width - list.len() as f32 * BUTTON_WIDTH - 8.0;
         if x < left || x >= left + list.len() as f32 * BUTTON_WIDTH {
@@ -183,18 +198,19 @@ impl Header {
     pub fn render(&mut self, sugarloaf: &mut Sugarloaf, width: f32, color: [f32; 4]) {
         #[cfg(feature = "profiling")]
         let _timing = crate::profiling::span("header.render");
-        if self.fullscreen {
-            self.hover = None;
-            self.opacity.fill(0.0);
-            return;
-        }
         let library = sugarloaf.font_library();
         if self.font_library.as_ref().is_none_or(|previous| {
             !std::sync::Arc::ptr_eq(&previous.inner, &library.inner)
         }) {
+            #[cfg(target_os = "windows")]
             load_font(library, "SegoeMDL2Assets", "segmdl2.ttf");
             self.app_font = super::app_icons::load_font(library);
             self.font_library = Some(library.clone());
+        }
+        if self.fullscreen {
+            self.hover = None;
+            self.opacity.fill(0.0);
+            return;
         }
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.05);
@@ -209,7 +225,7 @@ impl Header {
         let list = if self.toolbar_enabled {
             actions(width)
         } else {
-            &ACTIONS[1..]
+            window_actions()
         };
         let left = width - list.len() as f32 * BUTTON_WIDTH - 8.0;
         for (i, action) in list.iter().enumerate() {
@@ -239,6 +255,7 @@ impl Header {
             };
             let cx = x + BUTTON_WIDTH / 2.0;
             let cy = HEADER_HEIGHT / 2.0;
+            #[cfg(target_os = "windows")]
             let icon = match action {
                 HeaderAction::NewTab => "\u{e710}",
                 HeaderAction::Minimize => "\u{e921}",
@@ -246,6 +263,7 @@ impl Header {
                 HeaderAction::Maximize => "\u{e922}",
                 HeaderAction::Close => "\u{e8bb}",
             };
+            #[cfg(target_os = "windows")]
             if draw_icon(sugarloaf, icon, cx, cy, 12.0, glyph) {
                 continue;
             }

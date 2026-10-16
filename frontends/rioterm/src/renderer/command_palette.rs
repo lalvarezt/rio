@@ -106,15 +106,23 @@ struct Command {
     action: PaletteAction,
 }
 
+const fn platform_shortcut(macos: &'static str, desktop: &'static str) -> &'static str {
+    if cfg!(target_os = "macos") {
+        macos
+    } else {
+        desktop
+    }
+}
+
 const COMMANDS: &[Command] = &[
     Command {
         title: "New Tab",
-        shortcut: "Cmd+T",
+        shortcut: platform_shortcut("Cmd+T", "Ctrl+Shift+T"),
         action: PaletteAction::TabCreate,
     },
     Command {
         title: "Close Tab",
-        shortcut: "Cmd+W",
+        shortcut: platform_shortcut("Cmd+W", "Ctrl+Shift+W"),
         action: PaletteAction::TabClose,
     },
     Command {
@@ -134,12 +142,12 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         title: "Split Right",
-        shortcut: "Cmd+D",
+        shortcut: platform_shortcut("Cmd+D", "Ctrl+Shift+R"),
         action: PaletteAction::SplitRight,
     },
     Command {
         title: "Split Down",
-        shortcut: "Cmd+Shift+D",
+        shortcut: platform_shortcut("Cmd+Shift+D", "Ctrl+Shift+D"),
         action: PaletteAction::SplitDown,
     },
     Command {
@@ -159,27 +167,27 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         title: "Settings",
-        shortcut: "Cmd+,",
+        shortcut: platform_shortcut("Cmd+,", "Ctrl+Shift+,"),
         action: PaletteAction::ConfigEditor,
     },
     Command {
         title: "New Window",
-        shortcut: "Cmd+N",
+        shortcut: platform_shortcut("Cmd+N", "Ctrl+Shift+N"),
         action: PaletteAction::WindowCreateNew,
     },
     Command {
         title: "Increase Font Size",
-        shortcut: "Cmd++",
+        shortcut: platform_shortcut("Cmd++", "Ctrl+="),
         action: PaletteAction::IncreaseFontSize,
     },
     Command {
         title: "Decrease Font Size",
-        shortcut: "Cmd+-",
+        shortcut: platform_shortcut("Cmd+-", "Ctrl+-"),
         action: PaletteAction::DecreaseFontSize,
     },
     Command {
         title: "Reset Font Size",
-        shortcut: "Cmd+0",
+        shortcut: platform_shortcut("Cmd+0", "Ctrl+0"),
         action: PaletteAction::ResetFontSize,
     },
     Command {
@@ -199,17 +207,17 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         title: "Copy",
-        shortcut: "Cmd+C",
+        shortcut: platform_shortcut("Cmd+C", "Ctrl+Shift+C"),
         action: PaletteAction::Copy,
     },
     Command {
         title: "Paste",
-        shortcut: "Cmd+V",
+        shortcut: platform_shortcut("Cmd+V", "Ctrl+Shift+V"),
         action: PaletteAction::Paste,
     },
     Command {
         title: "Search Forward",
-        shortcut: "Cmd+F",
+        shortcut: platform_shortcut("Cmd+F", "Ctrl+Shift+F"),
         action: PaletteAction::SearchForward,
     },
     Command {
@@ -229,7 +237,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         title: "Quit",
-        shortcut: "Cmd+Q",
+        shortcut: platform_shortcut("Cmd+Q", ""),
         action: PaletteAction::Quit,
     },
 ];

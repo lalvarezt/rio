@@ -8,7 +8,7 @@ pub fn default_unfocused_split_opacity() -> f32 {
 }
 
 /// macOS hides the strip for a lone tab (the native-app feel);
-/// Linux/Windows keep it, drawn as a centred title.
+/// Linux and Windows keep the tab pill visible.
 #[inline]
 pub fn default_hide_if_single() -> bool {
     cfg!(target_os = "macos")
@@ -216,23 +216,23 @@ pub struct Navigation {
     )]
     pub unfocused_split_fill: Option<ColorArray>,
     /// Maximum tab width in logical pixels, clamped to `[80.0, 1024.0]`.
-    /// Windows tabs size to their titles between the configured bounds.
+    /// Desktop tabs size to their titles between the configured bounds.
     /// Tabs shrink further when necessary to fit the window.
     #[serde(default = "default_max_tab_width", rename = "max-tab-width")]
     pub max_tab_width: f32,
-    /// Minimum preferred Windows tab width, bounded by `max-tab-width`.
+    /// Minimum preferred Desktop tab width, bounded by `max-tab-width`.
     #[serde(default = "default_min_tab_width", rename = "min-tab-width")]
     pub min_tab_width: f32,
-    /// Windows tab icon size in logical pixels, clamped to `[8.0, 32.0]`.
+    /// Desktop tab icon size in logical pixels, clamped to `[8.0, 32.0]`.
     #[serde(default = "default_tab_icon_size", rename = "tab-icon-size")]
     pub tab_icon_size: f32,
-    /// Windows tab pill border reflections, from `0.0` (off) to `1.0`.
+    /// Desktop tab pill border reflections, from `0.0` (off) to `1.0`.
     #[serde(
         default = "default_tab_glass_intensity",
         rename = "tab-glass-intensity"
     )]
     pub tab_glass_intensity: f32,
-    /// Map command names to a bundled app or named icon (Windows tab pills).
+    /// Map command names to a bundled app or named icon in Desktop tabs.
     #[serde(default, rename = "app-icons")]
     pub app_icons: std::collections::BTreeMap<String, String>,
 }
@@ -359,8 +359,7 @@ mod tests {
     }
 
     /// The default is platform-split: macOS hides the strip for a lone
-    /// tab, Linux/Windows keep it as a centred title with no island
-    /// behind it.
+    /// tab, Linux and Windows keep the tab pill visible.
     #[test]
     fn hide_if_single_platform_default() {
         let decoded = toml::from_str::<Root>("[navigation]\nmode = 'Tab'\n").unwrap();

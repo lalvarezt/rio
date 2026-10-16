@@ -39,12 +39,12 @@ impl<'a> WgpuContext<'a> {
         let instance = {
             let _timing =
                 tracing::debug_span!(target: "rio_profile", "gpu.instance").entered();
-            #[cfg(target_os = "windows")]
+            #[cfg(not(target_arch = "wasm32"))]
             let instance = {
                 use std::collections::HashMap;
                 use std::sync::{Mutex, OnceLock};
 
-                // Backends and instance options are process-wide on Windows.
+                // Backends and instance options are process-wide on desktop.
                 // Keep adapter selection per surface, but initialize each
                 // requested set of graphics backends only once.
                 static INSTANCES: OnceLock<
@@ -59,7 +59,7 @@ impl<'a> WgpuContext<'a> {
                     .or_insert_with(|| wgpu::Instance::new(instance_desc))
                     .clone()
             };
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(target_arch = "wasm32")]
             let instance = wgpu::Instance::new(instance_desc);
             instance
         };

@@ -147,10 +147,7 @@ pub fn create_window_builder(
 
             if config.navigation.is_enabled() {
                 window_builder = window_builder
-                    .with_traffic_light_position(
-                        TRAFFIC_LIGHT_PADDING,
-                        TRAFFIC_LIGHT_PADDING,
-                    )
+                    .with_traffic_light_position(12.0, TRAFFIC_LIGHT_PADDING)
                     .with_mouse_down_can_move_window(false);
             }
         }

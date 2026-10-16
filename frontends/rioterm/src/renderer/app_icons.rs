@@ -44,7 +44,7 @@ pub fn draw(
         Icon::Logo(logo) => logos::draw(sugarloaf, logo, cx, cy, size, color),
         Icon::Glyph(glyph) => font_id.is_some_and(|id| {
             let mut utf8 = [0; 4];
-            super::windows_chrome::draw_font_icon(
+            super::window_chrome::draw_font_icon(
                 sugarloaf,
                 glyph.encode_utf8(&mut utf8),
                 cx,

@@ -59,6 +59,9 @@ smallvec = { workspace = true }
 rio-window = { workspace = true }
 lru = "0.16.0"
 rio-notifier = { workspace = true }
+resvg = { version = "0.48.1", default-features = false }
+toml = "0.9.2"
+rio-fonts = { workspace = true, features = ["symbols-nerd-font"] }
 
 [target.'cfg(all(not(target_os = "macos"), not(target_os = "windows")))'.dependencies]
 cpal = { version = "0.15", optional = true }
@@ -73,8 +76,6 @@ cfg_aliases = "0.2.1"
 winres = "0.1.12"
 
 [target.'cfg(windows)'.dependencies]
-resvg = { version = "0.48.1", default-features = false }
-toml = "0.9.2"
 ahash = { version = "0.8.12", default-features = false, features = ["std"] }
 dunce = "1.0.5"
 tinyvec = { version = "1.8.1", features = ["alloc"] }
@@ -101,9 +102,6 @@ features = ["wgpu"]
 [target.'cfg(windows)'.dependencies.rio-backend]
 workspace = true
 features = ["wgpu"]
-[target.'cfg(windows)'.dependencies.rio-fonts]
-workspace = true
-features = ["symbols-nerd-font"]
 [target.'cfg(target_arch = "wasm32")'.dependencies.sugarloaf]
 workspace = true
 features = ["wgpu"]

@@ -107,7 +107,6 @@ impl Default for BorderConfig {
 
 pub struct ContextGrid<T: EventListener> {
     /// Tab identity remains stable when panes are focused, added, or removed.
-    #[cfg(target_os = "windows")]
     pub tab_id: usize,
     pub width: f32,
     pub height: f32,
@@ -170,7 +169,6 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         let width = context.dimension.width;
         let height = context.dimension.height;
         let scale = context.dimension.dimension.scale;
-        #[cfg(target_os = "windows")]
         let tab_id = context.route_id;
 
         let mut tree: TaffyTree<()> = TaffyTree::new();
@@ -232,7 +230,6 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         };
 
         let mut grid = Self {
-            #[cfg(target_os = "windows")]
             tab_id,
             inner,
             current: panel_node,

@@ -303,6 +303,13 @@ impl VulkanGlyphAtlas {
         key: GlyphKey,
         glyph: RasterizedGlyph<'_>,
     ) -> Option<AtlasSlot> {
+        let slot = self.upload(glyph)?;
+        self.slots.insert(key, slot);
+        Some(slot)
+    }
+
+    /// Pack pixels without a glyph-cache entry, for artwork cached by the caller.
+    pub fn upload(&mut self, glyph: RasterizedGlyph<'_>) -> Option<AtlasSlot> {
         if glyph.width == 0 || glyph.height == 0 {
             // Whitespace / control glyphs — record an empty slot in
             // page 0 so lookups don't keep retrying. The slot has
@@ -316,7 +323,6 @@ impl VulkanGlyphAtlas {
                 bearing_y: glyph.bearing_y,
                 page: 0,
             };
-            self.slots.insert(key, slot);
             return Some(slot);
         }
 
@@ -333,7 +339,6 @@ impl VulkanGlyphAtlas {
                     bearing_y: glyph.bearing_y,
                     page: i as u8,
                 };
-                self.slots.insert(key, slot);
                 page.pending.push(PendingUpload {
                     x,
                     y,
@@ -371,7 +376,6 @@ impl VulkanGlyphAtlas {
             bearing_y: glyph.bearing_y,
             page: new_idx as u8,
         };
-        self.slots.insert(key, slot);
         page.pending.push(PendingUpload {
             x,
             y,

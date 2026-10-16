@@ -163,7 +163,6 @@ pub struct Text {
     ascent_cache: FxHashMap<(u32, u16), i16>,
     shape_cache: FxHashMap<u64, Arc<ShapedRun>>,
     shape_cache_order: VecDeque<u64>,
-    #[cfg(target_os = "windows")]
     icons: FxHashMap<(&'static str, u16), Option<crate::grid::atlas::AtlasSlot>>,
 
     #[cfg(target_os = "macos")]
@@ -197,7 +196,6 @@ impl Text {
             ascent_cache: FxHashMap::default(),
             shape_cache: FxHashMap::default(),
             shape_cache_order: VecDeque::new(),
-            #[cfg(target_os = "windows")]
             icons: FxHashMap::default(),
             #[cfg(target_os = "macos")]
             handle_cache: FxHashMap::default(),
@@ -223,7 +221,6 @@ impl Text {
         if self.cpu.is_some() {
             return;
         }
-        #[cfg(target_os = "windows")]
         self.icons.clear();
         self.cpu = Some(TextCpuState {
             atlas_grayscale: crate::grid::cpu::CpuGridAtlas::new_grayscale(),
@@ -270,7 +267,6 @@ impl Text {
     /// Draw a cached icon centered at logical `(cx, cy)`, using the UI color
     /// atlas. `key` identifies immutable artwork. Rasterization runs only on
     /// a cache miss and returns square premultiplied RGBA pixels at `size`.
-    #[cfg(target_os = "windows")]
     pub fn draw_icon(
         &mut self,
         key: &'static str,
@@ -305,25 +301,7 @@ impl Text {
             };
             let _timing =
                 tracing::debug_span!(target: "rio_profile", "ui.icon_upload").entered();
-            let slot = if let Some(cpu) = self.cpu.as_mut() {
-                cpu.atlas_color.upload(raster).or_else(|| {
-                    cpu.atlas_color
-                        .grow()
-                        .then(|| cpu.atlas_color.upload(raster))
-                        .flatten()
-                })
-            } else {
-                #[cfg(feature = "wgpu")]
-                {
-                    self.wgpu
-                        .as_mut()
-                        .and_then(|gpu| gpu.atlas_color.upload(raster))
-                }
-                #[cfg(not(feature = "wgpu"))]
-                {
-                    None
-                }
-            };
+            let slot = self.upload_color(raster);
             // A full atlas cannot accept this immutable artwork on a later
             // frame either. Atlas initialization clears successful and failed
             // entries together.
@@ -396,8 +374,40 @@ impl Text {
             .unwrap_or(0.0)
     }
 
+    fn upload_color(
+        &mut self,
+        raster: crate::grid::RasterizedGlyph<'_>,
+    ) -> Option<crate::grid::atlas::AtlasSlot> {
+        if let Some(cpu) = self.cpu.as_mut() {
+            return cpu.atlas_color.upload(raster).or_else(|| {
+                cpu.atlas_color
+                    .grow()
+                    .then(|| cpu.atlas_color.upload(raster))
+                    .flatten()
+            });
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(metal) = self.metal.as_mut() {
+            return metal.atlas_color.upload(raster).or_else(|| {
+                metal
+                    .atlas_color
+                    .grow(&metal.device, &metal.command_queue)
+                    .then(|| metal.atlas_color.upload(raster))
+                    .flatten()
+            });
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(vulkan) = self.vulkan.as_mut() {
+            return vulkan.atlas_color.upload(raster);
+        }
+        #[cfg(all(feature = "wgpu", not(target_os = "macos")))]
+        if let Some(wgpu) = self.wgpu.as_mut() {
+            return wgpu.atlas_color.upload(raster);
+        }
+        None
+    }
+
     /// Visible glyph top and height, relative to `draw`'s logical y origin.
-    #[cfg(target_os = "windows")]
     pub fn vertical_bounds(&mut self, text: &str, opts: &DrawOpts) -> Option<(f32, f32)> {
         let run = self.shape_for(text, opts)?;
         let mut top = f32::INFINITY;
@@ -1003,6 +1013,7 @@ impl Text {
         let instance_buffers = (0..frames)
             .map(|_| alloc_instance_buffer_metal(device, instance_capacity))
             .collect();
+        self.icons.clear();
         self.metal = Some(TextMetalState {
             device: device.to_owned(),
             command_queue: command_queue.to_owned(),
@@ -1137,7 +1148,6 @@ impl Text {
             instance_buffer,
             instance_capacity,
         });
-        #[cfg(target_os = "windows")]
         self.icons.clear();
     }
 

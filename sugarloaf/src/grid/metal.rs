@@ -201,6 +201,13 @@ impl MetalGlyphAtlas {
         key: GlyphKey,
         glyph: RasterizedGlyph<'_>,
     ) -> Option<AtlasSlot> {
+        let slot = self.upload(glyph)?;
+        self.slots.insert(key, slot);
+        Some(slot)
+    }
+
+    /// Upload artwork whose cache entry is owned by the caller.
+    pub fn upload(&mut self, glyph: RasterizedGlyph<'_>) -> Option<AtlasSlot> {
         if glyph.width == 0 || glyph.height == 0 {
             let slot = AtlasSlot {
                 x: 0,
@@ -211,7 +218,6 @@ impl MetalGlyphAtlas {
                 bearing_y: glyph.bearing_y,
                 page: 0,
             };
-            self.slots.insert(key, slot);
             return Some(slot);
         }
 
@@ -225,7 +231,6 @@ impl MetalGlyphAtlas {
             bearing_y: glyph.bearing_y,
             page: 0,
         };
-        self.slots.insert(key, slot);
 
         let region = MTLRegion {
             origin: metal::MTLOrigin {

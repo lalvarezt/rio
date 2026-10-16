@@ -1,6 +1,6 @@
-# Windows app icons
+# App icons
 
-Windows tabs use a bundled app catalog for AI tools, editors, file managers,
+Linux, macOS, and Windows tabs use a bundled app catalog for AI tools, editors, file managers,
 fuzzy selectors, monitors, version control, infrastructure, databases and other
 terminal apps. Codex uses the OpenAI mark, Claude uses its starburst, htop uses
 a bar chart, fzf uses a filter and yazi uses a duck. Unknown apps use the terminal
@@ -30,8 +30,9 @@ Named icons such as `folder`, `filter`, `database`, `monitor`, `code`, `ai`,
 They can override a built-in command's icon. Invalid targets produce a warning
 and keep the normal fallback.
 
-For Windows overrides in a shared config, use
-`[platform.windows.navigation.app-icons]`. Platform mappings merge with base
+For platform overrides in a shared config, use
+`[platform.linux.navigation.app-icons]` or `[platform.windows.navigation.app-icons]`.
+Platform mappings merge with base
 mappings, with the platform value winning for the same key.
 
 Icon size remains independent:

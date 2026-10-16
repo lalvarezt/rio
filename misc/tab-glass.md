@@ -1,6 +1,6 @@
-# Windows tab glass
+# Tab glass
 
-The Windows tab pill has a thin reflective border around its rounded contour.
+Linux, macOS, and Windows tab pills have a thin reflective border around their rounded contours.
 Set its strength in `config.toml`:
 
 ```toml
@@ -15,7 +15,8 @@ configuration and follow the tab's selection and hover transitions.
 The intensity changes only the border. The pill's interior color and opacity
 stay the same, with no sheen or gradient painted over its contents.
 
-For a Windows override in a shared configuration, use
+For a platform override in a shared configuration, use
+`[platform.linux.navigation]`, `[platform.macos.navigation]`, or
 `[platform.windows.navigation]` instead of `[navigation]`.
 
 The effect also works with an opaque window. Enable the Windows backdrop
@@ -29,11 +30,11 @@ blur = true
 
 Glass intensity changes the border's reflections, not the window opacity or the
 Windows Acrylic material. It does not refract the desktop or use Apple's native
-Liquid Glass renderer. Other operating systems keep their existing tab style.
+Liquid Glass renderer.
 
 ## Tab motion and controls
 
-Windows tabs animate into place when opened, closed, reordered, or resized by
+Linux, macOS, and Windows tabs animate into place when opened, closed, reordered, or resized by
 a title change. Rapid changes retarget the current motion. Title widths are
 cached, and shrinking waits briefly for transient title updates to stop.
 Creating, selecting, or closing a tab moves the selection capsule while terminal
@@ -50,3 +51,12 @@ while tabs move.
 With multiple tabs, hovering a tab reveals its close button. Closing an inactive
 tab preserves the selected tab. The close button uses the existing tab width and
 shortens the visible title when needed, without moving neighboring tabs.
+
+Tabs grow to fit their titles between `navigation.min-tab-width` and
+`navigation.max-tab-width`. The width includes the app icon and optional SSH
+badge. Titles get an ellipsis when the configured maximum or available strip
+space cannot fit the complete title.
+
+Linux keeps its window-manager decorations and shows a new-tab button in the
+strip. Windows draws its minimize, maximize, and close buttons in the header.
+macOS keeps its native traffic lights, with the tabs inset to leave room for them.

@@ -2,7 +2,7 @@
 // Licensed under the MIT license in the root of this source tree.
 
 use super::*;
-use crate::renderer::windows_chrome::{alpha, fade, snap};
+use crate::renderer::window_chrome::{alpha, fade, snap};
 use std::time::Duration;
 
 fn flag(value: bool) -> f32 {
@@ -423,23 +423,19 @@ impl Tabs {
 impl Island {
     pub fn animate_tab_navigation(&mut self, from: usize, to: usize, direction: i8) {
         if from != to {
-            self.windows_tabs.navigation = Some((from, to, direction));
+            self.tabs.navigation = Some((from, to, direction));
         }
     }
     /// Reorder thresholds use destination slots, while clicks use displayed geometry.
     pub fn drag_layout(&self, width: f32, scale: f32, count: usize) -> TabStripLayout {
-        if self.windows_tabs.order.len() != count {
+        if self.tabs.order.len() != count {
             return tab_strip_layout(width, scale, count, self.max_tab_width);
         }
-        self.windows_tabs.target_layout(
-            width,
-            scale,
-            self.min_tab_width,
-            self.max_tab_width,
-        )
+        self.tabs
+            .target_layout(width, scale, self.min_tab_width, self.max_tab_width)
     }
 
-    pub(super) fn render_windows_tabs(
+    pub(super) fn render_tabs(
         &mut self,
         sugarloaf: &mut Sugarloaf,
         window_width: f32,
@@ -447,18 +443,27 @@ impl Island {
         context_manager: &ContextManager<EventProxy>,
         bg: [f32; 4],
     ) {
+        self.sync_focused_program_status(context_manager);
+        let count = context_manager.len();
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.window_header.toolbar_enabled = !(self.hide_if_single && count == 1);
+        }
         self.window_header.render(
             sugarloaf,
             window_width / scale,
             self.active_text_color,
         );
-        self.sync_focused_program_status(context_manager);
-        let count = context_manager.len();
         self.window_progress_visible = self.uses_window_progress(count);
         if self.hide_if_single && count == 1 {
-            self.windows_tabs = Tabs::default();
+            self.tabs = Tabs::default();
             self.drag = None;
-            self.render_progress_bar(sugarloaf, window_width, scale, ISLAND_HEIGHT);
+            let y = if cfg!(any(target_os = "windows", target_os = "macos")) {
+                ISLAND_HEIGHT
+            } else {
+                0.0
+            };
+            self.render_progress_bar(sugarloaf, window_width, scale, y);
             return;
         }
         let selected = context_manager.current_index();
@@ -466,7 +471,7 @@ impl Island {
             || self.drag.as_ref().is_some_and(|d| {
                 d.tab_index != selected
                     || self
-                        .windows_tabs
+                        .tabs
                         .order
                         .get(d.tab_index)
                         .is_some_and(|id| *id != context_manager.tab_id(selected))
@@ -475,7 +480,7 @@ impl Island {
             self.drag = None;
         }
         let now = Instant::now();
-        let dt = if self.windows_tabs.needs_redraw() {
+        let dt = if self.tabs.needs_redraw() {
             now.duration_since(self.last_anim_frame)
                 .as_secs_f32()
                 .min(DRAG_MAX_DT)
@@ -510,7 +515,7 @@ impl Island {
                 }
             })
             .collect();
-        self.windows_tabs.update(
+        self.tabs.update(
             contents,
             sugarloaf,
             (window_width, scale),
@@ -528,22 +533,22 @@ impl Island {
                 self.drag_floating_left(&self.drag_layout(window_width, scale, count))
             })
             .or_else(|| {
-                self.windows_tabs.floating.and_then(|id| {
-                    self.windows_tabs.tabs.get(&id).map(|t| t.left.value())
-                })
+                self.tabs
+                    .floating
+                    .and_then(|id| self.tabs.tabs.get(&id).map(|t| t.left.value()))
             });
-        let floating = self.windows_tabs.floating;
+        let floating = self.tabs.floating;
         let occlusion = floating_left.and_then(|left| {
             floating.map(|id| {
                 let (x, _, w, _, _) =
-                    island_rect(left, self.windows_tabs.tabs[&id].width.value());
+                    island_rect(left, self.tabs.tabs[&id].width.value());
                 [x, x + w]
             })
         });
-        let fills = windows_island_fills(bg);
+        let fills = tab_fills(bg);
         let bounds = tab_strip_layout(window_width, scale, count, f32::MAX);
         let right = bounds.left_margin + bounds.tabs_width;
-        let title_y = crate::renderer::windows_chrome::centered_text_y(
+        let title_y = crate::renderer::window_chrome::centered_text_y(
             sugarloaf,
             "Mg",
             TAB_CENTER_Y + 2.0,
@@ -554,14 +559,14 @@ impl Island {
             },
         );
         // Exiting presentations have no input target and paint beneath live tabs.
-        for tab in self.windows_tabs.tabs.values().filter(|t| !t.live) {
-            self.draw_windows_tab(
+        for tab in self.tabs.tabs.values().filter(|t| !t.live) {
+            self.draw_tab(
                 sugarloaf, tab, false, count, right, title_y, &fills, occlusion, None,
             );
         }
         if floating.is_none() {
-            if let Some(selection) = &self.windows_tabs.selection {
-                let fill = self.windows_tabs.tabs[&selection.id]
+            if let Some(selection) = &self.tabs.selection {
+                let fill = self.tabs.tabs[&selection.id]
                     .content
                     .custom_color
                     .unwrap_or(fills.active);
@@ -594,8 +599,6 @@ impl Island {
                                 h,
                                 radius,
                                 fill,
-                                None,
-                                None,
                                 self.tab_glass_intensity,
                                 0,
                             );
@@ -604,11 +607,11 @@ impl Island {
                 });
             }
         }
-        for id in &self.windows_tabs.order {
+        for id in &self.tabs.order {
             if Some(*id) != floating {
-                self.draw_windows_tab(
+                self.draw_tab(
                     sugarloaf,
-                    &self.windows_tabs.tabs[id],
+                    &self.tabs.tabs[id],
                     *id == context_manager.tab_id(selected),
                     count,
                     right,
@@ -620,9 +623,9 @@ impl Island {
             }
         }
         if let (Some(id), Some(left)) = (floating, floating_left) {
-            self.draw_windows_tab(
+            self.draw_tab(
                 sugarloaf,
-                &self.windows_tabs.tabs[&id],
+                &self.tabs.tabs[&id],
                 true,
                 count,
                 right,
@@ -647,7 +650,7 @@ impl Island {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn draw_windows_tab(
+    fn draw_tab(
         &self,
         sugarloaf: &mut Sugarloaf,
         tab: &Tab,
@@ -682,7 +685,7 @@ impl Island {
                 y - 1.0,
                 w + 4.0,
                 h + 3.0,
-                [0.0, 0.0, 0.0, self.windows_tabs.elevation * 0.18],
+                [0.0, 0.0, 0.0, self.tabs.elevation * 0.18],
                 0.05,
                 radius + 2.0,
                 order,
@@ -707,8 +710,6 @@ impl Island {
                 h,
                 radius,
                 alpha(fill, tab.opacity),
-                None,
-                None,
                 self.tab_glass_intensity
                     * if floating.is_some() {
                         1.0

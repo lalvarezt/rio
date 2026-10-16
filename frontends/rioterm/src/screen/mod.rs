@@ -1519,7 +1519,6 @@ impl Screen<'_> {
                             old_index,
                             new_index,
                         );
-                        #[cfg(target_os = "windows")]
                         if let Some(island) = &mut self.renderer.island {
                             island.animate_tab_navigation(old_index, new_index, 1);
                         }
@@ -1536,7 +1535,6 @@ impl Screen<'_> {
                             old_index,
                             new_index,
                         );
-                        #[cfg(target_os = "windows")]
                         if let Some(island) = &mut self.renderer.island {
                             island.animate_tab_navigation(old_index, new_index, -1);
                         }
@@ -1577,7 +1575,6 @@ impl Screen<'_> {
                             old_index,
                             new_index,
                         );
-                        #[cfg(target_os = "windows")]
                         if let Some(island) = &mut self.renderer.island {
                             island.animate_tab_navigation(old_index, new_index, 1);
                         }
@@ -1594,14 +1591,8 @@ impl Screen<'_> {
                             old_index,
                             new_index,
                         );
-                        let layout = self.island_tab_layout(self.context_manager.len());
-                        if let Some(ref mut island) = self.renderer.island {
-                            island.remap_tab_swap_with_layout(
-                                old_index, new_index, &layout,
-                            );
-                        }
-                        #[cfg(target_os = "windows")]
                         if let Some(island) = &mut self.renderer.island {
+                            island.remap_tab_swap(old_index, new_index);
                             island.animate_tab_navigation(old_index, new_index, -1);
                         }
                         self.mark_dirty();
@@ -1617,14 +1608,8 @@ impl Screen<'_> {
                             old_index,
                             new_index,
                         );
-                        let layout = self.island_tab_layout(self.context_manager.len());
-                        if let Some(ref mut island) = self.renderer.island {
-                            island.remap_tab_swap_with_layout(
-                                old_index, new_index, &layout,
-                            );
-                        }
-                        #[cfg(target_os = "windows")]
                         if let Some(island) = &mut self.renderer.island {
+                            island.remap_tab_swap(old_index, new_index);
                             island.animate_tab_navigation(old_index, new_index, 1);
                         }
                         self.mark_dirty();
@@ -1640,7 +1625,6 @@ impl Screen<'_> {
                             old_index,
                             new_index,
                         );
-                        #[cfg(target_os = "windows")]
                         if let Some(island) = &mut self.renderer.island {
                             island.animate_tab_navigation(old_index, new_index, -1);
                         }
@@ -2865,7 +2849,6 @@ impl Screen<'_> {
                 self.sugarloaf.window_size().width,
                 self.sugarloaf.scale_factor(),
                 num_tabs,
-                #[cfg(target_os = "windows")]
                 &self.context_manager,
             );
         }
@@ -2878,7 +2861,6 @@ impl Screen<'_> {
     }
 
     fn island_drag_layout(&self, num_tabs: usize) -> TabStripLayout {
-        #[cfg(target_os = "windows")]
         if let Some(island) = &self.renderer.island {
             return island.drag_layout(
                 self.sugarloaf.window_size().width,
@@ -2917,17 +2899,14 @@ impl Screen<'_> {
         if self.allow_manual_dragging {
             self.start_window_drag(window);
         }
-        #[cfg(target_os = "windows")]
-        if !window.is_decorated() {
+        #[cfg(not(target_os = "macos"))]
+        {
             self.mouse.left_button_state = ElementState::Released;
             let _ = window.drag_window();
         }
     }
 
-    #[cfg(target_os = "windows")]
-    pub fn windows_header_action(
-        &self,
-    ) -> Option<crate::renderer::windows_chrome::HeaderAction> {
+    pub fn header_action(&self) -> Option<crate::renderer::window_chrome::HeaderAction> {
         let scale = self.sugarloaf.scale_factor();
         self.renderer.island.as_ref()?.window_header.hit_test(
             self.mouse.x as f32 / scale,
@@ -2936,28 +2915,32 @@ impl Screen<'_> {
         )
     }
 
-    #[cfg(target_os = "windows")]
-    pub fn handle_windows_header_click(
+    pub fn handle_header_click(
         &mut self,
         window: &rio_window::window::Window,
         clipboard: &mut Clipboard,
     ) -> bool {
-        use crate::renderer::windows_chrome::HeaderAction;
+        use crate::renderer::window_chrome::HeaderAction;
+        #[cfg(target_os = "windows")]
         use rio_window::platform::windows::WindowExtWindows;
-        let Some(action) = self.windows_header_action() else {
+        let Some(action) = self.header_action() else {
             return false;
         };
         match action {
             HeaderAction::Minimize => window.set_minimized(true),
             HeaderAction::Maximize => window.set_maximized(!window.is_maximized()),
-            HeaderAction::Close => window.request_close(),
+            HeaderAction::Close => {
+                #[cfg(target_os = "windows")]
+                window.request_close();
+                #[cfg(not(target_os = "windows"))]
+                return false;
+            }
             HeaderAction::NewTab => self.create_tab(clipboard),
         }
         true
     }
 
-    #[cfg(target_os = "windows")]
-    pub fn update_windows_header_hover(&mut self, x: f64, y: f64) -> bool {
+    pub fn update_header_hover(&mut self, x: f64, y: f64) -> bool {
         let scale = self.sugarloaf.scale_factor();
         let width = self.sugarloaf.window_size().width / scale;
         let changed = self.renderer.island.as_mut().is_some_and(|island| {
@@ -2984,24 +2967,10 @@ impl Screen<'_> {
         })
     }
 
-    #[cfg(not(target_os = "windows"))]
-    fn apply_close_hover(&mut self, hover: bool) -> bool {
-        let changed = self
-            .renderer
-            .island
-            .as_mut()
-            .is_some_and(|island| island.set_close_hover(hover));
-        if changed {
-            self.mark_dirty();
-        }
-        changed
-    }
-
     pub fn update_close_button_hover(&mut self, mouse_x: f64, mouse_y: f64) -> bool {
         let num_tabs = self.context_manager.len();
         let scale_factor = self.sugarloaf.scale_factor();
 
-        #[cfg(target_os = "windows")]
         {
             let pointer = (self.renderer.navigation.island_visible(num_tabs)
                 && mouse_y >= 0.0
@@ -3017,25 +2986,10 @@ impl Screen<'_> {
             }
             changed
         }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let hovering = num_tabs > 1
-                && self.renderer.navigation.island_visible(num_tabs)
-                && mouse_y <= (ISLAND_HEIGHT * scale_factor) as f64
-                && island::close_button_hit(
-                    &self.island_tab_layout(num_tabs),
-                    self.context_manager.current_index(),
-                    mouse_x as f32 / scale_factor,
-                );
-            self.apply_close_hover(hovering)
-        }
     }
 
     #[inline]
     pub fn clear_close_button_hover(&mut self) -> bool {
-        #[cfg(not(target_os = "windows"))]
-        let changed = self.apply_close_hover(false);
-        #[cfg(target_os = "windows")]
         {
             let header_changed = self
                 .renderer
@@ -3052,8 +3006,6 @@ impl Screen<'_> {
             }
             return tab_changed || header_changed;
         }
-        #[cfg(not(target_os = "windows"))]
-        changed
     }
 
     pub fn handle_island_click(
@@ -3141,18 +3093,10 @@ impl Screen<'_> {
         let layout = self.island_tab_layout(num_tabs);
         let x_in_tabs = mouse_x_unscaled - layout.left_margin;
 
-        #[cfg(target_os = "windows")]
         let close_under_pointer = num_tabs > 1
             && layout.tab_at(mouse_x_unscaled).is_some_and(|index| {
                 island::close_button_hit(&layout, index, mouse_x_unscaled)
             });
-        #[cfg(not(target_os = "windows"))]
-        let close_under_pointer = island::close_button_hit(
-            &layout,
-            self.context_manager.current_index(),
-            mouse_x_unscaled,
-        );
-
         if !is_right_click
             && self.is_close_press_tail(mouse_x_unscaled)
             && !close_under_pointer
@@ -3160,25 +3104,13 @@ impl Screen<'_> {
             return true;
         }
 
-        // A lone tab is drawn as a title centred across the strip rather than
-        // an island in the first slot, so the whole strip belongs to it and a
-        // right-click anywhere on it should reach that tab. The left margin
-        // (traffic lights on macOS) stays outside either way.
-        let past_last_tab = (num_tabs > 1 || cfg!(target_os = "windows"))
-            && x_in_tabs >= layout.tabs_width;
-        if x_in_tabs < 0.0 || past_last_tab {
+        if x_in_tabs < 0.0 || x_in_tabs >= layout.tabs_width {
             if !is_right_click {
                 self.on_chrome_press(window, chrome_press);
             }
             return true;
         }
 
-        #[cfg(not(target_os = "windows"))]
-        let clicked_tab = layout
-            .tab_at(mouse_x_unscaled)
-            .unwrap_or(0)
-            .min(num_tabs - 1);
-        #[cfg(target_os = "windows")]
         let clicked_tab = match layout.tab_at(mouse_x_unscaled) {
             Some(index) => index,
             None => {
@@ -3217,13 +3149,9 @@ impl Screen<'_> {
             return true;
         }
 
-        if (cfg!(target_os = "windows")
-            || clicked_tab == self.context_manager.current_index())
-            && island::close_button_hit(&layout, clicked_tab, mouse_x_unscaled)
-        {
+        if island::close_button_hit(&layout, clicked_tab, mouse_x_unscaled) {
             self.stop_hint_mode_if_active();
             self.last_close_press = Some((std::time::Instant::now(), mouse_x_unscaled));
-            #[cfg(target_os = "windows")]
             if clicked_tab != self.context_manager.current_index() {
                 self.context_manager
                     .close_unfocused_tab(clicked_tab, &mut self.sugarloaf);
@@ -3261,11 +3189,7 @@ impl Screen<'_> {
             }
         }
 
-        #[cfg(target_os = "macos")]
-        let can_reorder = self.allow_manual_dragging;
-        #[cfg(not(target_os = "macos"))]
-        let can_reorder = true;
-        if num_tabs > 1 && can_reorder {
+        if num_tabs > 1 {
             if let Some(ref mut island) = self.renderer.island {
                 let tab_left = layout.left(clicked_tab);
                 island.start_drag(
@@ -3345,7 +3269,7 @@ impl Screen<'_> {
                 new_index,
             );
             if let Some(ref mut island) = self.renderer.island {
-                island.remap_tab_move(old_index, new_index, layout.width(old_index));
+                island.remap_tab_move(old_index, new_index);
             }
         }
         self.mark_dirty();
@@ -3956,7 +3880,6 @@ impl Screen<'_> {
             &mut self.sugarloaf,
             &self.context_manager.current().dimension,
         );
-        #[cfg(target_os = "windows")]
         if let Some(island) = &mut self.renderer.island {
             let width =
                 self.sugarloaf.window_size().width / self.sugarloaf.scale_factor();
