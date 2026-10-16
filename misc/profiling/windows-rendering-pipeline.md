@@ -147,6 +147,74 @@ small plain-row saving does not justify the added branch and styled regression.
 Background output hashes matched; production background emission stays on the
 existing path. Artifacts: `target/profiles/pipeline-bg`.
 
+## 6. Search and selection invalidation
+
+Search no longer forces full terminal damage on every frame. It compares the
+visible matches and the last painted focused match, so moving focus still
+repaints when the match list stays identical. Query changes continue to compute
+the visible matches. The owned match list moves into the frame and back with
+the other snapshot buffers; collecting the regex results no longer clones the
+new vector immediately.
+The unused match-tracking wrapper is removed; rendering collects the existing
+visible-match iterator directly.
+
+Selection changes mark the visible rows intersecting the old and new ranges
+dirty, then use the existing partial-snapshot path. Clipping uses the current
+scroll offset under the terminal lock. No extra dirty bitmap or row cache is
+introduced. Existing full damage from scrolling/resizing still takes priority.
+
+Three interleaved native runs per variant use a stable 224×58 screen and 120
+target frames. Search stays open; selection alternates an endpoint within a
+three-row range. Temporary hooks assert that each requested overlay was entered.
+
+| Workload | Rows emitted before | After | Median screen CPU before, ms | After, ms |
+| --- | ---: | ---: | ---: | ---: |
+| Stable search | 7,018 | 116 | 18.465 | 6.566 |
+| Three-row selection changes | 7,018–7,064 | 528–574 | 7.938 | 4.110 |
+
+Counts include initial frames and occasional startup/resize frames. Search
+still has two foreground uploads in both variants because unchanged streams
+are already filtered by stage 4. Selection uploads remain 121–122; each edit
+does change its foreground colors. CPU times vary with host load, while the
+row-count reduction repeats in every run. Artifacts:
+`target/profiles/terminal-render-overlay-confirm-{before,after}-{1,2,3}-{search,selection}`.
+
+The screen spans include the temporary allocation probe's per-frame log write;
+the repeated row counts are stronger evidence than those host-sensitive times.
+
+All 14 native terminal-body captures match the baseline pixel for pixel. They
+cover focused-match navigation, query edits and no matches, search dismissal,
+selection growth and movement, block selection, clearing, scrollback clipping
+and a wholly offscreen selection. Artifacts:
+`target/profiles/overlay-visual-{before,after}-{search,selection}`.
+
+## 7. Search scanning
+
+After limiting redraws, repeated regex scans remained measurable: each stable
+search frame still walked the viewport. The search overlay now reports whether
+its existing query changed and only owns a new string on a change. Matching
+reuses the existing terminal damage, snapshot dimensions/scroll offset and
+renderer active-route identity. Cursor/chrome frames can keep their matches;
+query edits, terminal edits, resizing, scrolling and context switches rescan.
+Focused-match invalidation from stage 6 remains independent of this gate.
+No additional query or viewport cache is introduced.
+
+Three interleaved 120-frame native runs reduce regex scans from 120 to one in
+every run. Before scan medians range from 3.286 to 6.965 ms. Screen-span medians
+are 5.646/2.208, 7.072/1.617 and 9.658/1.604 ms before/after. In these runs the
+allocation probe's log write happens after the screen timing span. Host load
+and pre-ready screen-call counts still vary, so these screen medians do not
+establish a latency percentage. The consistent eliminated scans are the
+strongest result. Artifacts: `target/profiles/terminal-render-query-{before,after}-{1,2,3}`.
+
+The same captures time the remaining uniform-buffer upload at 0.080–0.138 ms
+per call, making it the next GPU preparation candidate.
+
+Eleven native GPU captures match stage 6 pixel for pixel through query/focus
+edits, scrollback, new PTY output, resize in both directions, switching between
+two tabs while search remains active, and dismissal. Artifacts:
+`target/profiles/query-visual-{before,after}-search`.
+
 ## Remaining stages
 
 Overlays, background emission, font resolution, shaping keys, glyph

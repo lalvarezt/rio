@@ -28,7 +28,7 @@ use crate::layout::ContextDimension;
 use crate::mouse::{calculate_mouse_position, Mouse};
 use crate::renderer::island::{self, TabStripLayout, ISLAND_HEIGHT};
 use crate::renderer::{utils::padding_top_from_config, Renderer};
-use crate::screen::hint::HintMatches;
+use crate::screen::hint::visible_regex_match_iter;
 use crate::selection::{Selection, SelectionType};
 use core::fmt::Debug;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
@@ -4089,38 +4089,57 @@ impl Screen<'_> {
         }
 
         let is_search_active = self.search_active();
-        if is_search_active {
-            if let Some(history_index) = self.search_state.history_index {
-                self.renderer.set_active_search(
-                    self.search_state.history.get(history_index).cloned(),
-                );
-            }
+        let search_changed = if is_search_active {
+            self.renderer.set_active_search(
+                self.search_state
+                    .history_index
+                    .and_then(|index| self.search_state.history.get(index))
+                    .map(String::as_str),
+            )
         } else {
-            self.renderer.set_active_search(None);
-        }
+            self.renderer.set_active_search(None)
+        };
 
         if is_search_active {
-            // Update search hints in renderable content
-            let terminal = self.context_manager.current().terminal.lock();
-            let hints = self
-                .search_state
-                .dfas_mut()
-                .map(|dfas| HintMatches::visible_regex_matches(&terminal, dfas));
-            drop(terminal);
+            let current = self.context_manager.current();
+            let terminal = current.terminal.lock();
+            let content = &current.renderable_content;
+            // Cursor and chrome frames can reuse matches; edits, viewport changes
+            // and context switches must search the current terminal again.
+            let needs_search = search_changed
+                || self.hint_state.is_active()
+                || self.renderer.active_route_changed(current.route_id)
+                || content.display_offset != terminal.display_offset()
+                || content.columns != terminal.columns()
+                || content.screen_lines != terminal.screen_lines()
+                || matches!(
+                    terminal.peek_damage_event(),
+                    Some(
+                        rio_backend::event::TerminalDamage::Full
+                            | rio_backend::event::TerminalDamage::Partial
+                    )
+                );
+            if needs_search {
+                let hints = self.search_state.dfas_mut().map(|dfas| {
+                    visible_regex_match_iter(&terminal, dfas).collect::<Vec<_>>()
+                });
+                drop(terminal);
 
-            self.context_manager
-                .current_mut()
-                .renderable_content
-                .hint_matches = hints.map(|h| h.iter().cloned().collect());
-
-            // Force invalidation for search with full damage
-            {
-                let current = self.context_manager.current_mut();
-                current
-                    .renderable_content
-                    .pending_update
-                    .set_terminal_damage(rio_backend::event::TerminalDamage::Full);
+                let content = &mut self.context_manager.current_mut().renderable_content;
+                if content.hint_matches != hints {
+                    content
+                        .pending_update
+                        .set_terminal_damage(rio_backend::event::TerminalDamage::Full);
+                }
+                content.hint_matches = hints;
             }
+        }
+        let content = &mut self.context_manager.current_mut().renderable_content;
+        if content.focused_search_match != self.search_state.focused_match {
+            content.focused_search_match = self.search_state.focused_match.clone();
+            content
+                .pending_update
+                .set_terminal_damage(rio_backend::event::TerminalDamage::Full);
         }
 
         let (window_update, any_panel_dirty) = self
@@ -4351,7 +4370,7 @@ impl Screen<'_> {
                     &mut ctx.renderable_content.frame_damage,
                     rio_backend::event::TerminalDamage::Noop,
                 );
-                let hint_matches = ctx.renderable_content.hint_matches.clone();
+                let hint_matches = ctx.renderable_content.hint_matches.take();
                 let is_active = *key == active_key;
                 // `focused_match` lives on `Screen::search_state` — it's
                 // a per-window state tied to whichever panel has search
@@ -4879,6 +4898,7 @@ impl Screen<'_> {
                     item.val.renderable_content.row_styles = p.row_styles;
                     item.val.renderable_content.extras = p.extras;
                     item.val.renderable_content.hint_labels = p.hint_labels;
+                    item.val.renderable_content.hint_matches = p.hint_matches;
                 }
             }
             panels.clear();

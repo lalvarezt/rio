@@ -50,6 +50,8 @@ pub struct RenderableContent {
     pub hint_labels: Option<Vec<HintLabel>>,
     pub highlighted_hint: Option<crate::hints::HintMatch>,
     pub hint_matches: Option<Vec<rio_backend::crosswords::search::Match>>,
+    /// Focus last painted into the grid, independent of the visible match list.
+    pub focused_search_match: Option<rio_backend::crosswords::search::Match>,
     pub last_typing: Option<Instant>,
     pub last_blink_toggle: Option<Instant>,
     pub pending_update: PendingUpdate,
@@ -121,6 +123,7 @@ impl RenderableContent {
             hint_labels: None,
             highlighted_hint: None,
             hint_matches: None,
+            focused_search_match: None,
             last_typing: None,
             last_blink_toggle: None,
             pending_update: PendingUpdate::default(),

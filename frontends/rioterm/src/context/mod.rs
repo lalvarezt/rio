@@ -95,10 +95,19 @@ impl<T: EventListener> Context<T> {
         let has_updated = old_selection != selection_range;
 
         if has_updated {
-            // Selection affects terminal line rendering, so use terminal damage
+            let mut terminal = self.terminal.lock();
+            let top = -(terminal.display_offset() as i32);
+            let bottom = top + terminal.screen_lines() as i32 - 1;
+            for selection in [old_selection, selection_range].into_iter().flatten() {
+                for line in
+                    selection.start.row.0.max(top)..=selection.end.row.0.min(bottom)
+                {
+                    terminal.grid[rio_backend::crosswords::pos::Line(line)].dirty = true;
+                }
+            }
             self.renderable_content
                 .pending_update
-                .set_terminal_damage(rio_backend::event::TerminalDamage::Full);
+                .set_terminal_damage(rio_backend::event::TerminalDamage::Partial);
         }
 
         self.renderable_content.selection_range = selection_range;

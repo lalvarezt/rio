@@ -82,12 +82,16 @@ impl SearchOverlay {
     }
 
     #[inline]
-    pub fn set_active_search(&mut self, active_search: Option<String>) {
+    pub fn set_active_search(&mut self, active_search: Option<&str>) -> bool {
+        if self.active_search.as_deref() == active_search {
+            return false;
+        }
         let was_active = self.active_search.is_some();
-        self.active_search = active_search;
+        self.active_search = active_search.map(str::to_owned);
         if !was_active && self.active_search.is_some() {
             self.caret_blink_start = Instant::now();
         }
+        true
     }
 
     /// Returns (overlay_x, overlay_y, overlay_width, overlay_height) in logical coords.

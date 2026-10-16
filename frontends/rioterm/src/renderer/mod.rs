@@ -301,8 +301,12 @@ impl Renderer {
     }
 
     #[inline]
-    pub fn set_active_search(&mut self, active_search: Option<String>) {
-        self.search.set_active_search(active_search);
+    pub fn set_active_search(&mut self, active_search: Option<&str>) -> bool {
+        self.search.set_active_search(active_search)
+    }
+
+    pub(crate) fn active_route_changed(&self, route_id: usize) -> bool {
+        self.last_active != Some(route_id)
     }
 
     #[inline]
@@ -462,11 +466,8 @@ impl Renderer {
         let grid = context_manager.current_grid_mut();
         let active_route = grid.current().route_id;
         let grid_scaled_margin = grid.get_scaled_margin();
-        let mut has_active_changed = false;
-        if self.last_active != Some(active_route) {
-            has_active_changed = true;
-            self.last_active = Some(active_route);
-        }
+        let has_active_changed = self.active_route_changed(active_route);
+        self.last_active = Some(active_route);
 
         for (_key, grid_context) in grid.contexts_mut().iter_mut() {
             let panel_rect = grid_context.layout_rect;
