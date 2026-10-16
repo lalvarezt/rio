@@ -16,6 +16,9 @@
       <ui:WixUI Id="WixUI_Minimal" />
       <Feature Id="ProductFeature" Title="ConsoleApp" Level="1">
          <ComponentRef Id="RioExe" />
+         <ComponentRef Id="ConptyDll" />
+         <ComponentRef Id="OpenConsoleExe" />
+         <ComponentRef Id="ConptyLicense" />
          <ComponentRef Id="RioShortcut" />
          <ComponentRef Id="ModifyPathEnv" />
          <ComponentRef Id="ContextMenu" />
@@ -24,6 +27,15 @@
       <DirectoryRef Id="RioProgramFiles">
          <Component Id="RioExe">
             <File Id="RioExeFile" Source="{{ .Binary }}.exe" Name="rio.exe" KeyPath="yes" />
+         </Component>
+         <Component Id="ConptyDll">
+            <File Source="conpty.dll" KeyPath="yes" />
+         </Component>
+         <Component Id="OpenConsoleExe">
+            <File Source="OpenConsole.exe" KeyPath="yes" />
+         </Component>
+         <Component Id="ConptyLicense">
+            <File Source="ConPTY-LICENSE.txt" KeyPath="yes" />
          </Component>
       </DirectoryRef>
       <DirectoryRef Id="RioProgramMenu">
