@@ -500,12 +500,7 @@ impl Island {
     ) {
         self.sync_focused_program_status(context_manager);
         let count = context_manager.len();
-        #[cfg(not(target_os = "windows"))]
-        {
-            self.window_header.toolbar_enabled = !(self.hide_if_single && count == 1);
-        }
-        self.window_header
-            .render(sugarloaf, window_width / scale, self.animation);
+        self.window_header.render(sugarloaf, window_width / scale);
         if self.hide_if_single && count == 1 {
             self.tabs = Tabs::default();
             self.drag = None;

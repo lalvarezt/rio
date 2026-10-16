@@ -64,9 +64,12 @@ hides its status border. Legacy OSC 9;4 reports keep the window progress bar.
 
 ## Window controls and command palette
 
-Windows groups minimize, maximize or restore, and close controls at the right
-of the bar. The new-tab button has a separate pill. macOS keeps its native
-traffic lights on the left, and Linux keeps its window-manager controls.
+Windows uses square-cornered caption buttons at the upper-right edge, with
+46 × 32 logical-pixel hit areas, system Segoe caption glyphs, light and dark
+foregrounds, and the standard red close hover. The colors and glyphs follow
+[Microsoft Terminal's caption resources](https://github.com/microsoft/terminal/blob/main/src/cascadia/TerminalApp/MinMaxCloseControl.xaml).
+The add-tab button is hidden. macOS keeps its native traffic lights on the
+left, and Linux keeps its window-manager controls.
 
 The command palette uses the terminal theme, a proportional system UI font,
 and grouped commands. Its height follows the results and available window
@@ -142,6 +145,6 @@ Tabs grow to fit their titles between `navigation.min-tab-width` and
 badge. Titles get an ellipsis when the configured maximum or available strip
 space cannot fit the complete title.
 
-Linux keeps its window-manager decorations and shows a new-tab button in the
-strip. Windows draws its minimize, maximize, and close buttons in the header.
+Linux keeps its window-manager decorations. Windows draws its minimize,
+maximize, and close buttons in the header.
 macOS keeps its native traffic lights, with the tabs inset to leave room for them.

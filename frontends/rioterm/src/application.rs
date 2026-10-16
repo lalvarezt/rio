@@ -1312,10 +1312,10 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 }
                 if state == ElementState::Pressed
                     && button == MouseButton::Left
-                    && route.window.screen.handle_header_click(
-                        &route.window.winit_window,
-                        &mut self.router.clipboard,
-                    )
+                    && route
+                        .window
+                        .screen
+                        .handle_header_click(&route.window.winit_window)
                 {
                     route.request_overlay_redraw();
                     return;
@@ -2324,8 +2324,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         route.window.winit_window.is_maximized();
                     island.window_header.fullscreen =
                         route.window.winit_window.fullscreen().is_some();
-                    island.window_header.toolbar_enabled =
-                        route.path == RoutePath::Terminal;
+                    island.window_header.focused = route.window.is_focused;
                 }
 
                 match route.path {

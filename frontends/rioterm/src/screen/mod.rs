@@ -2908,11 +2908,7 @@ impl Screen<'_> {
         )
     }
 
-    pub fn handle_header_click(
-        &mut self,
-        window: &rio_window::window::Window,
-        clipboard: &mut Clipboard,
-    ) -> bool {
+    pub fn handle_header_click(&mut self, window: &rio_window::window::Window) -> bool {
         use crate::renderer::window_chrome::HeaderAction;
         #[cfg(target_os = "windows")]
         use rio_window::platform::windows::WindowExtWindows;
@@ -2928,7 +2924,6 @@ impl Screen<'_> {
                 #[cfg(not(target_os = "windows"))]
                 return false;
             }
-            HeaderAction::NewTab => self.create_tab(clipboard),
         }
         true
     }
@@ -3876,9 +3871,7 @@ impl Screen<'_> {
         if let Some(island) = &mut self.renderer.island {
             let width =
                 self.sugarloaf.window_size().width / self.sugarloaf.scale_factor();
-            island
-                .window_header
-                .render(&mut self.sugarloaf, width, island.animation);
+            island.window_header.render(&mut self.sugarloaf, width);
         }
         self.sugarloaf.render();
     }

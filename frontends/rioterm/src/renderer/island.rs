@@ -206,9 +206,8 @@ pub fn tab_strip_layout(
     #[cfg(not(target_os = "macos"))]
     let left_margin = 6.0;
 
-    let right_margin = ISLAND_MARGIN_RIGHT
-        + crate::renderer::window_chrome::controls_width(window_width / scale_factor)
-        + 8.0;
+    let right_margin =
+        ISLAND_MARGIN_RIGHT + crate::renderer::window_chrome::controls_width();
     let available_width =
         ((window_width / scale_factor) - right_margin - left_margin).max(0.0);
     let tab_width =
@@ -749,9 +748,7 @@ impl Island {
         scale: f32,
         frame_interval: std::time::Duration,
     ) -> Option<std::time::Duration> {
-        if self.window_header.needs_redraw()
-            || matches!(self.progress_state, Some(ProgressState::Indeterminate))
-        {
+        if matches!(self.progress_state, Some(ProgressState::Indeterminate)) {
             Some(std::time::Duration::ZERO)
         } else {
             self.tabs.next_frame_in(scale, self.hover_x).map(|delay| {
@@ -1784,8 +1781,7 @@ mod tests {
         let available = 500.0
             - layout.left_margin
             - ISLAND_MARGIN_RIGHT
-            - crate::renderer::window_chrome::controls_width(500.0)
-            - 8.0;
+            - crate::renderer::window_chrome::controls_width();
         assert_eq!(layout.tab_width, available / 4.0);
         assert_eq!(layout.tabs_width, available);
         assert!(tab_strip_layout(1000.0, 2.0, 0, 240.0)

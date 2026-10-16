@@ -4,73 +4,33 @@ use rio_backend::sugarloaf::font::FontData;
 use rio_backend::sugarloaf::font::FontLibrary;
 use rio_backend::sugarloaf::text::DrawOpts;
 use rio_backend::sugarloaf::Sugarloaf;
-use std::time::Instant;
 
 pub const HEADER_HEIGHT: f32 = 54.0;
-const BUTTON_WIDTH: f32 = 36.0;
-const CONTROL_GAP: f32 = 10.0;
-const CONTROL_MARGIN: f32 = 8.0;
-const CONTROL_INSET: f32 = 2.0;
+const BUTTON_WIDTH: f32 = 46.0;
+const BUTTON_HEIGHT: f32 = 32.0;
 const CONTROL_ORDER: u8 = 16;
-const GLYPH_HALF_SIZE: f32 = 5.0;
-const GLYPH_STROKE: f32 = 1.2;
-const RESTORE_OFFSET: f32 = 3.0;
+const GLYPH_SIZE: f32 = 10.0;
+// Windows caption resources, independent of the terminal's ANSI palette.
+const CLOSE_HOVER: [f32; 4] = [196.0 / 255.0, 43.0 / 255.0, 28.0 / 255.0, 1.0];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeaderAction {
-    NewTab,
     Minimize,
     Maximize,
     Close,
 }
 
-const ACTIONS: [HeaderAction; 4] = [
-    HeaderAction::NewTab,
+#[cfg(target_os = "windows")]
+const ACTIONS: &[HeaderAction] = &[
     HeaderAction::Minimize,
     HeaderAction::Maximize,
     HeaderAction::Close,
 ];
+#[cfg(not(target_os = "windows"))]
+const ACTIONS: &[HeaderAction] = &[];
 
-fn actions(width: f32) -> &'static [HeaderAction] {
-    if width >= 480.0 {
-        #[cfg(target_os = "windows")]
-        return &ACTIONS;
-        #[cfg(not(target_os = "windows"))]
-        return &ACTIONS[..1];
-    }
-    window_actions()
-}
-
-fn window_actions() -> &'static [HeaderAction] {
-    #[cfg(target_os = "windows")]
-    {
-        &ACTIONS[1..]
-    }
-    #[cfg(not(target_os = "windows"))]
-    &[]
-}
-
-fn group_width(list: &[HeaderAction]) -> f32 {
-    list.len() as f32 * BUTTON_WIDTH
-        + if list.len() > 1 && list[0] == HeaderAction::NewTab {
-            CONTROL_GAP
-        } else {
-            0.0
-        }
-}
-
-fn button_x(list: &[HeaderAction], index: usize, width: f32) -> f32 {
-    width - CONTROL_MARGIN - group_width(list)
-        + index as f32 * BUTTON_WIDTH
-        + if index > 0 && list[0] == HeaderAction::NewTab {
-            CONTROL_GAP
-        } else {
-            0.0
-        }
-}
-
-pub fn controls_width(width: f32) -> f32 {
-    group_width(actions(width)) + CONTROL_MARGIN
+pub fn controls_width() -> f32 {
+    ACTIONS.len() as f32 * BUTTON_WIDTH
 }
 
 /// Shared colors for application chrome and overlays.
@@ -83,7 +43,6 @@ pub struct Theme {
     pub hover: [f32; 4],
     pub accent: [f32; 4],
     pub on_accent: [f32; 4],
-    pub danger: [f32; 4],
 }
 
 fn mix(a: [f32; 4], b: [f32; 4], amount: f32) -> [f32; 4] {
@@ -113,7 +72,6 @@ impl Theme {
             } else {
                 [1.0; 4]
             },
-            danger: colors.red,
         }
     }
 }
@@ -301,42 +259,35 @@ pub fn draw_font_icon(
 
 pub struct Header {
     hover: Option<HeaderAction>,
-    opacity: [f32; 4],
-    last_frame: Instant,
     font_library: Option<FontLibrary>,
+    caption_font: Option<usize>,
     pub app_font: Option<usize>,
     pub theme: Theme,
     pub maximized: bool,
     pub fullscreen: bool,
-    pub toolbar_enabled: bool,
+    pub focused: bool,
 }
 
 impl Header {
     pub fn new() -> Self {
         Self {
             hover: None,
-            opacity: [0.0; 4],
-            last_frame: Instant::now(),
             font_library: None,
+            caption_font: None,
             app_font: None,
             theme: Theme::new(&Colors::default()),
             maximized: false,
             fullscreen: false,
-            toolbar_enabled: true,
+            focused: true,
         }
     }
 
     pub fn hit_test(&self, x: f32, y: f32, width: f32) -> Option<HeaderAction> {
-        if self.fullscreen || !(6.0..HEADER_HEIGHT - 6.0).contains(&y) {
+        if self.fullscreen || !(0.0..BUTTON_HEIGHT).contains(&y) {
             return None;
         }
-        let list = if self.toolbar_enabled {
-            actions(width)
-        } else {
-            window_actions()
-        };
-        list.iter().enumerate().find_map(|(index, action)| {
-            let left = button_x(list, index, width);
+        ACTIONS.iter().enumerate().find_map(|(index, action)| {
+            let left = width - controls_width() + index as f32 * BUTTON_WIDTH;
             (x >= left && x < left + BUTTON_WIDTH).then_some(*action)
         })
     }
@@ -355,161 +306,70 @@ impl Header {
         changed
     }
 
-    pub fn needs_redraw(&self) -> bool {
-        ACTIONS.iter().enumerate().any(|(i, action)| {
-            self.opacity[i] != u8::from(self.hover == Some(*action)) as f32
-        })
-    }
-
-    pub fn render(
-        &mut self,
-        sugarloaf: &mut Sugarloaf,
-        width: f32,
-        animation: Animation,
-    ) {
+    pub fn render(&mut self, sugarloaf: &mut Sugarloaf, width: f32) {
         #[cfg(feature = "profiling")]
         let _timing = crate::profiling::span("header.render");
-        let color = self.theme.foreground;
         let library = sugarloaf.font_library();
         if self.font_library.as_ref().is_none_or(|previous| {
             !std::sync::Arc::ptr_eq(&previous.inner, &library.inner)
         }) {
             #[cfg(target_os = "windows")]
-            load_font(library, "SegoeMDL2Assets", "segmdl2.ttf");
+            {
+                self.caption_font = load_font(library, "SegoeMDL2Assets", "segmdl2.ttf");
+            }
             self.app_font = super::app_icons::load_font(library);
             self.font_library = Some(library.clone());
         }
         if self.fullscreen {
             self.hover = None;
-            self.opacity.fill(0.0);
             return;
         }
-        let now = Instant::now();
-        let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.05);
-        self.last_frame = now;
-        for (i, action) in ACTIONS.iter().enumerate() {
-            fade(
-                &mut self.opacity[i],
-                u8::from(self.hover == Some(*action)) as f32,
-                dt,
-                animation,
-            );
-        }
-        let list = if self.toolbar_enabled {
-            actions(width)
-        } else {
-            window_actions()
-        };
-        let base = alpha(color, 0.055);
-        for (i, action) in list.iter().enumerate() {
-            let x = button_x(list, i, width);
-            let index = ACTIONS.iter().position(|a| a == action).unwrap();
-            let hover = self.opacity[index];
-            // New-tab has its own pill; Windows caption actions share one.
-            if *action == HeaderAction::NewTab
-                || i == 0
-                || list[i - 1] == HeaderAction::NewTab
-            {
-                let group = if *action == HeaderAction::NewTab {
-                    BUTTON_WIDTH
-                } else {
-                    (list.len() - i) as f32 * BUTTON_WIDTH
-                };
-                sugarloaf.rounded_rect(
+        // Match Windows' light/dark caption resources rather than ANSI colors.
+        let dark = self.theme.surface[0] * 0.2126
+            + self.theme.surface[1] * 0.7152
+            + self.theme.surface[2] * 0.0722
+            < 0.5;
+        let foreground = if dark { [1.0; 4] } else { [0.0, 0.0, 0.0, 1.0] };
+        let hover_fill = alpha(foreground, if dark { 15.0 / 255.0 } else { 9.0 / 255.0 });
+        let inactive = alpha(foreground, if dark { 93.0 / 255.0 } else { 92.0 / 255.0 });
+        for (index, action) in ACTIONS.iter().enumerate() {
+            let x = width - controls_width() + index as f32 * BUTTON_WIDTH;
+            let hovered = self.hover == Some(*action);
+            let close_hover = hovered && *action == HeaderAction::Close;
+            if hovered {
+                sugarloaf.rect(
                     None,
                     x,
-                    (HEADER_HEIGHT - BUTTON_WIDTH) / 2.0,
-                    group,
+                    0.0,
                     BUTTON_WIDTH,
-                    base,
-                    0.05,
-                    BUTTON_WIDTH / 2.0,
+                    BUTTON_HEIGHT,
+                    if close_hover { CLOSE_HOVER } else { hover_fill },
+                    0.0,
                     CONTROL_ORDER,
                 );
             }
-            if hover > 0.0 {
-                let tint = if *action == HeaderAction::Close {
-                    self.theme.danger
-                } else {
-                    color
-                };
-                sugarloaf.rounded_rect(
-                    None,
-                    x + CONTROL_INSET,
-                    (HEADER_HEIGHT - BUTTON_WIDTH) / 2.0 + CONTROL_INSET,
-                    BUTTON_WIDTH - CONTROL_INSET * 2.0,
-                    BUTTON_WIDTH - CONTROL_INSET * 2.0,
-                    alpha(
-                        tint,
-                        hover
-                            * if *action == HeaderAction::Close {
-                                0.22
-                            } else {
-                                0.10
-                            },
-                    ),
-                    0.05,
-                    BUTTON_WIDTH / 2.0 - CONTROL_INSET * 2.0,
-                    CONTROL_ORDER + 1,
-                );
-            }
-            // An opaque secondary tint keeps intersecting strokes uniform.
-            let glyph = mix(self.theme.surface, color, 0.72 + hover * 0.28);
-            let glyph = if *action == HeaderAction::Close {
-                mix(glyph, self.theme.danger, hover)
-            } else {
-                glyph
+            let glyph = match action {
+                HeaderAction::Minimize => "\u{e921}",
+                HeaderAction::Maximize if self.maximized => "\u{e923}",
+                HeaderAction::Maximize => "\u{e922}",
+                HeaderAction::Close => "\u{e8bb}",
             };
-            let cx = x + BUTTON_WIDTH / 2.0;
-            let cy = HEADER_HEIGHT / 2.0;
-            // Caption geometry avoids font discovery, shaping, and platform
-            // glyph bearings on every frame.
-            let scale = sugarloaf.scale_factor();
-            let stroke = (GLYPH_STROKE * scale).round().max(1.0) / scale;
-            let align = |v| {
-                snap(v, scale)
-                    + if (stroke * scale) as u32 % 2 == 1 {
-                        0.5 / scale
-                    } else {
-                        0.0
-                    }
-            };
-            let mut line = |x1, y1, x2, y2| {
-                sugarloaf.line(
-                    align(x1),
-                    align(y1),
-                    align(x2),
-                    align(y2),
-                    stroke,
-                    0.0,
+            if let Some(font) = self.caption_font {
+                draw_font_icon(
+                    sugarloaf,
                     glyph,
-                    CONTROL_ORDER + 2,
+                    x + BUTTON_WIDTH / 2.0,
+                    BUTTON_HEIGHT / 2.0,
+                    GLYPH_SIZE,
+                    if close_hover {
+                        [1.0; 4]
+                    } else if self.focused || hovered {
+                        foreground
+                    } else {
+                        inactive
+                    },
+                    font,
                 );
-            };
-            let half = GLYPH_HALF_SIZE;
-            match action {
-                HeaderAction::Minimize => line(cx - half, cy, cx + half, cy),
-                HeaderAction::Close => {
-                    line(cx - half, cy - half, cx + half, cy + half);
-                    line(cx - half, cy + half, cx + half, cy - half);
-                }
-                HeaderAction::NewTab => {
-                    line(cx - half, cy, cx + half, cy);
-                    line(cx, cy - half, cx, cy + half);
-                }
-                HeaderAction::Maximize => {
-                    let edge = half - if self.maximized { RESTORE_OFFSET } else { 0.0 };
-                    let right = cx + edge;
-                    let top = cy - edge;
-                    line(cx - half, top, right, top);
-                    line(right, top, right, cy + half);
-                    line(right, cy + half, cx - half, cy + half);
-                    line(cx - half, cy + half, cx - half, top);
-                    if self.maximized {
-                        line(cx - edge, cy - half, cx + half, cy - half);
-                        line(cx + half, cy - half, cx + half, cy + edge);
-                    }
-                }
             }
         }
     }
