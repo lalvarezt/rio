@@ -108,6 +108,8 @@ pub struct PlatformNavigation {
     pub min_tab_width: Option<f32>,
     #[serde(default = "Option::default", rename = "tab-icon-size")]
     pub tab_icon_size: Option<f32>,
+    #[serde(default, rename = "tab-style")]
+    pub tab_style: Option<navigation::TabStyle>,
     #[serde(default = "Option::default", rename = "tab-glass-intensity")]
     pub tab_glass_intensity: Option<f32>,
     #[serde(default = "Option::default", rename = "tab-status-width")]

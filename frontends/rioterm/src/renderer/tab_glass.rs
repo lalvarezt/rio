@@ -15,7 +15,7 @@ pub(super) struct Status {
     pub width: f32,
 }
 
-/// A reflective rim over the existing pill. Only the border receives color;
+/// A reflective rim over the existing tab. Only the border receives color;
 /// the fill and the native backdrop inside it remain untouched.
 pub(super) fn draw(
     sugarloaf: &mut Sugarloaf,
@@ -57,8 +57,9 @@ fn draw_rim<const HAS_STATUS: bool>(
     let width = (w * scale).round();
     let height = (h * scale).round();
     let r = (radius * scale).min(width / 2.0).min(height / 2.0);
-    let columns = r.ceil().min((width / 2.0).floor()) as usize;
     let stroke = if HAS_STATUS { status.width } else { 1.0 };
+    // Straight corners still need side strips, including thick status rims.
+    let columns = r.max(stroke).ceil().min((width / 2.0).floor()) as usize;
     let straight = width - 2.0 * r;
     let vertical = height - 2.0 * r;
     let quarter = std::f32::consts::FRAC_PI_2 * r;
@@ -149,7 +150,7 @@ fn draw_rim<const HAS_STATUS: bool>(
         let normal_y = if py < height / 2.0 { -1.0 } else { 1.0 };
         let left = columns as f32;
         let length = width - left * 2.0;
-        let alpha = coverage(-edge_y);
+        let alpha = coverage(-edge_y.min(width / 2.0));
         if progress_end.is_some() && normal_y < 0.0 {
             // Split at twelve o'clock, where the clockwise contour wraps.
             let half = length / 2.0;
@@ -186,7 +187,7 @@ fn draw_rim<const HAS_STATUS: bool>(
         let dy = (r - edge_y).max(0.0);
         let outer_left = r - (r * r - dy * dy).max(0.0).sqrt();
         let inner_r = (r - stroke).max(0.0);
-        let inner_left = r - (inner_r * inner_r - dy * dy).max(0.0).sqrt();
+        let inner_left = (r - (inner_r * inner_r - dy * dy).max(0.0).sqrt()).max(stroke);
         let first = (outer_left - 1.0).max(0.0).floor() as usize;
         let end = ((inner_left + 1.0).ceil() as usize).min(columns);
         for column in first..end {
@@ -197,19 +198,36 @@ fn draw_rim<const HAS_STATUS: bool>(
             if alpha <= 0.0 {
                 continue;
             }
-            let nx = dx.max(0.0) / normal_length.max(f32::EPSILON);
-            let ny = normal_y * dy / normal_length.max(f32::EPSILON);
+            let (nx, ny) = if normal_length > 0.0 {
+                (dx.max(0.0) / normal_length, normal_y * dy / normal_length)
+            } else if dx > r - edge_y {
+                (1.0, 0.0)
+            } else {
+                (0.0, normal_y)
+            };
             // Only determinate progress needs arc positions. Plain glass and
             // whole status rims keep the original scan without trigonometry.
-            let arc = if progress_end.is_some() {
+            let arc = if progress_end.is_some() && r > 0.0 {
                 dy.atan2(dx.max(0.0)) * r
             } else {
                 0.0
             };
             let side = (py - r).clamp(0.0, vertical);
-            let right_travel = straight / 2.0 + quarter + side + normal_y * arc;
-            let left_travel =
-                perimeter - straight / 2.0 - quarter - side - normal_y * arc;
+            let (left_travel, right_travel) = if progress_end.is_some() && nx == 0.0 {
+                // The nearest contour point can lie on a horizontal edge,
+                // including inside a square corner's inward stroke.
+                let travel = straight / 2.0 + dx;
+                if normal_y < 0.0 {
+                    (perimeter - travel, travel)
+                } else {
+                    (perimeter / 2.0 + travel, perimeter / 2.0 - travel)
+                }
+            } else {
+                (
+                    perimeter - straight / 2.0 - quarter - side - normal_y * arc,
+                    straight / 2.0 + quarter + side + normal_y * arc,
+                )
+            };
             span(
                 column as f32,
                 row as f32,

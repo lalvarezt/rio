@@ -12,6 +12,7 @@ use crate::context::ContextManager;
 use crate::renderer::helpers::spring::Spring;
 use crate::renderer::tab_glass::Status;
 use rio_backend::config::colors::Colors;
+use rio_backend::config::navigation::TabStyle;
 use rio_backend::event::{EventProxy, ProgressReport, ProgressState};
 use rio_backend::program_status::{
     BlockedKind, ProgramState, ProgramStatusRecord, ProgramStatusStore,
@@ -413,6 +414,7 @@ pub struct Island {
     pub min_tab_width: f32,
     pub tab_icon_size: f32,
     pub animation: rio_backend::config::navigation::Animation,
+    tab_style: TabStyle,
     tab_glass_intensity: f32,
     tab_status_width: f32,
     app_icons: super::app_icons::Library,
@@ -466,6 +468,7 @@ impl Island {
             min_tab_width: rio_backend::config::navigation::default_min_tab_width(),
             tab_icon_size: rio_backend::config::navigation::default_tab_icon_size(),
             animation: rio_backend::config::navigation::Animation::default(),
+            tab_style: TabStyle::default(),
             tab_glass_intensity:
                 rio_backend::config::navigation::default_tab_glass_intensity(),
             tab_status_width: rio_backend::config::navigation::default_tab_status_width(),
@@ -496,6 +499,7 @@ impl Island {
         navigation: &rio_backend::config::navigation::Navigation,
     ) {
         self.animation = navigation.animation;
+        self.tab_style = navigation.tab_style;
         self.max_tab_width = rio_backend::config::navigation::clamp_max_tab_width(
             navigation.max_tab_width,
         );
@@ -516,6 +520,15 @@ impl Island {
                 rio_backend::config::navigation::clamp_tab_glass_intensity(
                     navigation.tab_glass_intensity,
                 );
+        }
+    }
+
+    /// Apply the style at the shared surface renderer, including shadows and
+    /// close-button hover. Layout and interaction stay independent of shape.
+    fn tab_radius(&self, pill_radius: f32) -> f32 {
+        match self.tab_style {
+            TabStyle::Pill => pill_radius,
+            TabStyle::Windows => 0.0,
         }
     }
 

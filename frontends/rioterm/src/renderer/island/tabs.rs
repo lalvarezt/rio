@@ -643,7 +643,7 @@ impl Island {
                                 y,
                                 w,
                                 h,
-                                radius,
+                                self.tab_radius(radius),
                                 fill,
                                 self.tab_glass_intensity,
                                 status,
@@ -732,7 +732,7 @@ impl Island {
                 h + 3.0,
                 [0.0, 0.0, 0.0, self.tabs.elevation * 0.18],
                 0.05,
-                radius + 2.0,
+                self.tab_radius(radius + 2.0),
                 order,
             );
             Some(tab.content.custom_color.unwrap_or(fills.active))
@@ -753,7 +753,7 @@ impl Island {
                 y,
                 w,
                 h,
-                radius,
+                self.tab_radius(radius),
                 alpha(fill, tab.opacity),
                 self.tab_glass_intensity
                     * tab.opacity
@@ -832,7 +832,7 @@ impl Island {
                         CLOSE_SPACE,
                         alpha(fills.close_hover, tab.hover),
                         0.05,
-                        CLOSE_HOVER_CORNER_RADIUS,
+                        self.tab_radius(CLOSE_HOVER_CORNER_RADIUS),
                         order + 1,
                     );
                 }

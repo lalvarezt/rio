@@ -619,6 +619,9 @@ impl Config {
             if let Some(tab_icon_size) = navigation_overwrite.tab_icon_size {
                 self.navigation.tab_icon_size = tab_icon_size;
             }
+            if let Some(style) = navigation_overwrite.tab_style {
+                self.navigation.tab_style = style;
+            }
             if let Some(intensity) = navigation_overwrite.tab_glass_intensity {
                 self.navigation.tab_glass_intensity = intensity;
             }

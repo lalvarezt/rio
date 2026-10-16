@@ -195,6 +195,14 @@ pub enum Animation {
     Full,
 }
 
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TabStyle {
+    #[default]
+    Pill,
+    Windows,
+}
+
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct Navigation {
     #[serde(default = "NavigationMode::default")]
@@ -249,7 +257,10 @@ pub struct Navigation {
     /// Desktop tab icon size in logical pixels, clamped to `[8.0, 32.0]`.
     #[serde(default = "default_tab_icon_size", rename = "tab-icon-size")]
     pub tab_icon_size: f32,
-    /// Desktop tab pill border reflections, from `0.0` (off) to `1.0`.
+    /// Tab shape; both styles share colors, reflections, status, and motion.
+    #[serde(default, rename = "tab-style")]
+    pub tab_style: TabStyle,
+    /// Desktop tab border reflections, from `0.0` (off) to `1.0`.
     #[serde(
         default = "default_tab_glass_intensity",
         rename = "tab-glass-intensity"
@@ -259,7 +270,7 @@ pub struct Navigation {
     /// Zero hides the status border, preserving the ordinary glass reflection.
     #[serde(default = "default_tab_status_width", rename = "tab-status-width")]
     pub tab_status_width: f32,
-    /// Tab motion and header hover transitions. Defaults to the full effect.
+    /// Tab motion and hover transitions. Defaults to the full effect.
     #[serde(default)]
     pub animation: Animation,
     /// Map command names to a bundled app or named icon in Desktop tabs.
@@ -283,6 +294,7 @@ impl Default for Navigation {
             max_tab_width: default_max_tab_width(),
             min_tab_width: default_min_tab_width(),
             tab_icon_size: default_tab_icon_size(),
+            tab_style: TabStyle::default(),
             tab_glass_intensity: default_tab_glass_intensity(),
             tab_status_width: default_tab_status_width(),
             animation: Animation::default(),

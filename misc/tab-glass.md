@@ -1,18 +1,24 @@
 # Tab glass
 
-Linux, macOS, and Windows tab pills have a thin reflective border around their rounded contours.
-Set its strength in `config.toml`:
+Linux, macOS, and Windows tabs share a thin reflective border. Choose their
+shape and reflection strength in `config.toml`:
 
 ```toml
 [navigation]
+tab-style = "pill"
 tab-glass-intensity = 0.5
 ```
 
-The default is `0.5`. Use `0.0` for the flat pill or `1.0` for the strongest
+`tab-style` defaults to `"pill"`, the existing rounded shape. `"windows"`
+uses square corners for tabs and their close-button hovers. Both styles keep
+the same colors, spacing, icons, reflections, status borders, and animations.
+The style reloads with the configuration and supports platform overrides.
+
+The default glass intensity is `0.5`. Use `0.0` for a flat tab or `1.0` for the strongest
 reflections. Values outside this range are clamped. Changes reload with the
 configuration and follow the tab's selection and hover transitions.
 
-The intensity changes only the border. The pill's interior color and opacity
+The intensity changes only the border. The tab's interior color and opacity
 stay the same, with no sheen or gradient painted over its contents.
 
 For a platform override in a shared configuration, use
