@@ -12,9 +12,6 @@ fn flag(value: bool) -> f32 {
 
 const SETTLE_TIME: f32 = 0.18;
 const SHRINK_DELAY: Duration = Duration::from_millis(120);
-const CLOSE_SPACE: f32 = CLOSE_HOVER_HALF * 2.0;
-const TITLE_END_INSET: f32 =
-    CLOSE_MARGIN_RIGHT + CLOSE_HOVER_HALF + TAB_GAP / 2.0 + TAB_ICON_GAP;
 
 struct Position {
     target: f32,
@@ -66,7 +63,7 @@ struct Tab {
     preferred_width: f32,
     measured_width: f32,
     pending_shrink: Option<Instant>,
-    measurement: Option<[f32; 4]>,
+    measurement: Option<[f32; 5]>,
 }
 
 struct Selection {
@@ -80,6 +77,7 @@ struct Selection {
 
 #[derive(Default)]
 pub(super) struct Tabs {
+    pub(super) appearance: TabAppearance,
     tabs: FxHashMap<usize, Tab>,
     order: Vec<usize>,
     selection: Option<Selection>,
@@ -107,9 +105,10 @@ impl Tabs {
                 let left = tab.left.value();
                 let width = tab.width.value();
                 (x >= left && x < left + width).then(|| {
-                    let (ix, _, iw, _, _) = island_rect(left, width);
                     let close = floating != Some(*id)
-                        && close_button_center(ix, iw)
+                        && self
+                            .appearance
+                            .close_center(left, width)
                             .is_some_and(|cx| (x - cx).abs() <= CLOSE_HIT_HALF_WIDTH);
                     (*id, close)
                 })
@@ -183,7 +182,9 @@ impl Tabs {
         min: f32,
         max: f32,
     ) -> TabStripLayout {
-        let mut layout = tab_strip_layout(width, scale, self.order.len(), f32::MAX);
+        let mut layout = self
+            .appearance
+            .layout(width, scale, self.order.len(), f32::MAX);
         let available = layout.tabs_width;
         layout.widths = self
             .order
@@ -217,7 +218,7 @@ impl Tabs {
         max: f32,
     ) -> TabStripLayout {
         let count = context_manager.len();
-        let mut layout = tab_strip_layout(width, scale, count, max);
+        let mut layout = self.appearance.layout(width, scale, count, max);
         layout.topmost = self
             .floating
             .and_then(|id| (0..count).find(|&index| context_manager.tab_id(index) == id));
@@ -269,7 +270,8 @@ impl Tabs {
             self.floating = None;
             self.elevation = 0.0;
         }
-        let measurement = Some([scale, min, max, icon_size]);
+        let end_inset = self.appearance.title_end_inset(false);
+        let measurement = Some([scale, min, max, icon_size, end_inset]);
         let opts = DrawOpts {
             font_size: snap(TITLE_FONT_SIZE, scale),
             font_id: Some(rio_backend::sugarloaf::font::FONT_ID_REGULAR),
@@ -290,8 +292,8 @@ impl Tabs {
                     || tab.content.bell != content.bell
             });
             let measured = if changed {
-                let padding = tab_title_padding(content.remote, icon_size)
-                    + TAB_TITLE_PADDING_RIGHT
+                let padding = self.appearance.title_padding(content.remote, icon_size)
+                    + end_inset
                     + if content.bell {
                         BELL_DOT_SIZE + BELL_GAP
                     } else {
@@ -484,7 +486,10 @@ impl Island {
     /// Reorder thresholds use destination slots, while clicks use displayed geometry.
     pub fn drag_layout(&self, width: f32, scale: f32, count: usize) -> TabStripLayout {
         if self.tabs.order.len() != count {
-            return tab_strip_layout(width, scale, count, self.max_tab_width);
+            return self
+                .tabs
+                .appearance
+                .layout(width, scale, count, self.max_tab_width);
         }
         self.tabs
             .target_layout(width, scale, self.min_tab_width, self.max_tab_width)
@@ -500,9 +505,13 @@ impl Island {
     ) {
         self.sync_focused_program_status(context_manager);
         let count = context_manager.len();
+        let appearance = self.tabs.appearance;
         self.window_header.render(sugarloaf, window_width / scale);
         if self.hide_if_single && count == 1 {
-            self.tabs = Tabs::default();
+            self.tabs = Tabs {
+                appearance,
+                ..Tabs::default()
+            };
             self.drag = None;
             let y = if cfg!(any(target_os = "windows", target_os = "macos")) {
                 ISLAND_HEIGHT
@@ -588,17 +597,17 @@ impl Island {
         let occlusion = floating_left.and_then(|left| {
             floating.map(|id| {
                 let (x, _, w, _, _) =
-                    island_rect(left, self.tabs.tabs[&id].width.value());
+                    appearance.rect(left, self.tabs.tabs[&id].width.value());
                 [x, x + w]
             })
         });
         let fills = tab_fills(bg);
-        let bounds = tab_strip_layout(window_width, scale, count, f32::MAX);
+        let bounds = appearance.layout(window_width, scale, count, f32::MAX);
         let right = bounds.left_margin + bounds.tabs_width;
         let title_y = crate::renderer::window_chrome::centered_text_y(
             sugarloaf,
             "Mg",
-            TAB_CENTER_Y + 2.0,
+            appearance.center_y() + 2.0,
             &DrawOpts {
                 font_size: snap(TITLE_FONT_SIZE, scale),
                 font_id: Some(rio_backend::sugarloaf::font::FONT_ID_REGULAR),
@@ -632,7 +641,7 @@ impl Island {
                 ];
                 sugarloaf.with_shape_clip(clip, |sugarloaf| {
                     for offset in copies.iter().take(if period > 0.0 { 3 } else { 1 }) {
-                        let (x, y, w, h, radius) = island_rect(
+                        let (x, y, w, h, radius) = appearance.rect(
                             selection.left.value() + offset,
                             selection.width.value(),
                         );
@@ -643,7 +652,7 @@ impl Island {
                                 y,
                                 w,
                                 h,
-                                self.tab_radius(radius),
+                                radius,
                                 fill,
                                 self.tab_glass_intensity,
                                 status,
@@ -709,7 +718,8 @@ impl Island {
     ) {
         let left = floating.unwrap_or_else(|| tab.left.value());
         let width = tab.width.value().min((right - left).max(0.0));
-        let (x, y, w, h, radius) = island_rect(left, width);
+        let appearance = self.tabs.appearance;
+        let (x, y, w, h, radius) = appearance.rect(left, width);
         if w <= 0.0 || tab.opacity == 0.0 {
             return;
         }
@@ -732,7 +742,7 @@ impl Island {
                 h + 3.0,
                 [0.0, 0.0, 0.0, self.tabs.elevation * 0.18],
                 0.05,
-                self.tab_radius(radius + 2.0),
+                appearance.radius(radius + 2.0),
                 order,
             );
             Some(tab.content.custom_color.unwrap_or(fills.active))
@@ -753,7 +763,7 @@ impl Island {
                 y,
                 w,
                 h,
-                self.tab_radius(radius),
+                radius,
                 alpha(fill, tab.opacity),
                 self.tab_glass_intensity
                     * tab.opacity
@@ -766,17 +776,14 @@ impl Island {
                 order,
             );
         }
-        let padding = tab_title_padding(tab.content.remote, self.tab_icon_size);
+        let padding = appearance.title_padding(tab.content.remote, self.tab_icon_size);
         let bell_width = if tab.content.bell {
             BELL_DOT_SIZE + BELL_GAP
         } else {
             0.0
         };
-        let end_inset = if count > 1 && tab.hover > 0.0 && floating.is_none() {
-            TITLE_END_INSET
-        } else {
-            TAB_TITLE_PADDING_RIGHT
-        };
+        let end_inset = appearance
+            .title_end_inset(count > 1 && tab.hover > 0.0 && floating.is_none());
         let budget = (width - padding - end_inset - bell_width).max(0.0);
         if budget >= TITLE_FONT_SIZE {
             let opts = DrawOpts {
@@ -808,9 +815,19 @@ impl Island {
                 .text_mut()
                 .draw(text_x + bell_width, title_y, &title, &opts);
         }
-        self.render_tab_icons(sugarloaf, &tab.content, x, w, color, order + 1);
-        if count > 1 && tab.live && floating.is_none() && tab.hover > 0.0 {
-            if let Some(cx) = close_button_center(x, w) {
+        let close_center = appearance.close_center(left, width);
+        let icon_width = if appearance.persistent_close {
+            close_center
+                .map_or(w, |cx| (cx - CLOSE_HOVER_HALF - TAB_ICON_GAP - x).max(0.0))
+        } else {
+            w
+        };
+        self.render_tab_icons(sugarloaf, &tab.content, x, icon_width, color, order + 1);
+        if appearance.shows_close(count)
+            && tab.live
+            && (appearance.persistent_close || (floating.is_none() && tab.hover > 0.0))
+        {
+            if let Some(cx) = close_center {
                 let cx = snap(cx, sugarloaf.scale_factor());
                 if occlusion.is_some_and(|[start, end]| {
                     cx + CLOSE_HOVER_HALF > start && cx - CLOSE_HOVER_HALF < end
@@ -820,23 +837,45 @@ impl Island {
                         .exclude_horizontal_range_since(text_start, occlusion.unwrap());
                     return;
                 }
-                let hot = self
-                    .hover_x
-                    .is_some_and(|pointer| (pointer - cx).abs() <= CLOSE_HIT_HALF_WIDTH);
+                let hot = floating.is_none()
+                    && self.hover_x.is_some_and(|pointer| {
+                        (pointer - cx).abs() <= CLOSE_HIT_HALF_WIDTH
+                    });
                 if hot {
                     sugarloaf.rounded_rect(
                         None,
                         cx - CLOSE_HOVER_HALF,
-                        TAB_CENTER_Y - CLOSE_HOVER_HALF,
+                        appearance.center_y() - CLOSE_HOVER_HALF,
                         CLOSE_SPACE,
                         CLOSE_SPACE,
-                        alpha(fills.close_hover, tab.hover),
+                        alpha(
+                            fills.close_hover,
+                            if appearance.persistent_close {
+                                1.0
+                            } else {
+                                tab.hover
+                            },
+                        ),
                         0.05,
-                        self.tab_radius(CLOSE_HOVER_CORNER_RADIUS),
+                        appearance.radius(CLOSE_HOVER_CORNER_RADIUS),
                         order + 1,
                     );
                 }
-                draw_close_button(sugarloaf, cx, alpha(color, tab.hover), hot, order + 2);
+                draw_close_button(
+                    sugarloaf,
+                    cx,
+                    appearance.center_y(),
+                    alpha(
+                        color,
+                        if appearance.persistent_close {
+                            1.0
+                        } else {
+                            tab.hover
+                        },
+                    ),
+                    hot,
+                    order + 2,
+                );
             }
         }
         if let Some(range) = occlusion {

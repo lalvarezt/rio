@@ -3081,10 +3081,12 @@ impl Screen<'_> {
         let layout = self.island_tab_layout(num_tabs);
         let x_in_tabs = mouse_x_unscaled - layout.left_margin;
 
-        let close_under_pointer = num_tabs > 1
-            && layout.tab_at(mouse_x_unscaled).is_some_and(|index| {
-                island::close_button_hit(&layout, index, mouse_x_unscaled)
-            });
+        let close_under_pointer = self.renderer.island.as_ref().is_some_and(|island| {
+            island.shows_close_button(num_tabs)
+                && layout.tab_at(mouse_x_unscaled).is_some_and(|index| {
+                    island.close_button_hit(&layout, index, mouse_x_unscaled)
+                })
+        });
         if !is_right_click
             && self.is_close_press_tail(mouse_x_unscaled)
             && !close_under_pointer
@@ -3132,14 +3134,18 @@ impl Screen<'_> {
             return true;
         }
 
-        if num_tabs == 1 {
+        if num_tabs == 1 && !close_under_pointer {
             self.on_chrome_press(window, chrome_press);
             return true;
         }
 
-        if island::close_button_hit(&layout, clicked_tab, mouse_x_unscaled) {
+        if close_under_pointer {
             self.stop_hint_mode_if_active();
             self.last_close_press = Some((std::time::Instant::now(), mouse_x_unscaled));
+            if num_tabs == 1 {
+                self.context_manager.request_close_window();
+                return true;
+            }
             if clicked_tab != self.context_manager.current_index() {
                 self.context_manager
                     .close_unfocused_tab(clicked_tab, &mut self.sugarloaf);

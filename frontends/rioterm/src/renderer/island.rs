@@ -34,7 +34,6 @@ const TAB_ICON_GAP: f32 = 8.0;
 const TAB_GAP: f32 = 6.0;
 const TAB_INSET_BOTTOM: f32 = 6.0;
 const TAB_INSET_TOP: f32 = TAB_INSET_BOTTOM;
-const TAB_CENTER_Y: f32 = (TAB_INSET_TOP + ISLAND_HEIGHT - TAB_INSET_BOTTOM) / 2.0;
 const TAB_RADIUS: f32 = 19.0;
 /// Bell dot for tabs that rang while in the background, and the gap
 /// between it and the tab title. A dot, not a glyph: the UI text layer
@@ -86,6 +85,8 @@ const CLOSE_MARGIN_RIGHT: f32 = 22.0;
 const CLOSE_GLYPH_HALF: f32 = 3.5;
 const CLOSE_MIN_ISLAND_WIDTH: f32 = 64.0;
 const CLOSE_HOVER_HALF: f32 = 10.0;
+const CLOSE_SPACE: f32 = CLOSE_HOVER_HALF * 2.0;
+const CLOSE_TITLE_INSET: f32 = CLOSE_MARGIN_RIGHT + CLOSE_HOVER_HALF + TAB_ICON_GAP;
 const CLOSE_HOVER_CORNER_RADIUS: f32 = 5.0;
 const CLOSE_HIT_HALF_WIDTH: f32 = 10.0;
 const CLOSE_ALPHA_IDLE: f32 = 0.55;
@@ -127,11 +128,6 @@ struct TabPresentation {
     icon: super::app_icons::Icon,
     remote: bool,
     bell: bool,
-}
-
-fn tab_title_padding(remote: bool, icon_size: f32) -> f32 {
-    let icons = if remote { 2.0 } else { 1.0 };
-    TAB_GAP / 2.0 + TAB_ICON_INSET_X + icons * (icon_size + TAB_ICON_GAP)
 }
 
 #[derive(Clone, PartialEq)]
@@ -202,25 +198,7 @@ pub fn tab_strip_layout(
     num_tabs: usize,
     max_tab_width: f32,
 ) -> TabStripLayout {
-    #[cfg(target_os = "macos")]
-    let left_margin = ISLAND_MARGIN_LEFT_MACOS;
-    #[cfg(not(target_os = "macos"))]
-    let left_margin = 6.0;
-
-    let right_margin =
-        ISLAND_MARGIN_RIGHT + crate::renderer::window_chrome::controls_width();
-    let available_width =
-        ((window_width / scale_factor) - right_margin - left_margin).max(0.0);
-    let tab_width =
-        (available_width / num_tabs.max(1) as f32).clamp(0.0, max_tab_width.max(0.0));
-    TabStripLayout {
-        left_margin,
-        tab_width,
-        tabs_width: tab_width * num_tabs as f32,
-        widths: Vec::new(),
-        positions: Vec::new(),
-        topmost: None,
-    }
+    TabAppearance::default().layout(window_width, scale_factor, num_tabs, max_tab_width)
 }
 
 struct IslandFills {
@@ -246,13 +224,13 @@ fn tab_fills(bg: [f32; 4]) -> IslandFills {
 fn draw_tab_icon(
     sugarloaf: &mut Sugarloaf,
     x: f32,
+    cy: f32,
     color: [f32; 4],
     order: u8,
     icon: super::app_icons::Icon,
     font_id: Option<usize>,
     size: f32,
 ) {
-    let cy = TAB_CENTER_Y;
     if super::app_icons::draw(sugarloaf, icon, x + size / 2.0, cy, size, color, font_id) {
         return;
     }
@@ -333,50 +311,140 @@ fn draw_island(
     );
 }
 
-#[inline]
-fn island_rect(slot_x: f32, tab_width: f32) -> (f32, f32, f32, f32, f32) {
-    let x = slot_x + TAB_GAP / 2.0;
-    let w = (tab_width - TAB_GAP).max(0.0);
-    let y = TAB_INSET_TOP;
-    let h = ISLAND_HEIGHT - TAB_INSET_TOP - TAB_INSET_BOTTOM;
-    let radius = TAB_RADIUS.min(w / 2.0).min(h / 2.0);
-    (x, y, w, h, radius)
+/// Style geometry shared by measurement, drawing, and pointer targets.
+#[derive(Clone, Copy)]
+struct TabAppearance {
+    inset_top: f32,
+    rounded: bool,
+    persistent_close: bool,
 }
 
-#[inline]
-fn close_button_center(island_x: f32, island_w: f32) -> Option<f32> {
-    (island_w >= CLOSE_MIN_ISLAND_WIDTH)
-        .then_some(island_x + island_w - CLOSE_MARGIN_RIGHT)
-}
-
-#[inline]
-fn close_button_center_x(layout: &TabStripLayout, tab_index: usize) -> Option<f32> {
-    let slot_x = layout.left(tab_index);
-    let (ix, _, iw, _, _) = island_rect(slot_x, layout.width(tab_index));
-    close_button_center(ix, iw)
-}
-
-#[inline]
-pub fn close_button_hit(
-    layout: &TabStripLayout,
-    tab_index: usize,
-    x_unscaled: f32,
-) -> bool {
-    if layout.topmost == Some(tab_index) {
-        return false;
+impl Default for TabAppearance {
+    fn default() -> Self {
+        Self::from(TabStyle::default())
     }
-    close_button_center_x(layout, tab_index)
-        .is_some_and(|cx| (x_unscaled - cx).abs() <= CLOSE_HIT_HALF_WIDTH)
+}
+
+impl From<TabStyle> for TabAppearance {
+    fn from(style: TabStyle) -> Self {
+        let windows = style == TabStyle::Windows;
+        Self {
+            inset_top: if windows { 0.0 } else { TAB_INSET_TOP },
+            rounded: !windows,
+            persistent_close: windows,
+        }
+    }
+}
+
+impl TabAppearance {
+    fn gap(self) -> f32 {
+        if self.rounded {
+            TAB_GAP
+        } else {
+            0.0
+        }
+    }
+
+    fn layout(
+        self,
+        window_width: f32,
+        scale_factor: f32,
+        num_tabs: usize,
+        max_tab_width: f32,
+    ) -> TabStripLayout {
+        #[cfg(target_os = "macos")]
+        let left_margin = ISLAND_MARGIN_LEFT_MACOS;
+        #[cfg(not(target_os = "macos"))]
+        let left_margin = self.gap();
+        let right_margin =
+            ISLAND_MARGIN_RIGHT + crate::renderer::window_chrome::controls_width();
+        let available_width =
+            (window_width / scale_factor - right_margin - left_margin).max(0.0);
+        let tab_width =
+            (available_width / num_tabs.max(1) as f32).clamp(0.0, max_tab_width.max(0.0));
+        TabStripLayout {
+            left_margin,
+            tab_width,
+            tabs_width: tab_width * num_tabs as f32,
+            widths: Vec::new(),
+            positions: Vec::new(),
+            topmost: None,
+        }
+    }
+
+    fn icon_padding(self, remote: bool, icon_size: f32) -> f32 {
+        let icons = if remote { 2.0 } else { 1.0 };
+        TAB_ICON_INSET_X + icons * (icon_size + TAB_ICON_GAP)
+    }
+
+    fn title_padding(self, remote: bool, icon_size: f32) -> f32 {
+        self.gap() / 2.0 + self.icon_padding(remote, icon_size)
+    }
+
+    fn radius(self, pill_radius: f32) -> f32 {
+        if self.rounded {
+            pill_radius
+        } else {
+            0.0
+        }
+    }
+
+    fn center_y(self) -> f32 {
+        (self.inset_top + ISLAND_HEIGHT - TAB_INSET_BOTTOM) / 2.0
+    }
+
+    fn rect(self, slot_x: f32, tab_width: f32) -> (f32, f32, f32, f32, f32) {
+        let x = slot_x + self.gap() / 2.0;
+        let w = (tab_width - self.gap()).max(0.0);
+        let h = ISLAND_HEIGHT - self.inset_top - TAB_INSET_BOTTOM;
+        (
+            x,
+            self.inset_top,
+            w,
+            h,
+            self.radius(TAB_RADIUS.min(w / 2.0).min(h / 2.0)),
+        )
+    }
+
+    fn shows_close(self, count: usize) -> bool {
+        self.persistent_close || count > 1
+    }
+
+    fn title_end_inset(self, hovered_close: bool) -> f32 {
+        if self.persistent_close || hovered_close {
+            self.gap() / 2.0 + CLOSE_TITLE_INSET
+        } else {
+            TAB_TITLE_PADDING_RIGHT
+        }
+    }
+
+    fn close_center(self, slot_x: f32, tab_width: f32) -> Option<f32> {
+        let (x, _, w, _, _) = self.rect(slot_x, tab_width);
+        let minimum = if self.persistent_close {
+            CLOSE_SPACE
+        } else {
+            CLOSE_MIN_ISLAND_WIDTH
+        };
+        (w >= minimum).then_some(x + w - CLOSE_MARGIN_RIGHT.min(w / 2.0))
+    }
+
+    fn close_button_center_x(
+        self,
+        layout: &TabStripLayout,
+        tab_index: usize,
+    ) -> Option<f32> {
+        self.close_center(layout.left(tab_index), layout.width(tab_index))
+    }
 }
 
 fn draw_close_button(
     sugarloaf: &mut Sugarloaf,
     cx: f32,
+    cy: f32,
     color: [f32; 4],
     hover: bool,
     order: u8,
 ) {
-    let cy = TAB_CENTER_Y;
     let r = CLOSE_GLYPH_HALF;
     let alpha = if hover {
         CLOSE_ALPHA_HOVER
@@ -414,7 +482,6 @@ pub struct Island {
     pub min_tab_width: f32,
     pub tab_icon_size: f32,
     pub animation: rio_backend::config::navigation::Animation,
-    tab_style: TabStyle,
     tab_glass_intensity: f32,
     tab_status_width: f32,
     app_icons: super::app_icons::Library,
@@ -468,7 +535,6 @@ impl Island {
             min_tab_width: rio_backend::config::navigation::default_min_tab_width(),
             tab_icon_size: rio_backend::config::navigation::default_tab_icon_size(),
             animation: rio_backend::config::navigation::Animation::default(),
-            tab_style: TabStyle::default(),
             tab_glass_intensity:
                 rio_backend::config::navigation::default_tab_glass_intensity(),
             tab_status_width: rio_backend::config::navigation::default_tab_status_width(),
@@ -499,7 +565,7 @@ impl Island {
         navigation: &rio_backend::config::navigation::Navigation,
     ) {
         self.animation = navigation.animation;
-        self.tab_style = navigation.tab_style;
+        self.tabs.appearance = TabAppearance::from(navigation.tab_style);
         self.max_tab_width = rio_backend::config::navigation::clamp_max_tab_width(
             navigation.max_tab_width,
         );
@@ -523,13 +589,22 @@ impl Island {
         }
     }
 
-    /// Apply the style at the shared surface renderer, including shadows and
-    /// close-button hover. Layout and interaction stay independent of shape.
-    fn tab_radius(&self, pill_radius: f32) -> f32 {
-        match self.tab_style {
-            TabStyle::Pill => pill_radius,
-            TabStyle::Windows => 0.0,
-        }
+    pub fn shows_close_button(&self, count: usize) -> bool {
+        self.tabs.appearance.shows_close(count)
+    }
+
+    pub fn close_button_hit(
+        &self,
+        layout: &TabStripLayout,
+        index: usize,
+        x: f32,
+    ) -> bool {
+        layout.topmost != Some(index)
+            && self
+                .tabs
+                .appearance
+                .close_button_center_x(layout, index)
+                .is_some_and(|cx| (x - cx).abs() <= CLOSE_HIT_HALF_WIDTH)
     }
 
     /// Share per-tab geometry between rendering, dragging, and hit testing.
@@ -558,7 +633,12 @@ impl Island {
         color: [f32; 4],
         order: u8,
     ) {
-        if width < tab_title_padding(tab.remote, self.tab_icon_size) - TAB_GAP / 2.0 {
+        if width
+            < self
+                .tabs
+                .appearance
+                .icon_padding(tab.remote, self.tab_icon_size)
+        {
             return;
         }
         let mut x = x + TAB_ICON_INSET_X;
@@ -566,6 +646,7 @@ impl Island {
             draw_tab_icon(
                 sugarloaf,
                 x,
+                self.tabs.appearance.center_y(),
                 color,
                 order,
                 super::app_icons::SSH_ICON,
@@ -577,6 +658,7 @@ impl Island {
         draw_tab_icon(
             sugarloaf,
             x,
+            self.tabs.appearance.center_y(),
             color,
             order,
             tab.icon,
@@ -1447,14 +1529,15 @@ mod tests {
     fn island_rect_insets_slot_and_clamps_radius() {
         // Slot at x=100, width 180 → island inset by half the gap on
         // each side and the configured top and bottom insets.
-        let (x, y, w, h, radius) = island_rect(100.0, 180.0);
+        let appearance = TabAppearance::default();
+        let (x, y, w, h, radius) = appearance.rect(100.0, 180.0);
         assert_eq!(x, 100.0 + TAB_GAP / 2.0);
         assert_eq!(y, TAB_INSET_TOP);
         assert_eq!(w, 180.0 - TAB_GAP);
         assert_eq!(h, ISLAND_HEIGHT - TAB_INSET_TOP - TAB_INSET_BOTTOM);
         assert_eq!(radius, TAB_RADIUS);
 
-        let (_, _, w, h, radius) = island_rect(0.0, 4.0);
+        let (_, _, w, h, radius) = appearance.rect(0.0, 4.0);
         assert_eq!(w, 0.0);
         assert_eq!(radius, 0.0);
         assert!(radius <= h / 2.0);
@@ -1878,7 +1961,9 @@ mod tests {
             positions: Vec::new(),
             topmost: None,
         };
-        let cx = close_button_center_x(&layout, 1).unwrap();
+        let cx = TabAppearance::default()
+            .close_button_center_x(&layout, 1)
+            .unwrap();
         assert_eq!(
             cx,
             180.0 + TAB_GAP / 2.0 + (180.0 - TAB_GAP) - CLOSE_MARGIN_RIGHT
@@ -1896,7 +1981,10 @@ mod tests {
             positions: Vec::new(),
             topmost: None,
         };
-        assert_eq!(close_button_center_x(&narrow, 3), None);
+        assert_eq!(
+            TabAppearance::default().close_button_center_x(&narrow, 3),
+            None
+        );
     }
 
     #[test]

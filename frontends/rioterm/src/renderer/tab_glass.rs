@@ -63,13 +63,22 @@ fn draw_rim<const HAS_STATUS: bool>(
     let straight = width - 2.0 * r;
     let vertical = height - 2.0 * r;
     let quarter = std::f32::consts::FRAC_PI_2 * r;
+    // Clockwise distance starts where the upper-left arc meets the top edge.
+    // With square corners, that tangent is the rectangle's upper-left corner.
     let perimeter = 2.0 * (straight + vertical) + 4.0 * quarter;
     let progress = if HAS_STATUS {
         status.progress.filter(|p| *p < 100)
     } else {
         None
     };
-    let progress_end = progress.map(|p| perimeter * f32::from(p) / 100.0);
+    let progress_end = progress
+        .filter(|p| *p > 0)
+        .map(|p| perimeter * f32::from(p) / 100.0);
+    let base_strength = if progress == Some(0) {
+        TRACK_OPACITY
+    } else {
+        STATUS_OPACITY
+    };
 
     // Scan only the rim, in physical pixels. Subtracting the inner contour's
     // coverage gives an antialiased stroke without a background
@@ -141,7 +150,7 @@ fn draw_rim<const HAS_STATUS: bool>(
                 emit(column + cut, length - cut, after);
             }
         } else {
-            emit(column, length, STATUS_OPACITY);
+            emit(column, length, base_strength);
         }
     };
     for row in 0..height as usize {
@@ -151,38 +160,19 @@ fn draw_rim<const HAS_STATUS: bool>(
         let left = columns as f32;
         let length = width - left * 2.0;
         let alpha = coverage(-edge_y.min(width / 2.0));
-        if progress_end.is_some() && normal_y < 0.0 {
-            // Split at twelve o'clock, where the clockwise contour wraps.
-            let half = length / 2.0;
-            span(
-                left,
-                row as f32,
-                half,
-                alpha,
-                [0.0, normal_y],
-                perimeter - half,
-                1.0,
-            );
-            span(
-                width / 2.0,
-                row as f32,
-                half,
-                alpha,
-                [0.0, normal_y],
-                0.0,
-                1.0,
-            );
-        } else {
-            span(
-                left,
-                row as f32,
-                length,
-                alpha,
-                [0.0, normal_y],
-                perimeter / 2.0 + width / 2.0 - left,
-                -1.0,
-            );
-        }
+        span(
+            left,
+            row as f32,
+            length,
+            alpha,
+            [0.0, normal_y],
+            if normal_y < 0.0 {
+                left - r
+            } else {
+                perimeter / 2.0 + width - r - left
+            },
+            if normal_y < 0.0 { 1.0 } else { -1.0 },
+        );
 
         let dy = (r - edge_y).max(0.0);
         let outer_left = r - (r * r - dy * dy).max(0.0).sqrt();
@@ -216,16 +206,15 @@ fn draw_rim<const HAS_STATUS: bool>(
             let (left_travel, right_travel) = if progress_end.is_some() && nx == 0.0 {
                 // The nearest contour point can lie on a horizontal edge,
                 // including inside a square corner's inward stroke.
-                let travel = straight / 2.0 + dx;
                 if normal_y < 0.0 {
-                    (perimeter - travel, travel)
+                    (-dx, straight + dx)
                 } else {
-                    (perimeter / 2.0 + travel, perimeter / 2.0 - travel)
+                    (perimeter / 2.0 + straight + dx, perimeter / 2.0 - dx)
                 }
             } else {
                 (
-                    perimeter - straight / 2.0 - quarter - side - normal_y * arc,
-                    straight / 2.0 + quarter + side + normal_y * arc,
+                    perimeter - quarter - side - normal_y * arc,
+                    straight + quarter + side + normal_y * arc,
                 )
             };
             span(

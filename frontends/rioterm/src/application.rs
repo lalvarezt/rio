@@ -165,6 +165,25 @@ impl Application<'_> {
 }
 
 impl Application<'_> {
+    fn close_window(
+        &mut self,
+        window_id: rio_backend::event::WindowId,
+        event_loop: &ActiveEventLoop,
+        confirmed: bool,
+    ) {
+        if self.config.confirm_before_quit && !confirmed {
+            if let Some(route) = self.router.routes.get_mut(&window_id) {
+                route.confirm_quit();
+            }
+            return;
+        }
+        if self.router.routes.remove(&window_id).is_some()
+            && self.router.routes.is_empty()
+        {
+            event_loop.exit();
+        }
+    }
+
     /// One pane's title data changed (OSC 0/2 title carried in
     /// `raw_title`, OSC 7 directory as `None`): re-render, repaint the
     /// strip when the displayed text changed, and poke the titlebar.
@@ -1076,6 +1095,16 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     event_loop.exit();
                 }
             }
+            #[cfg(not(target_os = "macos"))]
+            RioEventType::Rio(RioEvent::CloseWindow) => {
+                #[cfg(target_os = "windows")]
+                if let Some(route) = self.router.routes.get(&window_id) {
+                    use rio_window::platform::windows::WindowExtWindows;
+                    route.window.winit_window.request_close();
+                }
+                #[cfg(not(target_os = "windows"))]
+                self.close_window(window_id, event_loop, false);
+            }
             #[cfg(target_os = "macos")]
             RioEventType::Rio(RioEvent::SelectNativeTabByIndex(tab_index)) => {
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
@@ -1255,24 +1284,11 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 // (see `set_confirm_before_quit` plumbing).
                 // Either way, by the time we see `CloseRequested`
                 // the user has already confirmed — just close.
-                if cfg!(any(target_os = "macos", target_os = "windows")) {
-                    self.router.routes.remove(&window_id);
-                    if self.router.routes.is_empty() {
-                        event_loop.exit();
-                    }
-                    return;
-                }
-
-                if self.config.confirm_before_quit {
-                    route.confirm_quit();
-                    return;
-                } else {
-                    self.router.routes.remove(&window_id);
-                }
-
-                if self.router.routes.is_empty() {
-                    event_loop.exit();
-                }
+                self.close_window(
+                    window_id,
+                    event_loop,
+                    cfg!(any(target_os = "macos", target_os = "windows")),
+                );
             }
 
             WindowEvent::ModifiersChanged(modifiers) => {

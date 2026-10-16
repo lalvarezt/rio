@@ -1151,6 +1151,11 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         }
     }
 
+    pub fn request_close_window(&self) {
+        self.event_proxy
+            .send_event(RioEvent::CloseWindow, self.window_id);
+    }
+
     #[inline]
     pub fn close_current_context(&mut self, sugarloaf: &mut Sugarloaf) {
         if self.contexts.len() == 1 {
@@ -1158,8 +1163,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             // keep Rio running in background.
             #[cfg(target_os = "macos")]
             {
-                self.event_proxy
-                    .send_event(RioEvent::CloseWindow, self.window_id);
+                self.request_close_window();
             }
             return;
         }

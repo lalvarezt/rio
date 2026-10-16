@@ -10,8 +10,11 @@ tab-glass-intensity = 0.5
 ```
 
 `tab-style` defaults to `"pill"`, the existing rounded shape. `"windows"`
-uses square corners for tabs and their close-button hovers. Both styles keep
-the same colors, spacing, icons, reflections, status borders, and animations.
+uses square corners, touches the upper-left edge, and places tabs directly
+next to each other. Its close buttons stay visible, including on a single tab,
+and their space is included in the preferred tab width. On macOS, the native
+traffic-light area remains reserved. Both styles share colors, icons,
+reflections, status borders, and animations.
 The style reloads with the configuration and supports platform overrides.
 
 The default glass intensity is `0.5`. Use `0.0` for a flat tab or `1.0` for the strongest
@@ -46,7 +49,8 @@ yellow for blocked, and red for errors. Idle and cleared reports restore the
 ordinary glass border.
 
 A working or blocked report with `progress=0` through `progress=100` fills the
-contour clockwise from the top center. The remaining contour is a faint track.
+contour clockwise from the upper-left corner. On a pill, it starts where the
+upper-left curve meets the straight top edge. The remaining contour is a faint track.
 Without a percentage, the whole border carries the status color. The glass
 reflection remains over the color; setting `tab-glass-intensity = 0` removes
 only the reflection.
@@ -142,13 +146,15 @@ selected tab above its neighbors. Moving between the first and last positions
 wraps the selection capsule through the strip's edges. Hover follows the tab currently beneath the pointer, including
 while tabs move.
 
-With multiple tabs, hovering a tab reveals its close button. Closing an inactive
-tab preserves the selected tab. The close button uses the existing tab width and
-shortens the visible title when needed, without moving neighboring tabs.
+With multiple pill-style tabs, hovering a tab reveals its close button and
+shortens the visible title without moving neighboring tabs. Window-style close
+buttons are always visible and reserve their width before the title is measured.
+Closing an inactive tab preserves the selected tab.
 
 Tabs grow to fit their titles between `navigation.min-tab-width` and
-`navigation.max-tab-width`. The width includes the app icon and optional SSH
-badge. Titles get an ellipsis when the configured maximum or available strip
+`navigation.max-tab-width`. The width includes the app icon, optional SSH
+badge, and persistent close button in window style. Titles get an ellipsis when
+the configured maximum or available strip
 space cannot fit the complete title.
 
 Linux keeps its window-manager decorations. Windows draws its minimize,
