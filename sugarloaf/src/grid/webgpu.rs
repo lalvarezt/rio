@@ -218,7 +218,7 @@ impl WgpuGridRenderer {
         let bg_cpu = vec![CellBg::TRANSPARENT; bg_len];
         let bg_buffer = alloc_bg_buffer(&device, cols, rows);
 
-        let initial_fg_capacity = bg_len.max(1);
+        let initial_fg_capacity = bg_len.saturating_add(CURSOR_ROW_SLOTS);
         let fg_buffer = alloc_fg_buffer(&device, initial_fg_capacity);
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -320,7 +320,7 @@ impl WgpuGridRenderer {
         self.bg_cpu = vec![CellBg::TRANSPARENT; bg_len];
         self.bg_buffer = alloc_bg_buffer(&self.device, cols, rows);
         self.fg_rows = init_fg_rows(rows);
-        let initial_fg_capacity = bg_len.max(1);
+        let initial_fg_capacity = bg_len.saturating_add(CURSOR_ROW_SLOTS);
         self.fg_buffer = alloc_fg_buffer(&self.device, initial_fg_capacity);
         self.fg_capacity = initial_fg_capacity;
         self.needs_full_rebuild = true;
@@ -395,6 +395,9 @@ impl WgpuGridRenderer {
     }
 
     pub fn set_cursor(&mut self, block: &[CellText], non_block: &[CellText]) {
+        // A zero-area instance keeps text offsets stable while the block blinks.
+        let hidden = [CellText::default()];
+        let block = if block.is_empty() { &hidden } else { block };
         self.write_fg_row(0, block);
         let last = self.fg_rows.len().saturating_sub(1);
         if last > 0 {
@@ -527,7 +530,9 @@ impl WgpuGridRenderer {
         }
 
         let instance_count = self.fg_live_count as usize;
-        if instance_count == 0 {
+        if instance_count == 0
+            || (instance_count == 1 && self.fg_rows[0][0].glyph_size == [0, 0])
+        {
             return;
         }
 
@@ -577,7 +582,13 @@ fn alloc_fg_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
 
 fn init_fg_rows(rows: u32) -> Vec<Vec<CellText>> {
     (0..(rows as usize + CURSOR_ROW_SLOTS))
-        .map(|_| Vec::new())
+        .map(|index| {
+            if index == 0 {
+                vec![CellText::default()]
+            } else {
+                Vec::new()
+            }
+        })
         .collect()
 }
 

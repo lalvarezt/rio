@@ -235,6 +235,35 @@ still match the starting binary pixel for pixel, including block/bar cursor
 changes and both resize directions. Artifacts:
 `target/profiles/pipeline-visual-uniform`.
 
+## 9. Cursor stream layout
+
+The block cursor occupied a variable-length slot before the packed text rows.
+Showing/hiding it shifted every text offset even though no text changed. WGPU
+now keeps one zero-area instance in that slot while hidden. Cursor changes
+replace the slot without moving terminal text. The trailing non-block cursor
+retains its existing slot. Initial capacity accounts for both cursor slots;
+an otherwise empty stream still skips the text draw.
+
+The native probe alternates actual VT show/hide commands over a stable screen
+and verifies repeated foreground updates. Three interleaved runs retain 122
+foreground flushes and 116 initial emitted rows per run in both variants.
+After dropping the first ten upload samples, median transfer size falls from
+389,792 to 32 bytes in every run. Per-run preparation/upload medians:
+
+| Run | Before, ms | After, ms |
+| --- | ---: | ---: |
+| 1 | 0.22445 | 0.01455 |
+| 2 | 0.12835 | 0.01560 |
+| 3 | 0.14565 | 0.01615 |
+
+The foreground writer, packed ordering and sprite rendering remain shared;
+there is no separate cursor buffer or additional draw. Artifacts:
+`target/profiles/terminal-render-cursor-{before,after}-{1,2,3}`.
+
+The normal Windows debug build passes, and all eight rendering captures still
+match the starting binary pixel for pixel. Artifacts:
+`target/profiles/pipeline-visual-final`.
+
 ## Remaining stages
 
 Overlays, background emission, font resolution, shaping keys, glyph
