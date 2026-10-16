@@ -57,10 +57,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GWL_USERDATA, HTCAPTION, HTCLIENT, IDYES, MB_ICONQUESTION, MB_TASKMODAL, MB_YESNO,
     MINMAXINFO, MNC_CLOSE, MSG, MWMO_INPUTAVAILABLE, NCCALCSIZE_PARAMS, PM_REMOVE,
     PT_PEN, PT_TOUCH, QS_ALLINPUT, RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL, SC_MINIMIZE,
-    SC_RESTORE, SIZE_MAXIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    WHEEL_DELTA, WINDOWPOS, WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT, WMSZ_LEFT,
-    WMSZ_RIGHT, WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT, WM_CAPTURECHANGED, WM_CLOSE,
-    WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE,
+    SC_RESTORE, SIZE_MAXIMIZED, SIZE_MINIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, WHEEL_DELTA, WINDOWPOS, WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT,
+    WMSZ_LEFT, WMSZ_RIGHT, WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT, WM_CAPTURECHANGED,
+    WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE,
     WM_GETMINMAXINFO, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT,
     WM_IME_STARTCOMPOSITION, WM_INPUT, WM_INPUT_DEVICE_CHANGE, WM_KEYDOWN, WM_KEYUP,
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
@@ -1588,7 +1588,13 @@ unsafe fn public_window_callback_inner(
             let w = super::loword(lparam as u32) as u32;
             let h = super::hiword(lparam as u32) as u32;
 
-            let physical_size = PhysicalSize::new(w, h);
+            // Undecorated windows can retain an iconic client area while minimized.
+            // It is not a usable render size and must not reflow the terminal.
+            let physical_size = if wparam == SIZE_MINIMIZED as usize {
+                PhysicalSize::new(0, 0)
+            } else {
+                PhysicalSize::new(w, h)
+            };
             let event = Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
                 event: Resized(physical_size),
