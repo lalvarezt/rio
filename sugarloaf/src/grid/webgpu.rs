@@ -178,9 +178,9 @@ pub struct WgpuGridRenderer {
     /// and `write_buffer` call. Same pattern as `MetalGridRenderer`.
     fg_live_count: u32,
     /// Any row-level write since the last flush.
-    fg_dirty: bool,
-    /// `bg_cpu` changed since the last `write_buffer`.
-    bg_dirty: bool,
+    fg_dirty: std::ops::Range<usize>,
+    /// Cell range changed since the last background upload.
+    bg_dirty: std::ops::Range<usize>,
 
     uniform_buffer: wgpu::Buffer,
 
@@ -276,8 +276,8 @@ impl WgpuGridRenderer {
             fg_capacity: initial_fg_capacity,
             fg_staging: Vec::new(),
             fg_live_count: 0,
-            fg_dirty: true,
-            bg_dirty: true,
+            fg_dirty: 0..rows as usize + 2,
+            bg_dirty: 0..(cols as usize * rows as usize),
             uniform_buffer,
             bg_bind_group_layout,
             bg_bind_group,
@@ -322,8 +322,9 @@ impl WgpuGridRenderer {
         self.fg_buffer = alloc_fg_buffer(&self.device, initial_fg_capacity);
         self.fg_capacity = initial_fg_capacity;
         self.needs_full_rebuild = true;
-        self.fg_dirty = true;
-        self.bg_dirty = true;
+        self.fg_dirty = 0..self.fg_rows.len();
+        self.bg_dirty = 0..bg_len;
+        self.fg_staging.clear();
         self.fg_live_count = 0;
         self.bg_bind_group = create_bg_bind_group(
             &self.device,
@@ -334,66 +335,68 @@ impl WgpuGridRenderer {
     }
 
     pub fn write_row(&mut self, row: u32, bg: &[CellBg], fg: &[CellText]) {
-        let idx = (row as usize) + 1;
-        if let Some(slot) = self.fg_rows.get_mut(idx) {
-            slot.clear();
-            slot.extend_from_slice(fg);
-            self.fg_dirty = true;
-        }
+        self.write_fg_row(row as usize + 1, fg);
 
         if row >= self.rows {
             return;
         }
         let row_start = (row as usize) * (self.cols as usize);
         let row_len = (self.cols as usize).min(bg.len());
-        let cpu = &mut self.bg_cpu;
-        cpu[row_start..row_start + row_len].copy_from_slice(&bg[..row_len]);
-        for slot in &mut cpu[row_start + row_len..row_start + self.cols as usize] {
-            *slot = CellBg::TRANSPARENT;
+        let cpu = &mut self.bg_cpu[row_start..row_start + self.cols as usize];
+        if cpu[..row_len] != bg[..row_len]
+            || cpu[row_len..]
+                .iter()
+                .any(|cell| *cell != CellBg::TRANSPARENT)
+        {
+            cpu[..row_len].copy_from_slice(&bg[..row_len]);
+            cpu[row_len..].fill(CellBg::TRANSPARENT);
+            extend_damage(
+                &mut self.bg_dirty,
+                row_start..row_start + self.cols as usize,
+            );
         }
-        self.bg_dirty = true;
     }
 
     pub fn clear_row(&mut self, row: u32) {
-        let idx = (row as usize) + 1;
-        if let Some(slot) = self.fg_rows.get_mut(idx) {
-            if !slot.is_empty() {
-                self.fg_dirty = true;
-            }
-            slot.clear();
-        }
+        self.write_fg_row(row as usize + 1, &[]);
         if row >= self.rows {
             return;
         }
         let row_start = (row as usize) * (self.cols as usize);
-        let cpu = &mut self.bg_cpu;
-        for slot in &mut cpu[row_start..row_start + self.cols as usize] {
-            *slot = CellBg::TRANSPARENT;
+        let cpu = &mut self.bg_cpu[row_start..row_start + self.cols as usize];
+        if cpu.iter().any(|cell| *cell != CellBg::TRANSPARENT) {
+            cpu.fill(CellBg::TRANSPARENT);
+            extend_damage(
+                &mut self.bg_dirty,
+                row_start..row_start + self.cols as usize,
+            );
         }
-        self.bg_dirty = true;
+    }
+
+    fn write_fg_row(&mut self, idx: usize, cells: &[CellText]) {
+        let row_count = self.fg_rows.len();
+        let Some(slot) = self.fg_rows.get_mut(idx) else {
+            return;
+        };
+        if bytemuck::cast_slice::<_, u8>(slot.as_slice()) == bytemuck::cast_slice(cells) {
+            return;
+        }
+        // A length change shifts every subsequent row in the packed GPU stream.
+        let end = if slot.len() == cells.len() {
+            idx + 1
+        } else {
+            row_count
+        };
+        slot.clear();
+        slot.extend_from_slice(cells);
+        extend_damage(&mut self.fg_dirty, idx..end);
     }
 
     pub fn set_cursor(&mut self, block: &[CellText], non_block: &[CellText]) {
-        let mut changed = false;
-        if let Some(slot) = self.fg_rows.first_mut() {
-            if slot.as_slice() != block {
-                slot.clear();
-                slot.extend_from_slice(block);
-                changed = true;
-            }
-        }
+        self.write_fg_row(0, block);
         let last = self.fg_rows.len().saturating_sub(1);
         if last > 0 {
-            if let Some(slot) = self.fg_rows.get_mut(last) {
-                if slot.as_slice() != non_block {
-                    slot.clear();
-                    slot.extend_from_slice(non_block);
-                    changed = true;
-                }
-            }
-        }
-        if changed {
-            self.fg_dirty = true;
+            self.write_fg_row(last, non_block);
         }
     }
 
@@ -411,8 +414,8 @@ impl WgpuGridRenderer {
         self.atlas_grayscale.clear();
         self.atlas_color.clear();
         self.needs_full_rebuild = true;
-        self.fg_dirty = true;
-        self.bg_dirty = true;
+        self.fg_dirty = 0..self.fg_rows.len();
+        self.bg_dirty = 0..self.bg_cpu.len();
     }
 
     /// The wgpu atlas is fixed-size (no grow yet), so on atlas-full
@@ -427,7 +430,7 @@ impl WgpuGridRenderer {
         }
         self.atlas_grayscale.clear();
         self.needs_full_rebuild = true;
-        self.fg_dirty = true;
+        self.fg_dirty = 0..self.fg_rows.len();
         self.atlas_grayscale.insert(key, glyph)
     }
 
@@ -441,7 +444,7 @@ impl WgpuGridRenderer {
         }
         self.atlas_color.clear();
         self.needs_full_rebuild = true;
-        self.fg_dirty = true;
+        self.fg_dirty = 0..self.fg_rows.len();
         self.atlas_color.insert(key, glyph)
     }
 
@@ -458,13 +461,13 @@ impl WgpuGridRenderer {
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
 
-        if self.bg_dirty {
+        if !self.bg_dirty.is_empty() {
             self.queue.write_buffer(
                 &self.bg_buffer,
-                0,
-                bytemuck::cast_slice(&self.bg_cpu),
+                (self.bg_dirty.start * std::mem::size_of::<CellBg>()) as u64,
+                bytemuck::cast_slice(&self.bg_cpu[self.bg_dirty.clone()]),
             );
-            self.bg_dirty = false;
+            self.bg_dirty = 0..0;
         }
 
         render_pass.set_pipeline(&self.bg_pipeline);
@@ -472,32 +475,45 @@ impl WgpuGridRenderer {
         render_pass.draw(0..3, 0..1);
     }
 
-    /// Record the cell-text pass. Lazily flushes per-row CPU vecs to
-    /// `fg_buffer` only when `fg_dirty` — saves ~(rows × cols ×
-    /// 32 B) of memcpy on Noop/CursorOnly damage frames.
+    /// Record the cell-text pass, flushing only changed packed rows.
     pub fn render_text(
         &mut self,
         render_pass: &mut wgpu::RenderPass<'_>,
         _uniforms: &GridUniforms,
     ) {
-        if self.fg_dirty {
-            self.fg_staging.clear();
-            for row in &self.fg_rows {
-                self.fg_staging.extend_from_slice(row);
+        if !self.fg_dirty.is_empty() {
+            let start = self.fg_rows[..self.fg_dirty.start]
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>();
+            let rows = &self.fg_rows[self.fg_dirty.clone()];
+            let end = start + rows.iter().map(Vec::len).sum::<usize>();
+            if self.fg_dirty.end == self.fg_rows.len() {
+                self.fg_staging.resize(end, CellText::default());
             }
+            let mut offset = start;
+            for row in rows {
+                let end = offset + row.len();
+                self.fg_staging[offset..end].copy_from_slice(row);
+                offset = end;
+            }
+            let mut dirty = start..end;
 
             if self.fg_staging.len() > self.fg_capacity {
                 let new_cap = self.fg_staging.len().next_power_of_two();
                 self.fg_buffer = alloc_fg_buffer(&self.device, new_cap);
                 self.fg_capacity = new_cap;
+                dirty = 0..self.fg_staging.len();
             }
-            self.queue.write_buffer(
-                &self.fg_buffer,
-                0,
-                bytemuck::cast_slice(&self.fg_staging),
-            );
+            if !dirty.is_empty() {
+                self.queue.write_buffer(
+                    &self.fg_buffer,
+                    (dirty.start * std::mem::size_of::<CellText>()) as u64,
+                    bytemuck::cast_slice(&self.fg_staging[dirty]),
+                );
+            }
             self.fg_live_count = self.fg_staging.len() as u32;
-            self.fg_dirty = false;
+            self.fg_dirty = 0..0;
         }
 
         let instance_count = self.fg_live_count as usize;
@@ -514,6 +530,15 @@ impl WgpuGridRenderer {
 }
 
 // ---------- buffer / layout / pipeline helpers ----------
+
+fn extend_damage(damage: &mut std::ops::Range<usize>, range: std::ops::Range<usize>) {
+    if damage.is_empty() {
+        *damage = range;
+    } else {
+        damage.start = damage.start.min(range.start);
+        damage.end = damage.end.max(range.end);
+    }
+}
 
 fn alloc_bg_buffer(device: &wgpu::Device, cols: u32, rows: u32) -> wgpu::Buffer {
     let size = (cols as u64)

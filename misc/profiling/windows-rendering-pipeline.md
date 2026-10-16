@@ -83,6 +83,46 @@ All 20 stream hashes match in each of three rounds, including Unicode cell
 mapping, hover, selection, IME and repeated warm emissions. Artifacts:
 `target/profiles/pipeline-hash`.
 
+## 4. GPU staging and uploads
+
+Foreground invalidation now records a range of rows. Equal-length edits only
+repack that range; a length change includes the packed suffix whose offsets
+move. Unchanged rows do not invalidate their resident stream. Cursor updates
+use the same writer. Background invalidation similarly records changed cells
+and skips identical rows. No second staging cache or offset table is added.
+
+Buffer growth uploads the complete new allocation. Resize clears staging and
+invalidates the new buffers; shrinking updates the live instance count even
+when the stream becomes empty. Atlas clears still force a complete rebuild.
+
+Three interleaved native runs per variant use the same 224×58 cmd/Python
+producer at 25 Hz, Vulkan and 120 target frames. Upload timing excludes probe
+log I/O. Medians of per-run medians:
+
+| Workload | Foreground preparation/upload before, ms | After, ms |
+| --- | ---: | ---: |
+| Sparse row edits | 0.2863 | 0.05305 |
+| Scrolling | 0.2867 | 0.2120 |
+| Dense updates | 0.2571 | 0.1868 |
+
+Sparse foreground transfers fall from 389,760 to 6,720 bytes, a 98.3% reduction.
+Scrolling and dense updates still transfer the full foreground stream. Each
+after-run needs one initial background upload instead of 52–53 uploads for
+unchanged default backgrounds. Artifacts:
+`target/profiles/terminal-render-pipeline-gpu-final-{before,after}-{1,2,3}`.
+
+Acquire, submit and present CPU timings vary materially with the host load.
+These measurements establish CPU staging/upload savings, not a whole-frame
+FPS gain or shader execution time. Uniform writes and draw encoding remain
+unchanged: the grid uses one background draw and one instanced text draw.
+
+Eight native GPU captures have identical terminal-body pixels to the starting
+binary. They cover row growth/shrinkage, packed-buffer growth, decorations,
+inline backgrounds and clearing, Unicode, block/bar cursors and both resize
+directions. The capture waits for startup and uses matching focus state;
+initial unsynchronized captures were discarded. Artifacts:
+`target/profiles/pipeline-visual-{before,after}`.
+
 ## Remaining stages
 
 Overlays, background emission, font resolution, shaping keys, glyph
