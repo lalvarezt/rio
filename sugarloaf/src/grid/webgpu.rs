@@ -183,6 +183,7 @@ pub struct WgpuGridRenderer {
     bg_dirty: std::ops::Range<usize>,
 
     uniform_buffer: wgpu::Buffer,
+    last_uniforms: Option<GridUniforms>,
 
     // bg pipeline
     bg_bind_group_layout: wgpu::BindGroupLayout,
@@ -276,9 +277,10 @@ impl WgpuGridRenderer {
             fg_capacity: initial_fg_capacity,
             fg_staging: Vec::new(),
             fg_live_count: 0,
-            fg_dirty: 0..rows as usize + 2,
+            fg_dirty: 0..rows as usize + CURSOR_ROW_SLOTS,
             bg_dirty: 0..(cols as usize * rows as usize),
             uniform_buffer,
+            last_uniforms: None,
             bg_bind_group_layout,
             bg_bind_group,
             bg_pipeline,
@@ -448,18 +450,26 @@ impl WgpuGridRenderer {
         self.atlas_color.insert(key, glyph)
     }
 
-    /// Record the cell-bg pass. Uploads the uniform buffer (cheap; the
-    /// bg path always runs first per frame so this is the right place
-    /// for it) and the bg cell storage buffer if it changed since the
-    /// last flush. Pair with `render_text`, with any
+    /// Record the cell-bg pass, uploading changed uniforms and background cells.
+    /// Pair with `render_text`, with any
     /// `kitty_below_text` images composited in between.
     pub fn render_bg(
         &mut self,
         render_pass: &mut wgpu::RenderPass<'_>,
         uniforms: &GridUniforms,
     ) {
-        self.queue
-            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
+        if self
+            .last_uniforms
+            .as_ref()
+            .is_none_or(|last| bytemuck::bytes_of(last) != bytemuck::bytes_of(uniforms))
+        {
+            self.queue.write_buffer(
+                &self.uniform_buffer,
+                0,
+                bytemuck::bytes_of(uniforms),
+            );
+            self.last_uniforms = Some(*uniforms);
+        }
 
         if !self.bg_dirty.is_empty() {
             self.queue.write_buffer(

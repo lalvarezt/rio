@@ -215,6 +215,26 @@ edits, scrollback, new PTY output, resize in both directions, switching between
 two tabs while search remains active, and dismissal. Artifacts:
 `target/profiles/query-visual-{before,after}-search`.
 
+## 8. Uniform uploads
+
+Each WGPU grid now retains the last uniform value it uploaded and compares
+the POD bytes before issuing another write. This adds one inline value per
+grid, with no allocation. New grids always upload; changes to cursor state,
+dimensions, padding, color controls or projection still upload. Resize retains
+the same uniform buffer, so comparing its resident value remains valid.
+
+Three interleaved stable-screen runs reduce 121, 217 and 219 uniform writes
+(including pre-ready frames) to one initial write in each run. Those baseline
+writes take 12.90–14.30 ms total per run; each after-run spends 0.031–0.097 ms
+on its initial write. No whole-frame speedup is inferred from differently sized
+startup samples. Artifacts:
+`target/profiles/terminal-render-uniform-{before,after}-{1,2,3}`.
+
+The normal Windows debug build passes. All eight native rendering captures
+still match the starting binary pixel for pixel, including block/bar cursor
+changes and both resize directions. Artifacts:
+`target/profiles/pipeline-visual-uniform`.
+
 ## Remaining stages
 
 Overlays, background emission, font resolution, shaping keys, glyph
