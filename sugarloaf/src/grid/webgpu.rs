@@ -167,6 +167,7 @@ pub struct WgpuGridRenderer {
 
     bg_cpu: Vec<CellBg>,
     bg_buffer: wgpu::Buffer,
+    bg_visible_rows: usize,
 
     fg_rows: Vec<Vec<CellText>>,
     fg_buffer: wgpu::Buffer,
@@ -272,6 +273,7 @@ impl WgpuGridRenderer {
             rows,
             bg_cpu,
             bg_buffer,
+            bg_visible_rows: 0,
             fg_rows: init_fg_rows(rows),
             fg_buffer,
             fg_capacity: initial_fg_capacity,
@@ -318,6 +320,7 @@ impl WgpuGridRenderer {
         self.rows = rows;
         let bg_len = (cols as usize) * (rows as usize);
         self.bg_cpu = vec![CellBg::TRANSPARENT; bg_len];
+        self.bg_visible_rows = 0;
         self.bg_buffer = alloc_bg_buffer(&self.device, cols, rows);
         self.fg_rows = init_fg_rows(rows);
         let initial_fg_capacity = bg_len.saturating_add(CURSOR_ROW_SLOTS);
@@ -338,7 +341,15 @@ impl WgpuGridRenderer {
 
     pub fn write_row(&mut self, row: u32, bg: &[CellBg], fg: &[CellText]) {
         self.write_fg_row(row as usize + 1, fg);
+        self.write_bg_row(row, bg);
+    }
 
+    pub fn clear_row(&mut self, row: u32) {
+        self.write_fg_row(row as usize + 1, &[]);
+        self.write_bg_row(row, &[]);
+    }
+
+    fn write_bg_row(&mut self, row: u32, bg: &[CellBg]) {
         if row >= self.rows {
             return;
         }
@@ -350,24 +361,12 @@ impl WgpuGridRenderer {
                 .iter()
                 .any(|cell| *cell != CellBg::TRANSPARENT)
         {
+            let was_visible = cpu.iter().any(|cell| *cell != CellBg::TRANSPARENT);
             cpu[..row_len].copy_from_slice(&bg[..row_len]);
             cpu[row_len..].fill(CellBg::TRANSPARENT);
-            extend_damage(
-                &mut self.bg_dirty,
-                row_start..row_start + self.cols as usize,
-            );
-        }
-    }
-
-    pub fn clear_row(&mut self, row: u32) {
-        self.write_fg_row(row as usize + 1, &[]);
-        if row >= self.rows {
-            return;
-        }
-        let row_start = (row as usize) * (self.cols as usize);
-        let cpu = &mut self.bg_cpu[row_start..row_start + self.cols as usize];
-        if cpu.iter().any(|cell| *cell != CellBg::TRANSPARENT) {
-            cpu.fill(CellBg::TRANSPARENT);
+            let is_visible = cpu.iter().any(|cell| *cell != CellBg::TRANSPARENT);
+            self.bg_visible_rows =
+                self.bg_visible_rows + is_visible as usize - was_visible as usize;
             extend_damage(
                 &mut self.bg_dirty,
                 row_start..row_start + self.cols as usize,
@@ -483,6 +482,9 @@ impl WgpuGridRenderer {
             self.bg_dirty = 0..0;
         }
 
+        if self.bg_visible_rows == 0 && uniforms.cursor_bg_color[3] == 0.0 {
+            return;
+        }
         render_pass.set_pipeline(&self.bg_pipeline);
         render_pass.set_bind_group(0, &self.bg_bind_group, &[]);
         render_pass.draw(0..3, 0..1);

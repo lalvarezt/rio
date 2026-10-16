@@ -264,10 +264,71 @@ The normal Windows debug build passes, and all eight rendering captures still
 match the starting binary pixel for pixel. Artifacts:
 `target/profiles/pipeline-visual-final`.
 
-## Remaining stages
+## 10. GPU background drawing
 
-Overlays, background emission, font resolution, shaping keys, glyph
-rasterization/atlases, foreground emission,
-cursor streams, GPU uploads/uniforms, draw encoding, presentation and resize
-lifetime are being inspected in order. Changes require measured benefit and
-output validation; an inspected stage does not require a speculative rewrite.
+Hardware timestamps identified a redundant fullscreen draw: canonical
+transparent background cells contribute nothing under premultiplied blending.
+WGPU now skips that draw when no row contains background data and the block
+cursor has no background to paint. Colored backgrounds and block cursors keep
+their draw. Background buffers still receive their updates before this gate,
+so later draws cannot expose stale cells.
+
+One visible-row count is maintained when a background row actually changes.
+Writes and clears share the same row writer; unchanged rows add no
+classification work. No per-frame full-screen scan or additional row cache is
+introduced. Window clearing and opacity handling are unchanged.
+
+Temporary Vulkan timestamp queries bracket the pass, background step and text
+step. Three interleaved runs per variant/workload discard the first ten GPU
+samples, leaving 111–162 samples per run. Medians of per-run medians:
+
+| Default-background workload, cursor hidden | GPU pass before, µs | After, µs |
+| --- | ---: | ---: |
+| Idle | 139.264 | 65.536 |
+| Sparse | 139.264 | 64.512 |
+| Scrolling | 139.264 | 65.536 |
+| Dense updates | 139.264 | 65.536 |
+
+This is about 53% less GPU pass time in these workloads. The interval through
+the background step falls from 80.896 to 3.072 µs; the remaining interval
+includes clearing and timestamp overhead. Text remains about 58–62 µs.
+Readbacks serialize these diagnostic runs, so their CPU/frame intervals are
+not FPS evidence. Timestamp instrumentation is removed from production code.
+Artifacts: `target/profiles/terminal-render-gpu-clock-{before,after}-{1,2,3}`.
+
+The final normal Windows debug build passes. All eight opaque rendering
+captures match the starting binary pixel for pixel, including colored
+backgrounds, clearing, block/bar cursors, buffer growth and resizing. A separate
+comparison over a fixed striped desktop with `opacity = 0.10` and `blur = true`
+also has identical terminal-body pixels. Artifacts:
+`target/profiles/pipeline-visual-gpu-final` and
+`target/profiles/pipeline-visual-glass-{before,after}`.
+
+## Completed audit
+
+| Stage | Result |
+| --- | --- |
+| PTY damage and snapshots | Existing notification coalescing and partial copies retained; default styles stay implicit. |
+| Screen preparation and locks | One snapshot lock per dirty panel retained; scratch and snapshot allocations reused. |
+| Search, selection, hints and IME | Search/selection optimized above; existing hover deduplication and old/new IME-row invalidation retained. |
+| Background construction | Rejected the plain-row fast path after styled-row regression; changed rows drive GPU invalidation and visibility. |
+| Font resolution | Existing regular-ASCII fast path, styled/fallback caches and route-specific glyph registry retained. |
+| Shaping and run cache | Bulk complete keys; no font features, ligatures or script handling disabled. Cold Swash shaping remains a cost. |
+| Rasterization and atlases | Reusable bitmap scratch; cache hits bypass rasterization; existing atlas-clear recovery retained. |
+| Foreground and decorations | Existing compact glyph records and shared shapes retained; empty decoration passes already skip. |
+| Cursor streams | Fixed block slot avoids moving resident text; trailing cursor ordering retained. |
+| GPU transfers and uniforms | Changed ranges only; unchanged uniform values stay resident. |
+| Draw encoding and shaders | Transparent background draw skipped; existing text draw, color conversion and blending retained. |
+| Acquire, submit and present | Existing pacing retained; host-sensitive CPU timings did not justify another scheduling change. |
+| Resize and resource lifetime | New buffers invalidate their resident data; packed growth/shrinkage and cursor transitions checked with native captures. |
+
+These measurements apply to the native Windows debug configuration described
+above. They do not establish release-build FPS or performance on other GPUs.
+
+The final profiling binary also completes the idle, sparse, scrolling and dense
+cmd workloads with timestamp instrumentation removed, passing shell-readiness,
+frame-count and repeated row/upload gates. Artifacts:
+`target/profiles/terminal-render-pipeline-final`.
+
+The application Rust diff is 25 lines smaller overall across ten files.
+Temporary instrumentation and native probes remain outside the tracked source.
