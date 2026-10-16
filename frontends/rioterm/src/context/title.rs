@@ -1,4 +1,5 @@
 use crate::context::Context;
+#[cfg(unix)]
 use std::path::Path;
 
 #[derive(PartialEq)]
@@ -25,13 +26,13 @@ impl Default for ContextTitle {
 
 /// Shorten an absolute path for display:
 /// - Replace home directory prefix with `~`
-/// - If 4+ components deep, show `…/last/three/components`
+/// - Outside Windows, if 4+ components deep, show `…/last/three/components`.
+///   Windows tabs fit the complete title to their measured width instead.
 fn shorten_path(absolute: &str) -> String {
-    let path = Path::new(absolute);
-
     // Replace home prefix with ~
     #[cfg(unix)]
     let display_path = {
+        let path = Path::new(absolute);
         if let Some(home) = dirs::home_dir() {
             if let Ok(stripped) = path.strip_prefix(&home) {
                 let s = stripped.to_string_lossy();
@@ -51,14 +52,15 @@ fn shorten_path(absolute: &str) -> String {
     #[cfg(not(unix))]
     let display_path = absolute.to_string();
 
-    // If 4+ components, show …/last3
-    let components: Vec<&str> =
-        display_path.split('/').filter(|s| !s.is_empty()).collect();
-    if components.len() >= 4 {
-        format!("…/{}", components[components.len() - 3..].join("/"))
-    } else {
-        display_path
+    #[cfg(not(target_os = "windows"))]
+    {
+        let components: Vec<&str> =
+            display_path.split('/').filter(|s| !s.is_empty()).collect();
+        if components.len() >= 4 {
+            return format!("…/{}", components[components.len() - 3..].join("/"));
+        }
     }
+    display_path
 }
 
 #[inline]
@@ -417,9 +419,14 @@ pub mod test {
             "/rio-sandbox-test-dir/sub",
         );
 
-        // Deep paths get truncated to last 3 components
-        assert_eq!(shorten_path("/a/b/c/d/e"), "…/c/d/e");
-        assert_eq!(shorten_path("/a/b/c/d"), "…/b/c/d");
+        // Windows leaves truncation to the tab's measured text budget.
+        if cfg!(target_os = "windows") {
+            assert_eq!(shorten_path("/a/b/c/d/e"), "/a/b/c/d/e");
+            assert_eq!(shorten_path("/a/b/c/d"), "/a/b/c/d");
+        } else {
+            assert_eq!(shorten_path("/a/b/c/d/e"), "…/c/d/e");
+            assert_eq!(shorten_path("/a/b/c/d"), "…/b/c/d");
+        }
 
         // 3 components stays as-is
         assert_eq!(shorten_path("/a/b/c"), "/a/b/c");
