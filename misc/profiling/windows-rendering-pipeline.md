@@ -123,6 +123,30 @@ directions. The capture waits for startup and uses matching focus state;
 initial unsynchronized captures were discarded. Artifacts:
 `target/profiles/pipeline-visual-{before,after}`.
 
+## 5. Glyph rasterization and background emission
+
+The non-CoreText rasterizer retains its temporary bitmap allocation between
+glyphs and borrows cached font data instead of cloning its `Arc`. The atlas
+still copies each bitmap before the scratch returns to the rasterizer. Failed
+rasterization and failed atlas insertion also return the scratch allocation.
+Cached atlas hits retain their existing early return.
+
+The optimized-core native probe clears the atlas and rasterizes 94 distinct
+ASCII glyphs per iteration, with font/shaping caches warmed. Three interleaved
+rounds, each with seven batches of 100 iterations, show 94 temporary bitmap
+allocations / 8,054 requested bytes falling to zero after warming. Rendered
+bitmap pixels match in all three rounds. Median run times are 6.730/6.297 ms
+before/after, but host variance is substantial; the established result is the
+allocation reduction, not a latency guarantee. Artifacts:
+`target/profiles/pipeline-raster-confirm`.
+
+A separate background fast-path experiment was discarded. Optimized native
+240-cell rows measured 297/188 ns for plain backgrounds, but styled rows
+regressed from 378 to 435 ns and inline backgrounds from 367 to 437 ns. The
+small plain-row saving does not justify the added branch and styled regression.
+Background output hashes matched; production background emission stays on the
+existing path. Artifacts: `target/profiles/pipeline-bg`.
+
 ## Remaining stages
 
 Overlays, background emission, font resolution, shaping keys, glyph

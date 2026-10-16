@@ -1379,6 +1379,8 @@ pub struct GridGlyphRasterizer {
     #[cfg(not(target_os = "macos"))]
     scale_ctx: rio_backend::sugarloaf::swash::scale::ScaleContext,
     #[cfg(not(target_os = "macos"))]
+    glyph_bytes: Vec<u8>,
+    #[cfg(not(target_os = "macos"))]
     font_data_cache: FxHashMap<
         u32,
         (
@@ -1419,6 +1421,8 @@ impl GridGlyphRasterizer {
             shape_ctx: rio_backend::sugarloaf::swash::shape::ShapeContext::new(),
             #[cfg(not(target_os = "macos"))]
             scale_ctx: rio_backend::sugarloaf::swash::scale::ScaleContext::new(),
+            #[cfg(not(target_os = "macos"))]
+            glyph_bytes: Vec::new(),
             #[cfg(not(target_os = "macos"))]
             font_data_cache: FxHashMap::default(),
         }
@@ -2877,11 +2881,15 @@ fn ensure_glyph_by_id(
     };
 
     let slot = if is_color {
-        grid.insert_glyph_color(key, raster)?
+        grid.insert_glyph_color(key, raster)
     } else {
-        grid.insert_glyph(key, raster)?
+        grid.insert_glyph(key, raster)
     };
-    Some((key, slot, is_color))
+    #[cfg(not(target_os = "macos"))]
+    {
+        rasterizer.glyph_bytes = raw.bytes;
+    }
+    Some((key, slot?, is_color))
 }
 
 /// Look up or rasterise a Glyph Protocol registration into the grid
@@ -3046,7 +3054,7 @@ fn rasterize_glyph_native(
         FontRef, Setting,
     };
 
-    let font_entry = rasterizer.font_data_cache.get(&font_id)?.clone();
+    let font_entry = rasterizer.font_data_cache.get(&font_id)?;
     let font_ref = FontRef {
         data: font_entry.0.as_ref(),
         offset: font_entry.1,
@@ -3087,6 +3095,8 @@ fn rasterize_glyph_native(
         None => &[Source::ColorOutline(0), Source::Outline],
     };
     let mut image = GlyphImage::new();
+    image.data = std::mem::take(&mut rasterizer.glyph_bytes);
+    image.data.clear();
     let embolden_amount = if synthetic_bold {
         (size_u16 as f32 / 14.0).max(1.0)
     } else {
@@ -3105,6 +3115,7 @@ fn rasterize_glyph_native(
         })
         .render_into(&mut scaler, glyph_id, &mut image);
     if !ok {
+        rasterizer.glyph_bytes = image.data;
         return None;
     }
     rio_backend::sugarloaf::font::normalize_color_bitmap(&mut image);
