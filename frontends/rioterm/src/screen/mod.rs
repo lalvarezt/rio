@@ -3887,6 +3887,7 @@ impl Screen<'_> {
                 &mut self.sugarloaf,
                 width,
                 self.renderer.named_colors.foreground,
+                island.animation,
             );
         }
         self.sugarloaf.render();
@@ -4003,7 +4004,10 @@ impl Screen<'_> {
         }
     }
 
-    pub(crate) fn render(&mut self) -> Option<crate::context::renderable::WindowUpdate> {
+    pub(crate) fn render(
+        &mut self,
+        frame_interval: std::time::Duration,
+    ) -> Option<crate::context::renderable::WindowUpdate> {
         #[cfg(feature = "profiling")]
         let _timing = crate::profiling::span("frame.screen");
         self.update_close_button_hover(self.mouse.x, self.mouse.y);
@@ -4131,8 +4135,10 @@ impl Screen<'_> {
         // movement can start animating in this same frame, and reading
         // it earlier would fail to schedule the continuation frame,
         // freezing the trail mid-flight until unrelated damage arrives.
-        let has_animation = self.renderer.needs_redraw();
-        let should_present = any_panel_dirty || has_animation;
+        let animation_delay = self
+            .renderer
+            .next_frame_in(self.sugarloaf.scale_factor(), frame_interval);
+        let should_present = any_panel_dirty || animation_delay.is_some();
 
         // Phase 2.2/2.3: per-panel CellBg + CellText emission with
         // per-row dirty gating. Iterates every panel in the active
@@ -4827,21 +4833,25 @@ impl Screen<'_> {
             panels.clear();
         }
 
-        // Mark as dirty if we need continuous rendering (e.g.,
-        // indeterminate progress bar, trail cursor animation). UI-only
-        // — terminal cells didn't change, but we want the next vsync
-        // to fire a render so overlays/animations tick forward.
-        if has_animation {
-            self.context_manager
-                .current_mut()
-                .renderable_content
-                .pending_update
-                .set_dirty();
+        // Continue visible motion on the native display clock. Delayed UI work
+        // uses the window scheduler without adding the terminal route's throttle.
+        // Title-shrink waits and subpixel tails can sleep longer than one frame.
+        if let Some(delay) = animation_delay {
+            if delay.is_zero() {
+                self.context_manager
+                    .current_mut()
+                    .renderable_content
+                    .pending_update
+                    .set_dirty();
+            } else {
+                self.context_manager
+                    .schedule_render(delay.as_millis() as u64 + 1);
+            }
         }
 
         if let Some(wake_in) = self.renderer.scrollbar.next_wake_in() {
             self.context_manager
-                .schedule_render_on_route(wake_in.as_millis() as u64);
+                .schedule_render(wake_in.as_millis() as u64);
         }
 
         // In case the configuration of blinking cursor is enabled

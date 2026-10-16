@@ -940,20 +940,22 @@ impl Renderer {
         (window_update, any_panel_dirty)
     }
 
-    /// Check if the renderer needs continuous redraw (for animations)
+    /// Time until the next animation frame. Terminal input redraws independently.
     #[inline]
-    pub fn needs_redraw(&mut self) -> bool {
+    pub fn next_frame_in(
+        &mut self,
+        scale: f32,
+        frame_interval: std::time::Duration,
+    ) -> Option<std::time::Duration> {
         if self.trail_cursor_enabled && self.trail_cursor.is_animating() {
-            return true;
+            return Some(std::time::Duration::ZERO);
         }
         if self.scrollbar.needs_redraw() {
-            return true;
+            return Some(std::time::Duration::ZERO);
         }
-        if let Some(island) = &self.island {
-            island.needs_redraw()
-        } else {
-            false
-        }
+        self.island
+            .as_ref()
+            .and_then(|island| island.next_frame_in(scale, frame_interval))
     }
 
     /// Scan visible rows for kitty Unicode-placeholder cells (U+10EEEE) and

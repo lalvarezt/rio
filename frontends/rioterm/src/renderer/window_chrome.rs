@@ -1,3 +1,4 @@
+use rio_backend::config::navigation::Animation;
 #[cfg(target_os = "windows")]
 use rio_backend::sugarloaf::font::FontData;
 use rio_backend::sugarloaf::font::FontLibrary;
@@ -46,7 +47,11 @@ pub fn controls_width(width: f32) -> f32 {
     actions(width).len() as f32 * BUTTON_WIDTH + 8.0
 }
 
-pub fn fade(value: &mut f32, target: f32, dt: f32) {
+pub fn fade(value: &mut f32, target: f32, dt: f32, animation: Animation) {
+    if animation != Animation::Full {
+        *value = target;
+        return;
+    }
     *value += (target - *value) * (1.0 - (-dt / 0.045).exp());
     if (*value - target).abs() < 0.005 {
         *value = target;
@@ -195,7 +200,13 @@ impl Header {
         })
     }
 
-    pub fn render(&mut self, sugarloaf: &mut Sugarloaf, width: f32, color: [f32; 4]) {
+    pub fn render(
+        &mut self,
+        sugarloaf: &mut Sugarloaf,
+        width: f32,
+        color: [f32; 4],
+        animation: Animation,
+    ) {
         #[cfg(feature = "profiling")]
         let _timing = crate::profiling::span("header.render");
         let library = sugarloaf.font_library();
@@ -220,6 +231,7 @@ impl Header {
                 &mut self.opacity[i],
                 u8::from(self.hover == Some(*action)) as f32,
                 dt,
+                animation,
             );
         }
         let list = if self.toolbar_enabled {

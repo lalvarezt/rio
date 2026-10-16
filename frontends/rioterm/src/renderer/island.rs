@@ -435,6 +435,7 @@ pub struct Island {
     pub max_tab_width: f32,
     pub min_tab_width: f32,
     pub tab_icon_size: f32,
+    pub animation: rio_backend::config::navigation::Animation,
     tab_glass_intensity: f32,
     app_icons: super::app_icons::Library,
     tabs: tabs::Tabs,
@@ -486,6 +487,7 @@ impl Island {
             max_tab_width,
             min_tab_width: rio_backend::config::navigation::default_min_tab_width(),
             tab_icon_size: rio_backend::config::navigation::default_tab_icon_size(),
+            animation: rio_backend::config::navigation::Animation::default(),
             tab_glass_intensity:
                 rio_backend::config::navigation::default_tab_glass_intensity(),
             app_icons: super::app_icons::Library::default(),
@@ -517,6 +519,7 @@ impl Island {
         &mut self,
         navigation: &rio_backend::config::navigation::Navigation,
     ) {
+        self.animation = navigation.animation;
         self.max_tab_width = rio_backend::config::navigation::clamp_max_tab_width(
             navigation.max_tab_width,
         );
@@ -765,12 +768,29 @@ impl Island {
         title
     }
 
-    /// Check if the island needs continuous rendering (for animations)
-    pub fn needs_redraw(&self) -> bool {
-        self.window_header.needs_redraw()
-            || self.tabs.needs_redraw()
+    pub fn next_frame_in(
+        &self,
+        scale: f32,
+        frame_interval: std::time::Duration,
+    ) -> Option<std::time::Duration> {
+        if self.window_header.needs_redraw()
             || (self.window_progress_visible
                 && matches!(self.progress_state, Some(ProgressState::Indeterminate)))
+        {
+            Some(std::time::Duration::ZERO)
+        } else {
+            self.tabs.next_frame_in(scale, self.hover_x).map(|delay| {
+                if self.is_dragging() {
+                    std::time::Duration::ZERO
+                } else if self.animation
+                    == rio_backend::config::navigation::Animation::Medium
+                {
+                    delay.max(frame_interval * 2)
+                } else {
+                    delay
+                }
+            })
+        }
     }
 
     /// Arm a tab drag at mouse press. The drag only `started`s once the
@@ -1678,7 +1698,9 @@ mod tests {
         island.sync_focused_program_status(&cm);
         island.window_progress_visible = island.uses_window_progress(2);
         assert!(
-            !island.needs_redraw(),
+            island
+                .next_frame_in(1.0, std::time::Duration::ZERO)
+                .is_none(),
             "a static tab underline must not animate an invisible window bar"
         );
 
@@ -1690,7 +1712,9 @@ mod tests {
             "legacy progress still uses the window bar"
         );
         assert!(
-            island.needs_redraw(),
+            island
+                .next_frame_in(1.0, std::time::Duration::ZERO)
+                .is_some(),
             "visible legacy indeterminate progress must animate"
         );
     }

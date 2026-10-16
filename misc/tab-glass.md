@@ -34,6 +34,42 @@ Liquid Glass renderer.
 
 ## Tab motion and controls
 
+Set the amount of tab motion in `config.toml`:
+
+```toml
+[navigation]
+animation = "full"
+```
+
+- `full` is the default. It keeps the existing slides, fades, and hover transitions.
+- `medium` uses shorter slides at half the monitor refresh rate and applies
+  opacity and hover changes immediately. On a 60 Hz display its animation budget
+  is 30 fps. Dragging still follows the pointer at the full monitor rate.
+- `none` applies tab positions, widths, selection, and hover changes immediately.
+  Title widths also shrink immediately.
+
+The setting reloads with the configuration and supports the same platform
+overrides as `tab-glass-intensity`. It controls tab and header decoration,
+while progress indicators and the separately configured cursor effects retain
+their behavior. Dragging continues to follow the pointer in every mode.
+
+On Windows, animation continuations use the existing DWM display clock.
+The fast part of `full` follows display refresh. `medium` uses a two-refresh
+interval budget between animation frames.
+Keyboard and terminal input request redraws independently of that delay.
+During the 120 ms title-shrink wait, the renderer schedules a wakeup instead of
+redrawing an unchanged strip. Near the end of a transition, it requests a wakeup
+after 33 ms when all remaining position and width offsets are below half a
+physical pixel, their velocities are low, and fade differences are below 1%.
+This reduces work in the nearly stationary part of an animation while visible
+travel keeps the normal monitor pacing.
+
+Motion uses a critically damped spring rather than linear interpolation.
+Position and velocity carry across interruptions, so a held shortcut or a rapid
+reversal retargets the current movement without restarting a fixed curve.
+See the [Windows profiling results](profiling/windows-animation-modes.md) for
+frame counts, input timings, and the shared repaint improvement.
+
 Linux, macOS, and Windows tabs animate into place when opened, closed, reordered, or resized by
 a title change. Rapid changes retarget the current motion. Title widths are
 cached, and shrinking waits briefly for transient title updates to stop.

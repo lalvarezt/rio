@@ -761,10 +761,18 @@ pub struct RouteWindow<'a> {
     #[cfg(target_os = "windows")]
     pub initial_frame_rendered: bool,
     pub render_timestamp: Instant,
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub vblank_interval: Duration,
     pub winit_window: Window,
     pub screen: Screen<'a>,
+}
+
+fn monitor_frame_interval(window: &Window) -> Duration {
+    let rate = window
+        .current_monitor()
+        .and_then(|monitor| monitor.refresh_rate_millihertz())
+        .filter(|rate| *rate != 0)
+        .unwrap_or(60_000);
+    Duration::from_micros(1_000_000_000 / u64::from(rate))
 }
 
 impl<'a> RouteWindow<'a> {
@@ -831,23 +839,7 @@ impl<'a> RouteWindow<'a> {
 
     #[inline]
     pub fn update_vblank_interval(&mut self) {
-        // On macOS, CVDisplayLink handles VSync synchronization automatically,
-        // so we don't need to calculate vblank intervals
-        #[cfg(not(target_os = "macos"))]
-        {
-            // Always update vblank interval based on monitor refresh rate
-            // Get the display refresh rate, default to 60Hz if unavailable
-            let refresh_rate_hz = self
-                .winit_window
-                .current_monitor()
-                .and_then(|monitor| monitor.refresh_rate_millihertz())
-                .unwrap_or(60_000) as f64
-                / 1000.0; // Convert millihertz to Hz
-
-            // Calculate frame time in microseconds (1,000,000 µs / refresh_rate)
-            let frame_time_us = (1_000_000.0 / refresh_rate_hz) as u64;
-            self.vblank_interval = Duration::from_micros(frame_time_us);
-        }
+        self.vblank_interval = monitor_frame_interval(&self.winit_window);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -920,24 +912,7 @@ impl<'a> RouteWindow<'a> {
             }
         }
 
-        // Get the display refresh rate and convert to frame interval
-        // On macOS, CVDisplayLink handles VSync synchronization automatically,
-        // so we don't need to calculate vblank intervals
-        #[cfg(target_os = "macos")]
-        let monitor_vblank_interval = Duration::from_micros(16667); // Placeholder value, not used
-
-        #[cfg(not(target_os = "macos"))]
-        let monitor_vblank_interval = {
-            let monitor_refresh_rate_hz = winit_window
-                .current_monitor()
-                .and_then(|monitor| monitor.refresh_rate_millihertz())
-                .unwrap_or(60_000) as f64
-                / 1000.0;
-
-            // Convert to microseconds for precise frame timing
-            let frame_time_us = (1_000_000.0 / monitor_refresh_rate_hz) as u64;
-            Duration::from_micros(frame_time_us)
-        };
+        let monitor_vblank_interval = monitor_frame_interval(&winit_window);
 
         // A window can be created without focus (`open -g`, spawned
         // behind another app) and may never receive a Focused(false)

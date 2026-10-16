@@ -172,6 +172,15 @@ pub struct ColorAutomation {
     pub color: ColorArray,
 }
 
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Animation {
+    None,
+    Medium,
+    #[default]
+    Full,
+}
+
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct Navigation {
     #[serde(default = "NavigationMode::default")]
@@ -232,6 +241,9 @@ pub struct Navigation {
         rename = "tab-glass-intensity"
     )]
     pub tab_glass_intensity: f32,
+    /// Tab motion and header hover transitions. Defaults to the full effect.
+    #[serde(default)]
+    pub animation: Animation,
     /// Map command names to a bundled app or named icon in Desktop tabs.
     #[serde(default, rename = "app-icons")]
     pub app_icons: std::collections::BTreeMap<String, String>,
@@ -254,6 +266,7 @@ impl Default for Navigation {
             min_tab_width: default_min_tab_width(),
             tab_icon_size: default_tab_icon_size(),
             tab_glass_intensity: default_tab_glass_intensity(),
+            animation: Animation::default(),
             app_icons: std::collections::BTreeMap::new(),
         }
     }

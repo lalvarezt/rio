@@ -612,11 +612,9 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     }
 
     #[inline]
-    pub fn schedule_render_on_route(&mut self, millis: u64) {
-        self.event_proxy.send_event(
-            RioEvent::PrepareRenderOnRoute(millis, self.current_route),
-            self.window_id,
-        );
+    pub fn schedule_render(&mut self, millis: u64) {
+        self.event_proxy
+            .send_event(RioEvent::PrepareRender(millis), self.window_id);
     }
 
     #[inline]

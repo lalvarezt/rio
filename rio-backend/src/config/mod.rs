@@ -622,6 +622,9 @@ impl Config {
             if let Some(intensity) = navigation_overwrite.tab_glass_intensity {
                 self.navigation.tab_glass_intensity = intensity;
             }
+            if let Some(animation) = navigation_overwrite.animation {
+                self.navigation.animation = animation;
+            }
             if let Some(icons) = &navigation_overwrite.app_icons {
                 self.navigation.app_icons.extend(icons.clone());
             }

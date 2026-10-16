@@ -110,7 +110,6 @@ impl Application<'_> {
                 | WindowEvent::HoveredFileCancelled
                 | WindowEvent::Destroyed
                 | WindowEvent::HoveredFile(_)
-                | WindowEvent::Moved(_)
         )
     }
 
@@ -428,7 +427,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         route.window.needs_render_after_occlusion = false;
                     }
 
-                    route.request_redraw();
+                    route.request_overlay_redraw();
                 }
             }
             RioEventType::Rio(RioEvent::RenderRoute(route_id)) => {
@@ -851,14 +850,11 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     let event =
                         EventPayload::new(RioEventType::Rio(RioEvent::Render), window_id);
 
-                    if !self.scheduler.scheduled(timer_id) {
-                        self.scheduler.schedule(
-                            event,
-                            Duration::from_millis(millis),
-                            false,
-                            timer_id,
-                        );
-                    }
+                    self.scheduler.schedule_once(
+                        event,
+                        Duration::from_millis(millis),
+                        timer_id,
+                    );
                 }
             }
             RioEventType::Rio(RioEvent::PrepareRenderOnRoute(millis, route_id)) => {
@@ -868,14 +864,11 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     window_id,
                 );
 
-                if !self.scheduler.scheduled(timer_id) {
-                    self.scheduler.schedule(
-                        event,
-                        Duration::from_millis(millis),
-                        false,
-                        timer_id,
-                    );
-                }
+                self.scheduler.schedule_once(
+                    event,
+                    Duration::from_millis(millis),
+                    timer_id,
+                );
             }
             RioEventType::Rio(RioEvent::BlinkCursor(millis, route_id)) => {
                 let timer_id = TimerId::new(Topic::CursorBlinking, route_id);
@@ -2283,6 +2276,8 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 route.window.screen.paste(&(path + " "), true);
             }
 
+            WindowEvent::Moved(_) => route.window.update_vblank_interval(),
+
             WindowEvent::Resized(new_size) => {
                 if new_size.width == 0 || new_size.height == 0 {
                     return;
@@ -2324,7 +2319,9 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         route.window.screen.render_welcome();
                     }
                     RoutePath::Terminal => {
-                        if let Some(window_update) = route.window.screen.render() {
+                        if let Some(window_update) =
+                            route.window.screen.render(route.window.vblank_interval)
+                        {
                             use crate::context::renderable::{
                                 BackgroundState, WindowUpdate,
                             };
@@ -2383,13 +2380,8 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 // println!("Time elapsed in render() is: {:?}", duration);
                 // }
 
-                // Game mode = unlocked framerate, so keep the event loop
-                // spinning. Every other case is vsync-paced: a
-                // `request_redraw` tells winit to deliver
-                // `RedrawRequested` at the next platform vsync, and the
-                // OS parks the thread until that event arrives. Busy-
-                // polling between vsyncs here would burn CPU without
-                // delivering more frames.
+                // Game mode redraws continuously. Event-based rendering requests
+                // another frame for pending damage; UI motion uses the scheduler.
                 if self.config.renderer.strategy.is_game() {
                     route.request_redraw();
                     event_loop.set_control_flow(ControlFlow::Poll);

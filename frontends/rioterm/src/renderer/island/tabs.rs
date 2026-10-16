@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::renderer::window_chrome::{alpha, fade, snap};
+use rio_backend::config::navigation::Animation;
 use std::time::Duration;
 
 fn flag(value: bool) -> f32 {
@@ -37,8 +38,21 @@ impl Position {
         self.target = target;
     }
 
-    fn advance(&mut self, dt: f32, scale: f32) -> bool {
-        self.offset.settle(dt, SETTLE_TIME, scale)
+    fn advance(&mut self, dt: f32, scale: f32, animation: Animation) -> bool {
+        let settle_time = match animation {
+            Animation::None => {
+                self.offset.reset();
+                return false;
+            }
+            Animation::Medium => 0.12,
+            Animation::Full => SETTLE_TIME,
+        };
+        self.offset.settle(dt, settle_time, scale)
+    }
+
+    fn nearly_settled(&self, scale: f32) -> bool {
+        self.offset.position.abs() * scale < 0.5
+            && self.offset.velocity.abs() * scale < 0.5 * 6.0 / SETTLE_TIME
     }
 }
 
@@ -101,8 +115,37 @@ impl Tabs {
                 })
             })
     }
-    pub(super) fn needs_redraw(&self) -> bool {
-        self.animating
+    pub(super) fn next_frame_in(
+        &self,
+        scale: f32,
+        hovered: Option<f32>,
+    ) -> Option<Duration> {
+        if self.animating {
+            let geometry_settled =
+                self.tabs.values().all(|tab| {
+                    tab.left.nearly_settled(scale) && tab.width.nearly_settled(scale)
+                }) && self.selection.as_ref().is_none_or(|selection| {
+                    selection.left.nearly_settled(scale)
+                        && selection.width.nearly_settled(scale)
+                });
+            let hovered_id = self.pointer_target(hovered).map(|(id, _)| id);
+            let fades_settled = self.tabs.iter().all(|(&id, tab)| {
+                (tab.opacity - flag(tab.live)).abs() < 0.01
+                    && (tab.hover - flag(Some(id) == hovered_id)).abs() < 0.01
+            }) && self.elevation < 0.01;
+            if geometry_settled && fades_settled {
+                return Some(Duration::from_millis(33));
+            }
+            return Some(Duration::ZERO);
+        }
+        let now = Instant::now();
+        self.tabs
+            .values()
+            .filter_map(|tab| {
+                tab.pending_shrink
+                    .map(|at| (at + SHRINK_DELAY).saturating_duration_since(now))
+            })
+            .min()
     }
 
     pub(super) fn move_tab(&mut self, from: usize, to: usize) {
@@ -204,6 +247,7 @@ impl Tabs {
         drag: Option<usize>,
         dt: f32,
         now: Instant,
+        animation: Animation,
     ) {
         let (window_width, scale) = dimensions;
         let (min, max) = limits;
@@ -266,7 +310,7 @@ impl Tabs {
                     tab.content = content;
                     tab.live = true;
                     tab.measurement = measurement;
-                    if measured >= tab.preferred_width {
+                    if animation == Animation::None || measured >= tab.preferred_width {
                         tab.preferred_width = measured;
                         tab.pending_shrink = None;
                     } else {
@@ -288,8 +332,18 @@ impl Tabs {
                     entry.insert(Tab {
                         content,
                         left: Position::new(0.0),
-                        width: Position::new(if initial { measured } else { 0.0 }),
-                        opacity: if initial { 1.0 } else { 0.0 },
+                        width: Position::new(
+                            if initial || animation == Animation::None {
+                                measured
+                            } else {
+                                0.0
+                            },
+                        ),
+                        opacity: if initial || animation != Animation::Full {
+                            1.0
+                        } else {
+                            0.0
+                        },
                         hover: 0.0,
                         live: true,
                         preferred_width: measured,
@@ -309,7 +363,7 @@ impl Tabs {
             if initial || self.snap_reorder {
                 tab.left = Position::new(left);
                 tab.width = Position::new(target.width(i));
-            } else if tab.opacity == 0.0 && tab.left.target == 0.0 {
+            } else if tab.left.target == 0.0 {
                 tab.left = Position::new(left);
             }
             tab.left.target(left);
@@ -322,19 +376,20 @@ impl Tabs {
                 tab.width.target(0.0);
                 tab.pending_shrink = None;
             }
-            moving |= tab.left.advance(dt, scale) | tab.width.advance(dt, scale);
+            moving |= tab.left.advance(dt, scale, animation)
+                | tab.width.advance(dt, scale, animation);
         }
         let hovered_id = self.pointer_target(hovered).map(|(id, _)| id);
         for (&id, tab) in &mut self.tabs {
-            fade(&mut tab.opacity, flag(tab.live), dt);
+            fade(&mut tab.opacity, flag(tab.live), dt, animation);
             fade(
                 &mut tab.hover,
                 flag(Some(id) == hovered_id && drag_id.is_none()),
                 dt,
+                animation,
             );
             moving |= tab.opacity != flag(tab.live)
-                || tab.hover != flag(Some(id) == hovered_id && drag_id.is_none())
-                || tab.pending_shrink.is_some();
+                || tab.hover != flag(Some(id) == hovered_id && drag_id.is_none());
         }
         self.tabs.retain(|_, tab| tab.live || tab.opacity > 0.0);
         let selected_tab = &self.tabs[&selected];
@@ -382,8 +437,8 @@ impl Tabs {
                 .left
                 .target(selected_tab.left.target + selection.target_offset);
             selection.width.target(selected_tab.width.target);
-            selection.travelling =
-                selection.left.advance(dt, scale) | selection.width.advance(dt, scale);
+            selection.travelling = selection.left.advance(dt, scale, animation)
+                | selection.width.advance(dt, scale, animation);
             moving |= selection.travelling;
             if !selection.travelling {
                 selection.left = Position::new(x);
@@ -397,7 +452,7 @@ impl Tabs {
         if let Some(id) = drag_id {
             self.floating = Some(id);
         }
-        fade(&mut self.elevation, flag(drag_id.is_some()), dt);
+        fade(&mut self.elevation, flag(drag_id.is_some()), dt, animation);
         if drag_id.is_none()
             && self.elevation == 0.0
             && self.floating.is_some_and(|id| {
@@ -453,6 +508,7 @@ impl Island {
             sugarloaf,
             window_width / scale,
             self.active_text_color,
+            self.animation,
         );
         self.window_progress_visible = self.uses_window_progress(count);
         if self.hide_if_single && count == 1 {
@@ -480,7 +536,7 @@ impl Island {
             self.drag = None;
         }
         let now = Instant::now();
-        let dt = if self.tabs.needs_redraw() {
+        let dt = if self.tabs.animating {
             now.duration_since(self.last_anim_frame)
                 .as_secs_f32()
                 .min(DRAG_MAX_DT)
@@ -526,6 +582,7 @@ impl Island {
             self.drag_index(),
             dt,
             now,
+            self.animation,
         );
         let floating_left = self
             .drag_index()
