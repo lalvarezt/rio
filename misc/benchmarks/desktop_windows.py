@@ -24,6 +24,7 @@ signature(user,"ShowWindow",[W.HWND,C.c_int],W.BOOL)
 signature(user,"GetClientRect",[W.HWND,C.POINTER(W.RECT)],W.BOOL)
 signature(user,"ClientToScreen",[W.HWND,C.POINTER(W.POINT)],W.BOOL)
 signature(user,"PostMessageW",[W.HWND,W.UINT,W.WPARAM,W.LPARAM],W.BOOL)
+signature(user,"MapVirtualKeyW",[W.UINT,W.UINT],W.UINT)
 signature(user,"GetDC",[W.HWND],W.HDC)
 signature(user,"ReleaseDC",[W.HWND,W.HDC],C.c_int)
 signature(user,"SetProcessDpiAwarenessContext",[C.c_void_p],W.BOOL)
@@ -81,7 +82,9 @@ class Window:
     def key(self, window, name):
         # Target only the benchmark window, even if a user changes focus.
         code = {"F6":0x75,"F7":0x76,"F8":0x77,"F9":0x78,"Down":0x28,"Up":0x26}.get(name)
-        events = [(0x100,code,1),(0x101,code,0xC0000001)] if code is not None else [(0x102,ord(name),1)]
+        if code is None: code = ord(name.upper())
+        flags = 1 | (user.MapVirtualKeyW(code,0)<<16) | ((1<<24) if name in ("Down","Up") else 0)
+        events = [(0x100,code,flags),(0x101,code,flags|0xC0000000)]
         for message,value,flags in events:
             if not user.PostMessageW(window,message,value,flags): raise C.WinError(C.get_last_error())
 
@@ -114,3 +117,9 @@ class Window:
 
     def close(self):
         pass
+
+    def minimize(self, window):
+        user.ShowWindow(window,6)
+
+    def restore(self, window):
+        user.ShowWindow(window,9)

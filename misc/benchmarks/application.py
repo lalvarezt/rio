@@ -27,7 +27,9 @@ def fixture(mode, folder):
     while not (folder/"go").exists():
         time.sleep(0.005)
     start = time.monotonic()
+    sizes = {(actual_cols,actual_rows)}
     for index in range(UPDATES):
+        if mode=="minimize": sizes.add(os.get_terminal_size(1))
         if mode == "dense":
             emit("".join(f"\x1b[{row+1};1H\x1b[{32+row%6}m{index:06} {line[7:]}" for row in range(rows)))
         elif mode == "sparse":
@@ -39,6 +41,7 @@ def fixture(mode, folder):
         elif mode == "unicode":
             emit(f"\x1b[{2+index%(rows-2)};1H\x1b[0m{index:06} " + "日本語 한글 λ α Ж é 👩‍💻 "*4)
         time.sleep(max(0, start+(index+1)*DURATION/UPDATES-time.monotonic()))
+    if mode=="minimize": (folder/f"sizes-{os.getpid()}.json").write_text(json.dumps(sorted(sizes)))
     (folder/f"done-{os.getpid()}").touch()
     while not (folder/"stop").exists():
         time.sleep(0.01)
@@ -161,7 +164,7 @@ def cpu_ns(process):
 
 def run(binary, mode, folder, env, cpu):
     folder.mkdir(parents=True,exist_ok=True)
-    for pattern in ["ready-*","done-*","go","stop"]:
+    for pattern in ["ready-*","done-*","sizes-*","go","stop"]:
         for path in folder.glob(pattern): path.unlink()
     config = folder/"config"; config.mkdir(exist_ok=True)
     (config/"config.toml").write_text(f"""[renderer]
@@ -232,6 +235,10 @@ keys = [{{key='F6',action='CreateTab'}},{{key='F7',action='OpenCommandPalette'}}
                 for index in range(int(DURATION*rate)):
                     x.key(window,("Down" if index%2==0 else "Up") if mode=="palette" else "F9")
                     time.sleep(max(0,start+(index+1)/rate-time.monotonic()))
+            if mode=="minimize":
+                for _ in range(20):
+                    x.minimize(window); time.sleep(0.05)
+                    x.restore(window); time.sleep(0.05)
             while len(list(folder.glob("done-*")))<tabs:
                 if process.poll() is not None or time.monotonic()>start+DURATION+10: raise RuntimeError("Fixture did not finish")
                 time.sleep(0.01)
@@ -243,9 +250,11 @@ keys = [{{key='F6',action='CreateTab'}},{{key='F7',action='OpenCommandPalette'}}
             process.wait(timeout=10)
             shutdown_ms = (time.monotonic()-stopping)*1000
             if process.returncode: raise RuntimeError(f"Rio exited {process.returncode}")
-            return {"kind":"bench","case":f"application/{mode}","sample":0,"ns":elapsed_cpu,
+            sizes = [json.loads(path.read_text()) for path in folder.glob("sizes-*.json")]
+            name = "windows/minimize_restore" if mode=="minimize" else f"application/{mode}"
+            return {"kind":"bench","case":name,"sample":0,"ns":elapsed_cpu,
                     "wall_ms":elapsed_wall*1000,"ready_ms":ready_ms,"shutdown_ms":shutdown_ms,
-                    "updates":UPDATES,"tabs":tabs,"metric":"process_cpu_ns_per_replay"}
+                    "updates":UPDATES,"tabs":tabs,"terminal_sizes":sizes,"metric":"process_cpu_ns_per_replay"}
         finally:
             if process.poll() is None:
                 (folder/"stop").touch(); process.terminate()

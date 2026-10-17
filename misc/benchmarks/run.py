@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import json
 import os
+import platform
 from pathlib import Path
 import shutil
 import signal
@@ -311,13 +312,22 @@ def run(args):
                     if suite == "application":
                         if args.no_gpu:
                             continue
-                        for mode in ["dense","sparse","scroll","cursor","unicode","search","idle","tabs","tab_repeat","palette"]:
+                        modes = ["dense","sparse","scroll","cursor","unicode","search","idle","tabs","tab_repeat","palette"]
+                        if sys.platform=="win32": modes.append("minimize")
+                        for mode in modes:
                             name = f"application/{mode}"
                             if args.filter and args.filter not in name:
                                 continue
                             print(f"Running pair {repeat+1}/{args.runs}: {revision} {name}", flush=True)
                             row = application.run(binary,mode,OUT/"application"/f"{repeat}-{revision}-{mode}",env,args.cpu)
                             output.write(json.dumps({"revision":revision,"repeat":repeat,"suite":suite,**row})+"\n")
+                            if sys.platform=="win32" and mode=="idle":
+                                output.write(json.dumps({"revision":revision,"repeat":repeat,"suite":suite,"kind":"bench","case":"windows/startup_exit","sample":0,"ns":row["shutdown_ms"]*1_000_000,"metric":"shell_eof_to_process_exit_ns"})+"\n")
+                            if mode=="minimize":
+                                stable = len(row["terminal_sizes"])==1 and len(row["terminal_sizes"][0])==1
+                                if revision=="branch" and not stable:
+                                    raise RuntimeError("Terminal dimensions changed during minimize/restore")
+                                output.write(json.dumps({"revision":revision,"repeat":repeat,"suite":suite,"kind":"counter","case":"windows/minimize_restore","terminal_size_variants":len(row["terminal_sizes"][0])})+"\n")
                             output.flush()
                         continue
                     if args.no_gpu and suite in ("gpu", "wgpu", "shader"):
@@ -346,7 +356,12 @@ def run(args):
                         row_revision = ["upstream", "branch"][row["variant"]] if suite == "shader" else revision
                         output.write(json.dumps({"revision":row_revision,"repeat":repeat,"suite":suite,**row})+"\n")
                     output.flush()
-    (OUT / "run.json").write_text(json.dumps({"driver_revision":driver_revision,"runs":args.runs,"samples":args.samples,"sample_ms":args.ms,"cpu":args.cpu,"platform":sys.platform,"backend":env.get("WGPU_BACKEND"),"display":("interactive Windows desktop" if sys.platform=="win32" else "isolated KWin Xwayland") if not args.no_gpu else None}, indent=2)+"\n")
+    model = platform.processor()
+    if sys.platform=="win32":
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as key:
+            model = winreg.QueryValueEx(key,"ProcessorNameString")[0].strip()
+    (OUT / "run.json").write_text(json.dumps({"driver_revision":driver_revision,"runs":args.runs,"samples":args.samples,"sample_ms":args.ms,"cpu":args.cpu,"platform":sys.platform,"system":platform.platform(),"cpu_model":model,"backend":env.get("WGPU_BACKEND"),"display":("interactive Windows desktop" if sys.platform=="win32" else "isolated KWin Xwayland") if not args.no_gpu else None}, indent=2)+"\n")
 
 
 def main():

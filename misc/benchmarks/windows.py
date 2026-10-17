@@ -12,6 +12,7 @@ import time
 
 
 def motion(executable, output, level, minimize=False):
+    from desktop_windows import cpu_ns
     user = C.WinDLL("user32",use_last_error=True)
     class Keyboard(C.Structure):
         _fields_ = [("vk",W.WORD),("scan",W.WORD),("flags",W.DWORD),("time",W.DWORD),("extra",C.c_size_t)]
@@ -47,6 +48,7 @@ keys = [{{key='F9',action='SelectNextTab'}}]
     env = dict(os.environ,RIO_CONFIG_HOME=str(config.resolve()),RIO_PROFILE_OUTPUT=str(report.resolve()),
                RIO_PROFILE_TABS="4",RIO_PROFILE_WINDOWS="1",RIO_PROFILE_FRAMES="0")
     with (folder/"process.log").open("w") as log:
+        launched = time.monotonic()
         process = subprocess.Popen([str(executable)],env=env,stdout=log,stderr=log)
         try:
             found = []
@@ -84,6 +86,8 @@ keys = [{{key='F9',action='SelectNextTab'}}]
             minimum = 15 if minimize or level=="none" else 30
             if process.returncode or capture["ready_tabs"]!=4 or capture["frames"]<minimum:
                 raise RuntimeError("Tab motion was not exercised; do not use this capture as a timing result")
+            capture["process_cpu_ms"] = cpu_ns(process)/1_000_000
+            capture["process_ms"] = (time.monotonic()-launched)*1000
             return {"case":"windows/minimize_restore" if minimize else f"windows/motion/{level}","capture":capture}
         finally:
             if process.poll() is None: process.terminate(); process.wait(timeout=5)
