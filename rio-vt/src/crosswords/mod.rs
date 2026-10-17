@@ -3764,14 +3764,25 @@ impl<U: EventListener> Handler for Crosswords<U> {
 
         if clustering {
             let mut remaining = codepoints;
-            while let Some(&cp) = remaining.first() {
+            while !remaining.is_empty() {
+                // Keep Unicode on the scalar loop until ASCII needs run detection.
+                let scalar_len = remaining
+                    .iter()
+                    .position(|cp| (0x20..=0x7e).contains(cp))
+                    .unwrap_or(remaining.len());
+                for &cp in &remaining[..scalar_len] {
+                    self.input(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                }
+                remaining = &remaining[scalar_len..];
+                if remaining.is_empty() {
+                    break;
+                }
                 // Printable ASCII cannot extend a cluster, just as in
                 // input_ascii_str. Keep it on the bulk path even when the
                 // parser decoded it together with preceding Unicode text.
-                if (0x20..=0x7e).contains(&cp)
-                    && remaining
-                        .get(1)
-                        .is_some_and(|cp| (0x20..=0x7e).contains(cp))
+                if remaining
+                    .get(1)
+                    .is_some_and(|cp| (0x20..=0x7e).contains(cp))
                 {
                     let ascii = 2 + remaining[2..]
                         .iter()
@@ -3787,7 +3798,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
                     );
                     remaining = &remaining[ascii..];
                 } else {
-                    self.input(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                    self.input(char::from_u32(remaining[0]).unwrap_or('\u{FFFD}'));
                     remaining = &remaining[1..];
                 }
             }

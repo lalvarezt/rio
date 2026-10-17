@@ -606,9 +606,8 @@ fn resolver_fast_path_matches_slow_path() {
     assert_eq!(out[0], Style::default());
     assert_eq!(out[1].fg, AnsiColor::Named(NamedColor::Blue));
 
-    // Unstyled row: fast fill must be indistinguishable.
+    // Unstyled row: an empty slice represents default styles and clears reuse.
     let plain: Row<Square> = Row::new(3);
-    let mut fast = Vec::new();
-    grid.resolve_row_styles(&plain, &mut fast);
-    assert_eq!(fast, vec![Style::default(); 3]);
+    grid.resolve_row_styles(&plain, &mut out);
+    assert!(out.is_empty());
 }

@@ -88,6 +88,7 @@ struct ShapedRun {
     #[cfg(not(target_os = "macos"))]
     wght_variation: Option<f32>,
     ascent_px: i16,
+    width_px: f32,
     glyphs: Vec<ShapedGlyph>,
 }
 
@@ -263,9 +264,8 @@ impl Text {
         let Some(shaped) = self.shape_for(text, opts) else {
             return 0.0;
         };
-        let width_px = shaped_width(&shaped);
         self.emit_instances(x, y, &shaped, opts);
-        width_px / self.scale_factor
+        shaped.width_px / self.scale_factor
     }
 
     /// Draw a cached icon centered at logical `(cx, cy)`, using the UI color
@@ -374,7 +374,7 @@ impl Text {
             return 0.0;
         }
         self.shape_for(text, opts)
-            .map(|r| shaped_width(&r) / self.scale_factor)
+            .map(|r| r.width_px / self.scale_factor)
             .unwrap_or(0.0)
     }
 
@@ -606,6 +606,7 @@ impl Text {
             #[cfg(not(target_os = "macos"))]
             wght_variation,
             ascent_px,
+            width_px: glyphs.iter().map(|g| g.advance).sum(),
             glyphs,
         });
         // Changing titles should not retain every historical label. Evict one
@@ -627,6 +628,8 @@ impl Text {
         let scale = self.scale_factor;
         let mut pen_x = x * scale;
         let py = y * scale;
+        // Most glyphs share the run baseline; snap that origin once.
+        let rounded_y = py.round();
         let color = opts.color;
 
         for glyph in &run.glyphs {
@@ -650,7 +653,14 @@ impl Text {
                 // origins can repeat an edge texel and drop the opposite row
                 // or column. Keep fractional advances, but place each bitmap
                 // on the pixel grid for every renderer.
-                pos: [(pen_x + glyph.x).round(), (py + glyph.y.max(0.0)).round()],
+                pos: [
+                    (pen_x + glyph.x).round(),
+                    if glyph.y.max(0.0) == 0.0 {
+                        rounded_y
+                    } else {
+                        (py + glyph.y).round()
+                    },
+                ],
                 glyph_pos: [slot.x as u32, slot.y as u32],
                 glyph_size: [slot.w as u32, slot.h as u32],
                 bearings: [slot.bearing_x, slot.bearing_y],
@@ -667,6 +677,8 @@ impl Text {
     /// Lookup or rasterize-and-insert a glyph. Returns
     /// `(x, y, w, h, bearing_x, bearing_y, is_color)` from the atlas
     /// slot. Per-OS rasterize path; shared slot shape.
+    // Keep cached atlas lookups in the per-glyph loop.
+    #[inline(always)]
     #[allow(clippy::type_complexity)]
     fn rasterize_slot(
         &mut self,
@@ -855,6 +867,7 @@ impl Text {
     /// `None` when shaping caches haven't been primed for this
     /// font_id (shouldn't happen — `shape()` always runs first) or
     /// when the atlas is at `ATLAS_MAX_SIZE` and the glyph won't fit.
+    #[inline(always)]
     #[allow(clippy::type_complexity)]
     fn rasterize_slot_cpu(
         &mut self,
@@ -1356,10 +1369,6 @@ impl Text {
 //  Helpers
 
 #[inline]
-fn shaped_width(run: &ShapedRun) -> f32 {
-    run.glyphs.iter().map(|g| g.advance).sum()
-}
-
 #[cfg(all(feature = "wgpu", not(target_os = "macos")))]
 fn bytemuck_instances(insts: &[TextInstance]) -> &[u8] {
     // Safety: TextInstance is repr(C) with all-primitive fields (no
