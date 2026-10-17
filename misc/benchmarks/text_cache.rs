@@ -15,7 +15,8 @@ fn branch_bench_text_cache() {
         );
     }
     println!(
-        "RIO_COUNTER {{\"case\":\"ui_text/title_churn\",\"retained_shapes\":{}}}",
-        text.shape_cache.len()
+        "RIO_COUNTER {{\"case\":\"ui_text/title_churn\",\"retained_shapes\":{},\"glyph_storage_bytes\":{}}}",
+        text.shape_cache.len(),
+        text.shape_cache.values().map(|run| run.glyphs.capacity() * std::mem::size_of::<ShapedGlyph>()).sum::<usize>()
     );
 }

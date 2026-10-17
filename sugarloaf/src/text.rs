@@ -10,7 +10,7 @@ use crate::font::FontLibrary;
 mod branch_benchmarks;
 use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 const MAX_SHAPED_RUNS: usize = 2048;
 
@@ -64,14 +64,13 @@ impl Default for DrawOpts {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-#[allow(unused)]
+#[derive(Clone, Debug)]
 struct ShapedGlyph {
     id: u16,
     x: f32,
     y: f32,
     advance: f32,
-    cluster: u32,
+    slot: OnceLock<(crate::grid::atlas::AtlasSlot, bool)>,
 }
 
 #[derive(Clone, Debug)]
@@ -226,7 +225,7 @@ impl Text {
         if self.cpu.is_some() {
             return;
         }
-        self.icons.clear();
+        self.clear_atlas_cache();
         self.cpu = Some(TextCpuState {
             atlas_grayscale: crate::grid::cpu::CpuGridAtlas::new_grayscale(),
             atlas_color: crate::grid::cpu::CpuGridAtlas::new_color(),
@@ -238,6 +237,12 @@ impl Text {
     #[inline]
     pub fn set_scale_factor(&mut self, scale: f32) {
         self.scale_factor = scale.max(1.0);
+    }
+
+    fn clear_atlas_cache(&mut self) {
+        self.icons.clear();
+        self.shape_cache.clear();
+        self.shape_cache_order.clear();
     }
 
     #[inline]
@@ -417,7 +422,7 @@ impl Text {
         let mut top = f32::INFINITY;
         let mut bottom = f32::NEG_INFINITY;
         for glyph in &run.glyphs {
-            let Some((slot, _)) = self.rasterize_slot(&run, glyph.id) else {
+            let Some((slot, _)) = self.rasterize_slot(&run, glyph) else {
                 continue;
             };
             if slot.w == 0 || slot.h == 0 {
@@ -513,7 +518,7 @@ impl Text {
                     x: g.x,
                     y: g.y,
                     advance: g.advance,
-                    cluster: g.cluster,
+                    slot: OnceLock::new(),
                 })
                 .collect();
             (glyphs, ascent_px)
@@ -572,8 +577,7 @@ impl Text {
                     m.ascent.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16
                 });
 
-            // Shape with swash. Flatten clusters to a Vec<ShapedGlyph>
-            // with UTF-8 byte offset as `cluster`.
+            // Flatten swash clusters to drawable glyph offsets and advances.
             let mut shaper = self
                 .shape_ctx
                 .builder(font_ref)
@@ -583,14 +587,13 @@ impl Text {
             shaper.add_str(text);
             let mut glyphs: Vec<ShapedGlyph> = Vec::new();
             shaper.shape_with(|cluster| {
-                let byte_offset = cluster.source.start;
                 for g in cluster.glyphs {
                     glyphs.push(ShapedGlyph {
                         id: g.id,
                         x: g.x,
                         y: g.y,
                         advance: g.advance,
-                        cluster: byte_offset,
+                        slot: OnceLock::new(),
                     });
                 }
             });
@@ -633,7 +636,7 @@ impl Text {
         let color = opts.color;
 
         for glyph in &run.glyphs {
-            let Some((slot, is_color)) = self.rasterize_slot(run, glyph.id) else {
+            let Some((slot, is_color)) = self.rasterize_slot(run, glyph) else {
                 continue;
             };
             if slot.w == 0 || slot.h == 0 {
@@ -674,13 +677,27 @@ impl Text {
         }
     }
 
+    /// Atlas slots survive growth; atlas initialization discards shaped runs.
+    #[inline(always)]
+    fn rasterize_slot(
+        &mut self,
+        run: &ShapedRun,
+        glyph: &ShapedGlyph,
+    ) -> Option<(crate::grid::atlas::AtlasSlot, bool)> {
+        if let Some(slot) = glyph.slot.get() {
+            return Some(*slot);
+        }
+        let slot = self.rasterize_slot_uncached(run, glyph.id)?;
+        let _ = glyph.slot.set(slot);
+        Some(slot)
+    }
+
     /// Lookup or rasterize-and-insert a glyph. Returns
     /// `(x, y, w, h, bearing_x, bearing_y, is_color)` from the atlas
     /// slot. Per-OS rasterize path; shared slot shape.
-    // Keep cached atlas lookups in the per-glyph loop.
-    #[inline(always)]
+    #[inline(never)]
     #[allow(clippy::type_complexity)]
-    fn rasterize_slot(
+    fn rasterize_slot_uncached(
         &mut self,
         run: &ShapedRun,
         glyph_id: u16,
@@ -1034,7 +1051,7 @@ impl Text {
         let instance_buffers = (0..frames)
             .map(|_| alloc_instance_buffer_metal(device, instance_capacity))
             .collect();
-        self.icons.clear();
+        self.clear_atlas_cache();
         self.metal = Some(TextMetalState {
             device: device.to_owned(),
             command_queue: command_queue.to_owned(),
@@ -1169,7 +1186,7 @@ impl Text {
             instance_buffer,
             instance_capacity,
         });
-        self.icons.clear();
+        self.clear_atlas_cache();
     }
 
     /// Record the UI text pass into `render_pass`. No-op if wgpu state
@@ -1225,6 +1242,7 @@ impl Text {
             return;
         }
         let state = build_text_vulkan_state(ctx);
+        self.clear_atlas_cache();
         self.vulkan = Some(state);
     }
 

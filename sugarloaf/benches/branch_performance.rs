@@ -41,6 +41,34 @@ fn main() {
             support::hash(pixels.iter().flat_map(|pixel| pixel.to_le_bytes())),
         );
     }
+    // Exercise reused slots with changed origins, colors, styles, and DPI.
+    // These inputs also cover pixel rounding around negative half pixels.
+    let mut positioned_pixels = vec![0u32; 1024 * 128];
+    for scale in [1.0, 1.25, 2.0] {
+        text.set_scale_factor(scale);
+        for (x, y) in [(-0.500_000_06, 0.499_999_97), (12.5, 9.5), (16.25, 12.75)] {
+            for (bold, italic) in [(false, false), (true, false), (false, true)] {
+                let positioned = DrawOpts {
+                    bold,
+                    italic,
+                    color: [73, 142, 219, 173],
+                    ..opts
+                };
+                text.clear();
+                text.draw(x, y, "Ag日本語 e\u{301} 👩\u{200d}💻", &positioned);
+                text.render_cpu(&mut positioned_pixels, 1024, 128);
+            }
+        }
+    }
+    support::check(
+        "ui_text/positioned_raster",
+        support::hash(
+            positioned_pixels
+                .iter()
+                .flat_map(|pixel| pixel.to_le_bytes()),
+        ),
+    );
+    text.set_scale_factor(1.0);
     let labels: Vec<_> = (0..4096)
         .map(|n| format!("~/project-{n:04}/src/main.rs"))
         .collect();
