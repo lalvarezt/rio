@@ -78,6 +78,10 @@ Win32 window controls on Windows and X11 controls on Linux. The native Linux
 Vulkan recording probe and Bash integration are skipped on Windows; WGPU,
 WGSL, CPU fixtures, and both existing internal suites run on either platform.
 
+Tab replays cover identical terminal contents at normal and repeated-key rates.
+The `tabs_distinct` replay also gives each tab a different row payload, so cache
+reuse across identical screens does not stand in for switching different screens.
+
 Build `rio-profile` on Windows with the repository's normal fast profiling
 configuration. Run the following command in an interactive Windows desktop:
 

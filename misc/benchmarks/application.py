@@ -11,6 +11,7 @@ import time
 
 DURATION = 4.0
 UPDATES = 240
+TAB_MODES = ("tabs", "tab_repeat", "tabs_distinct")
 
 
 def fixture(mode, folder):
@@ -21,6 +22,7 @@ def fixture(mode, folder):
     emit = lambda text: os.write(1, text.encode())
     text = "let value = compute(input) + 42; // benchmark 0123456789 "
     line = (text * 3)[:columns]
+    if mode=="tabs_distinct": line = f"{os.getpid():08x} " + line[9:]
     emit("\x1b[?1049h\x1b[?25l\x1b[2J" + "".join(f"\x1b[{row+1};1H{line}" for row in range(rows)))
     emit(f"\x1b]2;RIO_BENCH_{os.getpid()}\x07")
     (folder/f"ready-{os.getpid()}").write_text(json.dumps({"columns":actual_cols,"rows":actual_rows}))
@@ -207,14 +209,14 @@ keys = [{{key='F6',action='CreateTab'}},{{key='F7',action='OpenCommandPalette'}}
             if window is None: raise RuntimeError("No Rio client window")
             ready_ms = (time.monotonic()-launched)*1000
             x.focus(window)
-            tabs = 4 if mode in ("tabs","tab_repeat") else 1
+            tabs = 4 if mode in TAB_MODES else 1
             for count in range(2,tabs+1):
                 x.key(window,"F6")
                 while len(list(folder.glob("ready-*")))<count:
                     if process.poll() is not None or time.monotonic()>deadline: raise RuntimeError("Tab creation did not reach the fixture")
                     time.sleep(0.01)
             time.sleep(0.3)
-            if mode in ("tabs","tab_repeat"):
+            if mode in TAB_MODES:
                 before = x.image(window)
                 x.key(window,"F9")
                 wait_changed(x,window,before)
@@ -230,7 +232,7 @@ keys = [{{key='F6',action='CreateTab'}},{{key='F7',action='OpenCommandPalette'}}
             start_cpu = cpu_ns(process)
             start = time.monotonic()
             (folder/"go").touch()
-            if mode in ("tabs","tab_repeat","palette"):
+            if mode in (*TAB_MODES,"palette"):
                 rate = 120 if mode=="tab_repeat" else 30
                 for index in range(int(DURATION*rate)):
                     x.key(window,("Down" if index%2==0 else "Up") if mode=="palette" else "F9")

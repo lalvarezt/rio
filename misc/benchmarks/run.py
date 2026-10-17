@@ -312,7 +312,7 @@ def run(args):
                     if suite == "application":
                         if args.no_gpu:
                             continue
-                        modes = ["dense","sparse","scroll","cursor","unicode","search","idle","tabs","tab_repeat","palette"]
+                        modes = ["dense","sparse","scroll","cursor","unicode","search","idle","tabs","tab_repeat","tabs_distinct","palette"]
                         if sys.platform=="win32": modes.append("minimize")
                         for mode in modes:
                             name = f"application/{mode}"
