@@ -92,6 +92,11 @@ Rio, and refuses to send keyboard input if the profiling window loses focus.
 Motion captures fail if there are not enough frames to prove the input was
 exercised. These Windows cases are not part of the Linux result set.
 
+Keep native captures under `target/branch-performance/windows` alongside the
+shared results. `report.py` selects the platform from `run.json` and writes a
+separate Windows report. To generate it on Linux after copying the Windows
+artifacts, use `python3 misc/benchmarks/report.py --input target/windows-branch-performance`.
+
 ## Inspect generated artifacts
 
 The runner writes these files under `target/branch-performance`:
