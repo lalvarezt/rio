@@ -28,8 +28,12 @@ def windows_findings(index, results, motion, out):
                  "application/dense","application/scroll","application/search","application/palette","application/tabs",
                  "application/tab_repeat","application/tabs_distinct","windows/startup_exit","windows/minimize_restore",
                  "internal/vt_input/unicode_ascii","internal/vt_input/unicode","internal/bench_poll"]:
-        row = index[case]
-        lines.append(f"| `{case}` | {row['time_change_percent']:+.1f}% | {row['classification']} |")
+        row = index.get(case)
+        if row is None:
+            lines.append(f"| `{case}` | Not measured | Pending |")
+        else:
+            change = f"{row['time_change_percent']:+.1f}%" if row['time_change_percent'] is not None else "No paired ratio"
+            lines.append(f"| `{case}` | {change} | {row['classification']} |")
     lines += ["", "UI cache churn measures `Text::measure` over 4,096 distinct titles. "
         "The branch caps retained shapes at 2,048. This is a bounded-memory tradeoff, not a complete measure-and-draw frame. "
         "Warmed allocation counts and the retained-shape counter are recorded separately.", "",
@@ -41,29 +45,36 @@ def windows_findings(index, results, motion, out):
         "## Native Windows captures", "",
         "These captures instrument the branch only and use `cmd`, rather than PowerShell. "
         "They do not establish a speedup relative to upstream. Frame interval statistics include pacing waits and are not input latency. "
-        "The native capture process is not restricted to the shared suite's single CPU.", "",
+        "The native capture process is not restricted to the shared suite's single CPU. "
+        "Table values are medians across captures; the p95 column is the median of per-capture p95 values. "
+        "CPU totals include startup. None mode deliberately renders fewer frames, so frame intervals are not a smoothness score.", "",
         "| Motion level | Frames | Process CPU ms | Frame interval median ms | Frame interval p95 ms |", "|---|---:|---:|---:|---:|"]
     for level in ["none","medium","full"]:
         captures = [row["capture"] for row in motion if row["case"]==f"windows/motion/{level}"]
-        if not captures: continue
+        if not captures:
+            lines.append(f"| {level} | Pending | Pending | Pending | Pending |")
+            continue
         metric = lambda field:median(c["metrics"]["frame.interval"][field] for c in captures)
         lines.append(f"| {level} | {median(c['frames'] for c in captures):.0f} | "
                      f"{median(c['process_cpu_ms'] for c in captures):.3f} | {metric('median_ms'):.3f} | {metric('p95_ms'):.3f} |")
-    lines += ["", "| Branch workload | Shell ready ms | First frame ms | Process CPU ms |", "|---|---:|---:|---:|"]
+    lines += ["", "| Branch workload | Shell ready ms | First frame ms | Shell frame ms | Process CPU ms |", "|---|---:|---:|---:|---:|"]
     for case in ["startup_exit","second_window","many_tabs","dense"]:
         path = out/"windows"/case/"summary.json"
         if path.exists():
             summary = json.loads(path.read_text())
-            lines.append(f"| `{case}` | {summary['shell_ready_ms']:.3f} | {summary['first_frame_ms']:.3f} | {summary['process_cpu_ms']:.3f} |")
+            lines.append(f"| `{case}` | {summary['shell_ready_ms']:.3f} | {summary['first_frame_ms']:.3f} | {summary['shell_frame_ms']:.3f} | {summary['process_cpu_ms']:.3f} |")
+        else:
+            lines.append(f"| `{case}` | Pending | Pending | Pending | Pending |")
     return lines+[""]
 
 
-def main(out=OUT):
+def main(out=OUT, partial=False):
     build = json.loads((out/"build.json").read_text())
     run = json.loads((out/"run.json").read_text())
     is_windows = run["platform"]=="win32"
     label = "Windows" if is_windows else "Linux"
-    doc = ROOT/f"misc/profiling/{label.lower()}-branch-performance-report.md"
+    scope = "kernel" if partial else "branch"
+    doc = ROOT/f"misc/profiling/{label.lower()}-{scope}-performance-report.md"
     csv_path = doc.with_suffix(".csv")
     motion_path = out/"windows/motion.json"
     windows_motion = json.loads(motion_path.read_text()) if motion_path.exists() else []
@@ -149,7 +160,7 @@ def main(out=OUT):
     devices = sorted({row["adapter"] for row in rows if row["kind"]=="device"})
     device_suites = {suite:sorted({row["adapter"] for row in rows if row["kind"]=="device" and row["suite"]==suite})
                      for suite in sorted({row["suite"] for row in rows if row["kind"]=="device"})}
-    lines = [f"# {label} branch performance report", "",
+    lines = [f"# {label} {scope} performance report", "",
         f"Upstream: `{build['baseline']}`. Branch executable revision: `{build['branch']}`.",
         f"Benchmark driver revision: `{run['driver_revision']}`. The runner permits only Python-driver and report changes after the executable revision; compiled sources and fixture hashes must match.",
         "This report compares the recorded branch revision with upstream, not with intermediate optimization commits.","",
@@ -171,6 +182,10 @@ def main(out=OUT):
         "The results cannot be added into a single terminal speedup: the cases measure different operations and overlapping pipeline stages.","",
         f"The complete per-case timing and allocation results are in [the CSV]({csv_path.name}).", ""]
     if is_windows:
+        if partial:
+            lines += ["This is an incomplete suite report. CPU/GPU kernels are recorded; interactive application and native captures remain pending. Missing coverage is retained below, and validation still fails until those captures exist.",""]
+        if run.get("collection_parts"):
+            lines += ["Collection provenance: "+"; ".join(f"pairs {', '.join(str(n+1) for n in part['repeats'])} with driver `{part['driver_revision']}`" for part in run["collection_parts"])+". All parts use the same compiled fixtures; the Python parser update did not change their work.",""]
         lines += ["GPU probe adapters by suite: "+"; ".join(f"`{suite}`: {', '.join(names)}" for suite,names in device_suites.items())+".",""]
         lines += windows_findings(index,results,windows_motion,out)
     else:
@@ -282,4 +297,6 @@ def main(out=OUT):
 if __name__=="__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input",type=Path,default=OUT)
-    main(parser.parse_args().input.resolve())
+    parser.add_argument("--partial",action="store_true",help="write a separately named kernel report without relaxing coverage checks")
+    args = parser.parse_args()
+    main(args.input.resolve(),args.partial)
