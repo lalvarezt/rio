@@ -322,7 +322,7 @@ def run(args):
                             row = application.run(binary,mode,OUT/"application"/f"{repeat}-{revision}-{mode}",env,args.cpu)
                             output.write(json.dumps({"revision":revision,"repeat":repeat,"suite":suite,**row})+"\n")
                             if sys.platform=="win32" and mode=="idle":
-                                output.write(json.dumps({"revision":revision,"repeat":repeat,"suite":suite,"kind":"bench","case":"windows/startup_exit","sample":0,"ns":row["shutdown_ms"]*1_000_000,"metric":"shell_eof_to_process_exit_ns"})+"\n")
+                                output.write(json.dumps({"revision":revision,"repeat":repeat,"suite":suite,"kind":"bench","case":"windows/startup_exit","sample":0,"ns":row["shutdown_ms"]*1_000_000,"metric":"fixture_stop_to_process_exit_ns"})+"\n")
                             if mode=="minimize":
                                 stable = len(row["terminal_sizes"])==1 and len(row["terminal_sizes"][0])==1
                                 if revision=="branch" and not stable:

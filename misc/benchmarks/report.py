@@ -35,11 +35,13 @@ def windows_findings(index, results, motion, out):
         "Warmed allocation counts and the retained-shape counter are recorded separately.", "",
         "The Windows application replays use the same fixed terminal workloads as Linux and the Vulkan WGPU backend. "
         "They measure Rio process CPU time, excluding child Python interpreters. "
-        "The exit probe measures child-shell EOF to Rio process exit; it does not isolate event-loop dispatch latency. "
+        "The exit probe measures the fixture stop-file signal to Rio process exit, including the child's 10 ms polling interval and shutdown. "
+        "It does not isolate event-loop dispatch latency. "
         "Minimize/restore also samples the child terminal's dimensions throughout 20 cycles and fails if the branch changes them.", "",
         "## Native Windows captures", "",
         "These captures instrument the branch only and use `cmd`, rather than PowerShell. "
-        "They do not establish a speedup relative to upstream. Frame interval statistics include pacing waits and are not input latency.", "",
+        "They do not establish a speedup relative to upstream. Frame interval statistics include pacing waits and are not input latency. "
+        "The native capture process is not restricted to the shared suite's single CPU.", "",
         "| Motion level | Frames | Process CPU ms | Frame interval median ms | Frame interval p95 ms |", "|---|---:|---:|---:|---:|"]
     for level in ["none","medium","full"]:
         captures = [row["capture"] for row in motion if row["case"]==f"windows/motion/{level}"]
