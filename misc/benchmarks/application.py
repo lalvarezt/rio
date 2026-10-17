@@ -45,6 +45,7 @@ def fixture(mode, folder):
 
 
 class X11:
+    error_callback = C.CFUNCTYPE(C.c_int,C.c_void_p,C.c_void_p)(lambda _display,_error:0)
     class Key(C.Structure):
         _fields_ = [("type",C.c_int),("serial",C.c_ulong),("send_event",C.c_int),("display",C.c_void_p),
                     ("window",C.c_ulong),("root",C.c_ulong),("subwindow",C.c_ulong),("time",C.c_ulong),
@@ -57,6 +58,8 @@ class X11:
 
     def __init__(self, display):
         self.x = C.CDLL(ctypes.util.find_library("X11"))
+        self.x.XSetErrorHandler.argtypes = [type(self.error_callback)]
+        self.x.XSetErrorHandler(self.error_callback)
         definitions = {
             "XOpenDisplay":([C.c_char_p],C.c_void_p), "XDefaultRootWindow":([C.c_void_p],C.c_ulong),
             "XQueryTree":([C.c_void_p,C.c_ulong,C.POINTER(C.c_ulong),C.POINTER(C.c_ulong),C.POINTER(C.POINTER(C.c_ulong)),C.POINTER(C.c_uint)],C.c_int),

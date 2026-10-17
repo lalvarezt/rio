@@ -105,6 +105,15 @@ def main():
     for row in results:
         if row["classification"] not in ("faster","slower"): continue
         lines.append(f"| `{row['case']}` | {row['upstream_ns']/1000:,.3f} | {row['branch_ns']/1000:,.3f} | {row['time_change_percent']:+.1f}% | {row['pair_min_percent']:+.1f}% to {row['pair_max_percent']:+.1f}% |")
+    lines += ["", "## New feature costs", "",
+              "These cases measure work added by the branch. An upstream control, where present, provides context but does less or different work.",
+              "They are not included in the repeatable-speedup table above.", "",
+              "| Case | Upstream control µs/op | Branch µs/op |", "|---|---:|---:|"]
+    for row in results:
+        if row["classification"]!="new feature cost": continue
+        before = f"{row['upstream_ns']/1000:,.3f}" if row["upstream_ns"] is not None else "No equivalent"
+        after = f"{row['branch_ns']/1000:,.3f}" if row["branch_ns"] is not None else "Missing"
+        lines.append(f"| `{row['case']}` | {before} | {after} |")
     lines += ["", "The full CSV also retains mixed, unchanged, incomplete, and feature-cost cases. A shader measurement is GPU time per draw.",
               "WGPU frame measurements include encoding, submission, and completion. Native Vulkan recording measurements are CPU work without submission.",
               "Application entries are Rio process CPU time for a four-second replay, not wall time per rendered frame. They exclude child-process CPU time.","",
