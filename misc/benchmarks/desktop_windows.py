@@ -114,7 +114,7 @@ class Window:
         rect,point = W.RECT(),W.POINT()
         if not user.GetClientRect(window,C.byref(rect)) or not user.ClientToScreen(window,C.byref(point)):
             raise C.WinError(C.get_last_error())
-        width,height = min(1024,rect.right),min(640,rect.bottom)
+        width,height = rect.right,rect.bottom
         if width<=0 or height<=0: raise RuntimeError("Empty benchmark window")
         screen = user.GetDC(None)
         memory = gdi.CreateCompatibleDC(screen)
