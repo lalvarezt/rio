@@ -57,7 +57,7 @@ def main():
                 result[f"{revision}_{field}"] = median(values) if values else None
         results.append(result)
     with CSV.open("w") as output:
-        writer = csv.DictWriter(output,fieldnames=list(results[0]))
+        writer = csv.DictWriter(output,fieldnames=list(results[0]),lineterminator="\n")
         writer.writeheader(); writer.writerows(results)
     index = {row["case"]:row for row in results}
     coverage,missing = [],[]
@@ -70,11 +70,18 @@ def main():
         if absent: missing.append(change["id"])
     check_status = []
     errors = []
+    expected_repeats = set(range(run["runs"]))
+    for (case,revision),repeats in timings.items():
+        if repeats and set(repeats)!=expected_repeats:
+            errors.append(f"{case}/{revision}: incomplete run coverage")
+    for row in results:
+        if row["branch_ns"] is None or (row["classification"]!="new feature cost" and row["pairs"]!=run["runs"]):
+            errors.append(f"{row['case']}: incomplete comparison")
     for case,revisions in sorted(checks.items()):
         stable = all(len(values)==1 for values in revisions.values())
         same = stable and len(revisions)==2 and revisions["upstream"]==revisions["branch"]
         if same: state = "Identical upstream and branch hashes"
-        elif case.startswith("ui_text/") and stable: state = "Different UI raster hashes; bitmap-origin alignment changed on the branch"
+        elif case.startswith("ui_text/") and stable and len(revisions)==2: state = "Different UI raster hashes; bitmap-origin alignment changed on the branch"
         else: state = "MISMATCH or unstable check"; errors.append(case)
         check_status.append((case,state))
     cpuinfo = Path("/proc/cpuinfo").read_text()
@@ -100,7 +107,56 @@ def main():
         "This classification is a descriptive noise guard, not a confidence interval or a statistical significance test.",
         "New features with no equivalent upstream work are cost measurements. Their relative timings do not establish a feature-preserving speedup.",
         "The results cannot be added into a single terminal speedup: the cases measure different operations and overlapping pipeline stages.","",
-        "The complete per-case timing and allocation results are in [the CSV](linux-branch-performance-report.csv).", "",
+        "The complete per-case timing and allocation results are in [the CSV](linux-branch-performance-report.csv).", ""]
+    counts = collections.Counter(row["classification"] for row in results)
+    lines += ["## Findings", "",
+        f"The suite contains {len(results)} cases: {counts['faster']} faster, {counts['slower']} slower, "
+        f"{counts['mixed or within noise']} mixed or within the noise guard, and {counts['new feature cost']} new-feature costs. "
+        "These counts give equal weight to small helpers and whole-workload probes; they are not an overall performance score.", "",
+        "### Terminal input and CPU rendering", "",
+        f"Mixed Unicode/ASCII input time changes by {index['input/mixed']['time_change_percent']:+.1f}% relative to upstream. "
+        f"The existing `unicode_ascii` VT benchmark agrees ({index['internal/vt_input/unicode_ascii']['time_change_percent']:+.1f}%). "
+        "Plain ASCII input is within the noise guard. Pure Unicode is a repeatable regression: "
+        f"{index['input/unicode']['time_change_percent']:+.1f}% in the new fixture and "
+        f"{index['internal/vt_input/unicode']['time_change_percent']:+.1f}% in the existing VT benchmark. "
+        "The branch therefore does not improve every input distribution.", "",
+        f"Full plain snapshot time changes by {index['snapshot/plain/full']['time_change_percent']:+.1f}%; "
+        f"styled snapshot time changes by {index['snapshot/styled/full']['time_change_percent']:+.1f}%. "
+        "Both remove 60 warmed allocations and 76,800 allocated bytes per operation. "
+        "Cached row processing improves across all five fixtures, with smaller gains when row content changes. "
+        "Glyph bitmap reuse reduces warmed allocations, but the rasterization fixtures do not show a consistent timing win; "
+        "the Unicode rasterization case is slower. Narrow selection invalidation reduces the fixture's dirty rows from 60 to 4.", "",
+        "### GPU and application workloads", "",
+        "Native Vulkan CPU packing, upload, and command-recording cases improve with both one and two atlases. "
+        "The shared WGPU frame fixtures also improve, as does creating a second WGPU window context. "
+        "These are focused controls: zero-area glyphs isolate storage and upload work rather than dense text execution.", "",
+        "The native Vulkan background timestamps are mixed: the canonical transparent sentinel skips the draw, "
+        "and the cursor case improves slightly, but sparse and opaque cases regress substantially "
+        f"({index['gpu/background/sparse']['time_change_percent']:+.1f}% and "
+        f"{index['gpu/background/opaque']['time_change_percent']:+.1f}%). "
+        "The separate WGSL probe shows lower GPU time for zero-alpha-heavy backgrounds, including nonzero-RGB/zero-alpha cells, "
+        "while opaque and faint backgrounds stay within the noise guard. These probes use different pipelines and execution patterns. "
+        "The WGSL result does not explain away the native Vulkan regressions; their cause needs a separate investigation.", "",
+        "Four-second application replays consume less Rio CPU time for cursor updates, scrolling, and search. "
+        "Dense text, sparse text, Unicode, and palette replays are mixed or within the noise guard. "
+        "The tab replay uses more CPU with the branch's animated tab UI; the upstream control lacks equivalent work. "
+        "None of these process-CPU measurements establishes improved frame latency or fewer missed frames.", "",
+        "### UI, search, and feature costs", "",
+        "Palette scoring removes most allocations, and stable results/navigation reuse cached matches. "
+        "The large helper-level gains do not become a measurable palette application-replay gain in this run. "
+        "Changing a search query costs about 2 ns more in its isolated setter probe; unchanged queries are cheaper. "
+        f"The existing poll benchmark is within the noise guard ({index['internal/bench_poll']['time_change_percent']:+.1f}%).", "",
+        "Cached UI text is a repeatable regression despite removing its warmed allocation: short and Unicode labels are about 50% slower, "
+        "and long labels about 74% slower. The 4,096-title churn fixture exposes a larger time/memory tradeoff: "
+        "the branch retains 2,048 shapes instead of upstream's 4,096, so repeated sequential measurement evicts and reshapes titles. "
+        "This fixture measures `Text::measure` only; its roughly 160-fold cost increase does not describe a complete measure-and-draw frame. "
+        "It still identifies a workload where the bounded cache is substantially worse.", "",
+        "Icon catalog lookups, cached upload checks, animation steps, and status revision hits have small isolated costs. "
+        "SVG rasterization is a miss-only cost. Bash reporting adds work relative to the upstream no-hook control; "
+        "both hook fixtures emit three reports during 10,000 commands, including the existing-hook case. "
+        "The medium animation control performs five steps instead of full mode's 17; this measures work, not perceived smoothness.", "",
+        "The next profiling priorities are pure Unicode parsing, cached UI text and cache churn, and native Vulkan sparse/opaque background execution. "
+        "These are measured regressions or tradeoffs, rather than inferred opportunities from a single favorable microbenchmark.", "",
         "## Changes with repeatable timing differences", "",
         "| Case | Upstream µs/op | Branch µs/op | Time change | Paired range |", "|---|---:|---:|---:|---:|"]
     for row in results:
@@ -118,6 +174,14 @@ def main():
     lines += ["", "The full CSV also retains mixed, unchanged, incomplete, and feature-cost cases. A shader measurement is GPU time per draw.",
               "WGPU frame measurements include encoding, submission, and completion. Native Vulkan recording measurements are CPU work without submission.",
               "Application entries are Rio process CPU time for a four-second replay, not wall time per rendered frame. They exclude child-process CPU time.","",
+              "## Measurement limits", "",
+              "- Allocation probes count allocations in the whole process during a separate warmed pass; GPU-driver threads can contribute. Bytes mean cumulative allocated bytes, not retained memory or peak RSS.",
+              "- Application CPU accounting has a 10 ms tick resolution on this host. Small absolute differences, especially idle workloads, are coarse. The virtual display differs from an interactive desktop.",
+              "- Native Vulkan recording cases update rows, upload host data, and record reset/unsubmitted command buffers. They do not time GPU text execution. WGPU frame cases submit and wait, but their glyphs have zero area.",
+              "- Shader timestamps cover repeated background draws, not a complete terminal frame. Only the WGSL probe checks GPU framebuffer equality; native Vulkan background timestamps are not a framebuffer-equivalence test.",
+              "- Transparent draw elision tests the canonical `CellBg::TRANSPARENT` sentinel. Other zero-alpha encodings may still issue a draw and benefit only from the shader early-out.",
+              "- UI raster hashes differ intentionally with bitmap-origin alignment. Stable hashes record the output but do not establish visual correctness of that difference.",
+              "- Power policy and GPU clocks were not fixed. Alternating pairs reduce order bias but do not isolate every source of system variation.","",
               "## Storage and work counters", ""]
     for case,revisions in sorted(counters.items()):
         values = {}
@@ -134,7 +198,7 @@ def main():
     lines += ["", "P29–P31 are Windows lifecycle and display-clock cases. Their runner is committed, but Linux cannot validate those native behaviors.",
               "Linux WGPU results concern the shared renderer implementation; they are not Windows measurements.","",
               "## Reproduction and retained data", "", "```sh", "python3 misc/benchmarks/run.py build",
-              f"python3 misc/benchmarks/run.py run --runs {run['runs']} --samples {run['samples']} --ms {run['sample_ms']} --cpu {run['cpu']}",
+              f"WGPU_BACKEND=vulkan python3 misc/benchmarks/run.py run --runs {run['runs']} --samples {run['samples']} --ms {run['sample_ms']} --cpu {run['cpu']}",
               "python3 misc/benchmarks/report.py", "```", "",
               "The ignored `target/branch-performance` directory retains all samples, allocation probes, output hashes, build logs, isolated-display logs, and executable copies.",
               f"Compiled Rust fixture SHA-256: `{build['fixtures_sha256']}`.", ""]
