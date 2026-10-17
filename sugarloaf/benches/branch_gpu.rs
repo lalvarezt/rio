@@ -14,7 +14,10 @@ mod native {
     };
     use sugarloaf::{
         context::vulkan::{VulkanContext, FRAMES_IN_FLIGHT},
-        grid::{vulkan::VulkanGridRenderer, CellBg, CellText, GridUniforms},
+        grid::{
+            vulkan::VulkanGridRenderer, CellBg, CellText, GlyphKey, GridUniforms,
+            RasterizedGlyph,
+        },
         renderer::vulkan::{
             build_color_attachment, build_rendering_info,
             cmd_acquire_image_for_rendering, cmd_release_image_to_present,
@@ -79,7 +82,25 @@ mod native {
                 });
                 let device = ctx.device().clone();
                 let mut grid = VulkanGridRenderer::new(&ctx, 160, 48);
+                // Color pages are lazy. The two-atlas case must bind an actual
+                // allocated page even though its glyph quads have zero area.
+                grid.insert_glyph_color(
+                    GlyphKey {
+                        font_id: 0,
+                        glyph_id: 0,
+                        size_bucket: 64,
+                    },
+                    RasterizedGlyph {
+                        width: 1,
+                        height: 1,
+                        bearing_x: 0,
+                        bearing_y: 0,
+                        bytes: &[255, 0, 0, 255],
+                    },
+                )
+                .expect("color atlas fixture");
                 let mut uniforms: GridUniforms = std::mem::zeroed();
+                uniforms.projection[15] = 1.0;
                 uniforms.cell_size = [9.6, 20.0];
                 uniforms.grid_size = [160, 48];
                 uniforms.cursor_pos = [u32::MAX; 2];
@@ -194,6 +215,7 @@ mod native {
                 }
                 // The CPU recording loop never submits its command buffer. A real
                 // frame releases the acquired image before the GPU timing phase.
+                grid.prepare(&ctx, frame.cmd_buffer, frame.slot);
                 cmd_acquire_image_for_rendering(&device, frame.cmd_buffer, frame.image);
                 let attachments = [build_color_attachment(&frame, [0.1, 0.1, 0.15, 1.0])];
                 device.cmd_begin_rendering(

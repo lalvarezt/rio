@@ -53,6 +53,7 @@ fn main() {
     });
     let mut grid = WgpuGridRenderer::new(&ctx, 160, 48);
     let mut uniforms: GridUniforms = unsafe { std::mem::zeroed() };
+    uniforms.projection[15] = 1.0;
     uniforms.cell_size = [9.6, 20.0];
     uniforms.grid_size = [160, 48];
     uniforms.cursor_pos = [u32::MAX; 2];
