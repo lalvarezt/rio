@@ -201,6 +201,7 @@ def display():
     env = dict(os.environ, XDG_RUNTIME_DIR=str(runtime), QT_QPA_PLATFORM="offscreen", RIO_BENCH_DISPLAY_FILE=str(session))
     env.pop("DISPLAY", None)
     env.pop("WAYLAND_DISPLAY", None)
+    env.pop("WAYLAND_SOCKET", None)
     command = ["dbus-run-session", "--", "kwin_wayland", "--virtual", "--xwayland", "--no-lockscreen",
                "--width", "1600", "--height", "1000", "--exit-with-session", shlex.join([sys.executable,str(ROOT/'misc/benchmarks/display.py')])]
     with (OUT / "display.log").open("w") as log:
@@ -257,6 +258,9 @@ def run(args):
     manager = contextlib.nullcontext({}) if args.no_gpu else display()
     with manager as display_env, (OUT / "results.jsonl").open("w") as output:
         env.update(display_env)
+        if display_env:
+            env.pop("WAYLAND_DISPLAY",None)
+            env.pop("WAYLAND_SOCKET",None)
         suites = list(dict.fromkeys(suite for binaries in metadata["binaries"].values() for suite in binaries))
         for repeat in range(args.runs):
             order = ["upstream", "branch"] if repeat % 2 == 0 else ["branch", "upstream"]

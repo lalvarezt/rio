@@ -154,6 +154,8 @@ args = ['{Path(__file__).resolve()}', '--fixture', '{mode}', '{folder}']
 keys = [{{key='F6',action='CreateTab'}},{{key='F7',action='OpenCommandPalette'}},{{key='F8',action='SearchForward'}},{{key='F9',action='SelectNextTab'}}]
 """)
     env = dict(env,RIO_CONFIG_HOME=str(config))
+    env.pop("WAYLAND_DISPLAY",None)
+    env.pop("WAYLAND_SOCKET",None)
     def pin(): os.sched_setaffinity(0,{cpu})
     x = X11(env["DISPLAY"])
     with (folder/"application.log").open("w") as log:
