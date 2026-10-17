@@ -40,6 +40,15 @@ in addition to overlay drawing. It does not generate continuous PTY traffic.
 `--env NAME=VALUE` adds a process-local environment override and can be repeated.
 The summary records these overrides so driver-filtering experiments are repeatable.
 
+On Windows, `RIO_PROFILE_USE_CONFIG_SHELL=1` preserves the configured shell
+instead of starting the default `cmd` fixture. `RIO_PROFILE_READY_TITLE` sets
+the title substring that signals shell readiness, defaulting to
+`RIO_PROFILE_READY`. These options let a replay use its own shell and readiness
+marker while retaining frame counts and rendering spans. Set
+`RIO_PROFILE_SETTLE_MS` longer than the replay so automatic exit does not
+interrupt it. These controls affect only builds with the `profiling` feature.
+Captures retain the profiler's 20-second duration limit.
+
 The output directory contains each run's JSON capture, its console log, and
 `summary.json`. The summary reports medians across runs. Each timing contains
 the call count, total, median, 95th percentile, maximum, and first-call duration,

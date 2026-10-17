@@ -153,7 +153,12 @@ pub fn full_redraw() -> bool {
 }
 
 pub fn shell_title(route: usize, title: Option<&str>) {
-    if title.is_some_and(|title| title.contains("RIO_PROFILE_READY")) {
+    static READY_TITLE: OnceLock<String> = OnceLock::new();
+    let ready_title = READY_TITLE.get_or_init(|| {
+        std::env::var("RIO_PROFILE_READY_TITLE")
+            .unwrap_or_else(|_| "RIO_PROFILE_READY".to_owned())
+    });
+    if title.is_some_and(|title| title.contains(ready_title.as_str())) {
         let mut capture = CAPTURE.get().unwrap().lock().unwrap();
         capture.ready_routes.insert(route);
         if capture.ready_routes.len() == capture.target_tabs && capture.ready.is_none() {

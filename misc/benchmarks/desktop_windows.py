@@ -37,6 +37,7 @@ signature(kernel,"GetCurrentThreadId",[],W.DWORD)
 signature(kernel,"GetProcessAffinityMask",[W.HANDLE,C.POINTER(C.c_size_t),C.POINTER(C.c_size_t)],W.BOOL)
 signature(kernel,"SetProcessAffinityMask",[W.HANDLE,C.c_size_t],W.BOOL)
 signature(kernel,"GetProcessTimes",[W.HANDLE,*([C.POINTER(W.FILETIME)]*4)],W.BOOL)
+signature(kernel,"QueryProcessCycleTime",[W.HANDLE,C.POINTER(C.c_uint64)],W.BOOL)
 signature(gdi,"CreateCompatibleDC",[W.HDC],W.HDC)
 signature(gdi,"CreateCompatibleBitmap",[W.HDC,C.c_int,C.c_int],W.HBITMAP)
 signature(gdi,"SelectObject",[W.HDC,W.HANDLE],W.HANDLE)
@@ -64,6 +65,13 @@ def cpu_ns(process):
     if not kernel.GetProcessTimes(int(process._handle),*(C.byref(value) for value in values)):
         raise C.WinError(C.get_last_error())
     return sum((value.dwHighDateTime<<32)|value.dwLowDateTime for value in values[2:])*100
+
+
+def cpu_cycles(process):
+    value = C.c_uint64()
+    if not kernel.QueryProcessCycleTime(int(process._handle),C.byref(value)):
+        raise C.WinError(C.get_last_error())
+    return value.value
 
 
 class Window:

@@ -247,7 +247,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_environment_variables(&config);
 
     #[cfg(all(feature = "profiling", windows))]
-    {
+    if std::env::var_os("RIO_PROFILE_USE_CONFIG_SHELL").is_none() {
         config.shell.program = Some("cmd.exe".to_owned());
         config.shell.args = vec![
             "/d".into(),

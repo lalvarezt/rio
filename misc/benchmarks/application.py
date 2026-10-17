@@ -157,12 +157,30 @@ def pin_process(process, cpu):
     pin(process,cpu)
 
 
+if sys.platform=="linux":
+    process_clock = C.CDLL(None).clock_getcpuclockid
+    process_clock.argtypes = [C.c_int,C.POINTER(C.c_int)]
+    process_clock.restype = C.c_int
+
+
 def cpu_ns(process):
     if sys.platform=="win32":
         from desktop_windows import cpu_ns as process_cpu
         return process_cpu(process)
+    if sys.platform=="linux":
+        clock = C.c_int()
+        error = process_clock(process.pid,C.byref(clock))
+        if error: raise OSError(error,os.strerror(error))
+        return time.clock_gettime_ns(clock.value)
     fields = Path(f"/proc/{process.pid}/stat").read_text().rsplit(")",1)[1].split()
     return (int(fields[11])+int(fields[12])) * 1_000_000_000 // os.sysconf("SC_CLK_TCK")
+
+
+def cpu_cycles(process):
+    if sys.platform=="win32":
+        from desktop_windows import cpu_cycles as process_cycles
+        return process_cycles(process)
+    return None
 
 
 def run(binary, mode, folder, env, cpu):
@@ -231,6 +249,7 @@ keys = [{{key='F6',action='CreateTab'}},{{key='F7',action='OpenCommandPalette'}}
                     time.sleep(0.15)
                 wait_changed(x,window,before)
             start_cpu = cpu_ns(process)
+            start_cycles = cpu_cycles(process)
             start = time.monotonic()
             (folder/"go").touch()
             if mode in (*TAB_MODES,"palette"):
@@ -247,6 +266,7 @@ keys = [{{key='F6',action='CreateTab'}},{{key='F7',action='OpenCommandPalette'}}
                 time.sleep(0.01)
             time.sleep(0.15)
             elapsed_cpu = cpu_ns(process)-start_cpu
+            elapsed_cycles = cpu_cycles(process)-start_cycles if start_cycles is not None else None
             elapsed_wall = time.monotonic()-start
             stopping = time.monotonic()
             (folder/"stop").touch()
@@ -257,7 +277,9 @@ keys = [{{key='F6',action='CreateTab'}},{{key='F7',action='OpenCommandPalette'}}
             name = "windows/minimize_restore" if mode=="minimize" else f"application/{mode}"
             return {"kind":"bench","case":name,"sample":0,"ns":elapsed_cpu,
                     "wall_ms":elapsed_wall*1000,"ready_ms":ready_ms,"shutdown_ms":shutdown_ms,
-                    "updates":UPDATES,"tabs":tabs,"terminal_sizes":sizes,"metric":"process_cpu_ns_per_replay"}
+                    "updates":UPDATES,"tabs":tabs,"terminal_sizes":sizes,"metric":"process_cpu_ns_per_replay",
+                    "cpu_clock":"clock_getcpuclockid" if sys.platform=="linux" else "GetProcessTimes" if sys.platform=="win32" else "proc_stat",
+                    "cycles":elapsed_cycles}
         finally:
             if process.poll() is None:
                 (folder/"stop").touch(); process.terminate()

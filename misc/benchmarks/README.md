@@ -124,5 +124,12 @@ The runner writes these files under `target/branch-performance`:
 - `application/`: temporary configs, shell readiness markers, and process logs.
 - `display.log`: isolated compositor diagnostics.
 
+Linux application CPU time uses the POSIX process CPU clock rather than the
+coarser `/proc` clock ticks. Windows retains `GetProcessTimes` and also records
+`QueryProcessCycleTime` as `cycles`. Both include the Rio process's threads and
+exclude child shells. Cycle counts remain counts; they are not converted to
+time or compared across machines. The [Microsoft API reference](https://learn.microsoft.com/en-us/windows/win32/api/realtimeapiset/nf-realtimeapiset-queryprocesscycletime)
+describes the counter's scope. Each replay records its CPU clock name.
+
 The report retains per-case results, applicable change coverage, and checks
 that ran. A missing result is a coverage gap, not a zero-cost operation.
