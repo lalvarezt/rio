@@ -191,6 +191,7 @@ keys = [{{key='F6',action='CreateTab'}},{{key='F7',action='OpenCommandPalette'}}
     else:
         x = X11(env["DISPLAY"])
     with (folder/"application.log").open("w") as log:
+        launched = time.monotonic()
         process = subprocess.Popen([binary],env=env,stdout=log,stderr=log,preexec_fn=pin if sys.platform!="win32" else None)
         try:
             if sys.platform=="win32": pin_process(process,cpu)
@@ -201,6 +202,7 @@ keys = [{{key='F6',action='CreateTab'}},{{key='F7',action='OpenCommandPalette'}}
                 time.sleep(0.01)
             window = x.find(process.pid)
             if window is None: raise RuntimeError("No Rio client window")
+            ready_ms = (time.monotonic()-launched)*1000
             x.focus(window)
             tabs = 4 if mode in ("tabs","tab_repeat") else 1
             for count in range(2,tabs+1):
@@ -236,11 +238,14 @@ keys = [{{key='F6',action='CreateTab'}},{{key='F7',action='OpenCommandPalette'}}
             time.sleep(0.15)
             elapsed_cpu = cpu_ns(process)-start_cpu
             elapsed_wall = time.monotonic()-start
+            stopping = time.monotonic()
             (folder/"stop").touch()
             process.wait(timeout=10)
+            shutdown_ms = (time.monotonic()-stopping)*1000
             if process.returncode: raise RuntimeError(f"Rio exited {process.returncode}")
             return {"kind":"bench","case":f"application/{mode}","sample":0,"ns":elapsed_cpu,
-                    "wall_ms":elapsed_wall*1000,"updates":UPDATES,"tabs":tabs,"metric":"process_cpu_ns_per_replay"}
+                    "wall_ms":elapsed_wall*1000,"ready_ms":ready_ms,"shutdown_ms":shutdown_ms,
+                    "updates":UPDATES,"tabs":tabs,"metric":"process_cpu_ns_per_replay"}
         finally:
             if process.poll() is None:
                 (folder/"stop").touch(); process.terminate()

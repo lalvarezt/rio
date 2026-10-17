@@ -67,6 +67,9 @@ def prepare():
         subprocess.run(["git", "restore", "--source=HEAD", "--", *owned], cwd=UPSTREAM, check=True)
     elif git("status", "--porcelain", cwd=UPSTREAM):
         raise RuntimeError("The upstream worktree has unrelated changes")
+    # Mark ownership before modifying files so interrupted dependency downloads
+    # can be retried through the same guarded restoration path.
+    marker.write_text(BASE + "\n")
     shutil.copytree(ROOT / "misc/benchmarks", UPSTREAM / "misc/benchmarks", dirs_exist_ok=True)
     for package, names in {
         "rio-vt": ["branch_performance"],
@@ -98,9 +101,9 @@ def prepare():
     # The benchmark-only X11 dependency changes rio-grid's lockfile entry.
     # Preserve the upstream lock's versions while resolving that local edge.
     with (OUT/"upstream-metadata.log").open("w") as log:
-        subprocess.run(["cargo","metadata","--offline","--format-version","1"],cwd=UPSTREAM,
+        host = next(line.removeprefix("host: ") for line in subprocess.check_output(["rustc","-Vv"],text=True).splitlines() if line.startswith("host: "))
+        subprocess.run(["cargo","metadata","--format-version","1","--filter-platform",host],cwd=UPSTREAM,
                        stdout=subprocess.DEVNULL,stderr=log,check=True)
-    marker.write_text(BASE + "\n")
 
 
 def build_environment():
