@@ -87,7 +87,7 @@ def main(out=OUT):
         before,after = revisions["upstream"],revisions["branch"]
         pairs = sorted(before.keys() & after.keys())
         ratios = [after[repeat]/before[repeat] for repeat in pairs if before[repeat]>0]
-        classification = "new feature cost" if not before else "incomplete"
+        classification = "incomplete"
         if ratios:
             classification = "faster" if max(ratios)<0.98 else "slower" if min(ratios)>1.02 else "mixed or within noise"
         if any(case.startswith(prefix) for prefix in feature_prefixes):
@@ -119,6 +119,7 @@ def main(out=OUT):
         measured = cases + [row["case"] for row in windows_motion]
         absent = [prefix for prefix in prefixes if not any(case.startswith(prefix) for case in measured)]
         note = "Measured shared WGPU/WGSL work; Linux native Vulkan excluded" if is_windows and change["id"] in ("P12","P13") else "Measured"
+        if is_windows and change["id"]=="P30": note = "Measured branch-only native captures; no upstream instrumentation"
         coverage.append((change["id"],"Missing: "+", ".join(absent) if absent else note))
         if absent: missing.append(change["id"])
     check_status = []
@@ -240,7 +241,7 @@ def main(out=OUT):
               "WGPU frame measurements include encoding, submission, and completion. Native Vulkan recording measurements are CPU work without submission.",
               "Application entries are Rio process CPU time for a four-second replay, not wall time per rendered frame. They exclude child-process CPU time.","",
               "## Measurement limits", "",
-              "- Allocation probes count allocations in the whole process during a separate warmed pass; GPU-driver threads can contribute. Bytes mean cumulative allocated bytes, not retained memory or peak RSS.",
+              "- Allocation probes count calls through Rust's global allocator across the process during a separate warmed pass. Native driver allocations and GPU memory are excluded; driver-related Rust workers can contribute. Bytes mean cumulative allocated bytes, not retained memory or peak RSS.",
               ("- Windows application CPU accounting uses `GetProcessTimes`. Its resolution does not establish frame latency. Native motion captures use instrumentation and are separate from the uninstrumented upstream comparison." if is_windows else "- Application CPU accounting has a 10 ms tick resolution on this host. Small absolute differences, especially idle workloads, are coarse. The virtual display differs from an interactive desktop."),
               "- Native Vulkan recording cases update rows, upload host data, and record reset/unsubmitted command buffers. They do not time GPU text execution. WGPU frame cases submit and wait, but their glyphs have zero area.",
               "- Shader timestamps cover repeated background draws, not a complete terminal frame. Only the WGSL probe checks GPU framebuffer equality; native Vulkan background timestamps are not a framebuffer-equivalence test.",

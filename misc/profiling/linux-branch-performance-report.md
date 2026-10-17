@@ -185,7 +185,7 @@ Application entries are Rio process CPU time for a four-second replay, not wall 
 
 ## Measurement limits
 
-- Allocation probes count allocations in the whole process during a separate warmed pass; GPU-driver threads can contribute. Bytes mean cumulative allocated bytes, not retained memory or peak RSS.
+- Allocation probes count calls through Rust's global allocator across the process during a separate warmed pass. Native driver allocations and GPU memory are excluded; driver-related Rust workers can contribute. Bytes mean cumulative allocated bytes, not retained memory or peak RSS.
 - Application CPU accounting has a 10 ms tick resolution on this host. Small absolute differences, especially idle workloads, are coarse. The virtual display differs from an interactive desktop.
 - Native Vulkan recording cases update rows, upload host data, and record reset/unsubmitted command buffers. They do not time GPU text execution. WGPU frame cases submit and wait, but their glyphs have zero area.
 - Shader timestamps cover repeated background draws, not a complete terminal frame. Only the WGSL probe checks GPU framebuffer equality; native Vulkan background timestamps are not a framebuffer-equivalence test.
