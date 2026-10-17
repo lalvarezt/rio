@@ -12,7 +12,7 @@ import time
 
 
 def motion(executable, output, level, minimize=False):
-    from desktop_windows import cpu_ns
+    from desktop_windows import Window, cpu_ns
     user = C.WinDLL("user32",use_last_error=True)
     class Keyboard(C.Structure):
         _fields_ = [("vk",W.WORD),("scan",W.WORD),("flags",W.DWORD),("time",W.DWORD),("extra",C.c_size_t)]
@@ -64,7 +64,7 @@ keys = [{{key='F9',action='SelectNextTab'}}]
                 if process.poll() is not None or time.monotonic()>deadline: raise RuntimeError("No profiling window")
                 time.sleep(0.01)
             window = found[0]
-            user.ShowWindow(window,9); user.SetForegroundWindow(window)
+            Window().focus(window)
             time.sleep(0.4)
             original = W.RECT()
             if not user.GetClientRect(window,C.byref(original)): raise C.WinError(C.get_last_error())

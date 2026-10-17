@@ -2,6 +2,7 @@
 import ctypes as C
 from ctypes import wintypes as W
 import hashlib
+import time
 
 user = C.WinDLL("user32",use_last_error=True)
 kernel = C.WinDLL("kernel32",use_last_error=True)
@@ -19,6 +20,9 @@ signature(user,"EnumWindows",[callback_type,W.LPARAM],W.BOOL)
 signature(user,"GetWindowThreadProcessId",[W.HWND,C.POINTER(W.DWORD)],W.DWORD)
 signature(user,"IsWindowVisible",[W.HWND],W.BOOL)
 signature(user,"SetForegroundWindow",[W.HWND],W.BOOL)
+signature(user,"BringWindowToTop",[W.HWND],W.BOOL)
+signature(user,"AttachThreadInput",[W.DWORD,W.DWORD,W.BOOL],W.BOOL)
+signature(user,"SetWindowPos",[W.HWND,W.HWND,C.c_int,C.c_int,C.c_int,C.c_int,W.UINT],W.BOOL)
 signature(user,"GetForegroundWindow",[],W.HWND)
 signature(user,"ShowWindow",[W.HWND,C.c_int],W.BOOL)
 signature(user,"GetClientRect",[W.HWND,C.POINTER(W.RECT)],W.BOOL)
@@ -29,6 +33,7 @@ signature(user,"GetDC",[W.HWND],W.HDC)
 signature(user,"ReleaseDC",[W.HWND,W.HDC],C.c_int)
 signature(user,"SetProcessDpiAwarenessContext",[C.c_void_p],W.BOOL)
 signature(kernel,"GetCurrentProcess",[],W.HANDLE)
+signature(kernel,"GetCurrentThreadId",[],W.DWORD)
 signature(kernel,"GetProcessAffinityMask",[W.HANDLE,C.POINTER(C.c_size_t),C.POINTER(C.c_size_t)],W.BOOL)
 signature(kernel,"SetProcessAffinityMask",[W.HANDLE,C.c_size_t],W.BOOL)
 signature(kernel,"GetProcessTimes",[W.HANDLE,*([C.POINTER(W.FILETIME)]*4)],W.BOOL)
@@ -75,9 +80,21 @@ class Window:
 
     def focus(self, window):
         user.ShowWindow(window,9)
-        user.SetForegroundWindow(window)
-        if user.GetForegroundWindow()!=window:
-            raise RuntimeError("Benchmark window is not foreground")
+        user.SetWindowPos(window,None,0,0,0,0,0x0015)
+        deadline = time.monotonic()+2
+        while time.monotonic()<deadline:
+            foreground = user.GetForegroundWindow()
+            if foreground==window: return
+            thread = user.GetWindowThreadProcessId(foreground,None) if foreground else 0
+            current = kernel.GetCurrentThreadId()
+            attached = bool(thread and thread!=current and user.AttachThreadInput(current,thread,True))
+            try:
+                user.BringWindowToTop(window)
+                user.SetForegroundWindow(window)
+            finally:
+                if attached: user.AttachThreadInput(current,thread,False)
+            time.sleep(0.05)
+        raise RuntimeError("Benchmark window is not foreground")
 
     def key(self, window, name):
         # Target only the benchmark window, even if a user changes focus.
