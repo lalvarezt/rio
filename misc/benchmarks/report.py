@@ -18,6 +18,8 @@ def median(values):
 
 def windows_findings(index, results, motion, out, rows):
     counts = collections.Counter(row["classification"] for row in results)
+    profile_path = out/"profile-build.json"
+    profile = json.loads(profile_path.read_text()) if profile_path.exists() else {}
     lines = ["## Findings", "",
         f"The shared suite contains {len(results)} cases: {counts['faster']} faster, {counts['slower']} slower, "
         f"{counts['mixed or within noise']} mixed or within the noise guard, {counts['zero recorded time']} with a zero recorded time, "
@@ -40,6 +42,7 @@ def windows_findings(index, results, motion, out, rows):
         "Warmed allocation counts and the retained-shape counter are recorded separately.", "",
         "The Windows application replays use the same fixed terminal workloads as Linux and the Vulkan WGPU backend. "
         "They measure Rio process CPU time, excluding child Python interpreters. "
+        "Timing starts after the fixture's ready file and a 300 ms wait, rather than a first-frame acknowledgement. "
         "The fixture targets four seconds; PTY backpressure and scheduling can extend its wall duration. "
         "The exit probe measures the fixture stop-file signal to Rio process exit, including the child's 10 ms polling interval and shutdown. "
         "It does not isolate event-loop dispatch latency. "
@@ -53,13 +56,18 @@ def windows_findings(index, results, motion, out, rows):
                 values.append(f"{median(samples)/(1_000_000 if field=='ns' else 1):.3f}" if samples else "Pending")
         lines.append(f"| `{case}` | " + " | ".join(values) + " |")
     lines += ["", "These are medians across three replays per revision. A zero recorded CPU time has no valid percentage ratio. "
-        "The raw records retain every replay, including idle variation.", "",
+        "The raw records retain every replay, including idle variation. "
+        "Single-core replays also constrain the child fixture and driver workers; they do not establish performance at normal affinity. "
+        "See the [normal-affinity controls](windows-rendering-followup.md) for a separate comparison.", "",
         "## Native Windows captures", "",
         "These captures instrument the branch only and use `cmd`, rather than PowerShell. "
         "They do not establish a speedup relative to upstream. Frame interval statistics include pacing waits and are not input latency. "
         "The native capture process is not restricted to the shared suite's single CPU. "
         "Table values are medians across captures; the p95 column is the median of per-capture p95 values. "
         "CPU totals include startup. None mode deliberately renders fewer frames, so frame intervals are not a smoothness score.", "",
+        f"Instrumented executable revision: `{profile.get('revision','not recorded')}`. "
+        "The minimize/restore probe uses a ten-second settling interval so all 20 cycles can finish. "
+        "Other native captures use the default two-second interval. Each capture records `settle_ms`.", "",
         "| Motion level | Frames | Process CPU ms | Frame interval median ms | Frame interval p95 ms |", "|---|---:|---:|---:|---:|"]
     for level in ["none","medium","full"]:
         captures = [row["capture"] for row in motion if row["case"]==f"windows/motion/{level}"]
@@ -175,7 +183,7 @@ def main(out=OUT, partial=False):
                      for suite in sorted({row["suite"] for row in rows if row["kind"]=="device"})}
     lines = [f"# {label} {scope} performance report", "",
         f"Upstream: `{build['baseline']}`. Branch executable revision: `{build['branch']}`.",
-        f"Benchmark driver revision: `{run['driver_revision']}`. The runner permits only Python-driver and report changes after the executable revision; compiled sources and fixture hashes must match.",
+        f"Benchmark collection revision: `{run['driver_revision']}`. Executable revisions and the compiled fixture hash are recorded separately.",
         "This report compares the recorded branch revision with upstream, not with intermediate optimization commits.","",
         "## Measurement environment", "",
         f"- System: {run.get('system',platform.platform())}; {model}.",
@@ -202,6 +210,8 @@ def main(out=OUT, partial=False):
         if run.get("collection_parts"):
             lines += ["Collection provenance: "+"; ".join(f"{part.get('phase','collection')} pairs {', '.join(str(n+1) for n in part['repeats'])} with driver `{part['driver_revision']}`" for part in run["collection_parts"])+". All parts use the same compiled fixtures. Driver revisions are recorded separately from executable revisions.",""]
         lines += ["GPU probe adapters by suite: "+"; ".join(f"`{suite}`: {', '.join(names)}" for suite,names in device_suites.items())+".",""]
+        if run.get("dependency_cache"):
+            lines += ["Build cache provenance: "+run["dependency_cache"], ""]
         lines += windows_findings(index,results,windows_motion,out,rows)
     else:
         counts = collections.Counter(row["classification"] for row in results)

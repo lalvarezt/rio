@@ -13,6 +13,10 @@ upstream optimizations are not credited to this branch.
 The machine-readable coverage map is [changes.json](../benchmarks/changes.json).
 The Linux measurements are recorded separately in
 [linux-branch-performance-report.md](linux-branch-performance-report.md).
+The Windows measurements, including native lifecycle and animation captures,
+are in [windows-branch-performance-report.md](windows-branch-performance-report.md).
+The [Windows follow-up](windows-rendering-followup.md) adds normal-affinity
+controls and identifies the next profiling targets.
 
 ## Terminal input and snapshots
 
