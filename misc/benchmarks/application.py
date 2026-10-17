@@ -1,4 +1,4 @@
-"""Run fixed terminal workloads through Rio's actual Linux window and PTY."""
+"""Run fixed terminal workloads through Rio's actual window and PTY."""
 import ctypes as C
 import ctypes.util
 import hashlib
@@ -112,6 +112,10 @@ class X11:
             self.x.XSendEvent(self.display,window,0,mask,C.byref(event))
         self.x.XFlush(self.display)
 
+    def focus(self, window):
+        self.x.XSetInputFocus(self.display,window,1,0)
+        self.x.XSync(self.display,0)
+
     def image(self, window):
         image = self.x.XGetImage(self.display,window,0,0,1024,640,C.c_ulong(-1).value,2)
         if not image:
@@ -122,20 +126,36 @@ class X11:
         finally:
             self.x.XDestroyImage(image)
 
-    def wait_changed(self, window, before):
-        deadline = time.monotonic()+3
-        while time.monotonic()<deadline:
-            if self.image(window)!=before:
-                return
-            time.sleep(0.025)
-        raise RuntimeError("Requested UI input did not change the rendered client image")
-
     def close(self):
         self.x.XCloseDisplay(self.display)
 
 
-def cpu_ns(pid):
-    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")",1)[1].split()
+def wait_changed(driver, window, before):
+    deadline = time.monotonic()+3
+    while time.monotonic()<deadline:
+        if driver.image(window)!=before:
+            return
+        time.sleep(0.025)
+    raise RuntimeError("Requested UI input did not change the rendered client image")
+
+
+def available_cpus():
+    if sys.platform=="win32":
+        from desktop_windows import available_cpus as available
+        return available()
+    return os.sched_getaffinity(0)
+
+
+def pin_process(process, cpu):
+    from desktop_windows import pin_process as pin
+    pin(process,cpu)
+
+
+def cpu_ns(process):
+    if sys.platform=="win32":
+        from desktop_windows import cpu_ns as process_cpu
+        return process_cpu(process)
+    fields = Path(f"/proc/{process.pid}/stat").read_text().rsplit(")",1)[1].split()
     return (int(fields[11])+int(fields[12])) * 1_000_000_000 // os.sysconf("SC_CLK_TCK")
 
 
@@ -165,10 +185,15 @@ keys = [{{key='F6',action='CreateTab'}},{{key='F7',action='OpenCommandPalette'}}
     env.pop("WAYLAND_DISPLAY",None)
     env.pop("WAYLAND_SOCKET",None)
     def pin(): os.sched_setaffinity(0,{cpu})
-    x = X11(env["DISPLAY"])
+    if sys.platform=="win32":
+        from desktop_windows import Window
+        x = Window()
+    else:
+        x = X11(env["DISPLAY"])
     with (folder/"application.log").open("w") as log:
-        process = subprocess.Popen([binary],env=env,stdout=log,stderr=log,preexec_fn=pin)
+        process = subprocess.Popen([binary],env=env,stdout=log,stderr=log,preexec_fn=pin if sys.platform!="win32" else None)
         try:
+            if sys.platform=="win32": pin_process(process,cpu)
             deadline = time.monotonic()+20
             while not list(folder.glob("ready-*")):
                 if process.poll() is not None or time.monotonic()>deadline:
@@ -176,7 +201,7 @@ keys = [{{key='F6',action='CreateTab'}},{{key='F7',action='OpenCommandPalette'}}
                 time.sleep(0.01)
             window = x.find(process.pid)
             if window is None: raise RuntimeError("No Rio client window")
-            x.x.XSetInputFocus(x.display,window,1,0); x.x.XSync(x.display,0)
+            x.focus(window)
             tabs = 4 if mode in ("tabs","tab_repeat") else 1
             for count in range(2,tabs+1):
                 x.key(window,"F6")
@@ -187,7 +212,7 @@ keys = [{{key='F6',action='CreateTab'}},{{key='F7',action='OpenCommandPalette'}}
             if mode in ("tabs","tab_repeat"):
                 before = x.image(window)
                 x.key(window,"F9")
-                x.wait_changed(window,before)
+                wait_changed(x,window,before)
                 time.sleep(0.2)
             if mode in ("palette","search"):
                 before = x.image(window)
@@ -196,8 +221,8 @@ keys = [{{key='F6',action='CreateTab'}},{{key='F7',action='OpenCommandPalette'}}
                 if mode=="search":
                     for key in "compute": x.key(window,key)
                     time.sleep(0.15)
-                x.wait_changed(window,before)
-            start_cpu = cpu_ns(process.pid)
+                wait_changed(x,window,before)
+            start_cpu = cpu_ns(process)
             start = time.monotonic()
             (folder/"go").touch()
             if mode in ("tabs","tab_repeat","palette"):
@@ -209,7 +234,7 @@ keys = [{{key='F6',action='CreateTab'}},{{key='F7',action='OpenCommandPalette'}}
                 if process.poll() is not None or time.monotonic()>start+DURATION+10: raise RuntimeError("Fixture did not finish")
                 time.sleep(0.01)
             time.sleep(0.15)
-            elapsed_cpu = cpu_ns(process.pid)-start_cpu
+            elapsed_cpu = cpu_ns(process)-start_cpu
             elapsed_wall = time.monotonic()-start
             (folder/"stop").touch()
             process.wait(timeout=10)

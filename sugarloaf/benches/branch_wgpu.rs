@@ -3,15 +3,19 @@ mod support;
 
 #[cfg(target_os = "linux")]
 #[path = "../../misc/benchmarks/x11.rs"]
-mod x11;
+mod window;
 
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "windows")]
+#[path = "../../misc/benchmarks/win32.rs"]
+mod window;
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn main() {
     use sugarloaf::{
         context::webgpu::WgpuContext,
-        grid::{webgpu::WgpuGridRenderer, CellBg, CellText, GridUniforms},
+        grid::{CellBg, CellText, GridUniforms, webgpu::WgpuGridRenderer},
     };
-    let window = x11::Window::new();
+    let window = window::Window::new();
     let context =
         || WgpuContext::new(window.handle(), Default::default(), wgpu::Backends::VULKAN);
     // Keep a first context alive: the benchmark concerns subsequent windows.
@@ -130,7 +134,7 @@ fn main() {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn main() {
     println!("Use the Windows runtime benchmark driver for native-window measurements");
 }

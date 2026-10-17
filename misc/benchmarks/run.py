@@ -123,7 +123,9 @@ def build_one(revision, suite, cwd, env):
     if suite == "bash":
         return shutil.which("bash")
     if suite == "ui_internal":
-        command = ["cargo", "test", "--release", "-p", "sugarloaf", "--lib", "--features", "rio-window/x11", "--no-run"]
+        command = ["cargo", "test", "--release", "-p", "sugarloaf", "--lib", "--no-run"]
+        if sys.platform=="linux":
+            command += ["--features", "rio-window/x11"]
     elif suite == "frontend":
         command = ["cargo", "test", "--release", "-p", "rioterm", "--bin", "rio", "--no-run"]
     elif suite == "application":
@@ -131,8 +133,11 @@ def build_one(revision, suite, cwd, env):
     else:
         package, name = SUITES[suite]
         command = ["cargo", "bench", "-p", package, "--bench", name, "--no-run"]
-        if package in ("sugarloaf", "rio-grid"):
-            command += ["--features", "rio-window/x11" + (",wgpu" if suite in ("wgpu","shader") else "")]
+        features = (["rio-window/x11"] if sys.platform=="linux" and package in ("sugarloaf","rio-grid") else [])
+        if suite in ("wgpu","shader"):
+            features.append("wgpu")
+        if features:
+            command += ["--features", ",".join(features)]
     command += ["--locked", "--message-format=json"]
     log = OUT / f"build-{revision}-{suite}.log"
     print(f"Building {revision} {suite}", flush=True)
@@ -158,7 +163,7 @@ def build_one(revision, suite, cwd, env):
                 artifacts.append(row["executable"])
     if len(artifacts) != 1:
         raise RuntimeError(f"Expected one executable for {suite}, got {artifacts}")
-    destination = OUT / "binaries" / revision / suite
+    destination = OUT / "binaries" / revision / (suite + (".exe" if sys.platform=="win32" else ""))
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(".new")
     shutil.copy2(artifacts[0], temporary)
@@ -175,8 +180,10 @@ def build(args):
     env = build_environment()
     binaries = {}
     common = ["vt", "grid", "ui", "ui_internal", "frontend", "vt_internal", "poll_internal", "bash", "application"]
+    if sys.platform=="win32":
+        common.remove("bash")
     if not args.no_gpu:
-        common += ["gpu", "wgpu"]
+        common += (["gpu"] if sys.platform=="linux" else []) + ["wgpu"]
     for revision, cwd in [("upstream", UPSTREAM), ("branch", ROOT)]:
         suites = common + (["icons", "shader"] if revision == "branch" else [])
         if args.no_gpu:
@@ -243,10 +250,17 @@ def execute(path, arguments, env, cpu, log):
     def pin():
         os.sched_setaffinity(0, {cpu})
     with log.open("w") as output:
-        process = subprocess.run([path, *arguments], cwd=ROOT, env=env, stdout=output, stderr=subprocess.STDOUT,
-                                 preexec_fn=pin, timeout=300)
-    if process.returncode:
-        raise RuntimeError(f"Benchmark failed ({process.returncode}); see {log}")
+        with subprocess.Popen([path, *arguments], cwd=ROOT, env=env, stdout=output, stderr=subprocess.STDOUT,
+                              preexec_fn=pin if sys.platform!="win32" else None) as process:
+            if sys.platform=="win32":
+                application.pin_process(process,cpu)
+            try:
+                code = process.wait(timeout=300)
+            except subprocess.TimeoutExpired:
+                process.kill(); process.wait()
+                raise
+    if code:
+        raise RuntimeError(f"Benchmark failed ({code}); see {log}")
     return list(records(log.read_text()))
 
 
@@ -263,13 +277,13 @@ def run(args):
         changed = git("diff","--name-only",metadata["branch"],driver_revision).splitlines()
         if any(path not in driver_files and not (path.startswith("misc/profiling/") and path.endswith((".md",".csv"))) for path in changed):
             raise RuntimeError("Rebuild after changing compiled sources; only Python drivers and reports can change without rebuilding")
-    if args.cpu not in os.sched_getaffinity(0):
+    if args.cpu not in application.available_cpus():
         raise RuntimeError(f"CPU {args.cpu} is unavailable")
     env = dict(os.environ, RIO_BENCH_SAMPLES=str(args.samples), RIO_BENCH_MS=str(args.ms),
                RIO_BENCH_BASELINE=str(UPSTREAM), CARGO_TARGET_DIR=str(ROOT / "target"))
     if args.filter:
         env["RIO_BENCH_FILTER"] = args.filter
-    manager = contextlib.nullcontext({}) if args.no_gpu else display()
+    manager = contextlib.nullcontext({}) if args.no_gpu or sys.platform=="win32" else display()
     with manager as display_env, (OUT / "results.jsonl").open("w") as output:
         env.update(display_env)
         if display_env:
@@ -329,7 +343,7 @@ def run(args):
                         row_revision = ["upstream", "branch"][row["variant"]] if suite == "shader" else revision
                         output.write(json.dumps({"revision":row_revision,"repeat":repeat,"suite":suite,**row})+"\n")
                     output.flush()
-    (OUT / "run.json").write_text(json.dumps({"driver_revision":driver_revision,"runs":args.runs,"samples":args.samples,"sample_ms":args.ms,"cpu":args.cpu,"platform":sys.platform,"display":"isolated KWin Xwayland" if not args.no_gpu else None}, indent=2)+"\n")
+    (OUT / "run.json").write_text(json.dumps({"driver_revision":driver_revision,"runs":args.runs,"samples":args.samples,"sample_ms":args.ms,"cpu":args.cpu,"platform":sys.platform,"backend":env.get("WGPU_BACKEND"),"display":("interactive Windows desktop" if sys.platform=="win32" else "isolated KWin Xwayland") if not args.no_gpu else None}, indent=2)+"\n")
 
 
 def main():

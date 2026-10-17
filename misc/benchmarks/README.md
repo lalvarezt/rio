@@ -64,6 +64,20 @@ RIO_BENCH_BASELINE="$PWD/target/branch-performance/upstream" cargo bench -p suga
 
 ## Run Windows-only cases
 
+The shared upstream comparison also runs on Windows:
+
+```powershell
+python -X utf8 misc/benchmarks/run.py build
+$env:WGPU_BACKEND = 'vulkan'
+python -X utf8 misc/benchmarks/run.py run --runs 3 --samples 11 --ms 100 --cpu 2
+```
+
+Builds can run through SSH. Run measurements in the logged-in desktop session
+so application fixtures can verify their rendered output. The shared suite uses
+Win32 window controls on Windows and X11 controls on Linux. The native Linux
+Vulkan recording probe and Bash integration are skipped on Windows; WGPU,
+WGSL, CPU fixtures, and both existing internal suites run on either platform.
+
 Build `rio-profile` on Windows with the repository's normal fast profiling
 configuration. Run the following command in an interactive Windows desktop:
 
