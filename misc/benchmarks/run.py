@@ -289,18 +289,23 @@ def run(args):
                         continue
                     print(f"Running pair {repeat+1}/{args.runs}: {revision} {suite}", flush=True)
                     arguments = ["branch_bench", "--ignored", "--nocapture", "--test-threads=1"] if suite in ("frontend","ui_internal") else []
+                    tag = f"branch-perf-{revision}-{repeat}-{time.time_ns()}"
                     if suite in ("vt_internal","poll_internal"):
-                        arguments = ["--bench", "--noplot", "--warm-up-time", "0.2", "--measurement-time", "0.5", "--save-baseline", f"{revision}-{repeat}"]
+                        arguments = ["--bench", "--noplot", "--warm-up-time", "0.2", "--measurement-time", "0.5", "--save-baseline", tag]
+                        if args.filter:
+                            arguments.append(args.filter.removeprefix("internal/"))
                     log = OUT / f"run-{repeat}-{revision}-{suite}.log"
                     rows = execute(binary, arguments, env, args.cpu, log)
                     if suite in ("vt_internal","poll_internal"):
-                        for estimate in (ROOT/"target/criterion").glob(f"**/{revision}-{repeat}/estimates.json"):
+                        for estimate in (ROOT/"target/criterion").glob(f"**/{tag}/estimates.json"):
                             if (suite == "vt_internal") != ("vt_input" in estimate.parts):
                                 continue
                             values = json.loads(estimate.read_text())
                             name = "/".join(estimate.relative_to(ROOT/"target/criterion").parts[:-2])
                             rows.append({"kind":"bench", "case":f"internal/{name}", "sample":0, "ns":values["median"]["point_estimate"]})
                     if not rows:
+                        if args.filter:
+                            continue
                         raise RuntimeError(f"No benchmark records in {log}")
                     for row in rows:
                         row_revision = ["upstream", "branch"][row["variant"]] if suite == "shader" else revision
