@@ -361,7 +361,7 @@ def run(args):
         import winreg
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as key:
             model = winreg.QueryValueEx(key,"ProcessorNameString")[0].strip()
-    (OUT / "run.json").write_text(json.dumps({"driver_revision":driver_revision,"runs":args.runs,"samples":args.samples,"sample_ms":args.ms,"cpu":args.cpu,"platform":sys.platform,"system":platform.platform(),"cpu_model":model,"backend":env.get("WGPU_BACKEND"),"display":("interactive Windows desktop" if sys.platform=="win32" else "isolated KWin Xwayland") if not args.no_gpu else None}, indent=2)+"\n")
+    (OUT / "run.json").write_text(json.dumps({"driver_revision":driver_revision,"runs":args.runs,"start_repeat":getattr(args,"start_repeat",0),"samples":args.samples,"sample_ms":args.ms,"cpu":args.cpu,"platform":sys.platform,"system":platform.platform(),"cpu_model":model,"backend":env.get("WGPU_BACKEND"),"display":("interactive Windows desktop" if sys.platform=="win32" else "isolated KWin Xwayland") if not args.no_gpu else None}, indent=2)+"\n")
 
 
 def main():
