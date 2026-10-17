@@ -3748,19 +3748,48 @@ impl<U: EventListener> Handler for Crosswords<U> {
         // bulk-handling it correctly outweighs the win. Non-ASCII charsets
         // fall back too: decode runs can carry ASCII that needs mapping.
         let active = self.grid.cursor.charsets[self.active_charset];
+        let clustering = self.mode.contains(Mode::GRAPHEME_CLUSTER);
         if self.mode.contains(Mode::INSERT)
             || active != crate::crosswords::pos::StandardCharset::Ascii
-            // Grapheme clustering decides cell layout per codepoint
-            // against the previous cell; the bulk writers place whole
-            // width-runs at once and would split clusters. ASCII bulk
-            // paths stay fast: ASCII never continues a cluster, and
-            // the cluster check anchors on the previous cell, so it
-            // self-invalidates across a bulk run.
-            || self.mode.contains(Mode::GRAPHEME_CLUSTER)
+            || (clustering
+                && (!self.mode.contains(Mode::LINE_WRAP)
+                    || !self.graphics.atlas_placements.is_empty()))
         {
             for &cp in codepoints {
                 let c = char::from_u32(cp).unwrap_or('\u{FFFD}');
                 self.input(c);
+            }
+            return;
+        }
+
+        if clustering {
+            let mut remaining = codepoints;
+            while let Some(&cp) = remaining.first() {
+                // Printable ASCII cannot extend a cluster, just as in
+                // input_ascii_str. Keep it on the bulk path even when the
+                // parser decoded it together with preceding Unicode text.
+                if (0x20..=0x7e).contains(&cp)
+                    && remaining
+                        .get(1)
+                        .is_some_and(|cp| (0x20..=0x7e).contains(cp))
+                {
+                    let ascii = 2 + remaining[2..]
+                        .iter()
+                        .take_while(|&&cp| (0x20..=0x7e).contains(&cp))
+                        .count();
+                    self.grid.sync_template_style();
+                    let template = self.cell_template();
+                    let template_has_extras = template.extras_id().is_some();
+                    self.write_narrow_run(
+                        template,
+                        template_has_extras,
+                        &remaining[..ascii],
+                    );
+                    remaining = &remaining[ascii..];
+                } else {
+                    self.input(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                    remaining = &remaining[1..];
+                }
             }
             return;
         }

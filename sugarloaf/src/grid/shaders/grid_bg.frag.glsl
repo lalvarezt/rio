@@ -144,6 +144,10 @@ void main() {
     // Load + decode the CellBg.
     uint idx = uint(grid_pos.y) * uniforms.grid_size.x + uint(grid_pos.x);
     vec4 color = unpackUnorm4x8(cells[idx]);
+    if (color.a == 0.0) {
+        out_color = vec4(0.0);
+        return;
+    }
     color.rgb = grid_prepare_output_rgb(color.rgb, uniforms.input_colorspace);
     color.rgb *= color.a;
 

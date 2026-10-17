@@ -183,6 +183,11 @@ fn grid_bg_fragment(in: VsOut) -> @location(0) vec4<f32> {
  // values.
     let idx = u32(grid_pos.y) * uniforms.grid_size.x + u32(grid_pos.x);
     let word = cells[idx];
+    // Transparent cells contribute nothing; skip their color conversion.
+    // Keep this after the cursor overlay, which can cover a transparent cell.
+    if ((word >> 24u) == 0u) {
+        return vec4<f32>(0.0);
+    }
     let r = f32((word >>  0u) & 0xFFu) / 255.0;
     let g = f32((word >>  8u) & 0xFFu) / 255.0;
     let b = f32((word >> 16u) & 0xFFu) / 255.0;

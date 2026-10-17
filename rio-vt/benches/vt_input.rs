@@ -29,6 +29,16 @@ fn plain(total: usize) -> Vec<u8> {
     line.repeat(total / line.len() + 1).into_bytes()
 }
 
+fn unicode(total: usize) -> Vec<u8> {
+    let line = "日本語 한글 λ α Ж e\u{301} 👩\u{200d}💻 ╔═╗\r\n";
+    line.repeat(total / line.len() + 1).into_bytes()
+}
+
+fn unicode_ascii(total: usize) -> Vec<u8> {
+    let line = "日本語 the quick brown fox jumps over the lazy dog 0123456789 abcdefghijklmnopqrstuvwxyz\r\n";
+    line.repeat(total / line.len() + 1).into_bytes()
+}
+
 /// The benchmark suite's ANSI mix: 256-color pairs, truecolor bold,
 /// italic/underline toggles, resets between every word.
 fn ansi_mixed(total: usize) -> Vec<u8> {
@@ -127,8 +137,10 @@ impl rio_vt::performer::parser::Perform for NoopPerform {
 
 fn bench(c: &mut Criterion) {
     const BYTES: usize = 4 * 1024 * 1024;
-    let cases: [(&str, Vec<u8>); 5] = [
+    let cases: [(&str, Vec<u8>); 7] = [
         ("plain", plain(BYTES)),
+        ("unicode", unicode(BYTES)),
+        ("unicode_ascii", unicode_ascii(BYTES)),
         ("ansi_mixed", ansi_mixed(BYTES)),
         ("ansi_two_styles", ansi_two_styles(BYTES)),
         ("ansi_bare_csi", ansi_bare_csi(BYTES)),
