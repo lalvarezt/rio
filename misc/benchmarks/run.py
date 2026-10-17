@@ -259,6 +259,7 @@ def run(args):
         raise RuntimeError("Rebuild after changing compiled benchmark fixtures")
     if metadata["branch"] != driver_revision:
         driver_files = {str(path.relative_to(ROOT)) for path in (ROOT/"misc/benchmarks").glob("*.py")}
+        driver_files.add("misc/benchmarks/README.md")
         changed = git("diff","--name-only",metadata["branch"],driver_revision).splitlines()
         if any(path not in driver_files and not (path.startswith("misc/profiling/") and path.endswith((".md",".csv"))) for path in changed):
             raise RuntimeError("Rebuild after changing compiled sources; only Python drivers and reports can change without rebuilding")
