@@ -55,7 +55,7 @@ They do not run in ordinary test executions.
 The WGSL comparison needs a baseline worktree:
 
 ```sh
-RIO_BENCH_BASELINE="$PWD/target/branch-performance/upstream" cargo bench -p rioterm --bench branch_shader
+RIO_BENCH_BASELINE="$PWD/target/branch-performance/upstream" cargo bench -p sugarloaf --features wgpu,rio-window/x11 --bench branch_shader
 ```
 
 ## Run Windows-only cases

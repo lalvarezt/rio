@@ -29,7 +29,7 @@ SUITES = {
     "gpu": ("sugarloaf", "branch_gpu"),
     "wgpu": ("sugarloaf", "branch_wgpu"),
     "icons": ("sugarloaf", "branch_features"),
-    "shader": ("rioterm", "branch_shader"),
+    "shader": ("sugarloaf", "branch_shader"),
     "vt_internal": ("rio-vt", "vt_input"),
     "poll_internal": ("corcovado", "bench_poll"),
 }
@@ -132,7 +132,7 @@ def build_one(revision, suite, cwd, env):
         package, name = SUITES[suite]
         command = ["cargo", "bench", "-p", package, "--bench", name, "--no-run"]
         if package in ("sugarloaf", "rio-grid"):
-            command += ["--features", "rio-window/x11" + (",wgpu" if suite == "wgpu" else "")]
+            command += ["--features", "rio-window/x11" + (",wgpu" if suite in ("wgpu","shader") else "")]
     command += ["--locked", "--message-format=json"]
     log = OUT / f"build-{revision}-{suite}.log"
     print(f"Building {revision} {suite}", flush=True)
@@ -160,7 +160,9 @@ def build_one(revision, suite, cwd, env):
         raise RuntimeError(f"Expected one executable for {suite}, got {artifacts}")
     destination = OUT / "binaries" / revision / suite
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(artifacts[0], destination)
+    temporary = destination.with_suffix(".new")
+    shutil.copy2(artifacts[0], temporary)
+    temporary.replace(destination)
     return str(destination)
 
 

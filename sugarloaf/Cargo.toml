@@ -146,6 +146,12 @@ name = "branch_wgpu"
 harness = false
 required-features = ["wgpu"]
 
+[[bench]]
+name = "branch_shader"
+path = "../misc/benchmarks/wgsl.rs"
+harness = false
+required-features = ["wgpu"]
+
 [features]
 default = ["scale", "render"]
 scale = ["yazi"]
