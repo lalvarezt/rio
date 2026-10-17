@@ -356,7 +356,8 @@ impl WgpuGridRenderer {
         let row_start = (row as usize) * (self.cols as usize);
         let row_len = (self.cols as usize).min(bg.len());
         let cpu = &mut self.bg_cpu[row_start..row_start + self.cols as usize];
-        if cpu[..row_len] != bg[..row_len]
+        if bytemuck::cast_slice::<_, u8>(&cpu[..row_len])
+            != bytemuck::cast_slice(&bg[..row_len])
             || cpu[row_len..]
                 .iter()
                 .any(|cell| *cell != CellBg::TRANSPARENT)

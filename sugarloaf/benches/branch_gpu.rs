@@ -2,8 +2,12 @@
 mod support;
 
 #[cfg(target_os = "linux")]
+#[path = "../../misc/benchmarks/grid_storage.rs"]
+mod storage;
+
+#[cfg(target_os = "linux")]
 mod native {
-    use super::support;
+    use super::{storage, support};
     use ash::vk;
     use raw_window_handle::{
         RawDisplayHandle, RawWindowHandle, XlibDisplayHandle, XlibWindowHandle,
@@ -82,6 +86,7 @@ mod native {
                 });
                 let device = ctx.device().clone();
                 let mut grid = VulkanGridRenderer::new(&ctx, 160, 48);
+                storage::measure("gpu", |row, bg| grid.write_row(row, bg, &[]));
                 // Color pages are lazy. The two-atlas case must bind an actual
                 // allocated page even though its glyph quads have zero area.
                 grid.insert_glyph_color(

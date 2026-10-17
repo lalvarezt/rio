@@ -1,6 +1,9 @@
 #[path = "../../misc/benchmarks/support.rs"]
 mod support;
 
+#[path = "../../misc/benchmarks/grid_storage.rs"]
+mod storage;
+
 #[cfg(target_os = "linux")]
 #[path = "../../misc/benchmarks/x11.rs"]
 mod window;
@@ -13,7 +16,7 @@ mod window;
 fn main() {
     use sugarloaf::{
         context::webgpu::WgpuContext,
-        grid::{CellBg, CellText, GridUniforms, webgpu::WgpuGridRenderer},
+        grid::{webgpu::WgpuGridRenderer, CellBg, CellText, GridUniforms},
     };
     let window = window::Window::new();
     let next_window = window::Window::new();
@@ -63,6 +66,7 @@ fn main() {
         0
     });
     let mut grid = WgpuGridRenderer::new(&ctx, 160, 48);
+    storage::measure("wgpu", |row, bg| grid.write_row(row, bg, &[]));
     let mut uniforms: GridUniforms = unsafe { std::mem::zeroed() };
     uniforms.projection[15] = 1.0;
     uniforms.cell_size = [9.6, 20.0];
