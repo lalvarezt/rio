@@ -26,6 +26,10 @@ has a separate build directory. It preserves immutable executable copies under
 fixtures and test hooks. The worktree remains detached at the pinned upstream
 commit. The runner does not switch or reset your working branch.
 
+Python driver and report changes do not require recompiling unchanged Rust
+executables. The run records both revisions. Production-code, asset, manifest,
+and compiled-fixture changes still require a rebuild.
+
 To run without a GPU or virtual display, add `--no-gpu` to both build and run.
 To repeat one area, set `--filter`, for example `--filter input/mixed`.
 The Rust helpers support `RIO_BENCH_SAMPLES`, `RIO_BENCH_MS`, and

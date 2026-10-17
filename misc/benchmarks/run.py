@@ -229,8 +229,13 @@ def display():
 
 def records(text):
     for line in text.splitlines():
-        if line.startswith("RIO_") and " {" in line:
-            kind, value = line.split(" ", 1)
+        # libtest writes `test module::name ... ` before the first println.
+        # Read the marker rather than assuming it starts the output line.
+        marker = line.find("RIO_")
+        if marker < 0:
+            continue
+        kind, separator, value = line[marker:].partition(" ")
+        if separator and kind in {"RIO_BENCH","RIO_ALLOC","RIO_CHECK","RIO_COUNTER","RIO_DEVICE"} and value.startswith("{"):
             yield {"kind": kind.removeprefix("RIO_").lower(), **json.loads(value)}
 
 
@@ -249,8 +254,14 @@ def run(args):
     if git("status", "--porcelain"):
         raise RuntimeError("Commit the benchmark suite and document before measuring")
     metadata = json.loads((OUT / "build.json").read_text())
-    if metadata["branch"] != git("rev-parse", "HEAD"):
-        raise RuntimeError("Rebuild benchmarks at the committed branch revision")
+    driver_revision = git("rev-parse","HEAD")
+    if metadata["fixtures_sha256"] != fixture_hash():
+        raise RuntimeError("Rebuild after changing compiled benchmark fixtures")
+    if metadata["branch"] != driver_revision:
+        driver_files = {str(path.relative_to(ROOT)) for path in (ROOT/"misc/benchmarks").glob("*.py")}
+        changed = git("diff","--name-only",metadata["branch"],driver_revision).splitlines()
+        if any(path not in driver_files and not (path.startswith("misc/profiling/") and path.endswith((".md",".csv"))) for path in changed):
+            raise RuntimeError("Rebuild after changing compiled sources; only Python drivers and reports can change without rebuilding")
     if args.cpu not in os.sched_getaffinity(0):
         raise RuntimeError(f"CPU {args.cpu} is unavailable")
     env = dict(os.environ, RIO_BENCH_SAMPLES=str(args.samples), RIO_BENCH_MS=str(args.ms),
@@ -317,7 +328,7 @@ def run(args):
                         row_revision = ["upstream", "branch"][row["variant"]] if suite == "shader" else revision
                         output.write(json.dumps({"revision":row_revision,"repeat":repeat,"suite":suite,**row})+"\n")
                     output.flush()
-    (OUT / "run.json").write_text(json.dumps({"runs":args.runs,"samples":args.samples,"sample_ms":args.ms,"cpu":args.cpu,"platform":sys.platform,"display":"isolated KWin Xwayland" if not args.no_gpu else None}, indent=2)+"\n")
+    (OUT / "run.json").write_text(json.dumps({"driver_revision":driver_revision,"runs":args.runs,"samples":args.samples,"sample_ms":args.ms,"cpu":args.cpu,"platform":sys.platform,"display":"isolated KWin Xwayland" if not args.no_gpu else None}, indent=2)+"\n")
 
 
 def main():

@@ -81,7 +81,8 @@ def main():
     model = next((line.split(":",1)[1].strip() for line in cpuinfo.splitlines() if line.startswith("model name")),"unknown")
     devices = sorted({row["adapter"] for row in rows if row["kind"]=="device"})
     lines = ["# Linux branch performance report", "",
-        f"Upstream: `{build['baseline']}`. Branch benchmark revision: `{build['branch']}`.",
+        f"Upstream: `{build['baseline']}`. Branch executable revision: `{build['branch']}`.",
+        f"Benchmark driver revision: `{run['driver_revision']}`. The runner permits only Python-driver and report changes after the executable revision; compiled sources and fixture hashes must match.",
         "This report compares the final branch with upstream, not with intermediate optimization commits.","",
         "## Measurement environment", "",
         f"- System: {platform.platform()}; {model}.",
