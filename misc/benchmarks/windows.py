@@ -26,14 +26,8 @@ def motion(executable, output, level, minimize=False):
     user.SendInput.argtypes = [W.UINT,C.POINTER(Input),C.c_int]
     user.SendInput.restype = W.UINT
     user.GetForegroundWindow.restype = W.HWND
-    user.SetForegroundWindow.argtypes = [W.HWND]
     user.ShowWindow.argtypes = [W.HWND,C.c_int]
     user.GetClientRect.argtypes = [W.HWND,C.POINTER(W.RECT)]
-    user.GetWindowThreadProcessId.argtypes = [W.HWND,C.POINTER(W.DWORD)]
-    user.IsWindowVisible.argtypes = [W.HWND]
-    user.IsWindowVisible.restype = W.BOOL
-    callback_type = C.WINFUNCTYPE(W.BOOL,W.HWND,W.LPARAM)
-    user.EnumWindows.argtypes = [callback_type,W.LPARAM]
     folder = output/f"motion-{level}"; folder.mkdir(parents=True,exist_ok=True)
     config = folder/"config"; config.mkdir(exist_ok=True)
     (config/"config.toml").write_text(f"""[navigation]
@@ -51,20 +45,14 @@ keys = [{{key='F9',action='SelectNextTab'}}]
         launched = time.monotonic()
         process = subprocess.Popen([str(executable)],env=env,stdout=log,stderr=log)
         try:
-            found = []
-            @callback_type
-            def visit(window,_):
-                pid = W.DWORD()
-                user.GetWindowThreadProcessId(window,C.byref(pid))
-                if pid.value==process.pid and user.IsWindowVisible(window): found.append(window)
-                return True
+            desktop = Window()
+            window = None
             deadline = time.monotonic()+8
-            while not found:
-                user.EnumWindows(visit,0)
+            while window is None:
+                window = desktop.find(process.pid)
                 if process.poll() is not None or time.monotonic()>deadline: raise RuntimeError("No profiling window")
                 time.sleep(0.01)
-            window = found[0]
-            Window().focus(window)
+            desktop.focus(window)
             time.sleep(0.4)
             original = W.RECT()
             if not user.GetClientRect(window,C.byref(original)): raise C.WinError(C.get_last_error())

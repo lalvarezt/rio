@@ -73,10 +73,13 @@ class Window:
         def visit(window,_):
             owner = W.DWORD()
             user.GetWindowThreadProcessId(window,C.byref(owner))
-            if owner.value==pid and user.IsWindowVisible(window): found.append(window)
+            if owner.value==pid and user.IsWindowVisible(window):
+                rect = W.RECT()
+                if user.GetClientRect(window,C.byref(rect)) and rect.right>0 and rect.bottom>0:
+                    found.append((rect.right*rect.bottom,window))
             return True
         user.EnumWindows(visit,0)
-        return found[0] if found else None
+        return max(found,key=lambda item:item[0])[1] if found else None
 
     def focus(self, window):
         user.ShowWindow(window,9)

@@ -27,6 +27,7 @@ def fixture(mode, folder):
     emit(f"\x1b]2;RIO_BENCH_{os.getpid()}\x07")
     (folder/f"ready-{os.getpid()}").write_text(json.dumps({"columns":actual_cols,"rows":actual_rows}))
     while not (folder/"go").exists():
+        if (folder/"stop").exists(): return
         time.sleep(0.005)
     start = time.monotonic()
     sizes = {(actual_cols,actual_rows)}
