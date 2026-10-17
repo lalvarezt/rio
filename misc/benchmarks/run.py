@@ -294,7 +294,7 @@ def run(args):
             env.pop("WAYLAND_DISPLAY",None)
             env.pop("WAYLAND_SOCKET",None)
         suites = list(dict.fromkeys(suite for binaries in metadata["binaries"].values() for suite in binaries))
-        for repeat in range(args.runs):
+        for repeat in range(getattr(args,"start_repeat",0),args.runs):
             order = ["upstream", "branch"] if repeat % 2 == 0 else ["branch", "upstream"]
             for suite in suites:
                 for revision in order:
@@ -353,7 +353,7 @@ def run(args):
                             continue
                         raise RuntimeError(f"No benchmark records in {log}")
                     for row in rows:
-                        row_revision = ["upstream", "branch"][row["variant"]] if suite == "shader" else revision
+                        row_revision = ["upstream", "branch"][row["variant"]] if suite == "shader" and "variant" in row else revision
                         output.write(json.dumps({"revision":row_revision,"repeat":repeat,"suite":suite,**row})+"\n")
                     output.flush()
     model = platform.processor()
@@ -369,11 +369,15 @@ def main():
     parser.add_argument("action", choices=["prepare", "build", "run"])
     parser.add_argument("--no-gpu", action="store_true")
     parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument("--start-repeat",type=int,default=0,
+                        help="first zero-based pair to run after preserving completed samples")
     parser.add_argument("--samples", type=int, default=11)
     parser.add_argument("--ms", type=int, default=100)
     parser.add_argument("--cpu", type=int, default=2)
     parser.add_argument("--filter")
     args = parser.parse_args()
+    if not 0<=args.start_repeat<args.runs:
+        parser.error("start-repeat must be at least zero and smaller than runs")
     {"prepare":prepare, "build":lambda:build(args), "run":lambda:run(args)}[args.action]()
 
 
