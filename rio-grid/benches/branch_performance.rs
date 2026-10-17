@@ -76,7 +76,9 @@ fn main() {
             1000,
         );
         let mut processor = Processor::default();
-        let mut fixture = String::new();
+        // Counter edits below must stay on narrow cells for every script.
+        // Mutating the codepoint of a wide-cell continuation is not valid input.
+        let mut fixture = String::from("00000000");
         let text = match kind {
             "unicode" => "日本語 한글 λ α Ж unicode ",
             "combining" => "e\u{301} a\u{308} n\u{303} combining ",
