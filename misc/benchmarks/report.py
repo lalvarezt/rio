@@ -146,6 +146,8 @@ def main(out=OUT):
         cpuinfo = Path("/proc/cpuinfo").read_text()
         model = next((line.split(":",1)[1].strip() for line in cpuinfo.splitlines() if line.startswith("model name")),"unknown")
     devices = sorted({row["adapter"] for row in rows if row["kind"]=="device"})
+    device_suites = {suite:sorted({row["adapter"] for row in rows if row["kind"]=="device" and row["suite"]==suite})
+                     for suite in sorted({row["suite"] for row in rows if row["kind"]=="device"})}
     lines = [f"# {label} branch performance report", "",
         f"Upstream: `{build['baseline']}`. Branch executable revision: `{build['branch']}`.",
         f"Benchmark driver revision: `{run['driver_revision']}`. The runner permits only Python-driver and report changes after the executable revision; compiled sources and fixture hashes must match.",
@@ -168,6 +170,7 @@ def main(out=OUT):
         "The results cannot be added into a single terminal speedup: the cases measure different operations and overlapping pipeline stages.","",
         f"The complete per-case timing and allocation results are in [the CSV]({csv_path.name}).", ""]
     if is_windows:
+        lines += ["GPU probe adapters by suite: "+"; ".join(f"`{suite}`: {', '.join(names)}" for suite,names in device_suites.items())+".",""]
         lines += windows_findings(index,results,windows_motion,out)
     else:
         counts = collections.Counter(row["classification"] for row in results)

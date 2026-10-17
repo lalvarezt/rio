@@ -24,7 +24,12 @@ fn main() {
         },
     ))
     .unwrap();
-    eprintln!("Adapter: {:?}", adapter.get_info());
+    let info = adapter.get_info();
+    println!(
+        "RIO_DEVICE {{\"adapter\":{:?},\"backend\":{:?}}}",
+        info.name,
+        format!("{:?}", info.backend)
+    );
     let (device, queue) =
         futures::executor::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             required_features: wgpu::Features::TIMESTAMP_QUERY,
@@ -288,13 +293,17 @@ fn main() {
                         } else {
                             expected = Some(hash);
                         }
-                        println!("RIO_CHECK {{\"case\":\"wgsl/background/{case}/{colorspace}\",\"variant\":{variant},\"value\":\"{hash:016x}\"}}");
+                        println!(
+                            "RIO_CHECK {{\"case\":\"wgsl/background/{case}/{colorspace}\",\"variant\":{variant},\"value\":\"{hash:016x}\"}}"
+                        );
                     }
                     if repeat >= 10 {
                         let ns = (end - start) as f64
                             * queue.get_timestamp_period() as f64
                             / 16.0;
-                        println!("RIO_BENCH {{\"case\":\"wgsl/background/{case}/{colorspace}\",\"sample\":{repeat},\"variant\":{variant},\"iterations\":16,\"units\":1,\"ns\":{ns}}}");
+                        println!(
+                            "RIO_BENCH {{\"case\":\"wgsl/background/{case}/{colorspace}\",\"sample\":{repeat},\"variant\":{variant},\"iterations\":16,\"units\":1,\"ns\":{ns}}}"
+                        );
                     }
                 }
             }
