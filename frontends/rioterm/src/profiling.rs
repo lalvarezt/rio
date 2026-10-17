@@ -16,6 +16,7 @@ struct Capture {
     last_frame: Option<Instant>,
     frames: usize,
     target_frames: usize,
+    settle_time: Duration,
     samples: BTreeMap<&'static str, Vec<f64>>,
     active: Vec<&'static str>,
 }
@@ -38,6 +39,11 @@ pub fn init() {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
+            settle_time: std::env::var("RIO_PROFILE_SETTLE_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .map(Duration::from_millis)
+                .unwrap_or(Duration::from_secs(2)),
             samples: BTreeMap::new(),
             active: Vec::new(),
         })
@@ -187,7 +193,7 @@ pub fn finished() -> bool {
             .ready
             .zip(capture.shell_frame)
             .is_some_and(|(ready, frame)| {
-                ready.max(frame).elapsed() >= Duration::from_secs(2)
+                ready.max(frame).elapsed() >= capture.settle_time
                     && capture.frames >= capture.target_frames
             })
 }
@@ -218,12 +224,13 @@ fn write_report(path: std::path::PathBuf) {
         |value: Option<f64>| value.map_or("null".to_owned(), |v| format!("{v:.6}"));
     writeln!(
         file,
-        "{{\"active\":{:?},\"ready_tabs\":{},\"target_tabs\":{},\"frames\":{},\"target_frames\":{},\"shell_ready_ms\":{},\"first_frame_ms\":{},\"shell_frame_ms\":{},\"total_ms\":{:.6},\"metrics\":{{",
+        "{{\"active\":{:?},\"ready_tabs\":{},\"target_tabs\":{},\"frames\":{},\"target_frames\":{},\"settle_ms\":{},\"shell_ready_ms\":{},\"first_frame_ms\":{},\"shell_frame_ms\":{},\"total_ms\":{:.6},\"metrics\":{{",
         capture.active,
         capture.ready_routes.len(),
         capture.target_tabs,
         capture.frames,
         capture.target_frames,
+        capture.settle_time.as_millis(),
         number(ready),
         number(first_frame),
         number(shell_frame),

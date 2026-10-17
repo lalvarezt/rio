@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 
+MINIMIZE_SETTLE_MS = 10_000
 
 def motion(executable, output, level, minimize=False):
     from desktop_windows import Window, cpu_ns
@@ -41,6 +42,7 @@ keys = [{{key='F9',action='SelectNextTab'}}]
     report = folder/"capture.json"
     env = dict(os.environ,RIO_CONFIG_HOME=str(config.resolve()),RIO_PROFILE_OUTPUT=str(report.resolve()),
                RIO_PROFILE_TABS="4",RIO_PROFILE_WINDOWS="1",RIO_PROFILE_FRAMES="0")
+    if minimize: env["RIO_PROFILE_SETTLE_MS"] = str(MINIMIZE_SETTLE_MS)
     with (folder/"process.log").open("w") as log:
         launched = time.monotonic()
         process = subprocess.Popen([str(executable)],env=env,stdout=log,stderr=log)

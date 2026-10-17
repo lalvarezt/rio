@@ -49,7 +49,7 @@ def windows_findings(index, results, motion, out, rows):
         values = []
         for field in ["ns", "wall_ms"]:
             for revision in ["upstream", "branch"]:
-                samples = [row[field] for row in rows if row["case"]==case and row["revision"]==revision and field in row]
+                samples = [row[field] for row in rows if row.get("case")==case and row["revision"]==revision and field in row]
                 values.append(f"{median(samples)/(1_000_000 if field=='ns' else 1):.3f}" if samples else "Pending")
         lines.append(f"| `{case}` | " + " | ".join(values) + " |")
     lines += ["", "These are medians across three replays per revision. A zero recorded CPU time has no valid percentage ratio. "

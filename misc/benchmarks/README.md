@@ -102,6 +102,12 @@ Rio, and refuses to send keyboard input if the profiling window loses focus.
 Motion captures fail if there are not enough frames to prove the input was
 exercised. These Windows cases are not part of the Linux result set.
 
+The profiler normally exits two seconds after the shell's first frame.
+`RIO_PROFILE_SETTLE_MS` sets that interval and is recorded in each capture.
+The native minimize/restore probe uses ten seconds so its 20 cycles can finish.
+Metric summaries include only metrics present in every capture; a single frame
+has no frame interval.
+
 Keep native captures under `target/branch-performance/windows` alongside the
 shared results. `report.py` selects the platform from `run.json` and writes a
 separate Windows report. To generate it on Linux after copying the Windows
