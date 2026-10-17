@@ -111,6 +111,13 @@ def build_environment():
     return env
 
 
+def fixture_hash():
+    paths = list((ROOT/"misc/benchmarks").glob("*.rs"))
+    for package in ["rio-vt","rio-grid","sugarloaf","corcovado"]:
+        paths += list((ROOT/package/"benches").glob("*.rs"))
+    return hashlib.sha256(b"".join(path.read_bytes() for path in sorted(paths))).hexdigest()
+
+
 def build_one(revision, suite, cwd, env):
     env = dict(env,CARGO_TARGET_DIR=str(OUT/"build"/revision))
     if suite == "bash":
@@ -158,6 +165,10 @@ def build_one(revision, suite, cwd, env):
 
 
 def build(args):
+    if git("status","--porcelain"):
+        raise RuntimeError("Commit sources before building the comparison")
+    source_revision = git("rev-parse", "HEAD")
+    source_hash = fixture_hash()
     prepare()
     env = build_environment()
     binaries = {}
@@ -169,12 +180,14 @@ def build(args):
         if args.no_gpu:
             suites = [suite for suite in suites if suite != "shader"]
         binaries[revision] = {suite: build_one(revision, suite, cwd, env) for suite in suites}
+    if source_revision!=git("rev-parse","HEAD") or source_hash!=fixture_hash() or git("status","--porcelain"):
+        raise RuntimeError("Source changed during the build; rebuild before measuring")
     metadata = {
-        "baseline": BASE, "branch": git("rev-parse", "HEAD"), "binaries": binaries,
+        "baseline": BASE, "branch": source_revision, "binaries": binaries,
         "rustc": subprocess.check_output(["rustc", "-Vv"], text=True),
         "cargo": subprocess.check_output(["cargo", "--version"], text=True).strip(),
         "profile": {key: value for key,value in env.items() if key.startswith("CARGO_PROFILE_")},
-        "fixtures_sha256": hashlib.sha256(b"".join(path.read_bytes() for path in sorted((ROOT/"misc/benchmarks").glob("*.rs")))).hexdigest(),
+        "fixtures_sha256": source_hash,
     }
     (OUT / "build.json").write_text(json.dumps(metadata, indent=2) + "\n")
 
