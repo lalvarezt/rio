@@ -101,6 +101,8 @@ def main():
     args = parser.parse_args()
     if sys.platform!="win32": raise SystemExit("Windows lifecycle and display-clock benches cannot run on Linux")
     args.output.mkdir(parents=True,exist_ok=True)
+    config = args.output/"config"; config.mkdir(exist_ok=True)
+    (config/"config.toml").write_text("[navigation]\nmode = 'Tab'\n[cursor]\nblinking = false\n")
     driver = Path(__file__).resolve().parents[1]/"profiling/run-windows.py"
     for case,options in {
         "startup_exit":[],
@@ -109,7 +111,7 @@ def main():
         "dense":["--frames","300","--full-redraw"],
     }.items():
         subprocess.run([sys.executable,str(driver),str(args.executable.resolve()),"--runs",str(args.runs),
-                        "--output",str(args.output/case),*options],check=True)
+                        "--output",str(args.output/case),"--env",f"RIO_CONFIG_HOME={config.resolve()}",*options],check=True)
     rows = [motion(args.executable.resolve(),args.output/f"run-{repeat}",level)
             for repeat in range(args.runs) for level in ["none","medium","full"]]
     rows += [motion(args.executable.resolve(),args.output/f"minimize-{repeat}","full",minimize=True) for repeat in range(args.runs)]
