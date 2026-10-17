@@ -17,6 +17,9 @@ The Windows measurements, including native lifecycle and animation captures,
 are in [windows-branch-performance-report.md](windows-branch-performance-report.md).
 The [Windows follow-up](windows-rendering-followup.md) adds normal-affinity
 controls and identifies the next profiling targets.
+The [rendering optimization pass](rendering-optimization-pass.md) records the
+subsequent Linux and Windows atlas-slot and background-row improvements,
+application controls, and memory cost.
 
 ## Terminal input and snapshots
 
@@ -50,7 +53,7 @@ glyph misses. Other row cases retain their atlases.
 | ID | Final difference from upstream | Production code | Dedicated benchmark cases |
 |---|---|---|---|
 | P08 | WGPU drops unused duplicate cell storage and retains packed foreground storage. | `WgpuGridRenderer` | `wgpu/frame/full`, `wgpu/frame/unchanged`, with separate warmed allocation counts |
-| P09 | Changed WGPU backgrounds and foreground rows determine upload ranges. A foreground length change invalidates the shifted suffix. | `write_bg_row`, `write_fg_row`, `render_text` | `wgpu/frame/one_row`, `wgpu/frame/full` |
+| P09 | Changed WGPU backgrounds and foreground rows determine upload ranges. A foreground length change invalidates the shifted suffix. WGPU and native Vulkan compare packed background bytes when deciding whether rows changed. | `write_bg_row`, `write_fg_row`, `render_text`; `VulkanGridRenderer::write_row` | WGPU one-row and full frames; transparent, opaque, and changed-tail CPU row storage |
 | P10 | A zero-area block-cursor slot keeps resident WGPU text offsets stable when the block cursor disappears. | `WgpuGridRenderer::set_cursor` | `wgpu/frame/cursor_blink` |
 | P11 | WGPU skips uniform writes when all uniform bytes match the previous frame. | `WgpuGridRenderer::render_bg` | Unchanged versus changing-uniform frames |
 | P12 | WGPU and native Vulkan skip the background draw when no cell background or block cursor contributes. Background visibility follows changed rows, clearing, and resize. | Both grid renderers | Transparent and cursor-only background cases, plus unchanged WGPU frames |
@@ -88,7 +91,7 @@ an equal improvement in whole-frame latency.
 
 | ID | Final implementation | Production code | Dedicated benchmark cases |
 |---|---|---|---|
-| P20 | Measurement and drawing share cached shaped UI runs. | `Text::shape_for`, `measure`, `draw` | Short, long, and Unicode cached labels |
+| P20 | Measurement and drawing share cached shaped UI runs. Glyphs retain resolved atlas slots for drawing and vertical bounds; atlas initialization discards those runs. | `Text::shape_for`, `measure`, `draw`, `rasterize_slot` | Short, long, and Unicode cached labels; fractional-position raster checks |
 | P21 | UI shaping history has a fixed bound. Misses evict one old entry rather than clearing the complete cache. | `Text::shape_cache_order` | A working set of 4,096 changing titles, twice the current cache bound, plus a retained-entry counter |
 | P22 | Immutable SVG artwork is parsed and rasterized only on a shared UI color-atlas miss. Draws reuse the uploaded slot. | `logos::raster`, `Text::draw_icon` | Actual SVG rasterization and warmed atlas hits |
 | P23 | Failed immutable icon uploads are cached until atlas reinitialization. | `Text::draw_icon` | Repeated failed artwork, with an assertion that rasterization runs only once |
