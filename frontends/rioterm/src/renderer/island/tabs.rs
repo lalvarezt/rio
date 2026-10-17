@@ -2,6 +2,10 @@
 // Licensed under the MIT license in the root of this source tree.
 
 use super::*;
+
+#[cfg(test)]
+#[path = "../../../../../misc/benchmarks/frontend_tabs.rs"]
+mod branch_benchmarks;
 use crate::renderer::window_chrome::{alpha, fade, fit_text, snap};
 use rio_backend::config::navigation::Animation;
 use std::time::Duration;

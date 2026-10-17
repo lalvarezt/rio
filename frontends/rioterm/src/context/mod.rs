@@ -1,6 +1,10 @@
 pub mod renderable;
 pub mod title;
 
+#[cfg(test)]
+#[path = "../../../../misc/benchmarks/frontend_context.rs"]
+mod branch_benchmarks;
+
 use crate::ansi::CursorShape;
 use crate::context::title::{update_title, ContextTitle};
 use crate::event::sync::FairMutex;

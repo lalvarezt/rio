@@ -9,6 +9,10 @@ repository = "https://github.com/raphamorim/rio"
 description = "Translates terminal Square cells into CellBg / CellText instances for the grid GPU renderer, decoupled from any frontend via the GridPalette trait"
 readme = "README.md"
 
+[[bench]]
+name = "branch_performance"
+harness = false
+
 [lib]
 path = "src/lib.rs"
 
@@ -17,3 +21,6 @@ rio-backend = { workspace = true }
 rio-unicode = { workspace = true }
 rustc-hash = { workspace = true }
 rapidhash = { version = "4.4.1", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rio-window = { workspace = true, features = ["x11"] }

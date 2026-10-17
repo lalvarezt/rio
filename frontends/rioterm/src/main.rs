@@ -27,6 +27,10 @@ mod screen;
 mod shell_integration;
 mod watcher;
 
+#[cfg(test)]
+#[path = "../../../misc/benchmarks/support.rs"]
+mod performance;
+
 use clap::Parser;
 use rio_backend::config::config_dir_path;
 use rio_backend::event::EventPayload;

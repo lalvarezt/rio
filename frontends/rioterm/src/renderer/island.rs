@@ -23,6 +23,10 @@ use rustc_hash::FxHashMap;
 use std::time::Instant;
 
 pub const ISLAND_HEIGHT: f32 = crate::renderer::window_chrome::HEADER_HEIGHT;
+
+#[cfg(test)]
+#[path = "../../../../misc/benchmarks/frontend_status.rs"]
+mod branch_benchmarks;
 const PROGRESS_BAR_HEIGHT: f32 = 3.0;
 
 const PROGRESS_BAR_TIMEOUT_SECS: u64 = 15;

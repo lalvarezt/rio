@@ -34,6 +34,11 @@ rio-grid = { workspace = true }
 pretty_assertions = "1.4.1"
 criterion = { workspace = true }
 
+[[bench]]
+name = "branch_shader"
+path = "../../misc/benchmarks/wgsl.rs"
+harness = false
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 bitflags = { workspace = true }
 futures = { workspace = true }

@@ -129,6 +129,23 @@ deflate = "1.0.0"
 criterion = { workspace = true }
 naga = { version = "30.0.0", features = ["wgsl-in"] }
 
+[[bench]]
+name = "branch_performance"
+harness = false
+
+[[bench]]
+name = "branch_features"
+harness = false
+
+[[bench]]
+name = "branch_gpu"
+harness = false
+
+[[bench]]
+name = "branch_wgpu"
+harness = false
+required-features = ["wgpu"]
+
 [features]
 default = ["scale", "render"]
 scale = ["yazi"]

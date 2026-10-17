@@ -20,6 +20,10 @@ fn color_u8(c: [f32; 4]) -> [u8; 4] {
     ]
 }
 
+#[cfg(test)]
+#[path = "../../../../misc/benchmarks/frontend_palette.rs"]
+mod branch_benchmarks;
+
 const PALETTE_WIDTH: f32 = 480.0;
 const PALETTE_CORNER_RADIUS: f32 = 16.0;
 const PALETTE_MARGIN_TOP: f32 = 80.0;

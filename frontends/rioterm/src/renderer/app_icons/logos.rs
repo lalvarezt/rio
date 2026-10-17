@@ -1,6 +1,10 @@
 use resvg::{tiny_skia, usvg};
 use rio_backend::sugarloaf::Sugarloaf;
 
+#[cfg(test)]
+#[path = "../../../../../misc/benchmarks/frontend_logos.rs"]
+mod branch_benchmarks;
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct Logo {
     pub name: &'static str,

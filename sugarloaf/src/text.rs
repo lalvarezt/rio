@@ -4,6 +4,10 @@
 // LICENSE file in the root directory of this source tree.
 
 use crate::font::FontLibrary;
+
+#[cfg(test)]
+#[path = "../../misc/benchmarks/text_cache.rs"]
+mod branch_benchmarks;
 use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;

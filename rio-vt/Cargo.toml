@@ -85,3 +85,7 @@ criterion = { workspace = true }
 [[bench]]
 name = "vt_input"
 harness = false
+
+[[bench]]
+name = "branch_performance"
+harness = false

@@ -5,6 +5,10 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
+#[cfg(test)]
+#[path = "../../../../../misc/benchmarks/frontend_catalog.rs"]
+mod branch_benchmarks;
+
 #[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum Kind {

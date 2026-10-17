@@ -3994,6 +3994,7 @@ dependencies = [
  "rapidhash",
  "rio-backend",
  "rio-unicode",
+ "rio-window",
  "rustc-hash 2.1.3",
 ]
 

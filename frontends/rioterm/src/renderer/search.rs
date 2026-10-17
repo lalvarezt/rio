@@ -7,6 +7,10 @@ use rio_backend::sugarloaf::text::DrawOpts;
 use rio_backend::sugarloaf::Sugarloaf;
 use std::time::Instant;
 
+#[cfg(test)]
+#[path = "../../../../misc/benchmarks/frontend_search.rs"]
+mod branch_benchmarks;
+
 /// Convert `[f32; 4]` colour to the `[u8; 4]` non-premul form the
 /// `Text` draw path expects (the vertex shader premultiplies).
 #[inline]
