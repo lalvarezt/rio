@@ -122,6 +122,14 @@ class X11:
         finally:
             self.x.XDestroyImage(image)
 
+    def wait_changed(self, window, before):
+        deadline = time.monotonic()+3
+        while time.monotonic()<deadline:
+            if self.image(window)!=before:
+                return
+            time.sleep(0.025)
+        raise RuntimeError("Requested UI input did not change the rendered client image")
+
     def close(self):
         self.x.XCloseDisplay(self.display)
 
@@ -179,8 +187,8 @@ keys = [{{key='F6',action='CreateTab'}},{{key='F7',action='OpenCommandPalette'}}
             if mode in ("tabs","tab_repeat"):
                 before = x.image(window)
                 x.key(window,"F9")
+                x.wait_changed(window,before)
                 time.sleep(0.2)
-                if x.image(window)==before: raise RuntimeError("Tab navigation did not change the rendered UI")
             if mode in ("palette","search"):
                 before = x.image(window)
                 x.key(window,"F7" if mode=="palette" else "F8")
@@ -188,7 +196,7 @@ keys = [{{key='F6',action='CreateTab'}},{{key='F7',action='OpenCommandPalette'}}
                 if mode=="search":
                     for key in "compute": x.key(window,key)
                     time.sleep(0.15)
-                if x.image(window)==before: raise RuntimeError(f"{mode} input did not change the rendered UI")
+                x.wait_changed(window,before)
             start_cpu = cpu_ns(process.pid)
             start = time.monotonic()
             (folder/"go").touch()
