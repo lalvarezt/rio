@@ -27,6 +27,9 @@ fn main() {
             black_box(text.instances());
             width.to_bits() as u64
         });
+        support::measure(&name.replace("cached_", "measure_"), label.len(), || {
+            black_box(text.measure(black_box(label), &opts)).to_bits() as u64
+        });
         // Keep the raster check valid even when a different case is selected.
         text.clear();
         text.draw(12.0, 10.0, label, &opts);

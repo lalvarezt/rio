@@ -35,6 +35,12 @@ To repeat one area, set `--filter`, for example `--filter input/mixed`.
 The Rust helpers support `RIO_BENCH_SAMPLES`, `RIO_BENCH_MS`, and
 `RIO_BENCH_FILTER`. The runner sets these from its arguments.
 
+The native Vulkan background probe records 256 draws per timestamp interval.
+Set `RIO_BENCH_GPU_DRAWS` to override that count on both revisions. Short
+intervals can leave the GPU at different idle clocks and distort comparisons.
+Longer intervals reduce this effect; they do not lock the GPU clock. The result's
+`iterations` field records the draw count. No power policy is changed.
+
 The main comparison includes the existing `rio-vt/vt_input` and
 `corcovado/bench_poll` Criterion benches. Their measurements use the same
 fixtures and Criterion settings on both revisions. They remain separate from

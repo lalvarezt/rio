@@ -235,6 +235,12 @@ mod native {
                         None,
                     )
                     .unwrap();
+                // Short batches can measure different idle GPU clock states.
+                let draws = std::env::var("RIO_BENCH_GPU_DRAWS")
+                    .ok()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(256)
+                    .max(1);
                 for case in ["transparent", "sparse", "opaque", "cursor"] {
                     let name = format!("gpu/background/{case}");
                     if !support::selected(&name) {
@@ -299,7 +305,7 @@ mod native {
                             query,
                             0,
                         );
-                        for _ in 0..16 {
+                        for _ in 0..draws {
                             grid.render_bg(&ctx, cmd, frame.slot, &uniforms);
                         }
                         device.cmd_write_timestamp(
@@ -325,8 +331,8 @@ mod native {
                         if sample >= 5 {
                             let ns = (times[1] - times[0]) as f64
                                 * f64::from(properties.limits.timestamp_period)
-                                / 16.0;
-                            println!("RIO_BENCH {{\"case\":\"{name}\",\"sample\":{},\"iterations\":16,\"units\":1,\"ns\":{ns}}}", sample-5);
+                                / f64::from(draws);
+                            println!("RIO_BENCH {{\"case\":\"{name}\",\"sample\":{},\"iterations\":{draws},\"units\":1,\"ns\":{ns}}}", sample-5);
                         }
                     }
                 }

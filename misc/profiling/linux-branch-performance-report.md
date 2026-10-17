@@ -2,7 +2,7 @@
 
 Upstream: `59203ccd5fa1e6b760a738c1ad653bb29f2f3465`. Branch executable revision: `fc873453f9a459a9072eec7f5e5240fb334befde`.
 Benchmark driver revision: `fe06749a34fc068a0c92a02fc1336c3966540456`. The runner permits only Python-driver and report changes after the executable revision; compiled sources and fixture hashes must match.
-This report compares the final branch with upstream, not with intermediate optimization commits.
+This report compares the recorded branch revision with upstream, not with intermediate optimization commits.
 
 ## Measurement environment
 
@@ -40,7 +40,7 @@ Full plain snapshot time changes by -81.7%; styled snapshot time changes by -41.
 
 Native Vulkan CPU packing, upload, and command-recording cases improve with both one and two atlases. The shared WGPU frame fixtures also improve, as does creating a second WGPU window context. These are focused controls: zero-area glyphs isolate storage and upload work rather than dense text execution.
 
-The native Vulkan background timestamps are mixed: the canonical transparent sentinel skips the draw, and the cursor case improves slightly, but sparse and opaque cases regress substantially (+72.6% and +83.8%). The separate WGSL probe shows lower GPU time for zero-alpha-heavy backgrounds, including nonzero-RGB/zero-alpha cells, while opaque and faint backgrounds stay within the noise guard. These probes use different pipelines and execution patterns. The WGSL result does not explain away the native Vulkan regressions; their cause needs a separate investigation.
+The native Vulkan background timestamps change by +72.6% for sparse cells and +83.8% for opaque cells. The canonical transparent sentinel skips the draw. The separate WGSL probe shows lower GPU time for zero-alpha-heavy backgrounds, including nonzero-RGB/zero-alpha cells, while opaque and faint backgrounds stay within the noise guard. These probes use different pipelines and execution patterns. Short native batches can measure different GPU clock states. Alternating runs alone cannot establish a shader regression. See the [Linux follow-up](linux-rendering-followup.md) for clock diagnostics and longer batches.
 
 Four-second application replays consume less Rio CPU time for cursor updates, scrolling, and search. Dense text, sparse text, Unicode, and palette replays are mixed or within the noise guard. The tab replay uses more CPU with the branch's animated tab UI; the upstream control lacks equivalent work. None of these process-CPU measurements establishes improved frame latency or fewer missed frames.
 
