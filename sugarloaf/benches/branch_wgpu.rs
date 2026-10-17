@@ -16,10 +16,17 @@ fn main() {
         grid::{CellBg, CellText, GridUniforms, webgpu::WgpuGridRenderer},
     };
     let window = window::Window::new();
-    let context =
-        || WgpuContext::new(window.handle(), Default::default(), wgpu::Backends::VULKAN);
+    let next_window = window::Window::new();
+    let context = || {
+        WgpuContext::new(
+            next_window.handle(),
+            Default::default(),
+            wgpu::Backends::VULKAN,
+        )
+    };
     // Keep a first context alive: the benchmark concerns subsequent windows.
-    let ctx = context();
+    let ctx =
+        WgpuContext::new(window.handle(), Default::default(), wgpu::Backends::VULKAN);
     println!(
         "RIO_DEVICE {{\"adapter\":\"{}\",\"backend\":\"WGPU Vulkan\"}}",
         ctx.adapter_info.name
