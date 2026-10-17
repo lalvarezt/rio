@@ -16,11 +16,12 @@ def median(values):
     return statistics.median(values)
 
 
-def windows_findings(index, results, motion, out):
+def windows_findings(index, results, motion, out, rows):
     counts = collections.Counter(row["classification"] for row in results)
     lines = ["## Findings", "",
         f"The shared suite contains {len(results)} cases: {counts['faster']} faster, {counts['slower']} slower, "
-        f"{counts['mixed or within noise']} mixed or within the noise guard, and {counts['new feature cost']} new-feature costs. "
+        f"{counts['mixed or within noise']} mixed or within the noise guard, {counts['zero recorded time']} with a zero recorded time, "
+        f"and {counts['new feature cost']} new-feature costs. "
         "These counts are not an overall performance score. The following cases connect the isolated stages to application workloads.", "",
         "| Case | Paired time change | Classification |", "|---|---:|---|"]
     for case in ["input/mixed","input/unicode","snapshot/plain/full","row/plain/cached","ui_text/cached_long",
@@ -39,9 +40,20 @@ def windows_findings(index, results, motion, out):
         "Warmed allocation counts and the retained-shape counter are recorded separately.", "",
         "The Windows application replays use the same fixed terminal workloads as Linux and the Vulkan WGPU backend. "
         "They measure Rio process CPU time, excluding child Python interpreters. "
+        "The fixture targets four seconds; PTY backpressure and scheduling can extend its wall duration. "
         "The exit probe measures the fixture stop-file signal to Rio process exit, including the child's 10 ms polling interval and shutdown. "
         "It does not isolate event-loop dispatch latency. "
         "Minimize/restore also samples the child terminal's dimensions throughout 20 cycles and fails if the branch changes them.", "",
+        "| Replay | Upstream CPU ms | Branch CPU ms | Upstream wall ms | Branch wall ms |", "|---|---:|---:|---:|---:|"]
+    for case in sorted({row["case"] for row in rows if "wall_ms" in row}):
+        values = []
+        for field in ["ns", "wall_ms"]:
+            for revision in ["upstream", "branch"]:
+                samples = [row[field] for row in rows if row["case"]==case and row["revision"]==revision and field in row]
+                values.append(f"{median(samples)/(1_000_000 if field=='ns' else 1):.3f}" if samples else "Pending")
+        lines.append(f"| `{case}` | " + " | ".join(values) + " |")
+    lines += ["", "These are medians across three replays per revision. A zero recorded CPU time has no valid percentage ratio. "
+        "The raw records retain every replay, including idle variation.", "",
         "## Native Windows captures", "",
         "These captures instrument the branch only and use `cmd`, rather than PowerShell. "
         "They do not establish a speedup relative to upstream. Frame interval statistics include pacing waits and are not input latency. "
@@ -97,8 +109,9 @@ def main(out=OUT, partial=False):
         revisions = {revision:{repeat:median(values) for repeat,values in timings[(case,revision)].items()} for revision in ["upstream","branch"]}
         before,after = revisions["upstream"],revisions["branch"]
         pairs = sorted(before.keys() & after.keys())
-        ratios = [after[repeat]/before[repeat] for repeat in pairs if before[repeat]>0]
-        classification = "incomplete"
+        positive = all(before[repeat]>0 and after[repeat]>0 for repeat in pairs)
+        ratios = [after[repeat]/before[repeat] for repeat in pairs] if positive else []
+        classification = "zero recorded time" if pairs and not positive else "incomplete"
         if ratios:
             classification = "faster" if max(ratios)<0.98 else "slower" if min(ratios)>1.02 else "mixed or within noise"
         if any(case.startswith(prefix) for prefix in feature_prefixes):
@@ -167,7 +180,9 @@ def main(out=OUT, partial=False):
         "## Measurement environment", "",
         f"- System: {run.get('system',platform.platform())}; {model}.",
         f"- Toolchain: {build['rustc'].splitlines()[0]}; {build['cargo']}.",
-        f"- CPU affinity: logical CPU {run['cpu']}. No power policy was changed.",
+        f"- CPU affinity: logical CPU {run['cpu']}. "
+        + (f"Process priority: {run['process_priority']}. " if run.get("process_priority") else "")
+        + "No power policy was changed.",
         f"- GPU adapters reported by the probes: {', '.join(devices) or 'not measured'}.",
         f"- {run['runs']} alternating executable pairs; {run['samples']} CPU samples per pair and case.",
         f"- CPU samples target {run['sample_ms']} ms. Allocation counting uses a separate warmed pass.",
@@ -185,9 +200,9 @@ def main(out=OUT, partial=False):
         if partial:
             lines += ["This is an incomplete suite report. CPU/GPU kernels are recorded; interactive application and native captures remain pending. Missing coverage is retained below, and validation still fails until those captures exist.",""]
         if run.get("collection_parts"):
-            lines += ["Collection provenance: "+"; ".join(f"pairs {', '.join(str(n+1) for n in part['repeats'])} with driver `{part['driver_revision']}`" for part in run["collection_parts"])+". All parts use the same compiled fixtures; the Python parser update did not change their work.",""]
+            lines += ["Collection provenance: "+"; ".join(f"{part.get('phase','collection')} pairs {', '.join(str(n+1) for n in part['repeats'])} with driver `{part['driver_revision']}`" for part in run["collection_parts"])+". All parts use the same compiled fixtures. Driver revisions are recorded separately from executable revisions.",""]
         lines += ["GPU probe adapters by suite: "+"; ".join(f"`{suite}`: {', '.join(names)}" for suite,names in device_suites.items())+".",""]
-        lines += windows_findings(index,results,windows_motion,out)
+        lines += windows_findings(index,results,windows_motion,out,rows)
     else:
         counts = collections.Counter(row["classification"] for row in results)
         lines += ["## Findings", "",

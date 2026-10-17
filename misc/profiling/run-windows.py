@@ -94,7 +94,8 @@ if captures[0].get("process_cpu_ms") is not None:
 summary["metrics"] = {
     name: {key: statistics.median(c["metrics"][name][key] for c in captures)
            for key in captures[0]["metrics"][name]}
-    for name in captures[0]["metrics"]
+    # A one-frame capture has no frame interval. Summarize complete sets only.
+    for name in sorted(set.intersection(*(set(c["metrics"]) for c in captures)))
 }
 with args.executable.open("rb") as executable:
     executable_hash = hashlib.file_digest(executable, "sha256").hexdigest()
