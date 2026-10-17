@@ -27,6 +27,9 @@ fn main() {
             black_box(text.instances());
             width.to_bits() as u64
         });
+        // Keep the raster check valid even when a different case is selected.
+        text.clear();
+        text.draw(12.0, 10.0, label, &opts);
         let mut pixels = vec![0u32; 1024 * 64];
         text.render_cpu(&mut pixels, 1024, 64);
         assert!(pixels.iter().any(|pixel| *pixel != 0));
