@@ -137,7 +137,7 @@ pub(crate) const ID_BITSET_WORDS: usize = (u16::MAX as usize + 1).div_ceil(64);
 /// reused via a free list when cells are cleared.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ExtrasTable {
-    slots: Vec<Option<crate::crosswords::square::Extras>>,
+    slots: Vec<Option<std::sync::Arc<crate::crosswords::square::Extras>>>,
     free: Vec<u16>,
     /// Content-hash interning: identical extras share one slot.
     /// Emoji and combining sequences repeat constantly, and every
@@ -148,7 +148,7 @@ pub struct ExtrasTable {
     /// means slots are shared — mutating one in place would edit
     /// every referencing cell, so writers must copy-on-write
     /// (clone, modify, re-alloc).
-    lookup: rustc_hash::FxHashMap<crate::crosswords::square::Extras, u16>,
+    lookup: rustc_hash::FxHashMap<std::sync::Arc<crate::crosswords::square::Extras>, u16>,
     /// Allocations since the last mark-and-sweep. The table holds
     /// hyperlink and zero-width data whose slots stay referenced by
     /// cells until their rows scroll off the ring; without a periodic
@@ -180,6 +180,13 @@ impl ExtrasTable {
         &self,
         id: crate::crosswords::square::ExtrasId,
     ) -> Option<&crate::crosswords::square::Extras> {
+        self.slots.get(id as usize)?.as_deref()
+    }
+
+    pub(super) fn shared(
+        &self,
+        id: crate::crosswords::square::ExtrasId,
+    ) -> Option<&std::sync::Arc<crate::crosswords::square::Extras>> {
         self.slots.get(id as usize)?.as_ref()
     }
 
@@ -199,6 +206,7 @@ impl ExtrasTable {
             return id;
         }
         self.allocs_since_reclaim += 1;
+        let extras = std::sync::Arc::new(extras);
         if let Some(id) = self.free.pop() {
             self.lookup.insert(extras.clone(), id);
             self.slots[id as usize] = Some(extras);

@@ -19,6 +19,7 @@ pub mod formatter;
 pub mod grid;
 pub mod pos;
 pub mod search;
+pub mod snapshot;
 pub mod square;
 pub mod style;
 pub mod vi_mode;
@@ -2195,7 +2196,7 @@ impl<U: EventListener> Crosswords<U> {
         damage: &crate::event::TerminalDamage,
         dst: &mut Vec<Row<Square>>,
         row_styles: &mut Vec<Vec<crate::crosswords::style::Style>>,
-        extras: &mut rustc_hash::FxHashMap<u16, crate::crosswords::square::Extras>,
+        extras: &mut snapshot::SnapshotExtras,
     ) {
         use crate::event::TerminalDamage;
         let (start, end) = self.visible_line_bounds();
@@ -2203,7 +2204,8 @@ impl<U: EventListener> Crosswords<U> {
 
         let needs_full = matches!(damage, TerminalDamage::Full)
             || dst.len() != count
-            || row_styles.len() != count;
+            || row_styles.len() != count
+            || extras.row_count() != count;
 
         // Styles are resolved to values per copied row, so the snapshot
         // holds no style ids at all: sweeps reusing ids, table growth,
@@ -2211,12 +2213,14 @@ impl<U: EventListener> Crosswords<U> {
         if needs_full {
             self.fill_visible_rows(dst);
             row_styles.resize_with(count, Vec::new);
-            extras.clear();
+            extras.begin(count, true);
             for (i, row_idx) in (start..end).enumerate() {
                 let src = &self.grid[Line(row_idx)];
                 dst[i].dirty = true;
                 self.grid.resolve_row_styles(src, &mut row_styles[i]);
-                self.refresh_row_extras(src, extras);
+                if src.has_extras {
+                    extras.refresh(i, src, &self.grid.extras_table);
+                }
             }
             for row_idx in start..end {
                 self.grid[Line(row_idx)].dirty = false;
@@ -2235,6 +2239,7 @@ impl<U: EventListener> Crosswords<U> {
             }
         }
 
+        extras.begin(count, false);
         #[allow(clippy::needless_range_loop)]
         for y in 0..count {
             let row_idx = start + y as i32;
@@ -2245,36 +2250,10 @@ impl<U: EventListener> Crosswords<U> {
             dst[y].copy_from(src);
             dst[y].dirty = true;
             self.grid.resolve_row_styles(src, &mut row_styles[y]);
-            self.refresh_row_extras(src, extras);
+            extras.refresh(y, src, &self.grid.extras_table);
         }
         for row_idx in start..end {
             self.grid[Line(row_idx)].dirty = false;
-        }
-    }
-
-    /// Insert (overwriting) every extras id referenced by `row`'s
-    /// cells into `extras`. Overwrite semantics are deliberate — when
-    /// Live slots are immutable under interning (writers copy-on-
-    // write into fresh ids), so an overwrite here only ever swaps
-    // which immutable content a row's ids resolve to.
-    /// zerowidth combining codepoint appended to an existing cell),
-    /// the cell's row is marked dirty by the surrounding `IndexMut`
-    /// write, so any other rows referencing the same id pick up the
-    /// fresh data on this row's refresh.
-    fn refresh_row_extras(
-        &self,
-        row: &Row<Square>,
-        extras: &mut rustc_hash::FxHashMap<u16, crate::crosswords::square::Extras>,
-    ) {
-        if !row.has_extras {
-            return;
-        }
-        for sq in &row.inner {
-            if let Some(id) = sq.extras_id_checked() {
-                if let Some(live) = self.grid.extras_table.get(id) {
-                    extras.insert(id, live.clone());
-                }
-            }
         }
     }
 
@@ -6102,6 +6081,63 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_releases_extras_after_the_last_visible_reference() {
+        let mut cw = make_crosswords();
+        let mut processor = crate::performer::handler::Processor::default();
+        processor.advance(&mut cw, "e\u{301}\x1b[2;1He\u{301}".as_bytes());
+        let (mut rows, mut styles, mut extras) = Default::default();
+        cw.snapshot_visible(&TerminalDamage::Full, &mut rows, &mut styles, &mut extras);
+        assert_eq!(extras.len(), 1);
+
+        processor.advance(&mut cw, b"\x1b[1;1Hx");
+        cw.snapshot_visible(
+            &TerminalDamage::Partial,
+            &mut rows,
+            &mut styles,
+            &mut extras,
+        );
+        assert_eq!(extras.len(), 1);
+        let id = rows[1][Column(0)].extras_id().unwrap();
+        assert_eq!(extras.get(&id).unwrap().zerowidth, ['\u{301}']);
+
+        processor.advance(&mut cw, b"\x1b[2;1Hy");
+        cw.snapshot_visible(
+            &TerminalDamage::Partial,
+            &mut rows,
+            &mut styles,
+            &mut extras,
+        );
+        assert!(extras.is_empty());
+    }
+
+    #[test]
+    fn snapshot_refreshes_recycled_extras_without_mutating_older_snapshots() {
+        let mut cw = make_crosswords();
+        let mut processor = crate::performer::handler::Processor::default();
+        processor.advance(&mut cw, "e\u{301}".as_bytes());
+        let (mut rows, mut styles, mut extras) = Default::default();
+        cw.snapshot_visible(&TerminalDamage::Full, &mut rows, &mut styles, &mut extras);
+        let id = rows[0][Column(0)].extras_id().unwrap();
+        let older = extras.clone();
+
+        processor.advance(&mut cw, b"\x1b[1;1Hx");
+        cw.grid
+            .extras_table
+            .sweep_unmarked(&vec![0; grid::ID_BITSET_WORDS]);
+        processor.advance(&mut cw, "\x1b[1;1He\u{308}".as_bytes());
+        assert_eq!(cw.grid[Line(0)][Column(0)].extras_id(), Some(id));
+        cw.snapshot_visible(
+            &TerminalDamage::Partial,
+            &mut rows,
+            &mut styles,
+            &mut extras,
+        );
+        assert_eq!(extras.get(&id).unwrap().zerowidth, ['\u{308}']);
+        assert_eq!(older.get(&id).unwrap().zerowidth, ['\u{301}']);
+        assert_eq!(extras.len(), 1);
+    }
+
+    #[test]
     fn snapshot_resolves_styles_per_row() {
         use crate::config::colors::{AnsiColor, ColorRgb};
         use crate::crosswords::style::Style;
@@ -6109,7 +6145,7 @@ mod tests {
         let mut cw = make_crosswords();
         let mut rows = Vec::new();
         let mut row_styles = Vec::new();
-        let mut extras = rustc_hash::FxHashMap::default();
+        let mut extras = snapshot::SnapshotExtras::default();
 
         let red = AnsiColor::Spec(ColorRgb { r: 250, g: 0, b: 0 });
         cw.terminal_attribute(Attr::Background(red));

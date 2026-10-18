@@ -13,12 +13,11 @@ use rio_vt::config::colors::{AnsiColor, ColorRgb};
 use rio_vt::crosswords::grid::row::Row;
 use rio_vt::crosswords::grid::Dimensions;
 use rio_vt::crosswords::pos::Column;
-use rio_vt::crosswords::square::{ContentTag, Extras, Square};
+use rio_vt::crosswords::square::{ContentTag, Square};
 use rio_vt::crosswords::style::Style;
 use rio_vt::crosswords::Crosswords;
 use rio_vt::event::sync::FairMutex;
 use rio_vt::event::TerminalDamage;
-use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,7 +67,7 @@ pub struct RenderState {
     rows: Vec<Row<Square>>,
     /// Per-row resolved cell styles, index-parallel to `rows`.
     row_styles: Vec<Vec<Style>>,
-    extras: FxHashMap<u16, Extras>,
+    extras: rio_vt::crosswords::snapshot::SnapshotExtras,
     columns: usize,
     cursor_line: usize,
     cursor_column: usize,
@@ -102,7 +101,7 @@ impl RenderState {
             terminal,
             rows: Vec::new(),
             row_styles: Vec::new(),
-            extras: FxHashMap::default(),
+            extras: Default::default(),
             columns,
             cursor_line: 0,
             cursor_column: 0,
@@ -296,7 +295,7 @@ impl RenderState {
 
     /// Per-frame extras (grapheme clusters, hyperlinks), keyed by a
     /// cell's `extras_id`.
-    pub fn extras(&self) -> &FxHashMap<u16, Extras> {
+    pub fn extras(&self) -> &rio_vt::crosswords::snapshot::SnapshotExtras {
         &self.extras
     }
 

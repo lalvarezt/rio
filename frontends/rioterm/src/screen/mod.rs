@@ -4176,8 +4176,7 @@ impl Screen<'_> {
                 /// per-cell zero-width combining codepoints into the run
                 /// shape key so cells with the same base codepoint but
                 /// different combining marks don't alias in the cache.
-                extras:
-                    rustc_hash::FxHashMap<u16, rio_backend::crosswords::square::Extras>,
+                extras: rio_backend::crosswords::snapshot::SnapshotExtras,
                 term_colors: rio_backend::config::colors::term::TermColors,
                 cursor_col: u16,
                 cursor_row: u16,

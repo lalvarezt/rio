@@ -32,7 +32,7 @@ use rio_backend::config::colors::{AnsiColor, NamedColor};
 use rio_backend::crosswords::grid::row::Row;
 use rio_backend::crosswords::pos::{Column, Line, Pos};
 use rio_backend::crosswords::search::Match;
-use rio_backend::crosswords::square::{ContentTag, Extras, Square, Wide};
+use rio_backend::crosswords::square::{ContentTag, Square, Wide};
 use rio_backend::crosswords::style::{Style, StyleFlags, UnderlineKind};
 use rio_backend::selection::SelectionRange;
 use rustc_hash::FxHashMap;
@@ -41,7 +41,7 @@ use std::sync::Arc;
 /// Snapshot's per-frame extras map. Keyed by the cell's `extras_id`,
 /// populated by `Crosswords::snapshot_visible` from a walk of visible
 /// cells. The renderer reads via `extras.get(&id)`.
-pub type ExtrasMap = FxHashMap<u16, Extras>;
+pub use rio_backend::crosswords::snapshot::SnapshotExtras as ExtrasMap;
 
 pub mod preedit;
 use preedit::{PreeditCaret, PreeditCell, PreeditLine};

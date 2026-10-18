@@ -87,7 +87,7 @@ pub struct RenderableContent {
     /// `snapshot_visible`. Bounded by visible-cells-with-extras, not
     /// by total session-lifetime allocations on the live grid's
     /// `ExtrasTable`.
-    pub extras: rustc_hash::FxHashMap<u16, rio_backend::crosswords::square::Extras>,
+    pub extras: rio_backend::crosswords::snapshot::SnapshotExtras,
     /// Per-context palette + named-color overrides as of the snapshot.
     /// `Copy` — captured by value alongside the row data.
     pub term_colors: TermColors,
@@ -132,7 +132,7 @@ impl RenderableContent {
             frame_damage: TerminalDamage::Full,
             visible_rows: Vec::new(),
             row_styles: Vec::new(),
-            extras: rustc_hash::FxHashMap::default(),
+            extras: Default::default(),
             term_colors: TermColors::default(),
             display_offset: 0,
             columns: 0,
@@ -237,11 +237,10 @@ mod pipeline_tests {
     use rio_backend::ansi::CursorShape;
     use rio_backend::crosswords::grid::row::Row;
     use rio_backend::crosswords::pos::{Column, Line};
-    use rio_backend::crosswords::square::{Extras, Square};
+    use rio_backend::crosswords::square::Square;
     use rio_backend::crosswords::{Crosswords, CrosswordsSize};
     use rio_backend::event::{TerminalDamage, VoidListener, WindowId};
     use rio_backend::performer::handler::Processor;
-    use rustc_hash::FxHashMap;
 
     const COLS: usize = 40;
     const ROWS: usize = 12;
@@ -293,7 +292,7 @@ mod pipeline_tests {
     struct Frame {
         visible_rows: Vec<Row<Square>>,
         row_styles: Vec<Vec<rio_backend::crosswords::style::Style>>,
-        extras: FxHashMap<u16, Extras>,
+        extras: rio_backend::crosswords::snapshot::SnapshotExtras,
         painted: Vec<String>,
     }
 
@@ -302,7 +301,7 @@ mod pipeline_tests {
             Self {
                 visible_rows: Vec::new(),
                 row_styles: Vec::new(),
-                extras: FxHashMap::default(),
+                extras: Default::default(),
                 painted: vec![String::new(); ROWS],
             }
         }
