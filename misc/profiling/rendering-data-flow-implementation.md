@@ -3,7 +3,8 @@
 This implements the [data-flow audit](rendering-data-flow-audit.md) in stages.
 The baseline production revision is `0bcc2f3530`; `71f69ba95e` adds the audit
 without changing production code. Benchmarks and profiling run on Linux only.
-Later stages and whole-application comparisons remain in progress.
+The sections below record retained changes, rejected alternatives, and a final
+whole-application comparison.
 
 ## Snapshot extras ownership
 
@@ -421,11 +422,113 @@ with them it arrives in roughly 0.5 ms, and a theme change is delivered while
 idle. The library's eight tests pass. Temporary tracing and diagnostic hooks
 are not part of the committed application.
 
+## X11 socket readiness
+
+Optimized whole-application replays initially exposed higher CPU use during
+held tab selection despite less rendering work. Temporary thread-CPU spans
+put only 27 ms of a roughly 626 ms main-thread interval inside rendering.
+Native-loop counters then found about 300,000–390,000 polling passes per
+four-second replay, versus roughly 1,000 useful event batches. This also
+affected the baseline, so isolated grid timings could not explain it.
+
+The repeated wakes reported a readable X11 socket while `XPending` returned
+no event. A non-consuming socket peek found a generic X event. Xlib shares
+the connection with XCB readers; socket readability does not imply that an
+event is available in Xlib's queue. Processing every reported readiness
+through the normal event drain still spun and was rejected.
+
+The X11 source now uses edge-triggered polling. Existing pending-queue checks
+still run before blocking, and the event drain consumes all available Xlib
+events. In the instrumented held-tab control, polling passes fell from about
+386,000 to 1,800 and process CPU from 780 to 96 ms. Input-event counts were
+consistent with the baseline. These diagnostic times include instrumentation;
+the matched uninstrumented comparison is recorded separately below.
+
+The redraw callback also updates custom caption-button state only on Windows,
+where those controls exist. This removes a synchronous X11 maximized-state
+property query on every frame, worth about 5–6 ms per four-second replay in
+the temporary caption-query diagnostic.
+
+## Final whole-application comparison
+
+The real application entry point was built as a Cargo benchmark target on
+both revisions with matching optimization settings: optimization level 3,
+16 codegen units, no LTO, debug information or incremental compilation, and
+unwinding enabled for both artifacts. Interactive application builds remain
+debug. Separate target directories avoid cross-worktree artifact reuse.
+Each case has three alternating before/after pairs, pinned to logical CPU 2,
+with 240 fixture updates over four seconds; held tab selection sends 120
+selection commands per second. No builds or other benchmarks ran concurrently.
+
+These are process CPU times, not frame latency or monitor presentation times.
+The before revision is `71f69ba95e` (production code identical to
+`0bcc2f3530`). The final artifact includes the changes through `8cd5da8c5a`
+and the X11 socket/caption fixes above. Values are medians; percentage changes
+are medians of the paired ratios, so they need not equal the ratio of columns.
+
+| Four-second replay | Before, ms CPU | After, ms CPU | Paired change |
+|---|---:|---:|---:|
+| Idle | 4.868 | 0.000 | No measured CPU during the timed interval |
+| Dense text | 114.635 | 101.334 | -11.9% |
+| Sparse updates | 75.881 | 66.132 | -13.9% |
+| Scrolling | 140.819 | 109.991 | -21.2% |
+| Unicode updates | 83.104 | 78.347 | -7.4% |
+| Cursor movement | 63.294 | 53.563 | -14.8% |
+| Palette navigation | 44.699 | 35.171 | -21.1% |
+| Visible search | 85.871 | 56.007 | -34.4% |
+| Held tab selection | 799.266 | 86.668 | -89.2% |
+
+All three pairs improve in each active case. The dense-text paired changes
+range from -0.8% to -12.2%, so its magnitude is less certain than the table's
+median suggests. Held-tab baseline CPU is variable (649–917 ms), while final
+CPU is 86–91 ms; its three paired reductions range from 85.9% to 90.6%.
+This comparison covers this Linux machine and isolated KWin/Xwayland fixture,
+not Windows performance or every compositor/driver combination.
+
+The debug application passes ten compositor replays: dense/sparse updates,
+scrolling, Unicode, cursor movement, palette/search input, rapid tab selection,
+distinct tab content, and twenty minimize/restore cycles. The terminal remains
+179 by 52 cells through the last control. The eight window-library tests and
+formatting check also pass. The idle activation/theme wake control passes again,
+including its expected failure with the pending-work checks removed.
+A supplementary XTest wheel-injection control did
+not change the palette on either the previous or final debug binary. Temporary
+input logs showed pointer motion but no wheel callback from that injection;
+this control does not establish physical mouse-wheel coverage.
+
+## Ownership choices kept local
+
+The shared-atlas avenue was examined without introducing another glyph cache.
+Ordinary glyphs are duplicated across grids on their first use, but warmed
+grids already retain their slots, and prepared rows avoid those lookups on
+full redraws. With font choices and shaping already warm, the saved Linux
+controls put rerasterizing a complete 160-column row around 0.07–0.31 ms, versus
+roughly 2–4 us with resident glyphs. Those raster costs do not recur during
+ordinary tab switching.
+
+A window-owned atlas would require changes beyond sharing its allocation:
+custom glyph keys currently omit route identity, and one panel clearing an
+atlas would invalidate another panel's already-emitted geometry in the same
+frame. Correct sharing needs namespaced keys and coordinated invalidation across
+panels and backends. It was not added without a measured steady-state benefit.
+Grids continue to retain useful glyphs while open and release their resources
+when closed; color pages remain lazy. The texture sizes in the audit are logical
+allocations, not measurements of physical GPU residency.
+
+Likewise, discarded overlay preparation was reduced at its source by removing
+redundant redraw requests. The remaining one startup discard does not justify
+splitting overlay state updates from drawing or adding draw-suppression flags
+throughout the UI.
+
 ## Retained artifacts
 
 `target/data-flow-implementation` contains the immutable before/after binaries,
 build logs, paired samples, summaries, and test logs. `measure.py` runs the
 paired CPU comparisons. The snapshot workload is the audit's saved probe,
 adapted to the new extras owner without changing its inputs. `baseline/` is
-the detached baseline worktree. Further implementation results will be added
-here rather than inferred from the audit's sampled CPU percentages.
+the detached baseline worktree. `application-edge-bench-summary.json` records
+the final whole-application samples and executable hashes; `final-edge-ui.json`
+records the compositor replays. `final-edge-restored-ui.json` records palette,
+distinct-tab, and minimize/restore checks on the final debug binary after
+removing diagnostic logging. Temporary diagnostic hooks are excluded from the
+application sources and final debug binary.

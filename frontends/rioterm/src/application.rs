@@ -2330,6 +2330,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
 
             WindowEvent::RedrawRequested => {
                 route.begin_render();
+                #[cfg(target_os = "windows")]
                 if let Some(island) = &mut route.window.screen.renderer.island {
                     island.window_header.maximized =
                         route.window.winit_window.is_maximized();

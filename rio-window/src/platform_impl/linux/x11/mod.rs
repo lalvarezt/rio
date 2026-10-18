@@ -293,11 +293,15 @@ impl<T: 'static> EventLoop<T> {
         let handle = event_loop.handle();
 
         // Create the X11 event dispatcher.
+        // Xlib shares this socket with XCB readers, including the renderer.
+        // Readability need not mean an event is available to Xlib. Level
+        // polling spins until the other reader consumes that data; queued
+        // Xlib events are checked by has_pending before each wait instead.
         let source = X11Source::new(
             // SAFETY: xcb owns the FD and outlives the source.
             unsafe { BorrowedFd::borrow_raw(xconn.xcb_connection().as_raw_fd()) },
             calloop::Interest::READ,
-            calloop::Mode::Level,
+            calloop::Mode::Edge,
         );
         handle
             .insert_source(source, |readiness, _, state| {
