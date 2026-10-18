@@ -331,8 +331,7 @@ impl<T: event::EventListener> Crosswords<T> {
 
         let mut cell = iter.square();
         self.skip_fullwidth(&mut iter, &mut cell, regex.direction);
-        let mut cell_chars: Vec<char> = Vec::with_capacity(4);
-        self.cell_search_chars(cell, regex.direction, &mut cell_chars);
+        let (mut base, mut cluster) = self.cell_search_chars(cell);
         let mut char_idx = 0;
         let mut last_wrapped = iter.square().wrapline();
 
@@ -355,8 +354,12 @@ impl<T: event::EventListener> Crosswords<T> {
             // text (a decomposed `é`, a ZWJ emoji) can match. Match
             // positions stay cell-granular: the whole cluster is one
             // grid position.
-            'chars: while char_idx < cell_chars.len() {
-                let c = cell_chars[char_idx];
+            'chars: while char_idx <= cluster.len() {
+                let index = match regex.direction {
+                    Direction::Right => char_idx,
+                    Direction::Left => cluster.len() - char_idx,
+                };
+                let c = if index == 0 { base } else { cluster[index - 1] };
                 // Convert char to array of bytes.
                 let mut buf = [0; 4];
                 let utf8_len = c.encode_utf8(&mut buf).len();
@@ -445,7 +448,7 @@ impl<T: event::EventListener> Crosswords<T> {
 
             self.skip_fullwidth(&mut iter, &mut cell, regex.direction);
 
-            self.cell_search_chars(cell, regex.direction, &mut cell_chars);
+            (base, cluster) = self.cell_search_chars(cell);
             char_idx = 0;
             let wrapped = iter.square().wrapline();
 
@@ -481,35 +484,27 @@ impl<T: event::EventListener> Crosswords<T> {
     }
 
     /// The characters a cell contributes to a regex search: its base
-    /// codepoint plus attached cluster codepoints, reversed for a
-    /// leftward search (the byte loop reverses within each char). A
+    /// codepoint plus borrowed attached cluster codepoints. The caller walks
+    /// these in either direction without copying or reversing the cluster. A
     /// bg-only cell stores color where the codepoint lives and reads
     /// as a blank, not as the color bits decoded into a char.
-    fn cell_search_chars(
-        &self,
-        cell: &Square,
-        direction: Direction,
-        out: &mut Vec<char>,
-    ) {
-        out.clear();
+    fn cell_search_chars(&self, cell: &Square) -> (char, &[char]) {
         if !matches!(
             cell.content_tag(),
             crate::crosswords::square::ContentTag::Codepoint
         ) {
-            out.push(' ');
-            return;
+            return (' ', &[]);
         }
-        out.push(cell.c());
-        if cell.has_grapheme() {
-            if let Some(id) = cell.extras_id() {
-                if let Some(extras) = self.grid.extras_table.get(id) {
-                    out.extend(extras.zerowidth.iter().copied());
-                }
-            }
-        }
-        if direction == Direction::Left {
-            out.reverse();
-        }
+        let cluster = cell
+            .has_grapheme()
+            .then(|| {
+                cell.extras_id()
+                    .and_then(|id| self.grid.extras_table.get(id))
+            })
+            .flatten()
+            .map(|extras| extras.zerowidth.as_slice())
+            .unwrap_or(&[]);
+        (cell.c(), cluster)
     }
 
     /// Advance a grid iterator over fullwidth characters.

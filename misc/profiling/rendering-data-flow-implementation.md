@@ -274,6 +274,40 @@ style-ID reuse and hint-style expansion without losing the surrounding style.
 Five debug application replays also pass with compositor captures covering dense
 text, Unicode, cursor changes, palette navigation, and repeated tab selection.
 
+## Search character streaming
+
+Regex search now borrows each cell's attached codepoints instead of allocating,
+copying, and reversing a temporary character vector for every forward/backward
+search pass. The DFA still consumes the same UTF-8 bytes in the same order and
+retains its existing cell-position and empty-match handling. There is no new
+search cache or retained character stream in this change.
+
+Fourteen paired controls cover ASCII, absent matches, Unicode, combining marks,
+clusters longer than the old initial vector capacity, empty-match patterns, and
+anchors, in both directions. All match-position checks agree with baseline.
+Warmed allocation counts become zero, from 1–1,441 per scan. Paired median
+times improve by roughly 8–25%: ASCII forward matching falls from 170 to 143 us,
+and the long-cluster forward case falls from 127 to 96 us. The terminal library
+passes all 565 tests.
+A debug search-navigation replay also passes; the compositor capture shows the
+current match highlighted at the expected cell position.
+
+## Rejected row mutation metadata
+
+Two prototypes added content versions to rows to support reuse after scrolling.
+One minted a version on the first write after a snapshot; the other kept a
+stable identity and advanced a local revision on every mutable access. Both
+preserved versions in snapshot copies and gave independent clones new identities.
+The lazy prototype is also insufficient for search, which can observe multiple
+edits before a snapshot clears the row's dirty bit.
+
+Neither prototype was retained. Paired parser controls slow roughly 8–9% in
+several Unicode and escape-sequence cases with the lazy prototype, and roughly
+5–6% with local revisions. Both also increase row-construction cost and metadata
+storage. These costs would apply even when the terminal is parsing without
+drawing. Prepared-row reuse will instead be evaluated with exact content checks
+in the rendering path, keeping the existing cell-write path unchanged.
+
 ## Retained artifacts
 
 `target/data-flow-implementation` contains the immutable before/after binaries,
