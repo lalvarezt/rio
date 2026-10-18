@@ -350,6 +350,36 @@ Temporary application traces confirm that a first sparse edit emits one row
 instead of the whole viewport, and repeated tab switching restores 11,486 rows
 over 332 frames. These debug traces measure work counts, not latency.
 
+## Native Vulkan grid resources
+
+Vulkan grids now share immutable pipelines, descriptor layouts, and the sampler
+per device context and target format, matching the WGPU ownership model. Each
+grid keeps its own descriptor pools, buffers, and atlases. The cache belongs to
+the context rather than the shared device owner, avoiding an ownership cycle;
+grid creation takes its lock, while drawing does not. Sharing alone removes six
+Rust allocations and about 20 KB of allocation traffic per grid. Constructor
+elapsed time remains near 0.6 ms in that comparison.
+
+Atlas page creation previously submitted a separate command buffer and waited
+on a fence merely to establish its initial image layout. It now records that
+transition with the normal frame uploads. Pages receiving glyph data go directly
+from the undefined layout to the upload layout; empty pages receive their
+descriptor's read layout before drawing. The one-shot submission helper and
+stored queue handles are removed.
+
+Three alternating paired runs reduce native grid construction from 601 to
+181 us, and construction with a color page from 1.98 ms to 194 us. A control
+that also uploads grayscale and color glyphs and waits for GPU completion falls
+from 2.39 to 1.95 ms, a 13–20% reduction across the pairs. This last comparison
+includes the deferred work rather than counting only the shorter constructor.
+
+All 36 mapped GPU frame-slot/packing/cursor checks pass, as do 119 renderer
+tests and eight debug application replays with compositor captures. Unicode,
+emoji, palette, and tab rendering remain visible and correctly placed. Optional
+Vulkan validation could not run: this environment failed to load the debug-utils
+extension. The mapped-buffer checks and actual rendered-output checks ran
+without that mode.
+
 ## Retained artifacts
 
 `target/data-flow-implementation` contains the immutable before/after binaries,

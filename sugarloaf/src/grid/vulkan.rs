@@ -196,8 +196,6 @@ pub struct VulkanGlyphAtlas {
     sampler: vk::Sampler,
     descriptor_pool: vk::DescriptorPool,
     descriptor_set_layout: vk::DescriptorSetLayout,
-    queue: vk::Queue,
-    queue_family_index: u32,
 }
 
 impl VulkanGlyphAtlas {
@@ -246,13 +244,9 @@ impl VulkanGlyphAtlas {
         eager_first_page: bool,
     ) -> Self {
         let shared = ctx.shared().clone();
-        let queue = ctx.queue;
-        let queue_family_index = ctx.queue_family_index;
         let pages = if eager_first_page {
             vec![make_page(
                 &shared,
-                queue,
-                queue_family_index,
                 format,
                 descriptor_pool,
                 descriptor_set_layout,
@@ -272,8 +266,6 @@ impl VulkanGlyphAtlas {
             sampler,
             descriptor_pool,
             descriptor_set_layout,
-            queue,
-            queue_family_index,
         }
     }
 
@@ -282,7 +274,8 @@ impl VulkanGlyphAtlas {
     /// non-empty page into `cmd`. Caller MUST be outside a
     /// dynamic-rendering pass — Vulkan 1.3 spec
     /// `VUID-vkCmdCopyBufferToImage-renderpass` forbids transfer
-    /// commands inside one. No-op when no page has pending uploads.
+    /// commands inside one. New empty pages also receive their initial layout;
+    /// later calls without pending uploads only inspect the page flags.
     ///
     /// We take `&Arc<VkShared>` rather than `&VulkanContext` so the
     /// text overlay path can call this without holding an immutable
@@ -302,6 +295,9 @@ impl VulkanGlyphAtlas {
             .map(|u| (u.w as usize) * (u.h as usize) * self.bytes_per_pixel as usize)
             .sum();
         if total_bytes == 0 {
+            for page in &mut self.pages {
+                initialize_empty_page(&shared.raw, cmd, page);
+            }
             return;
         }
 
@@ -324,6 +320,7 @@ impl VulkanGlyphAtlas {
         let mut offset: u64 = 0;
         for page in &mut self.pages {
             if page.pending.is_empty() {
+                initialize_empty_page(&shared.raw, cmd, page);
                 continue;
             }
             let mut copies: Vec<vk::BufferImageCopy> =
@@ -428,8 +425,6 @@ impl VulkanGlyphAtlas {
         }
         let new_page = make_page(
             &self.shared,
-            self.queue,
-            self.queue_family_index,
             self.format,
             self.descriptor_pool,
             self.descriptor_set_layout,
@@ -481,37 +476,12 @@ impl VulkanGlyphAtlas {
 /// or accept a use-after-free on every resize.
 fn make_page(
     shared: &Arc<VkShared>,
-    queue: vk::Queue,
-    queue_family_index: u32,
     format: vk::Format,
     descriptor_pool: vk::DescriptorPool,
     descriptor_set_layout: vk::DescriptorSetLayout,
     sampler: vk::Sampler,
 ) -> VulkanAtlasPage {
     let image = allocate_atlas_page_image(shared, format);
-    let img_handle = image.handle();
-
-    // Oneshot: UNDEFINED → SHADER_READ_ONLY so `upload_to_page`'s
-    // `initialized` branch (SHADER_READ → TRANSFER_DST → SHADER_READ)
-    // is correct from the very first upload, and so the layout matches
-    // the `SHADER_READ_ONLY_OPTIMAL` declared in the descriptor write
-    // below.
-    submit_inline_oneshot(shared, queue, queue_family_index, |cmd| unsafe {
-        let to_read = vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
-            .src_access_mask(vk::AccessFlags2::empty())
-            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-            .dst_access_mask(vk::AccessFlags2::SHADER_READ)
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(img_handle)
-            .subresource_range(color_subresource_range());
-        let barriers = [to_read];
-        let dep = vk::DependencyInfo::default().image_memory_barriers(&barriers);
-        shared.raw.cmd_pipeline_barrier2(cmd, &dep);
-    });
 
     let descriptor_set =
         allocate_one_descriptor_set(&shared.raw, descriptor_pool, descriptor_set_layout);
@@ -521,7 +491,7 @@ fn make_page(
         image,
         allocator: AtlasAllocator::new(ATLAS_PAGE_SIZE, ATLAS_PAGE_SIZE),
         pending: Vec::new(),
-        initialized: true,
+        initialized: false,
         descriptor_set,
     }
 }
@@ -599,57 +569,6 @@ fn allocate_atlas_page_image(shared: &Arc<VkShared>, format: vk::Format) -> Vulk
     }
 }
 
-/// Build, submit, and wait on a one-shot command buffer. Inline
-/// equivalent of `VulkanContext::submit_oneshot` for callers that
-/// only hold an `Arc<VkShared>` plus the queue handles — used by
-/// `make_page` to do each new page's initial layout transition.
-fn submit_inline_oneshot(
-    shared: &Arc<VkShared>,
-    queue: vk::Queue,
-    queue_family_index: u32,
-    record: impl FnOnce(vk::CommandBuffer),
-) {
-    unsafe {
-        let pool_info = vk::CommandPoolCreateInfo::default()
-            .queue_family_index(queue_family_index)
-            .flags(vk::CommandPoolCreateFlags::TRANSIENT);
-        let pool = shared
-            .create_command_pool(&pool_info, None)
-            .expect("oneshot: create_command_pool");
-
-        let alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let cmd = shared
-            .allocate_command_buffers(&alloc)
-            .expect("oneshot: allocate_command_buffers")[0];
-
-        let begin = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        shared
-            .begin_command_buffer(cmd, &begin)
-            .expect("oneshot: begin");
-        record(cmd);
-        shared.end_command_buffer(cmd).expect("oneshot: end");
-
-        let fence = shared
-            .create_fence(&vk::FenceCreateInfo::default(), None)
-            .expect("oneshot: create_fence");
-        let cmds = [cmd];
-        let submit = vk::SubmitInfo::default().command_buffers(&cmds);
-        shared
-            .queue_submit(queue, &[submit], fence)
-            .expect("oneshot: queue_submit");
-        shared
-            .wait_for_fences(&[fence], true, u64::MAX)
-            .expect("oneshot: wait_for_fences");
-
-        shared.destroy_fence(fence, None);
-        shared.destroy_command_pool(pool, None);
-    }
-}
-
 /// Write a page's combined-image-sampler binding (=0) to point at
 /// `image` + `sampler`. Called exactly once when the page is created;
 /// the set is brand new at that point, so the write has no in-flight
@@ -674,6 +593,97 @@ fn update_page_descriptor_set(
     unsafe { device.update_descriptor_sets(&[write], &[]) };
 }
 
+/// Immutable grid state shared by all terminals using this device and target
+/// format. The context owns the cache; the device owner has no back-reference.
+pub(crate) struct GridPipelines {
+    shared: Arc<VkShared>,
+    bg_descriptor_set_layout: vk::DescriptorSetLayout,
+    bg_pipeline_layout: vk::PipelineLayout,
+    bg_pipeline: vk::Pipeline,
+    text_uniform_descriptor_set_layout: vk::DescriptorSetLayout,
+    text_atlas_descriptor_set_layout: vk::DescriptorSetLayout,
+    text_pipeline_layout: vk::PipelineLayout,
+    text_pipeline: vk::Pipeline,
+    sampler: vk::Sampler,
+}
+
+impl GridPipelines {
+    fn new(ctx: &VulkanContext) -> Self {
+        let shared = ctx.shared().clone();
+        let device = &shared.raw;
+        let bg_descriptor_set_layout = create_bg_descriptor_set_layout(device);
+        let bg_pipeline_layout =
+            create_pipeline_layout(device, &[bg_descriptor_set_layout], &[]);
+        let bg_pipeline = create_bg_pipeline(
+            device,
+            ctx.pipeline_cache(),
+            bg_pipeline_layout,
+            ctx.swapchain_format(),
+        );
+        let sampler = create_sampler(device);
+        let text_uniform_descriptor_set_layout =
+            create_text_uniform_descriptor_set_layout(device);
+        let text_atlas_descriptor_set_layout =
+            create_text_atlas_descriptor_set_layout(device);
+        // Push constant `is_color: u32` switches sampling mode per draw.
+        let text_push_constants = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            .offset(0)
+            .size(4)];
+        let text_pipeline_layout = create_pipeline_layout(
+            device,
+            &[
+                text_uniform_descriptor_set_layout,
+                text_atlas_descriptor_set_layout,
+            ],
+            &text_push_constants,
+        );
+        let text_pipeline = create_text_pipeline(
+            device,
+            ctx.pipeline_cache(),
+            text_pipeline_layout,
+            ctx.swapchain_format(),
+        );
+        Self {
+            shared,
+            bg_descriptor_set_layout,
+            bg_pipeline_layout,
+            bg_pipeline,
+            text_uniform_descriptor_set_layout,
+            text_atlas_descriptor_set_layout,
+            text_pipeline_layout,
+            text_pipeline,
+            sampler,
+        }
+    }
+}
+
+impl Drop for GridPipelines {
+    fn drop(&mut self) {
+        // The context and each grid idle the device before releasing their
+        // ownership. The last owner therefore cannot leave a draw in flight.
+        unsafe {
+            self.shared.destroy_pipeline(self.text_pipeline, None);
+            self.shared
+                .destroy_pipeline_layout(self.text_pipeline_layout, None);
+            self.shared.destroy_descriptor_set_layout(
+                self.text_atlas_descriptor_set_layout,
+                None,
+            );
+            self.shared.destroy_descriptor_set_layout(
+                self.text_uniform_descriptor_set_layout,
+                None,
+            );
+            self.shared.destroy_sampler(self.sampler, None);
+            self.shared.destroy_pipeline(self.bg_pipeline, None);
+            self.shared
+                .destroy_pipeline_layout(self.bg_pipeline_layout, None);
+            self.shared
+                .destroy_descriptor_set_layout(self.bg_descriptor_set_layout, None);
+        }
+    }
+}
+
 pub struct VulkanGridRenderer {
     /// Shared device handle. Cloned from `VulkanContext` at
     /// construction so this renderer's `Drop` can call `destroy_*` on
@@ -685,6 +695,7 @@ pub struct VulkanGridRenderer {
     /// allocate bg buffers via `allocate_host_visible_buffer_raw`
     /// without needing a `&VulkanContext` borrow.
     shared: Arc<VkShared>,
+    pipelines: Arc<GridPipelines>,
 
     cols: u32,
     rows: u32,
@@ -697,10 +708,7 @@ pub struct VulkanGridRenderer {
     uniform_buffers: [VulkanBuffer; FRAMES_IN_FLIGHT],
 
     bg_descriptor_pool: vk::DescriptorPool,
-    bg_descriptor_set_layout: vk::DescriptorSetLayout,
     bg_descriptor_sets: [vk::DescriptorSet; FRAMES_IN_FLIGHT],
-    bg_pipeline_layout: vk::PipelineLayout,
-    bg_pipeline: vk::Pipeline,
 
     fg_rows: Vec<Vec<CellText>>,
     fg_staging: Vec<CellText>,
@@ -717,18 +725,10 @@ pub struct VulkanGridRenderer {
     /// this same layout before drawing, so grouping happens once per edit.
     fg_buckets: Vec<TextBucket>,
 
-    text_uniform_descriptor_set_layout: vk::DescriptorSetLayout,
-    /// Layout for one atlas page's descriptor set (a single combined
-    /// image+sampler at binding 0). Shared across all pages of both
-    /// atlases — pages have identical descriptor shape.
-    text_atlas_descriptor_set_layout: vk::DescriptorSetLayout,
     /// Pool sized for `FRAMES_IN_FLIGHT` uniform sets plus
     /// `MAX_PAGES × 2` atlas page sets (grayscale + color atlases).
     text_descriptor_pool: vk::DescriptorPool,
     text_uniform_descriptor_sets: [vk::DescriptorSet; FRAMES_IN_FLIGHT],
-    text_pipeline_layout: vk::PipelineLayout,
-    text_pipeline: vk::Pipeline,
-    sampler: vk::Sampler,
 
     pub atlas_grayscale: VulkanGlyphAtlas,
     pub atlas_color: VulkanGlyphAtlas,
@@ -740,6 +740,13 @@ impl VulkanGridRenderer {
     pub fn new(ctx: &VulkanContext, cols: u32, rows: u32) -> Self {
         let shared = ctx.shared().clone();
         let device = &shared.raw;
+        let pipelines = ctx
+            .grid_pipelines
+            .lock()
+            .unwrap()
+            .entry(ctx.swapchain_format())
+            .or_insert_with(|| Arc::new(GridPipelines::new(ctx)))
+            .clone();
 
         let bg_buffers = std::array::from_fn(|_| alloc_bg_buffer(ctx, cols, rows));
         let uniform_buffers = std::array::from_fn(|_| {
@@ -749,12 +756,11 @@ impl VulkanGridRenderer {
             )
         });
 
-        let bg_descriptor_set_layout = create_bg_descriptor_set_layout(device);
         let bg_descriptor_pool = create_bg_descriptor_pool(device);
         let bg_descriptor_sets = allocate_descriptor_sets(
             device,
             bg_descriptor_pool,
-            bg_descriptor_set_layout,
+            pipelines.bg_descriptor_set_layout,
         );
         for slot in 0..FRAMES_IN_FLIGHT {
             update_bg_descriptor_set(
@@ -764,30 +770,15 @@ impl VulkanGridRenderer {
                 &bg_buffers[slot],
             );
         }
-        let bg_pipeline_layout =
-            create_pipeline_layout(device, &[bg_descriptor_set_layout], &[]);
-        let pipeline_cache = ctx.pipeline_cache();
-        let bg_pipeline = create_bg_pipeline(
-            device,
-            pipeline_cache,
-            bg_pipeline_layout,
-            ctx.swapchain_format(),
-        );
-
         // Text pipeline plumbing — built BEFORE the atlases so each
         // atlas can allocate its initial page's descriptor set from
         // the pool we hand it.
-        let sampler = create_sampler(device);
-        let text_uniform_descriptor_set_layout =
-            create_text_uniform_descriptor_set_layout(device);
-        let text_atlas_descriptor_set_layout =
-            create_text_atlas_descriptor_set_layout(device);
         let text_descriptor_pool = create_text_descriptor_pool(device);
 
         let text_uniform_descriptor_sets = allocate_descriptor_sets(
             device,
             text_descriptor_pool,
-            text_uniform_descriptor_set_layout,
+            pipelines.text_uniform_descriptor_set_layout,
         );
         for slot in 0..FRAMES_IN_FLIGHT {
             update_text_uniform_descriptor_set(
@@ -800,41 +791,20 @@ impl VulkanGridRenderer {
         let atlas_grayscale = VulkanGlyphAtlas::new_grayscale(
             ctx,
             text_descriptor_pool,
-            text_atlas_descriptor_set_layout,
-            sampler,
+            pipelines.text_atlas_descriptor_set_layout,
+            pipelines.sampler,
         );
         let atlas_color = VulkanGlyphAtlas::new_color(
             ctx,
             text_descriptor_pool,
-            text_atlas_descriptor_set_layout,
-            sampler,
-        );
-
-        // Push constant `is_color: u32` switches sampling mode per
-        // draw — see `grid_text.frag.glsl`. Fragment stage only;
-        // 4 bytes at offset 0.
-        let text_push_constants = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-            .offset(0)
-            .size(4)];
-        let text_pipeline_layout = create_pipeline_layout(
-            device,
-            &[
-                text_uniform_descriptor_set_layout,
-                text_atlas_descriptor_set_layout,
-            ],
-            &text_push_constants,
-        );
-        let text_pipeline = create_text_pipeline(
-            device,
-            pipeline_cache,
-            text_pipeline_layout,
-            ctx.swapchain_format(),
+            pipelines.text_atlas_descriptor_set_layout,
+            pipelines.sampler,
         );
 
         let bg_len = (cols as usize) * (rows as usize);
         Self {
             shared,
+            pipelines,
             cols,
             rows,
             bg_buffers,
@@ -843,10 +813,7 @@ impl VulkanGridRenderer {
             bg_visible_rows: 0,
             uniform_buffers,
             bg_descriptor_pool,
-            bg_descriptor_set_layout,
             bg_descriptor_sets,
-            bg_pipeline_layout,
-            bg_pipeline,
             fg_rows: init_fg_rows(rows),
             fg_staging: Vec::new(),
             fg_staging_dirty: true,
@@ -857,13 +824,8 @@ impl VulkanGridRenderer {
             cursor_buffers: std::array::from_fn(|_| TextBuffer::default()),
             cursor_dirty: [true; FRAMES_IN_FLIGHT],
             fg_buckets: Vec::new(),
-            text_uniform_descriptor_set_layout,
-            text_atlas_descriptor_set_layout,
             text_descriptor_pool,
             text_uniform_descriptor_sets,
-            text_pipeline_layout,
-            text_pipeline,
-            sampler,
             atlas_grayscale,
             atlas_color,
             needs_full_rebuild: true,
@@ -1084,7 +1046,7 @@ impl VulkanGridRenderer {
     /// Drain pending atlas uploads into `cmd`. MUST be called BEFORE
     /// `Sugarloaf::render_vulkan` opens its dynamic-rendering pass —
     /// `vkCmdCopyBufferToImage` is forbidden inside a render pass.
-    /// No-op when both atlases have no pending entries.
+    /// Initializes new pages and flushes queued glyph uploads.
     pub fn prepare(
         &mut self,
         ctx: &VulkanContext,
@@ -1092,8 +1054,7 @@ impl VulkanGridRenderer {
         frame_slot: usize,
     ) {
         debug_assert!(frame_slot < FRAMES_IN_FLIGHT);
-        // Each atlas's `flush_uploads` early-outs when no page has
-        // anything pending, so we can call it unconditionally.
+        // Initial layouts and glyph copies share the frame submission.
         self.flush_pending_uploads(ctx, cmd, frame_slot);
     }
 
@@ -1138,12 +1099,12 @@ impl VulkanGridRenderer {
             self.shared.cmd_bind_pipeline(
                 cmd,
                 vk::PipelineBindPoint::GRAPHICS,
-                self.bg_pipeline,
+                self.pipelines.bg_pipeline,
             );
             self.shared.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::GRAPHICS,
-                self.bg_pipeline_layout,
+                self.pipelines.bg_pipeline_layout,
                 0,
                 &[self.bg_descriptor_sets[slot]],
                 &[],
@@ -1254,13 +1215,13 @@ impl VulkanGridRenderer {
             self.shared.cmd_bind_pipeline(
                 cmd,
                 vk::PipelineBindPoint::GRAPHICS,
-                self.text_pipeline,
+                self.pipelines.text_pipeline,
             );
             // Uniform set at slot 0 stays the same across every bucket.
             self.shared.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::GRAPHICS,
-                self.text_pipeline_layout,
+                self.pipelines.text_pipeline_layout,
                 0,
                 &[self.text_uniform_descriptor_sets[slot]],
                 &[],
@@ -1304,7 +1265,7 @@ impl VulkanGridRenderer {
                 self.shared.cmd_bind_descriptor_sets(
                     cmd,
                     vk::PipelineBindPoint::GRAPHICS,
-                    self.text_pipeline_layout,
+                    self.pipelines.text_pipeline_layout,
                     1,
                     &[set],
                     &[],
@@ -1316,7 +1277,7 @@ impl VulkanGridRenderer {
                 };
                 self.shared.cmd_push_constants(
                     cmd,
-                    self.text_pipeline_layout,
+                    self.pipelines.text_pipeline_layout,
                     vk::ShaderStageFlags::FRAGMENT,
                     0,
                     &is_color.to_ne_bytes(),
@@ -1338,6 +1299,35 @@ impl VulkanGridRenderer {
         self.atlas_grayscale.flush_uploads(&self.shared, cmd, slot);
         self.atlas_color.flush_uploads(&self.shared, cmd, slot);
     }
+}
+
+/// An empty page can still be bound by a zero-area glyph. Initialize its
+/// descriptor layout on the frame command buffer, without a separate submission.
+fn initialize_empty_page(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    page: &mut VulkanAtlasPage,
+) {
+    if page.initialized {
+        return;
+    }
+    let barriers = [vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+        .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+        .dst_access_mask(vk::AccessFlags2::SHADER_READ)
+        .old_layout(vk::ImageLayout::UNDEFINED)
+        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(page.image.handle())
+        .subresource_range(color_subresource_range())];
+    unsafe {
+        device.cmd_pipeline_barrier2(
+            cmd,
+            &vk::DependencyInfo::default().image_memory_barriers(&barriers),
+        );
+    }
+    page.initialized = true;
 }
 
 /// Record an atlas upload: barrier image → `TRANSFER_DST_OPTIMAL`,
@@ -1426,33 +1416,15 @@ fn upload_to_page(
 impl Drop for VulkanGridRenderer {
     fn drop(&mut self) {
         unsafe {
-            // Idle the queue before destroying pipelines / descriptor
+            // Idle the queue before destroying descriptor
             // resources. The shared `Arc<VkShared>` keeps the
             // underlying device alive across this whole Drop —
             // `vkDestroyDevice` runs only after every clone is gone.
             let _ = self.shared.device_wait_idle();
-            self.shared.destroy_pipeline(self.text_pipeline, None);
-            self.shared
-                .destroy_pipeline_layout(self.text_pipeline_layout, None);
             self.shared
                 .destroy_descriptor_pool(self.text_descriptor_pool, None);
-            self.shared.destroy_descriptor_set_layout(
-                self.text_atlas_descriptor_set_layout,
-                None,
-            );
-            self.shared.destroy_descriptor_set_layout(
-                self.text_uniform_descriptor_set_layout,
-                None,
-            );
-            self.shared.destroy_sampler(self.sampler, None);
-
-            self.shared.destroy_pipeline(self.bg_pipeline, None);
-            self.shared
-                .destroy_pipeline_layout(self.bg_pipeline_layout, None);
             self.shared
                 .destroy_descriptor_pool(self.bg_descriptor_pool, None);
-            self.shared
-                .destroy_descriptor_set_layout(self.bg_descriptor_set_layout, None);
             // Buffers + atlas images drop themselves.
         }
     }
