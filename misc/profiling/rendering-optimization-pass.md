@@ -110,9 +110,9 @@ from -29.4% to -25.9%. These are CPU storage results, not GPU frame speedups.
 Each platform ran 36 uninstrumented replays: six workloads, three alternating
 pairs, and two revisions. Each workload issues 240 updates over four seconds.
 Measurement includes the final 150 ms settling interval. Process CPU counters
-exclude child workload interpreters. Tab workloads create three terminals;
-their ready sizes match before and after on both OSes: 179x52, 178x48, and
-177x44. Single-terminal workloads use 179x52.
+exclude child workload interpreters. Tab workloads create four terminals;
+their ready sizes match before and after on both OSes: two at 179x52, one at
+178x48, and one at 177x44. Single-terminal workloads use 179x52.
 
 Linux now reads the process CPU clock through `clock_getcpuclockid`, avoiding
 the 10 ms quantization of `/proc` accounting. Windows retains `GetProcessTimes`
