@@ -13,6 +13,9 @@ use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock};
 
 const MAX_SHAPED_RUNS: usize = 2048;
+// Ordinary title churn retains about 2.4 MiB. Bound payload bytes as well as
+// entry count so long labels cannot multiply that footprint without limit.
+const MAX_SHAPED_BYTES: usize = 4 * 1024 * 1024;
 
 // `pos` is **pixel-space top-left** of the glyph's text bounding box.
 // `bearings.x` shifts it right to the glyph bitmap's left edge;
@@ -91,6 +94,13 @@ struct ShapedRun {
     glyphs: Vec<ShapedGlyph>,
 }
 
+impl ShapedRun {
+    fn cache_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.glyphs.capacity() * std::mem::size_of::<ShapedGlyph>()
+    }
+}
+
 #[inline]
 fn shape_hash(font_id: u32, size_bucket: u16, style_flags: u8, text: &str) -> u64 {
     use core::hash::Hasher;
@@ -146,6 +156,10 @@ struct TextVulkanState {
     instance_buffers: [Option<crate::context::vulkan::VulkanBuffer>;
         crate::context::vulkan::FRAMES_IN_FLIGHT],
     instance_capacity: [usize; crate::context::vulkan::FRAMES_IN_FLIGHT],
+    previous_instances: Vec<TextInstance>,
+    instance_groups: Vec<((u8, u8), Vec<TextInstance>)>,
+    instance_buckets: Vec<((u8, u8), u32, u32)>,
+    instance_dirty: [bool; crate::context::vulkan::FRAMES_IN_FLIGHT],
     descriptor_pool: ash::vk::DescriptorPool,
     uniform_descriptor_set_layout: ash::vk::DescriptorSetLayout,
     atlas_descriptor_set_layout: ash::vk::DescriptorSetLayout,
@@ -167,6 +181,7 @@ pub struct Text {
     ascent_cache: FxHashMap<(u32, u16), i16>,
     shape_cache: FxHashMap<u64, Arc<ShapedRun>>,
     shape_cache_order: VecDeque<u64>,
+    shape_cache_bytes: usize,
     icons: FxHashMap<(&'static str, u16), Option<crate::grid::atlas::AtlasSlot>>,
 
     #[cfg(target_os = "macos")]
@@ -200,6 +215,7 @@ impl Text {
             ascent_cache: FxHashMap::default(),
             shape_cache: FxHashMap::default(),
             shape_cache_order: VecDeque::new(),
+            shape_cache_bytes: 0,
             icons: FxHashMap::default(),
             #[cfg(target_os = "macos")]
             handle_cache: FxHashMap::default(),
@@ -243,6 +259,7 @@ impl Text {
         self.icons.clear();
         self.shape_cache.clear();
         self.shape_cache_order.clear();
+        self.shape_cache_bytes = 0;
     }
 
     #[inline]
@@ -612,14 +629,20 @@ impl Text {
             width_px: glyphs.iter().map(|g| g.advance).sum(),
             glyphs,
         });
-        // Changing titles should not retain every historical label. Evict one
-        // oldest entry per miss so cache hits need no recency bookkeeping and
-        // eviction never drops the whole cache in one frame.
-        if self.shape_cache_order.len() == MAX_SHAPED_RUNS {
-            if let Some(oldest) = self.shape_cache_order.pop_front() {
-                self.shape_cache.remove(&oldest);
-            }
+        let bytes = run.cache_bytes();
+        // An oversized label can still be drawn, without evicting the useful
+        // working set or keeping its large allocation in the cache.
+        if bytes > MAX_SHAPED_BYTES {
+            return Some(run);
         }
+        while self.shape_cache_order.len() == MAX_SHAPED_RUNS
+            || self.shape_cache_bytes + bytes > MAX_SHAPED_BYTES
+        {
+            let oldest = self.shape_cache_order.pop_front().unwrap();
+            let old = self.shape_cache.remove(&oldest).unwrap();
+            self.shape_cache_bytes -= old.cache_bytes();
+        }
+        self.shape_cache_bytes += bytes;
         self.shape_cache_order.push_back(hash);
         self.shape_cache.insert(hash, run.clone());
         Some(run)
@@ -1297,26 +1320,48 @@ impl Text {
         // mismatched instances can't share a draw. Typical overlay:
         // 1–2 buckets (a few glyphs on page 0, both kinds at most),
         // so the linear-search grouping is cheap.
-        let mut groups: Vec<((u8, u8), Vec<TextInstance>)> = Vec::with_capacity(4);
-        for inst in &self.instances {
-            let key = (inst.atlas, inst.page);
-            match groups.iter_mut().find(|(k, _)| *k == key) {
-                Some(g) => g.1.push(*inst),
-                None => groups.push((key, vec![*inst])),
+        if bytemuck_instances(&state.previous_instances)
+            != bytemuck_instances(&self.instances)
+        {
+            state.previous_instances.clear();
+            state.previous_instances.extend_from_slice(&self.instances);
+            for (_, instances) in &mut state.instance_groups {
+                instances.clear();
             }
-        }
-        let mut bucketed: Vec<TextInstance> = Vec::with_capacity(self.instances.len());
-        let mut buckets: Vec<((u8, u8), u32, u32)> = Vec::with_capacity(groups.len());
-        for ((kind, page), insts) in groups.into_iter() {
-            let start = bucketed.len() as u32;
-            let count = insts.len() as u32;
-            bucketed.extend_from_slice(&insts);
-            buckets.push(((kind, page), start, count));
+            let mut used = 0;
+            for inst in &self.instances {
+                let key = (inst.atlas, inst.page);
+                let group = match state.instance_groups[..used]
+                    .iter()
+                    .position(|(k, _)| *k == key)
+                {
+                    Some(index) => index,
+                    None => {
+                        if used == state.instance_groups.len() {
+                            state.instance_groups.push((key, Vec::new()));
+                        } else {
+                            state.instance_groups[used].0 = key;
+                        }
+                        used += 1;
+                        used - 1
+                    }
+                };
+                state.instance_groups[group].1.push(*inst);
+            }
+            state.instance_buckets.clear();
+            let mut start = 0;
+            for (key, instances) in &state.instance_groups[..used] {
+                let count = instances.len() as u32;
+                if count != 0 {
+                    state.instance_buckets.push((*key, start, count));
+                    start += count;
+                }
+            }
+            state.instance_dirty.fill(true);
         }
 
         // Grow per-slot instance buffer if needed.
-        let instance_count = bucketed.len();
-        let needed_bytes = instance_count * std::mem::size_of::<TextInstance>();
+        let instance_count = self.instances.len();
         if instance_count > state.instance_capacity[slot] {
             let new_cap = instance_count.next_power_of_two().max(256);
             state.instance_buffers[slot] =
@@ -1328,12 +1373,19 @@ impl Text {
             state.instance_capacity[slot] = new_cap;
         }
         let instance_buf = state.instance_buffers[slot].as_ref().unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bucketed.as_ptr() as *const u8,
-                instance_buf.as_mut_ptr(),
-                needed_bytes,
-            );
+        if state.instance_dirty[slot] {
+            let mut dst = instance_buf.as_mut_ptr() as *mut TextInstance;
+            for (_, instances) in &state.instance_groups {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        instances.as_ptr(),
+                        dst,
+                        instances.len(),
+                    );
+                    dst = dst.add(instances.len());
+                }
+            }
+            state.instance_dirty[slot] = false;
         }
 
         unsafe {
@@ -1356,7 +1408,7 @@ impl Text {
                 .cmd_bind_vertex_buffers(cmd, 0, &[instance_buf.handle()], &[0]);
 
             // One draw per (kind, page) bucket.
-            for &((kind, page), start, count) in &buckets {
+            for &((kind, page), start, count) in &state.instance_buckets {
                 let set = if kind == 1 {
                     state.atlas_color.page_descriptor_set(page)
                 } else {
@@ -1387,7 +1439,7 @@ impl Text {
 //  Helpers
 
 #[inline]
-#[cfg(all(feature = "wgpu", not(target_os = "macos")))]
+#[cfg(any(target_os = "linux", all(feature = "wgpu", not(target_os = "macos"))))]
 fn bytemuck_instances(insts: &[TextInstance]) -> &[u8] {
     // Safety: TextInstance is repr(C) with all-primitive fields (no
     // padding surprises thanks to 4-byte alignment + explicit _pad).
@@ -1915,6 +1967,10 @@ fn build_text_vulkan_state(
         uniform_buffers,
         instance_buffers: std::array::from_fn(|_| None),
         instance_capacity: [0; FRAMES_IN_FLIGHT],
+        previous_instances: Vec::new(),
+        instance_groups: Vec::new(),
+        instance_buckets: Vec::new(),
+        instance_dirty: [true; FRAMES_IN_FLIGHT],
         descriptor_pool,
         uniform_descriptor_set_layout,
         atlas_descriptor_set_layout,

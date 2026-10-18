@@ -150,6 +150,61 @@ and rebuilt; the valid before/after hashes differ. Subsequent baseline builds
 use a separate target directory. The earlier foreground candidates were built
 in one working tree after edits and compared with immutable baseline binaries.
 
+## UI text storage
+
+The native Vulkan UI text candidate retains grouping scratch and compares the
+current instance bytes with the previous batch. Changed batches preserve the
+first-occurrence atlas/page order and write their groups directly into each
+dirty frame slot. This removes temporary grouping allocations and the extra
+flattening copy. Unchanged batches reuse grouping, draw ranges, and uploads.
+One retained instance copy makes equality exact rather than relying on a hash.
+
+Three paired CPU-recording comparisons cover 32, 256, and 4,096 glyphs, one or
+two atlases, and stable, rebuilt-identical, and moving batches. All eighteen
+warmed allocation counts become zero, from 8–16 allocations and 3,488–442,484
+bytes per operation. Stable recording improves by 9–75%; at 4,096 glyphs with
+one atlas it falls from 20.7 to 5.2 us. Rebuilding identical text improves by
+9–40%, while moving batches improve by 5–8%. The rebuilt and moving cases
+include cached shaping lookup and CPU instance emission. These are recording
+measurements, not submitted GPU latency.
+
+Thirty-six diagnostic workloads independently reconstruct expected grouping
+and compare mapped GPU contents. They exercise every frame slot, changing
+first-atlas order, empty batches, and color-only transitions. All checks pass.
+
+Shaped-run caching now has a 4 MiB payload budget alongside the existing
+2,048-entry limit. Accounting includes the run object and glyph-vector capacity;
+the separately count-bounded map, FIFO, and allocation headers are outside this
+payload figure. Ordinary title churn still retains 2,048 runs / 2,457,600 payload
+bytes. After 256 distinct long labels, retention falls from 153,157,632 to
+4,129,104 bytes. An additional oversized label previously raised retention to
+162,593,664 bytes; it now leaves the seven cached runs and their payload size
+unchanged. Oversized runs remain drawable without entering the cache.
+
+The budget is above the measured ordinary title working set. Cache hits keep
+their existing lookup path; misses evict oldest entries until both bounds fit.
+Atlas-cache resets also reset accounting; the memory diagnostic checks both
+the computed payload and the accounting counter, clears the cache, and shapes
+again successfully.
+
+Seven CPU text controls retain their raster hashes and allocation counts.
+Title churn is about 1% slower; short cached drawing adds roughly four
+nanoseconds, while cached Unicode drawing is about 5% faster. These results
+do not establish a general CPU shaping improvement. The renderer library
+passes 119 tests. Debug application replays exercise dense text, Unicode,
+cursor movement, palette navigation, and repeated tab selection. Compositor
+captures show the latest numbered content and correctly rendered overlays.
+These debug runs include screenshot overhead and are functional checks only.
+
+Direct X11 client captures in the isolated XWayland session sometimes return
+an earlier frame. This initially looked like a rendering regression. Isolated
+builds and actual-frame buffer tracing showed current data reaching all GPU
+slots; a compositor capture then showed updated Unicode while a client capture
+from the same run still showed initial ASCII. Validation now uses background
+Spectacle captures from the isolated compositor and hashes PNG image data
+without timestamp metadata. No foreground implementation was reverted on the
+basis of the stale client readback.
+
 ## Retained artifacts
 
 `target/data-flow-implementation` contains the immutable before/after binaries,
