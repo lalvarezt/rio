@@ -380,6 +380,47 @@ Vulkan validation could not run: this environment failed to load the debug-utils
 extension. The mapped-buffer checks and actual rendered-output checks ran
 without that mode.
 
+## X11 refresh demand
+
+Frame traces identified two sources of work outside the grid pipeline: every
+visible window kept a refresh timer running while idle, and the post-input
+sustain gate generated redraws that the frontend subsequently discarded. The
+window now queues a coalesced request and arms one timer at its next permitted
+refresh deadline. Idle windows have no timer. Animation continuations queued
+inside a redraw arm their next deadline before the event loop waits again.
+Visibility changes cancel pending timers; monitor-rate changes rearm pending
+work at the new rate. Activation replies and cached theme changes explicitly
+count as pending work so they do not depend on a periodic heartbeat.
+
+In debug application traces, idle loop iterations fall from 313 to 28 over the
+complete replay lifecycle, with seventeen presents in both cases. Palette
+navigation keeps 138 presents while discarded frames fall from 143 to one;
+repeated tab selection keeps 295 presents while discarded frames fall from
+39 to one. These are event/work counts rather than kernel-wakeup measurements.
+Ten compositor replays pass, including twenty minimize/restore cycles; the
+terminal remains at 179 by 52 cells throughout that resize control.
+
+An optimized benchmark isolates the native event loop from rendering. Over
+2.2 seconds, median idle CPU time falls from 8.94 to 0.128 ms, and 120 redraw
+requests per second fall from 25.13 to 24.23 ms. Continuous animation emits the
+same 130 frames; CPU time changes from 8.56 to 9.23 ms, about five additional
+microseconds per frame in this small control. Debug whole-application palette
+CPU falls about 34–43% across three paired runs. Held-tab timings vary too much
+to support an end-to-end tab-speed claim from those debug runs.
+
+A reusable-timer alternative was also implemented and checked. Its continuous
+animation timings overlap the one-shot version, but 30 redraw requests per
+second require 180 loop iterations rather than 120 and about 9.22 rather than
+5.39 ms CPU. It was removed along with its stop-completion messages, generation
+tracking, and rearm logic. The selected implementation also removes the X11
+input-rate tracker and contains fewer lines than the previous periodic loop.
+
+Dedicated background-wake diagnostics include a negative control. Without the
+pending-work checks, an activation reply waits 2.5 seconds for unrelated work;
+with them it arrives in roughly 0.5 ms, and a theme change is delivered while
+idle. The library's eight tests pass. Temporary tracing and diagnostic hooks
+are not part of the committed application.
+
 ## Retained artifacts
 
 `target/data-flow-implementation` contains the immutable before/after binaries,
