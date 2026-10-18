@@ -236,6 +236,22 @@ impl<T> Storage<T> {
         }
     }
 
+    /// Clear a span's dirty bits and report whether every bit was set. Resolve
+    /// the ring index once, as in `mark_lines_dirty`.
+    pub(crate) fn take_lines_dirty(&mut self, start: Line, count: usize) -> bool {
+        if count == 0 {
+            return true;
+        }
+        let mut idx = self.compute_index(start);
+        let len = self.inner.len();
+        let mut all_dirty = true;
+        for _ in 0..count {
+            all_dirty &= std::mem::take(&mut self.inner[idx].dirty);
+            idx = if idx == 0 { len - 1 } else { idx - 1 };
+        }
+        all_dirty
+    }
+
     /// Iterate every stored row. Order is the raw ring order, not logical line
     /// order, which is fine for whole-buffer predicates and per-row edits that
     /// don't depend on position (the resize in-place fast paths).
@@ -410,6 +426,23 @@ mod tests {
         assert_eq!(storage.len, 3);
         assert_eq!(storage.zero, 0);
         assert_eq!(storage.visible_lines, 3);
+    }
+
+    #[test]
+    fn take_dirty_span_clears_every_bit_across_ring_wraps() {
+        let mut storage = Storage::<char>::with_capacity(3, 1);
+        for _ in 0..3 {
+            storage.rotate(1);
+            storage.mark_lines_dirty(Line(0), 3);
+            assert!(storage.take_lines_dirty(Line(0), 3));
+            assert!(storage.inner.iter().all(|row| !row.dirty));
+            storage[Line(1)].dirty = true;
+            assert!(!storage.take_lines_dirty(Line(0), 3));
+            assert!(storage.inner.iter().all(|row| !row.dirty));
+            storage.mark_lines_dirty(Line(1), 2);
+            assert!(storage.take_lines_dirty(Line(1), 2));
+            assert!(storage.take_lines_dirty(Line(0), 0));
+        }
     }
 
     #[test]

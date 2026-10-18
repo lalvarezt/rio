@@ -58,8 +58,8 @@ pub struct RenderableContent {
     pub background: Option<BackgroundState>,
     /// Damage hint for the in-progress frame. Set by `Renderer::run`
     /// from PTY + UI damage merging, consumed by `Screen::render`'s
-    /// grid emit to choose `RowsToRebuild::{None,Dirty,All}`. The
-    /// per-row decision under `Dirty` reads `visible_rows[y].dirty`
+    /// grid emit to choose a full, partial, or uniform-only update. The
+    /// per-row decision for partial updates reads `visible_rows[y].dirty`
     /// rather than this hint, so this is just a coarse gate.
     ///
     /// `Full` on construction so the first frame's emission rebuilds
@@ -68,6 +68,9 @@ pub struct RenderableContent {
     /// after consumption so next frame only re-emits if damage
     /// actually arrived.
     pub frame_damage: TerminalDamage,
+    /// Content changes across the whole viewport, independent of full damage
+    /// from scrolling or switching tabs. Derived while copying the snapshot.
+    pub all_rows_modified: bool,
 
     /// Per-context viewport row buffer. Populated once per frame by
     /// `Renderer::run` via `Crosswords::snapshot_visible` (which
@@ -130,6 +133,7 @@ impl RenderableContent {
             is_blinking_cursor_visible: false,
             background: None,
             frame_damage: TerminalDamage::Full,
+            all_rows_modified: true,
             visible_rows: Vec::new(),
             row_styles: Vec::new(),
             extras: Default::default(),
@@ -333,10 +337,9 @@ mod pipeline_tests {
             );
             self.painted.resize(rows, String::new());
             if needs_full {
-                // RowsToRebuild::All: rebuild everything, bits not
-                // cleared (matches screen::render).
                 for y in 0..self.visible_rows.len() {
                     self.painted[y] = row_text(&self.visible_rows[y], cols);
+                    self.visible_rows[y].dirty = false;
                 }
                 return;
             }

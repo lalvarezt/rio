@@ -2191,13 +2191,16 @@ impl<U: EventListener> Crosswords<U> {
         buf
     }
 
+    /// Copy visible state and report whether every source row was modified.
+    /// This content hint is independent of full damage from viewport moves;
+    /// destination dirty flags retain their existing redraw semantics.
     pub fn snapshot_visible(
         &mut self,
         damage: &crate::event::TerminalDamage,
         dst: &mut Vec<Row<Square>>,
         row_styles: &mut Vec<snapshot::RowStyles>,
         extras: &mut snapshot::SnapshotExtras,
-    ) {
+    ) -> bool {
         use crate::event::TerminalDamage;
         let (start, end) = self.visible_line_bounds();
         let count = (end - start) as usize;
@@ -2222,10 +2225,7 @@ impl<U: EventListener> Crosswords<U> {
                     extras.refresh(i, src, &self.grid.extras_table);
                 }
             }
-            for row_idx in start..end {
-                self.grid[Line(row_idx)].dirty = false;
-            }
-            return;
+            return self.grid.raw.take_lines_dirty(Line(start), count);
         }
 
         // A Noop/CursorOnly frame normally has nothing to copy, but rows
@@ -2235,7 +2235,7 @@ impl<U: EventListener> Crosswords<U> {
         if matches!(damage, TerminalDamage::Noop | TerminalDamage::CursorOnly) {
             let any_dirty = (0..count as i32).any(|y| self.grid[Line(start + y)].dirty);
             if !any_dirty {
-                return;
+                return false;
             }
         }
 
@@ -2252,9 +2252,7 @@ impl<U: EventListener> Crosswords<U> {
             self.grid.resolve_row_styles(src, &mut row_styles[y]);
             extras.refresh(y, src, &self.grid.extras_table);
         }
-        for row_idx in start..end {
-            self.grid[Line(row_idx)].dirty = false;
-        }
+        self.grid.raw.take_lines_dirty(Line(start), count)
     }
 
     /// Half-open grid line range currently on screen, as `(start, end)`.
@@ -6179,6 +6177,49 @@ mod tests {
         cw.reset_damage();
         // The alt screen was cleared with the carried blue bg template.
         assert_eq!(row_styles[0].at(0).bg, blue);
+    }
+
+    #[test]
+    fn snapshot_separates_source_changes_from_full_redraw_flags() {
+        use crate::event::TerminalDamage;
+        let mut cw = make_crosswords();
+        let (mut rows, mut styles, mut extras) =
+            (Vec::new(), Vec::new(), snapshot::SnapshotExtras::default());
+        assert!(cw.snapshot_visible(
+            &TerminalDamage::Full,
+            &mut rows,
+            &mut styles,
+            &mut extras
+        ));
+        for row in &mut rows {
+            row.dirty = false;
+        }
+        assert!(!cw.snapshot_visible(
+            &TerminalDamage::Full,
+            &mut rows,
+            &mut styles,
+            &mut extras
+        ));
+        assert!(
+            rows.iter().all(|row| row.dirty),
+            "full redraw remains visible to library consumers"
+        );
+        cw.grid[Line(0)][Column(0)].set_c('x');
+        assert!(!cw.snapshot_visible(
+            &TerminalDamage::Partial,
+            &mut rows,
+            &mut styles,
+            &mut extras
+        ));
+        for y in 0..cw.screen_lines() {
+            cw.grid[Line(y as i32)][Column(0)].set_c('y');
+        }
+        assert!(cw.snapshot_visible(
+            &TerminalDamage::Full,
+            &mut rows,
+            &mut styles,
+            &mut extras
+        ));
     }
 
     #[test]

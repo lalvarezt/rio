@@ -6,7 +6,6 @@
 // were retired from https://github.com/alacritty/alacritty/blob/c39c3c97f1a1213418c3629cc59a1d46e34070e0/alacritty/src/input.rs
 // which is licensed under Apache 2.0 license.
 
-pub mod hint;
 pub mod touch;
 
 use crate::bindings::kitty_keyboard::build_key_sequence;
@@ -28,7 +27,6 @@ use crate::layout::ContextDimension;
 use crate::mouse::{calculate_mouse_position, Mouse};
 use crate::renderer::island::{self, TabStripLayout, ISLAND_HEIGHT};
 use crate::renderer::{utils::padding_top_from_config, Renderer};
-use crate::screen::hint::visible_regex_match_iter;
 use crate::selection::{Selection, SelectionType};
 use core::fmt::Debug;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
@@ -58,6 +56,9 @@ use touch::TouchPurpose;
 
 /// Maximum number of lines for the blocking search while still typing the search regex.
 const MAX_SEARCH_WHILE_TYPING: Option<usize> = Some(1000);
+
+/// Wrapped lines searched beyond the visible viewport for highlighting.
+const MAX_SEARCH_EXTRA_LINES: usize = 100;
 
 /// Maximum number of search terms stored in the history.
 const MAX_SEARCH_HISTORY_SIZE: usize = 255;
@@ -103,11 +104,16 @@ pub struct Screen<'screen> {
     pub allow_manual_dragging: bool,
     last_chrome_press: Option<ChromePress>,
     last_close_press: Option<(std::time::Instant, f32)>,
-    pub grids: rustc_hash::FxHashMap<usize, rio_backend::sugarloaf::grid::GridRenderer>,
+    grids: rustc_hash::FxHashMap<usize, PanelGrid>,
     pub grid_rasterizer: rio_grid::GridGlyphRasterizer,
     grid_bg_scratch: Vec<rio_backend::sugarloaf::grid::CellBg>,
     grid_fg_scratch: Vec<rio_backend::sugarloaf::grid::CellText>,
     grid_hint_scratch: Vec<rio_grid::RowHint>,
+}
+
+struct PanelGrid {
+    renderer: rio_backend::sugarloaf::grid::GridRenderer,
+    prepared: rio_grid::prepared::PreparedRows,
 }
 
 pub struct ChromePress {
@@ -374,13 +380,16 @@ impl Screen<'_> {
     pub fn ensure_grid(&mut self, route_id: usize, cols: u32, rows: u32) {
         use std::collections::hash_map::Entry;
         match self.grids.entry(route_id) {
-            Entry::Occupied(mut e) => e.get_mut().resize(cols, rows),
+            Entry::Occupied(mut e) => e.get_mut().renderer.resize(cols, rows),
             Entry::Vacant(e) => {
-                e.insert(rio_backend::sugarloaf::grid::GridRenderer::new(
-                    &self.sugarloaf.ctx,
-                    cols,
-                    rows,
-                ));
+                e.insert(PanelGrid {
+                    renderer: rio_backend::sugarloaf::grid::GridRenderer::new(
+                        &self.sugarloaf.ctx,
+                        cols,
+                        rows,
+                    ),
+                    prepared: Default::default(),
+                });
             }
         }
     }
@@ -550,8 +559,11 @@ impl Screen<'_> {
             self.sugarloaf.update_font(font_library);
             // Caches keyed by font_id would serve the old font's data.
             self.grid_rasterizer.clear_font_caches();
-            for grid in self.grids.values_mut() {
-                grid.clear_atlas();
+        }
+        for grid in self.grids.values_mut() {
+            grid.prepared.clear();
+            if should_update_font_library {
+                grid.renderer.clear_atlas();
             }
         }
         let s = self.sugarloaf.style_mut();
@@ -4059,9 +4071,10 @@ impl Screen<'_> {
                     )
                 );
             if needs_search {
-                let hints = self.search_state.dfas_mut().map(|dfas| {
-                    visible_regex_match_iter(&terminal, dfas).collect::<Vec<_>>()
-                });
+                let hints = self
+                    .search_state
+                    .dfas_mut()
+                    .map(|dfas| dfas.visible_matches(&terminal, MAX_SEARCH_EXTRA_LINES));
                 drop(terminal);
 
                 let content = &mut self.context_manager.current_mut().renderable_content;
@@ -4214,6 +4227,7 @@ impl Screen<'_> {
                 cursor_color: rio_backend::config::colors::ColorArray,
                 is_active: bool,
                 damage: rio_backend::event::TerminalDamage,
+                all_rows_modified: bool,
                 /// Selection is per-context (`renderable_content`), not
                 /// per-terminal. Grabbed alongside the grid snapshot so
                 /// `build_row_bg`/`build_row_fg` can tint selected cells.
@@ -4378,6 +4392,7 @@ impl Screen<'_> {
                     cell_h,
                     font_px,
                     visible_rows,
+                    all_rows_modified: ctx.renderable_content.all_rows_modified,
                     row_styles,
                     extras,
                     term_colors,
@@ -4431,6 +4446,10 @@ impl Screen<'_> {
                 let Some(p) = panels.iter_mut().find(|p| p.route_id == *route_id) else {
                     continue;
                 };
+                let PanelGrid {
+                    renderer: grid,
+                    prepared,
+                } = grid;
 
                 // Decide which rows to rebuild.
                 //
@@ -4447,27 +4466,17 @@ impl Screen<'_> {
                 let force_full = grid.needs_full_rebuild()
                     || matches!(p.damage, rio_backend::event::TerminalDamage::Full);
 
-                enum RowsToRebuild {
-                    None,
-                    All,
-                    /// Per-row decision: walk `visible_rows` and
-                    /// rebuild rows whose `dirty` bit is set.
-                    Dirty,
-                }
-                let rows_to_rebuild = if force_full {
-                    RowsToRebuild::All
-                } else {
-                    match p.damage {
-                        rio_backend::event::TerminalDamage::Full => RowsToRebuild::All,
-                        rio_backend::event::TerminalDamage::Partial => {
-                            RowsToRebuild::Dirty
-                        }
-                        rio_backend::event::TerminalDamage::CursorOnly
-                        | rio_backend::event::TerminalDamage::Noop => RowsToRebuild::None,
-                    }
-                };
-
                 let cols = p.cols as usize;
+                let custom_glyphs =
+                    force_full && font_library.glyph_registry_for(p.route_id).is_some();
+                if grid.needs_full_rebuild() {
+                    prepared.clear();
+                }
+                let reuse_rows =
+                    force_full && (prepared.is_empty() || !p.all_rows_modified);
+                if reuse_rows {
+                    prepared.begin(cols, [p.font_px, p.cell_w, p.cell_h], &p.term_colors);
+                }
                 bg_scratch.clear();
                 bg_scratch.reserve(cols);
                 fg_scratch.clear();
@@ -4496,17 +4505,14 @@ impl Screen<'_> {
                 // buffers. Closure-style to avoid duplicating the
                 // body between the `All` and `Only` branches.
                 //
-                // Two passes now: `build_row_bg` emits `CellBg` per
-                // cell (unconditional), `build_row_fg` does run-level
-                // shaping + glyph emission (macOS only). The bg pass
-                // never needs shaping so it runs on all platforms;
-                // the fg path is macOS-specific pending the
-                // wgpu+swash port.
+                // Backgrounds and shaped foregrounds share this path on all
+                // backends. Prepared rows bypass both passes on a full redraw.
                 let mut rebuild_row =
                     |p: &PanelFrame,
                      y: usize,
                      grid: &mut rio_backend::sugarloaf::grid::GridRenderer,
-                     rasterizer: &mut rio_grid::GridGlyphRasterizer| {
+                     rasterizer: &mut rio_grid::GridGlyphRasterizer,
+                     prepared: &mut rio_grid::prepared::PreparedRows| {
                         let Some(row) = p.visible_rows.get(y) else {
                             return;
                         };
@@ -4558,17 +4564,6 @@ impl Screen<'_> {
                                     block_bg: rio_grid::normalized_to_u8(p.cursor_color),
                                 },
                             );
-                        rio_grid::build_row_bg(
-                            row,
-                            cols,
-                            row_styles,
-                            renderer_ref,
-                            &p.term_colors,
-                            row_sel,
-                            hint_scratch,
-                            preedit_row.as_ref(),
-                            bg_scratch,
-                        );
                         let cursor_col_for_row = if p.cursor_visible
                             && (y as u16) == p.cursor_row
                             && p.cursor_shape != rio_backend::ansi::CursorShape::Hidden
@@ -4577,6 +4572,31 @@ impl Screen<'_> {
                         } else {
                             None
                         };
+                        // Registrations only override PUA cells. Other rows
+                        // remain reusable while registered rows read the live
+                        // glyph data on every rebuild.
+                        let registered_row = reuse_rows && custom_glyphs && row.inner.iter().any(|cell| {
+                            !cell.is_bg_only() && rio_backend::ansi::glyph_protocol::is_pua(cell.c() as u32)
+                        });
+                        let cache_input = (reuse_rows && preedit_row.is_none() && !registered_row).then(|| {
+                            rio_grid::prepared::RowInput::new(
+                                &row.inner, row_styles, &p.extras, row_sel,
+                                hint_scratch, cursor_col_for_row,
+                            )
+                        });
+                        if let Some(input) = &cache_input {
+                            if grid.needs_full_rebuild() {
+                                prepared.clear();
+                            } else if let Some(cached) = prepared.get(input) {
+                                cached.restore(y as u16, bg_scratch, fg_scratch);
+                                grid.write_row(y as u32, bg_scratch, fg_scratch);
+                                return;
+                            }
+                        }
+                        rio_grid::build_row_bg(
+                            row, cols, row_styles, renderer_ref, &p.term_colors,
+                            row_sel, hint_scratch, preedit_row.as_ref(), bg_scratch,
+                        );
                         rio_grid::build_row_fg(
                             row,
                             cols,
@@ -4598,39 +4618,31 @@ impl Screen<'_> {
                             cursor_col_for_row,
                             fg_scratch,
                         );
+                        if let Some(input) = &cache_input {
+                            if grid.needs_full_rebuild() {
+                                prepared.clear();
+                            } else {
+                                prepared.put(input, bg_scratch, fg_scratch);
+                            }
+                        }
                         grid.write_row(y as u32, bg_scratch, fg_scratch);
                     };
 
-                match rows_to_rebuild {
-                    RowsToRebuild::None => {
-                        // Nothing to rebuild — previous frame's
-                        // CellBg/CellText stay resident. The GPU
-                        // pass below still runs so updated uniforms
-                        // (cursor_pos moved, etc.) take effect.
-                    }
-                    RowsToRebuild::All => {
-                        // Clear the flag before rebuilding so an
-                        // atlas-full clear inside `rebuild_row` can
-                        // re-set it for the recovery pass below.
+                if force_full
+                    || matches!(p.damage, rio_backend::event::TerminalDamage::Partial)
+                {
+                    if force_full {
                         grid.mark_full_rebuild_done();
-                        #[allow(clippy::needless_range_loop)]
-                        for y in 0..p.visible_rows.len() {
-                            rebuild_row(p, y, grid, rasterizer);
-                        }
                     }
-                    RowsToRebuild::Dirty => {
-                        // Walk the snapshot rows; rebuild + clear the
-                        // per-row dirty bit. Set by `snapshot_visible`
-                        // for rows it copied this frame; cleared here
-                        // so next frame starts clean.
-                        #[allow(clippy::needless_range_loop)]
-                        for y in 0..p.visible_rows.len() {
-                            if !p.visible_rows[y].dirty {
-                                continue;
-                            }
-                            rebuild_row(p, y, grid, rasterizer);
-                            p.visible_rows[y].dirty = false;
+                    for y in 0..p.visible_rows.len() {
+                        if !force_full && !p.visible_rows[y].dirty {
+                            continue;
                         }
+                        rebuild_row(p, y, grid, rasterizer, prepared);
+                        // A full rebuild consumes these flags too. Leaving
+                        // them set made the following partial edit rebuild
+                        // every row again.
+                        p.visible_rows[y].dirty = false;
                     }
                 }
 
@@ -4641,17 +4653,19 @@ impl Screen<'_> {
                 // it didn't; the overlay did). Cheap: at most two rows.
                 if p.is_active {
                     let current = p.preedit_line.as_ref().map(|line| line.row);
-                    for row in [
-                        self.last_preedit_row
-                            .filter(|_| self.last_preedit_row != current),
-                        current,
-                    ]
-                    .into_iter()
-                    .flatten()
-                    {
-                        if row < p.visible_rows.len() {
-                            rebuild_row(p, row, grid, rasterizer);
-                            p.visible_rows[row].dirty = false;
+                    if !force_full {
+                        for row in [
+                            self.last_preedit_row
+                                .filter(|_| self.last_preedit_row != current),
+                            current,
+                        ]
+                        .into_iter()
+                        .flatten()
+                        {
+                            if row < p.visible_rows.len() {
+                                rebuild_row(p, row, grid, rasterizer, prepared);
+                                p.visible_rows[row].dirty = false;
+                            }
                         }
                     }
                     self.last_preedit_row = current;
@@ -4661,9 +4675,17 @@ impl Screen<'_> {
                 // during the rebuild above, so rows written before the
                 // clear reference stale slots. Re-emit everything.
                 if grid.needs_full_rebuild() {
+                    prepared.clear();
                     grid.mark_full_rebuild_done();
                     for y in 0..p.visible_rows.len() {
-                        rebuild_row(p, y, grid, rasterizer);
+                        rebuild_row(p, y, grid, rasterizer, prepared);
+                    }
+                }
+                if reuse_rows {
+                    if grid.needs_full_rebuild() {
+                        prepared.clear();
+                    } else {
+                        prepared.finish(p.visible_rows.len());
                     }
                 }
 

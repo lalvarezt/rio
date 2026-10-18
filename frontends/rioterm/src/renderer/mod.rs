@@ -517,7 +517,7 @@ impl Renderer {
                         // input, etc.): cells didn't change, but the
                         // panel still has to go through the render path
                         // so UI overlays paint on top of a fresh frame.
-                        // Noop propagates to `RowsToRebuild::None` in
+                        // Noop skips row emission in
                         // `screen::render`'s emit loop — grid keeps its
                         // resident CPU bg/fg buffers, zero row work.
                         (None, None) => TerminalDamage::Noop,
@@ -526,7 +526,7 @@ impl Renderer {
 
                 terminal.reset_damage();
 
-                terminal.snapshot_visible(
+                context.renderable_content.all_rows_modified = terminal.snapshot_visible(
                     &damage,
                     &mut context.renderable_content.visible_rows,
                     &mut context.renderable_content.row_styles,

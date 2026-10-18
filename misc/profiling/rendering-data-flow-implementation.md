@@ -301,12 +301,54 @@ preserved versions in snapshot copies and gave independent clones new identities
 The lazy prototype is also insufficient for search, which can observe multiple
 edits before a snapshot clears the row's dirty bit.
 
-Neither prototype was retained. Paired parser controls slow roughly 8–9% in
-several Unicode and escape-sequence cases with the lazy prototype, and roughly
-5–6% with local revisions. Both also increase row-construction cost and metadata
-storage. These costs would apply even when the terminal is parsing without
-drawing. Prepared-row reuse will instead be evaluated with exact content checks
-in the rendering path, keeping the existing cell-write path unchanged.
+Neither prototype was retained. Their measured builds slow several parser
+controls by roughly 5–9%, but follow-up controls show that binary layout also
+affects these timings: parser callbacks with identical normalized instructions
+can differ in elapsed time. Those measurements do not isolate the cost of the
+added bookkeeping. Both prototypes increase row-construction cost and metadata
+storage regardless. Prepared-row reuse instead uses exact content checks in the
+rendering path, keeping the existing cell-write path unchanged.
+
+## Visible search and prepared geometry
+
+Literal search highlighting reuses matches from unchanged logical wrapped
+lines. Exact cell and combining-character comparisons validate each reuse;
+hashes only locate candidates. Regular expressions and fully rewritten
+viewports keep the contiguous DFA scan. Sparse edits and scrolling improve
+roughly 82–88% in twenty-four paired controls; fully rewritten and regex
+controls remain near baseline. Differential tests cover edits before snapshots,
+wrapped lines, extras-ID reuse, and the fallback scan.
+
+Full grid redraws reuse prepared background and foreground geometry from the
+last viewport. Partial updates keep their direct emit path. Keys include resolved
+styles, selection, hint ranges, cursor shaping boundaries, and combining text.
+Geometry is relocated vertically on reuse. Font, palette, cell size, and atlas
+changes invalidate it; composition and registered custom glyph rows bypass it.
+Retired rows release dependency records, and spare storage is bounded by the
+viewport. Hyperlink targets are never retained by either cache: cluster-only
+records share immutable extras, while records containing both links and clusters
+copy only their characters into a reused arena.
+
+The existing source dirty bits identify fully rewritten viewports so they can
+keep the direct path. Snapshot acknowledgement consumes these bits in one ring
+walk and still marks every destination row dirty for a full snapshot. The
+frontend now clears consumed destination bits after full redraws too. Previously
+the first partial edit after a full redraw rebuilt all rows again.
+
+Paired 160-column, 60-row controls reduce full redraw/scroll preparation from
+about 170 to 17 us for plain text, 216 to 30 us for styled text, and 148 to 17 us
+for combining text. Selection changes improve roughly 83–87%. Warmed controls
+allocate zero times. Forcing cache validation on frames with no reusable rows
+costs 9–15%; the source-write admission rule avoids that path in the application.
+
+Sixty-three diagnostic cases compare every generated background and foreground
+field, including Unicode, decorations, ligatures, linked clusters, cursor
+boundaries, selection, scrolling, and atlas resets. All agree with the direct
+path. Validation passes 571 terminal tests, nineteen grid tests, and two frontend
+snapshot tests. Eight debug application replays pass with compositor captures.
+Temporary application traces confirm that a first sparse edit emits one row
+instead of the whole viewport, and repeated tab switching restores 11,486 rows
+over 332 frames. These debug traces measure work counts, not latency.
 
 ## Retained artifacts
 

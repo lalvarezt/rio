@@ -45,6 +45,7 @@ use std::sync::Arc;
 pub use rio_backend::crosswords::snapshot::SnapshotExtras as ExtrasMap;
 
 pub mod preedit;
+pub mod prepared;
 use preedit::{PreeditCaret, PreeditCell, PreeditLine};
 
 /// The IME composition threaded into a row build. Only handed to the
@@ -133,7 +134,7 @@ pub struct HintLabel {
 /// outside the selection. Block selections reduce to the same
 /// `[lo, hi]` on every row; linear selections expand middle rows to
 /// the full width.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct RowSelection {
     pub lo: u16,
     pub hi: u16,
@@ -207,7 +208,7 @@ pub enum HintTag {
 
 /// Per-row hint interval, closed on both ends. Several `RowHint`s may
 /// exist on one row (when the row contains multiple matches).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RowHint {
     pub lo: u16,
     pub hi: u16,
