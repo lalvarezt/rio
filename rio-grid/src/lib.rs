@@ -1318,14 +1318,9 @@ fn source_cell(starts: &[u32], cell: &mut u16, cluster: u32) -> u16 {
 }
 
 pub struct GridGlyphRasterizer {
-    /// Cache of `(char, style_flags, route_id) → (font_id, is_emoji)`
-    /// resolutions. The route_id is part of the key because Glyph
-    /// Protocol registrations are per-pane: the same PUA codepoint
-    /// can resolve to `CUSTOM_GLYPH_FONT_ID` in one pane and to a
-    /// system font in another. Non-PUA characters resolve identically
-    /// across panes; the duplication is cheap (a few bytes per
-    /// (char, route) pair) compared to the cost of mis-rendering.
-    font_resolve: FxHashMap<(char, u8, usize), (u32, bool)>,
+    /// Packed character/style and terminal route. The route keeps Glyph
+    /// Protocol registrations isolated between panes.
+    font_resolve: FxHashMap<(u32, usize), (u32, bool)>,
     ascent_cache: FxHashMap<(u32, u16), i16>,
     /// `(should_embolden, should_italicize)` per font_id. Read from
     /// `FontData` synthesis flags; matches the rich-text rasterizer's
@@ -1447,6 +1442,12 @@ impl GridGlyphRasterizer {
         }
     }
 
+    /// Release a closed terminal's font choices. Shaped runs remain useful to
+    /// other terminals in the window.
+    pub fn remove_route(&mut self, route_id: usize) {
+        self.font_resolve.retain(|&(_, route), _| route != route_id);
+    }
+
     /// Library-wide `(hinting, features)`, cached until the next
     /// `clear_font_caches`.
     fn library_settings(
@@ -1493,15 +1494,14 @@ impl GridGlyphRasterizer {
             return (rio_backend::sugarloaf::font::FONT_ID_REGULAR as u32, false);
         }
 
-        *self
-            .font_resolve
-            .entry((ch, style_flags, route_id))
-            .or_insert_with(|| {
-                let span_style = span_style_for_flags(style_flags);
-                let (id, emoji) =
-                    font_library.resolve_font_for_char(ch, &span_style, Some(route_id));
-                (id as u32, emoji)
-            })
+        // A Unicode scalar and eight style bits fit in one u32 cache key.
+        let key = ((ch as u32) << u8::BITS) | u32::from(style_flags);
+        *self.font_resolve.entry((key, route_id)).or_insert_with(|| {
+            let span_style = span_style_for_flags(style_flags);
+            let (id, emoji) =
+                font_library.resolve_font_for_char(ch, &span_style, Some(route_id));
+            (id as u32, emoji)
+        })
     }
 
     #[inline]

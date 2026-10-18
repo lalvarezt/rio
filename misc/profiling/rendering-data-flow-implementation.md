@@ -205,6 +205,39 @@ Spectacle captures from the isolated compositor and hashes PNG image data
 without timestamp metadata. No foreground implementation was reverted on the
 basis of the stale client readback.
 
+## Closed terminal resources and font resolution
+
+The window now releases a terminal's grid renderer and cached font choices
+when the terminal closes. Previously only its custom glyph registry was
+removed; the window's grid map had no removal path. A debug lifecycle replay
+opens sixteen auxiliary terminals, waits for each to upload real glyphs, and
+closes them. The previous path retains seventeen grids until window teardown.
+The new path retains one live grid after every auxiliary close and zero after
+the final terminal closes. This releases 64 MiB of obsolete logical grayscale
+atlas allocations, plus the associated grid buffers. Vulkan destruction waits
+for in-flight device work; measured cleanup takes roughly 0.3–1.5 ms in this
+debug replay. This is a retention fix, not a claim that destruction is free.
+
+Font-resolution keys pack the Unicode scalar and eight style bits into one
+`u32`, alongside the terminal route. Closed-route entries are removed together
+with the grid. Three paired cache controls improve by about 1.5–2% for ordinary
+and private-use characters across one or sixty-four routes, with zero warmed
+allocations and identical font choices. Twenty row controls preserve output
+checks and allocation counts: cached Unicode improves about 3%, while full
+rasterization controls vary from roughly 1% to 2% slower. The rasterization
+controls clear font caches on every operation and do not establish a general
+rendering speedup. Seventeen grid tests and the frontend/library integration
+check pass.
+
+Sharing ordinary-character resolution between routes was also benchmarked.
+Normalizing the existing key increased lookup cost by 26–28%. Separate maps
+reduced duplication but slowed ordinary lookups by 5–11% and private-use
+lookups by 73–79%. Packing those separate keys improved ordinary lookups by
+3–4% but still slowed private-use lookups by about 20%; a packed normalized
+single map was also slower. These sharing alternatives were discarded.
+Keeping the route preserves custom glyph isolation and gives the simplest
+measured improvement, while lifecycle cleanup bounds obsolete entries.
+
 ## Retained artifacts
 
 `target/data-flow-implementation` contains the immutable before/after binaries,

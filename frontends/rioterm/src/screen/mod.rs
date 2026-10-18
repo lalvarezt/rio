@@ -385,6 +385,14 @@ impl Screen<'_> {
         }
     }
 
+    pub(crate) fn remove_terminal_resources(&mut self, route_id: usize) {
+        self.sugarloaf
+            .font_library()
+            .remove_glyph_registry(route_id);
+        self.grid_rasterizer.remove_route(route_id);
+        self.grids.remove(&route_id);
+    }
+
     #[inline]
     pub fn ctx(&self) -> &ContextManager<EventProxy> {
         &self.context_manager
