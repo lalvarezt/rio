@@ -105,6 +105,51 @@ shapes to the timing fixtures. All checks pass. The native renderer library
 passes 119 tests; eight existing ignored tests remain ignored. Metal receives
 only the equality gate in this stage; no Metal runtime measurements are claimed.
 
+## WebGPU resource ownership
+
+Color atlases initially bind a one-texel texture and allocate the full 2048-square
+RGBA texture on the first nonempty color glyph. Monochrome grids avoid its
+16 MiB logical allocation; their grayscale atlas remains 4 MiB. The color binding
+is replaced once when that texture appears. WebGPU retains resources referenced
+by previously recorded or submitted work. Atlas clears reuse allocated storage.
+This changes logical texture allocation, not measured physical GPU residency.
+
+The context owns immutable grid pipelines and bind-group layouts, cached by
+target format. Each grid retains shared ownership and keeps its own uniforms,
+bindings, cell buffers, and glyph atlases. Pipeline lookup happens at grid
+construction. Draws take no cache lock. Replacing or closing a grid cannot
+invalidate another grid's pipeline state.
+
+Deferring the color atlas alone leaves CPU construction timings within noise.
+First-color construction adds 25 small CPU allocations for the deferred texture
+and replacement binding. Sharing pipelines is the measured CPU improvement:
+against the lazy-atlas candidate, warmed monochrome grid construction falls
+from 1.218 ms to 0.152 ms (87.5% less in paired medians). CPU allocations fall
+from 4,762 / 1,129,400 bytes to 99 / 40,073 bytes. Construction with one color
+glyph falls from 2.476 ms to 0.930 ms, with more timing variation, and from
+4,809 / 1,140,471 bytes to 146 / 51,144 bytes. These include submit-and-wait and
+exclude first-use pipeline construction through warmup. No steady-frame
+improvement is inferred.
+
+A background-only row-storage control is about 0.2 us slower across 48 rows in
+focused paired medians, despite no change to its write algorithm. That local
+tradeoff remains visible rather than being described as a universal improvement.
+Submitted frame controls show no consistent broad speedup. Three GPU readbacks
+check actual monochrome, first-color, and cleared-atlas pixels while leaving
+earlier bindings in flight; before/after hashes match.
+
+An alternative sharing the one-texel placeholder saved 11 additional allocations
+but made monochrome construction about 5% slower and increased the row-storage
+control cost. It was removed. Source hashes match the retained pipeline-only
+candidate exactly after restoration.
+
+The first lazy-atlas comparison accidentally reused Cargo's baseline artifact
+across worktrees. Identical executable hashes exposed this. Those samples are
+labelled `invalid-cache-reuse-*` and excluded. The current package was cleaned
+and rebuilt; the valid before/after hashes differ. Subsequent baseline builds
+use a separate target directory. The earlier foreground candidates were built
+in one working tree after edits and compared with immutable baseline binaries.
+
 ## Retained artifacts
 
 `target/data-flow-implementation` contains the immutable before/after binaries,

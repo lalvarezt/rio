@@ -1,5 +1,6 @@
 use crate::sugarloaf::{Colorspace, SugarloafWindow, SugarloafWindowSize};
 use crate::SugarloafRenderer;
+use std::sync::{Arc, Mutex};
 
 pub struct WgpuContext<'a> {
     pub device: wgpu::Device,
@@ -14,6 +15,12 @@ pub struct WgpuContext<'a> {
     pub supports_f16: bool,
     pub colorspace: Colorspace,
     pub max_texture_dimension_2d: u32,
+    pub(crate) grid_pipelines: Mutex<
+        rustc_hash::FxHashMap<
+            wgpu::TextureFormat,
+            Arc<crate::grid::webgpu::GridPipelines>,
+        >,
+    >,
 }
 
 impl<'a> WgpuContext<'a> {
@@ -255,6 +262,7 @@ impl<'a> WgpuContext<'a> {
             supports_f16: false,
             colorspace: renderer_config.colorspace,
             max_texture_dimension_2d,
+            grid_pipelines: Mutex::default(),
         };
         let configure_timing =
             tracing::debug_span!(target: "rio_profile", "gpu.configure").entered();

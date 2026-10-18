@@ -10,6 +10,7 @@
 //! `CellText`, grayscale glyph atlas, instanced quad draws.
 
 use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
 use super::atlas::{AtlasSlot, GlyphKey, RasterizedGlyph};
 use super::cell::{CellBg, CellText, GridUniforms};
@@ -20,6 +21,7 @@ const CURSOR_ROW_SLOTS: usize = 2;
 const ATLAS_SIZE: u32 = 2048;
 
 pub struct WgpuGlyphAtlas {
+    device: wgpu::Device,
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     allocator: AtlasAllocator,
@@ -36,9 +38,12 @@ impl WgpuGlyphAtlas {
             wgpu::TextureFormat::R8Unorm,
             1,
             "grid.atlas_grayscale",
+            ATLAS_SIZE,
         )
     }
 
+    /// A single texel satisfies the binding until a nonempty color glyph needs
+    /// the full atlas. Existing bind groups keep the old texture alive.
     pub fn new_color(device: &wgpu::Device, queue: wgpu::Queue) -> Self {
         Self::new_with_format(
             device,
@@ -46,6 +51,7 @@ impl WgpuGlyphAtlas {
             wgpu::TextureFormat::Rgba8Unorm,
             4,
             "grid.atlas_color",
+            1,
         )
     }
 
@@ -55,12 +61,32 @@ impl WgpuGlyphAtlas {
         format: wgpu::TextureFormat,
         bytes_per_pixel: u32,
         label: &'static str,
+        size: u32,
     ) -> Self {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
+        let texture = Self::create_texture(device, format, label, size);
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        Self {
+            device: device.clone(),
+            texture,
+            view,
+            allocator: AtlasAllocator::new(ATLAS_SIZE as u16, ATLAS_SIZE as u16),
+            slots: FxHashMap::default(),
+            queue,
+            bytes_per_pixel,
+        }
+    }
+
+    fn create_texture(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        label: &'static str,
+        size: u32,
+    ) -> wgpu::Texture {
+        device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
             size: wgpu::Extent3d {
-                width: ATLAS_SIZE,
-                height: ATLAS_SIZE,
+                width: size,
+                height: size,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -69,16 +95,7 @@ impl WgpuGlyphAtlas {
             format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        Self {
-            texture,
-            view,
-            allocator: AtlasAllocator::new(ATLAS_SIZE as u16, ATLAS_SIZE as u16),
-            slots: FxHashMap::default(),
-            queue,
-            bytes_per_pixel,
-        }
+        })
     }
 
     #[inline]
@@ -112,6 +129,15 @@ impl WgpuGlyphAtlas {
         }
 
         let (x, y) = self.allocator.allocate(glyph.width, glyph.height)?;
+        if self.texture.width() != ATLAS_SIZE {
+            self.texture = Self::create_texture(
+                &self.device,
+                self.texture.format(),
+                "grid.atlas_color",
+                ATLAS_SIZE,
+            );
+            self.view = self.texture.create_view(&Default::default());
+        }
         let slot = AtlasSlot {
             x,
             y,
@@ -158,6 +184,41 @@ impl WgpuGlyphAtlas {
     }
 }
 
+/// Immutable grid state shared by panels using one context and target format.
+pub(crate) struct GridPipelines {
+    bg_layout: wgpu::BindGroupLayout,
+    bg: wgpu::RenderPipeline,
+    text_uniform_layout: wgpu::BindGroupLayout,
+    text_atlas_layout: wgpu::BindGroupLayout,
+    text: wgpu::RenderPipeline,
+}
+
+impl GridPipelines {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let bg_layout = create_bg_bind_group_layout(device);
+        let text_uniform_layout = create_text_uniform_bgl(device);
+        let text_atlas_layout = create_text_atlas_bgl(device);
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("grid.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/grid.wgsl").into()),
+        });
+        let bg = build_bg_pipeline(device, format, &bg_layout, &shader);
+        let text = build_text_pipeline(
+            device,
+            format,
+            &[Some(&text_uniform_layout), Some(&text_atlas_layout)],
+            &shader,
+        );
+        Self {
+            bg_layout,
+            bg,
+            text_uniform_layout,
+            text_atlas_layout,
+            text,
+        }
+    }
+}
+
 pub struct WgpuGridRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -186,21 +247,13 @@ pub struct WgpuGridRenderer {
     uniform_buffer: wgpu::Buffer,
     last_uniforms: Option<GridUniforms>,
 
-    // bg pipeline
-    bg_bind_group_layout: wgpu::BindGroupLayout,
+    pipelines: Arc<GridPipelines>,
     bg_bind_group: wgpu::BindGroup,
-    bg_pipeline: wgpu::RenderPipeline,
 
-    // text pipeline. The bind-group-layout fields are retained for
-    // Phase 2 (recreating the atlas bind group when we grow/rotate
-    // the atlas texture); hence `#[allow(dead_code)]` for now.
-    #[allow(dead_code)]
-    text_uniform_bgl: wgpu::BindGroupLayout,
+    // Text uniforms and atlas textures use separate bind groups, so allocating
+    // the first color glyph can replace its texture without touching uniforms.
     text_uniform_bg: wgpu::BindGroup,
-    #[allow(dead_code)]
-    text_atlas_bgl: wgpu::BindGroupLayout,
     text_atlas_bg: wgpu::BindGroup,
-    text_pipeline: wgpu::RenderPipeline,
 
     atlas_grayscale: WgpuGlyphAtlas,
     atlas_color: WgpuGlyphAtlas,
@@ -214,6 +267,13 @@ impl WgpuGridRenderer {
     pub fn new(ctx: &WgpuContext<'_>, cols: u32, rows: u32) -> Self {
         let device = ctx.device.clone();
         let queue = ctx.queue.clone();
+        let pipelines = ctx
+            .grid_pipelines
+            .lock()
+            .unwrap()
+            .entry(ctx.format)
+            .or_insert_with(|| Arc::new(GridPipelines::new(&device, ctx.format)))
+            .clone();
 
         let bg_len = (cols as usize) * (rows as usize);
         let bg_cpu = vec![CellBg::TRANSPARENT; bg_len];
@@ -230,10 +290,9 @@ impl WgpuGridRenderer {
         });
 
         // bg pipeline — uniforms + storage buffer.
-        let bg_bind_group_layout = create_bg_bind_group_layout(&device);
         let bg_bind_group = create_bg_bind_group(
             &device,
-            &bg_bind_group_layout,
+            &pipelines.bg_layout,
             &uniform_buffer,
             &bg_buffer,
         );
@@ -241,29 +300,16 @@ impl WgpuGridRenderer {
         // text pipeline — uniforms in group(0), atlas textures in group(1).
         let atlas_grayscale = WgpuGlyphAtlas::new_grayscale(&device, queue.clone());
         let atlas_color = WgpuGlyphAtlas::new_color(&device, queue.clone());
-        let text_uniform_bgl = create_text_uniform_bgl(&device);
-        let text_uniform_bg =
-            create_text_uniform_bg(&device, &text_uniform_bgl, &uniform_buffer);
-        let text_atlas_bgl = create_text_atlas_bgl(&device);
+        let text_uniform_bg = create_text_uniform_bg(
+            &device,
+            &pipelines.text_uniform_layout,
+            &uniform_buffer,
+        );
         let text_atlas_bg = create_text_atlas_bg(
             &device,
-            &text_atlas_bgl,
+            &pipelines.text_atlas_layout,
             atlas_grayscale.view(),
             atlas_color.view(),
-        );
-
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("grid.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/grid.wgsl").into()),
-        });
-
-        let bg_pipeline =
-            build_bg_pipeline(&device, ctx.format, &bg_bind_group_layout, &shader);
-        let text_pipeline = build_text_pipeline(
-            &device,
-            ctx.format,
-            &[Some(&text_uniform_bgl), Some(&text_atlas_bgl)],
-            &shader,
         );
 
         Self {
@@ -283,14 +329,10 @@ impl WgpuGridRenderer {
             bg_dirty: 0..(cols as usize * rows as usize),
             uniform_buffer,
             last_uniforms: None,
-            bg_bind_group_layout,
+            pipelines,
             bg_bind_group,
-            bg_pipeline,
-            text_uniform_bgl,
             text_uniform_bg,
-            text_atlas_bgl,
             text_atlas_bg,
-            text_pipeline,
             atlas_grayscale,
             atlas_color,
             needs_full_rebuild: true,
@@ -333,7 +375,7 @@ impl WgpuGridRenderer {
         self.fg_live_count = 0;
         self.bg_bind_group = create_bg_bind_group(
             &self.device,
-            &self.bg_bind_group_layout,
+            &self.pipelines.bg_layout,
             &self.uniform_buffer,
             &self.bg_buffer,
         );
@@ -444,13 +486,24 @@ impl WgpuGridRenderer {
         key: GlyphKey,
         glyph: RasterizedGlyph<'_>,
     ) -> Option<AtlasSlot> {
-        if let Some(slot) = self.atlas_color.insert(key, glyph) {
-            return Some(slot);
+        let deferred = self.atlas_color.texture.width() != ATLAS_SIZE;
+        let slot = if let Some(slot) = self.atlas_color.insert(key, glyph) {
+            Some(slot)
+        } else {
+            self.atlas_color.clear();
+            self.needs_full_rebuild = true;
+            self.fg_dirty = 0..self.fg_rows.len();
+            self.atlas_color.insert(key, glyph)
+        };
+        if deferred && self.atlas_color.texture.width() == ATLAS_SIZE {
+            self.text_atlas_bg = create_text_atlas_bg(
+                &self.device,
+                &self.pipelines.text_atlas_layout,
+                self.atlas_grayscale.view(),
+                self.atlas_color.view(),
+            );
         }
-        self.atlas_color.clear();
-        self.needs_full_rebuild = true;
-        self.fg_dirty = 0..self.fg_rows.len();
-        self.atlas_color.insert(key, glyph)
+        slot
     }
 
     /// Record the cell-bg pass, uploading changed uniforms and background cells.
@@ -486,7 +539,7 @@ impl WgpuGridRenderer {
         if self.bg_visible_rows == 0 && uniforms.cursor_bg_color[3] == 0.0 {
             return;
         }
-        render_pass.set_pipeline(&self.bg_pipeline);
+        render_pass.set_pipeline(&self.pipelines.bg);
         render_pass.set_bind_group(0, &self.bg_bind_group, &[]);
         render_pass.draw(0..3, 0..1);
     }
@@ -539,7 +592,7 @@ impl WgpuGridRenderer {
             return;
         }
 
-        render_pass.set_pipeline(&self.text_pipeline);
+        render_pass.set_pipeline(&self.pipelines.text);
         render_pass.set_bind_group(0, &self.text_uniform_bg, &[]);
         render_pass.set_bind_group(1, &self.text_atlas_bg, &[]);
         render_pass.set_vertex_buffer(0, self.fg_buffer.slice(..));
