@@ -600,14 +600,42 @@ fn resolver_fast_path_matches_slow_path() {
     let mut styled: Row<Square> = Row::new(3);
     styled[Column(1)].set_style_id(id);
     styled.has_styles = true;
-    let mut out = Vec::new();
+    let mut out = crate::crosswords::snapshot::RowStyles::default();
     grid.resolve_row_styles(&styled, &mut out);
-    assert_eq!(out.len(), 3);
-    assert_eq!(out[0], Style::default());
-    assert_eq!(out[1].fg, AnsiColor::Named(NamedColor::Blue));
+    assert_eq!(out.uniform(), None);
+    assert_eq!(out.at(0), Style::default());
+    assert_eq!(out.at(1).fg, AnsiColor::Named(NamedColor::Blue));
 
-    // Unstyled row: an empty slice represents default styles and clears reuse.
+    // Unstyled rows discard old values while retaining mixed-row capacity.
     let plain: Row<Square> = Row::new(3);
     grid.resolve_row_styles(&plain, &mut out);
-    assert!(out.is_empty());
+    assert_eq!(out.uniform(), Some(Style::DEFAULT));
+}
+
+#[test]
+fn uniform_snapshot_keeps_values_after_style_id_reuse() {
+    use crate::crosswords::snapshot::RowStyles;
+    use crate::crosswords::style::{Style, StyleFlags};
+
+    let mut grid: Grid<Square> = Grid::new(2, 160, 0);
+    let bold = Style {
+        flags: StyleFlags::BOLD,
+        ..Style::DEFAULT
+    };
+    let italic = Style {
+        flags: StyleFlags::ITALIC,
+        ..Style::DEFAULT
+    };
+    let id = grid.style_set.intern(bold);
+    let row = Row::from_vec(vec![Square::from_char('x').with_style_id(id); 160], 160);
+    let mut snapshot = RowStyles::default();
+    grid.resolve_row_styles(&row, &mut snapshot);
+    assert_eq!(snapshot.uniform(), Some(bold));
+
+    grid.style_set
+        .sweep_unmarked(&vec![0; super::ID_BITSET_WORDS], 0);
+    assert_eq!(grid.style_set.intern(italic), id);
+    assert_eq!(snapshot.at(159), bold);
+    grid.resolve_row_styles(&row, &mut snapshot);
+    assert_eq!(snapshot.uniform(), Some(italic));
 }

@@ -2195,7 +2195,7 @@ impl<U: EventListener> Crosswords<U> {
         &mut self,
         damage: &crate::event::TerminalDamage,
         dst: &mut Vec<Row<Square>>,
-        row_styles: &mut Vec<Vec<crate::crosswords::style::Style>>,
+        row_styles: &mut Vec<snapshot::RowStyles>,
         extras: &mut snapshot::SnapshotExtras,
     ) {
         use crate::event::TerminalDamage;
@@ -2212,7 +2212,7 @@ impl<U: EventListener> Crosswords<U> {
         // and grid swaps can't affect rows copied on earlier frames.
         if needs_full {
             self.fill_visible_rows(dst);
-            row_styles.resize_with(count, Vec::new);
+            row_styles.resize_with(count, snapshot::RowStyles::default);
             extras.begin(count, true);
             for (i, row_idx) in (start..end).enumerate() {
                 let src = &self.grid[Line(row_idx)];
@@ -6154,8 +6154,8 @@ mod tests {
         cw.snapshot_visible(&damage, &mut rows, &mut row_styles, &mut extras);
         cw.reset_damage();
         assert_eq!(row_styles.len(), rows.len());
-        assert_eq!(row_styles[0][0].bg, red);
-        assert_eq!(row_styles[0][1].bg, Style::default().bg);
+        assert_eq!(row_styles[0].at(0).bg, red);
+        assert_eq!(row_styles[0].at(1).bg, Style::default().bg);
 
         // Rows copied on earlier frames hold resolved values, so table
         // mutations between frames cannot retint them: only the row the
@@ -6167,8 +6167,8 @@ mod tests {
         let damage = cw.peek_damage_event().unwrap();
         cw.snapshot_visible(&damage, &mut rows, &mut row_styles, &mut extras);
         cw.reset_damage();
-        assert_eq!(row_styles[0][0].bg, red);
-        assert_eq!(row_styles[1][0].bg, blue);
+        assert_eq!(row_styles[0].at(0).bg, red);
+        assert_eq!(row_styles[1].at(0).bg, blue);
 
         // An instance switch arrives as Full damage and re-resolves
         // everything against the newly active grid's table.
@@ -6178,7 +6178,7 @@ mod tests {
         cw.snapshot_visible(&damage, &mut rows, &mut row_styles, &mut extras);
         cw.reset_damage();
         // The alt screen was cleared with the carried blue bg template.
-        assert_eq!(row_styles[0][0].bg, blue);
+        assert_eq!(row_styles[0].at(0).bg, blue);
     }
 
     #[test]

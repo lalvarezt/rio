@@ -730,17 +730,38 @@ impl Grid<Square> {
     /// style; their color travels inline in the cell itself. Snapshots
     /// carry these resolved values instead of ids, so id reuse by the
     /// sweep can never affect rows copied on earlier frames.
-    /// An empty output represents a row of default styles.
-    pub fn resolve_row_styles(&self, src: &Row<Square>, out: &mut Vec<Style>) {
-        out.clear();
+    /// Uniform rows resolve once and retain no per-cell style values.
+    pub fn resolve_row_styles(
+        &self,
+        src: &Row<Square>,
+        out: &mut super::snapshot::RowStyles,
+    ) {
         if !src.has_styles {
+            out.set_uniform(Style::DEFAULT);
             return;
         }
-        out.extend(src.inner.iter().map(|sq| {
-            sq.style_id_checked()
-                .map(|id| self.style_set.get(id))
-                .unwrap_or_default()
-        }));
+        let first = src
+            .inner
+            .first()
+            .and_then(|sq| sq.style_id_checked())
+            .unwrap_or(0);
+        let style = self.style_set.get(first);
+        match src
+            .inner
+            .iter()
+            .position(|sq| sq.style_id_checked().unwrap_or(0) != first)
+        {
+            None => out.set_uniform(style),
+            Some(prefix) => out.set_mixed(
+                prefix,
+                style,
+                src.inner[prefix..].iter().map(|sq| {
+                    sq.style_id_checked()
+                        .map(|id| self.style_set.get(id))
+                        .unwrap_or_default()
+                }),
+            ),
+        }
     }
 
     /// Read the style id of the current cursor template.

@@ -13,6 +13,7 @@ use rio_vt::config::colors::{AnsiColor, ColorRgb};
 use rio_vt::crosswords::grid::row::Row;
 use rio_vt::crosswords::grid::Dimensions;
 use rio_vt::crosswords::pos::Column;
+use rio_vt::crosswords::snapshot::RowStyles;
 use rio_vt::crosswords::square::{ContentTag, Square};
 use rio_vt::crosswords::style::Style;
 use rio_vt::crosswords::Crosswords;
@@ -66,7 +67,7 @@ pub struct RenderState {
     terminal: Arc<FairMutex<Crosswords<Listener>>>,
     rows: Vec<Row<Square>>,
     /// Per-row resolved cell styles, index-parallel to `rows`.
-    row_styles: Vec<Vec<Style>>,
+    row_styles: Vec<RowStyles>,
     extras: rio_vt::crosswords::snapshot::SnapshotExtras,
     columns: usize,
     cursor_line: usize,
@@ -261,11 +262,7 @@ impl RenderState {
         // their background inline instead of carrying a style id; the
         // resolved per-row styles hold the default for them.
         match square.content_tag() {
-            ContentTag::Codepoint => self
-                .row_styles(line)
-                .get(column)
-                .copied()
-                .unwrap_or_default(),
+            ContentTag::Codepoint => self.row_styles(line).at(column),
             ContentTag::BgPalette => Style {
                 bg: AnsiColor::Indexed(square.bg_palette_index()),
                 ..Style::default()
@@ -280,10 +277,10 @@ impl RenderState {
         }
     }
 
-    /// Resolved styles for one visible row, index-parallel to its
-    /// cells. Empty for an out-of-range line.
-    pub fn row_styles(&self, line: usize) -> &[Style] {
-        self.row_styles.get(line).map(Vec::as_slice).unwrap_or(&[])
+    /// Resolved styles for one visible row. Out-of-range lines use defaults.
+    pub fn row_styles(&self, line: usize) -> &RowStyles {
+        static DEFAULT: RowStyles = RowStyles::DEFAULT;
+        self.row_styles.get(line).unwrap_or(&DEFAULT)
     }
 
     /// The snapshot's visible rows. Index-parallel to the resolved

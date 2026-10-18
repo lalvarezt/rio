@@ -1,8 +1,102 @@
 use super::grid::{row::Row, ExtrasTable, ID_BITSET_WORDS};
 use super::square::{Extras, Square};
+use super::style::{Style, StyleFlags};
 use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
+
+/// Resolved styles owned by a row snapshot. Uniform rows store one value;
+/// mixed rows keep an index-parallel vector. Values remain valid when the
+/// terminal reuses style IDs after the snapshot lock is released.
+#[derive(Clone, Debug, Default)]
+pub struct RowStyles {
+    uniform: Style,
+    mixed: Vec<Style>,
+}
+
+impl RowStyles {
+    pub const DEFAULT: Self = Self {
+        uniform: Style::DEFAULT,
+        mixed: Vec::new(),
+    };
+
+    #[inline]
+    pub fn at(&self, column: usize) -> Style {
+        self.mixed.get(column).copied().unwrap_or(self.uniform)
+    }
+
+    /// One style for the whole row, or `None` for mixed styles.
+    #[inline]
+    pub fn uniform(&self) -> Option<Style> {
+        self.mixed.is_empty().then_some(self.uniform)
+    }
+
+    #[inline]
+    pub fn flags(&self) -> StyleFlags {
+        self.mixed
+            .iter()
+            .fold(self.uniform.flags, |flags, style| flags | style.flags)
+    }
+
+    /// Expand only when an overlay needs to edit individual cell styles.
+    pub fn make_mut(&mut self, columns: usize) -> &mut [Style] {
+        self.mixed.resize(columns, self.uniform);
+        &mut self.mixed
+    }
+
+    pub(super) fn set_uniform(&mut self, style: Style) {
+        self.uniform = style;
+        self.mixed.clear();
+    }
+
+    pub(super) fn set_mixed(
+        &mut self,
+        prefix: usize,
+        style: Style,
+        remainder: impl ExactSizeIterator<Item = Style>,
+    ) {
+        self.uniform = Style::DEFAULT;
+        self.mixed.clear();
+        self.mixed.reserve(prefix + remainder.len());
+        self.mixed.resize(prefix, style);
+        self.mixed.extend(remainder);
+    }
+}
+
+#[cfg(test)]
+mod style_tests {
+    use super::*;
+
+    #[test]
+    fn overlays_expand_uniform_styles_and_reuse_mixed_storage() {
+        let bold = Style {
+            flags: StyleFlags::BOLD,
+            ..Style::DEFAULT
+        };
+        let italic = Style {
+            flags: StyleFlags::ITALIC,
+            ..Style::DEFAULT
+        };
+        let mut styles = RowStyles::default();
+        styles.set_uniform(bold);
+        let frozen = styles.clone();
+        styles.make_mut(160)[79] = italic;
+        assert_eq!(styles.at(0), bold);
+        assert_eq!(styles.at(79), italic);
+        assert_eq!(styles.at(159), bold);
+        assert_eq!(styles.flags(), StyleFlags::BOLD | StyleFlags::ITALIC);
+        assert_eq!(frozen.uniform(), Some(bold));
+        assert_eq!(frozen.at(79), bold);
+
+        let allocation = styles.mixed.as_ptr();
+        styles.set_uniform(italic);
+        assert_eq!(styles.uniform(), Some(italic));
+        assert_eq!(styles.flags(), StyleFlags::ITALIC);
+        styles.make_mut(160)[0] = bold;
+        assert_eq!(styles.mixed.as_ptr(), allocation);
+        assert_eq!(styles.at(79), italic);
+    }
+}
 
 #[derive(Clone, Debug)]
 struct SnapshotExtra {

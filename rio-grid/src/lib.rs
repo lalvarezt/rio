@@ -32,6 +32,7 @@ use rio_backend::config::colors::{AnsiColor, NamedColor};
 use rio_backend::crosswords::grid::row::Row;
 use rio_backend::crosswords::pos::{Column, Line, Pos};
 use rio_backend::crosswords::search::Match;
+use rio_backend::crosswords::snapshot::RowStyles;
 use rio_backend::crosswords::square::{ContentTag, Square, Wide};
 use rio_backend::crosswords::style::{Style, StyleFlags, UnderlineKind};
 use rio_backend::selection::SelectionRange;
@@ -126,13 +127,6 @@ pub struct HintLabel {
     pub position: Pos,
     pub label: char,
     pub is_first: bool,
-}
-
-/// The pre-resolved style for cell `x`: bg-only cells already hold the
-/// default here (their color travels inline in the cell).
-#[inline(always)]
-pub fn resolve_style(row_styles: &[Style], x: usize) -> Style {
-    row_styles.get(x).copied().unwrap_or(Style::DEFAULT)
 }
 
 /// Per-row selection interval, in column indices. `None` = row is
@@ -348,15 +342,15 @@ const HINT_LABEL_STYLE_ID: u16 = u16::MAX;
 
 pub fn overlay_hint_labels(
     row: &Row<Square>,
-    row_styles: &[Style],
+    row_styles: &RowStyles,
     labels: &[HintLabel],
     y: usize,
     display_offset: i32,
     label_styles: (Style, Style),
     row_hints: &mut Vec<RowHint>,
-) -> Option<(Row<Square>, Vec<Style>)> {
+) -> Option<(Row<Square>, RowStyles)> {
     let line = Line((y as i32) - display_offset);
-    let mut out: Option<(Row<Square>, Vec<Style>)> = None;
+    let mut out: Option<(Row<Square>, RowStyles)> = None;
     let (first_style, rest_style) = label_styles;
     for label in labels {
         if label.position.row != line {
@@ -366,15 +360,12 @@ pub fn overlay_hint_labels(
         if col >= row.len() {
             continue;
         }
-        let (target, styles) = out.get_or_insert_with(|| {
-            let mut styles = row_styles.to_vec();
-            styles.resize(row.len(), Style::default());
-            (row.clone(), styles)
-        });
+        let (target, styles) =
+            out.get_or_insert_with(|| (row.clone(), row_styles.clone()));
         let mut sq = Square::from_char(label.label);
         sq.set_style_id(HINT_LABEL_STYLE_ID);
         target[Column(col)] = sq;
-        styles[col] = if label.is_first {
+        styles.make_mut(row.len())[col] = if label.is_first {
             first_style
         } else {
             rest_style
@@ -1064,12 +1055,6 @@ fn underline_style_from_flags(flags: StyleFlags) -> Option<DecorationStyle> {
     })
 }
 
-fn combined_style_flags(styles: &[Style]) -> StyleFlags {
-    styles
-        .iter()
-        .fold(StyleFlags::empty(), |flags, style| flags | style.flags)
-}
-
 /// Decoration color: SGR 58 `underline_color` if set, else the cell's
 /// computed fg. `generic.zig:2968`.
 #[inline]
@@ -1180,7 +1165,7 @@ pub fn normalized_to_u8(c: [f32; 4]) -> [u8; 4] {
 pub fn build_row_bg<P: GridPalette>(
     row: &Row<Square>,
     cols: usize,
-    row_styles: &[Style],
+    row_styles: &RowStyles,
     palette: &P,
     term_colors: &TermColors,
     row_sel: Option<RowSelection>,
@@ -1207,7 +1192,7 @@ pub fn build_row_bg<P: GridPalette>(
         for x in 0..cols {
             let sq = row[Column(x)];
             bg_scratch.push(CellBg {
-                rgba: cell_bg(sq, resolve_style(row_styles, x), palette, term_colors),
+                rgba: cell_bg(sq, row_styles.at(x), palette, term_colors),
             });
         }
         return;
@@ -1235,7 +1220,7 @@ pub fn build_row_bg<P: GridPalette>(
     };
     for x in 0..cols {
         let sq = row[Column(x)];
-        let style = resolve_style(row_styles, x);
+        let style = row_styles.at(x);
         let col = x as u16;
         // The composition wins over selection / hint backgrounds: the
         // user is actively typing here, that signal reads first. Both
@@ -1824,7 +1809,7 @@ pub fn build_row_fg<P: GridPalette>(
     row: &Row<Square>,
     cols: usize,
     y: u16,
-    row_styles: &[Style],
+    row_styles: &RowStyles,
     extras_table: &ExtrasMap,
     palette: &P,
     term_colors: &TermColors,
@@ -1848,7 +1833,7 @@ pub fn build_row_fg<P: GridPalette>(
     fg_scratch: &mut Vec<CellText>,
 ) {
     fg_scratch.clear();
-    let row_flags = combined_style_flags(row_styles);
+    let row_flags = row_styles.flags();
 
     let size_bucket = (size_px * 4.0).round().clamp(0.0, u16::MAX as f32) as u16;
     let size_u16 = size_px.round().clamp(1.0, u16::MAX as f32) as u16;
@@ -1911,8 +1896,8 @@ pub fn build_row_fg<P: GridPalette>(
         .map(|i| i + 1)
         .unwrap_or(0);
     let default_fg = row_styles
-        .is_empty()
-        .then(|| cell_fg(Square::from_char(' '), Style::DEFAULT, palette, term_colors));
+        .uniform()
+        .map(|style| cell_fg(Square::from_char(' '), style, palette, term_colors));
 
     let mut x: usize = 0;
     while x < max {
@@ -1939,8 +1924,7 @@ pub fn build_row_fg<P: GridPalette>(
         // Open a run at x.
         let ch = sq.c();
         let run_start_style_id = sq.style_id();
-        let run_style_flags =
-            (resolve_style(row_styles, x).flags.bits() & SHAPING_FLAG_MASK) as u8;
+        let run_style_flags = (row_styles.at(x).flags.bits() & SHAPING_FLAG_MASK) as u8;
         let (font_id, is_emoji) =
             rasterizer.resolve_font(ch, run_style_flags, font_library, route_id);
 
@@ -1960,7 +1944,7 @@ pub fn build_row_fg<P: GridPalette>(
 
             // fg colour, mirroring the regular emit loop's
             // selection / hint precedence.
-            let style = resolve_style(row_styles, x);
+            let style = row_styles.at(x);
             let color = if !needs_per_cell_check {
                 cell_fg(sq, style, palette, term_colors)
             } else {
@@ -2053,7 +2037,7 @@ pub fn build_row_fg<P: GridPalette>(
                 if slot.w != 0 && slot.h != 0 {
                     // fg colour, mirroring the regular emit loop's
                     // selection / hint precedence.
-                    let style = resolve_style(row_styles, x);
+                    let style = row_styles.at(x);
                     let color = if !needs_per_cell_check {
                         cell_fg(sq, style, palette, term_colors)
                     } else {
@@ -2210,8 +2194,7 @@ pub fn build_row_fg<P: GridPalette>(
             }
             let style2_id = sq2.style_id();
             if style2_id != prev_style_id {
-                let f = (resolve_style(row_styles, end).flags.bits() & SHAPING_FLAG_MASK)
-                    as u8;
+                let f = (row_styles.at(end).flags.bits() & SHAPING_FLAG_MASK) as u8;
                 if f != run_style_flags {
                     break;
                 }
@@ -2319,7 +2302,7 @@ pub fn build_row_fg<P: GridPalette>(
                     default_fg.unwrap_or_else(|| {
                         cell_fg(
                             row[Column(src_col)],
-                            resolve_style(row_styles, src_col),
+                            row_styles.at(src_col),
                             palette,
                             term_colors,
                         )
@@ -2327,7 +2310,7 @@ pub fn build_row_fg<P: GridPalette>(
                 )
             } else {
                 let src_sq = row[Column(src_col)];
-                let src_style = resolve_style(row_styles, src_col);
+                let src_style = row_styles.at(src_col);
                 let is_sel = cell_in_row_sel(row_sel, src_col as u16);
                 let hint_tag = if is_sel {
                     None
@@ -2677,7 +2660,7 @@ fn emit_underlines<P: GridPalette>(
     row: &Row<Square>,
     cols: usize,
     y: u16,
-    row_styles: &[Style],
+    row_styles: &RowStyles,
     palette: &P,
     term_colors: &TermColors,
     grid: &mut GridRenderer,
@@ -2698,7 +2681,7 @@ fn emit_underlines<P: GridPalette>(
         if preedit.is_some_and(|p| p.suppresses(sq, x)) {
             continue;
         }
-        let style = resolve_style(row_styles, x);
+        let style = row_styles.at(x);
         let col = x as u16;
         // SGR underline (UNDER, double, curly, …) wins over the
         // hover-only forced underline. When the cell has no SGR
@@ -2759,7 +2742,7 @@ fn emit_strikethroughs<P: GridPalette>(
     row: &Row<Square>,
     cols: usize,
     y: u16,
-    row_styles: &[Style],
+    row_styles: &RowStyles,
     palette: &P,
     term_colors: &TermColors,
     grid: &mut GridRenderer,
@@ -2780,7 +2763,7 @@ fn emit_strikethroughs<P: GridPalette>(
         if preedit.is_some_and(|p| p.suppresses(sq, x)) {
             continue;
         }
-        let style = resolve_style(row_styles, x);
+        let style = row_styles.at(x);
         if !style.flags.contains(StyleFlags::STRIKEOUT) {
             continue;
         }
@@ -3164,7 +3147,7 @@ mod hint_label_tests {
         let (first_style, rest_style) = hint_label_styles(fg, bg);
         let pair = (first_style, rest_style);
         let row: Row<Square> = Row::new(10);
-        let row_styles = vec![Style::default(); 10];
+        let row_styles = RowStyles::default();
         let labels = [label(3, 2, 'j', true), label(3, 3, 'f', false)];
         let mut hints = Vec::new();
 
@@ -3178,11 +3161,11 @@ mod hint_label_tests {
             overlay_hint_labels(&row, &row_styles, &labels, 3, 0, pair, &mut hints)
                 .unwrap();
         assert_eq!(overlaid[Column(2)].c(), 'j');
-        assert_eq!(styles[2], first_style);
+        assert_eq!(styles.at(2), first_style);
         assert_eq!(overlaid[Column(3)].c(), 'f');
-        assert_eq!(styles[3], rest_style);
+        assert_eq!(styles.at(3), rest_style);
         assert_eq!(overlaid[Column(4)].c(), row[Column(4)].c());
-        assert_eq!(styles[4], Style::default());
+        assert_eq!(styles.at(4), Style::default());
         assert_eq!(hints.len(), 2);
         assert!(hints.iter().all(|h| h.tag == HintTag::Label));
         assert_eq!(cell_in_row_hints(&hints, 2), Some(HintTag::Label));

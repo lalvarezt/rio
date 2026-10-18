@@ -238,6 +238,42 @@ single map was also slower. These sharing alternatives were discarded.
 Keeping the route preserves custom glyph isolation and gives the simplest
 measured improvement, while lifecycle cleanup bounds obsolete entries.
 
+## Compact row style snapshots
+
+`RowStyles` now owns either one uniform style or a vector of mixed cell styles.
+The snapshot resolves values while holding the terminal lock, so style-ID reuse
+still cannot change an earlier snapshot. Grid emission, hint-label overlays,
+virtual image placements, and both library adapters use the same representation.
+Uniform foreground emission also resolves its color once per row.
+
+For a 160-by-60 uniformly styled viewport, style-vector payload falls from
+134,400 bytes to zero. Row-owner storage grows from 1,440 to 2,400 bytes; mixed
+rows retain their previous vector payload. A row that becomes uniform after
+being mixed retains its allocation for later reuse. Dropping that allocation
+was measured separately: alternating uniform/mixed snapshots then allocate
+thirty times / 67,200 bytes per operation and take about 9% longer. The retained
+allocation is bounded by the snapshot row working set.
+
+Three paired comparisons reduce uniform full snapshots from about 11.7 to
+5.9 us and partial updates from 320 to 237 ns. Rows with only the final cell
+different improve from 11.9 to 10.4 us; alternating uniform/mixed full snapshots
+improve about 26%. Rapidly mixed full snapshots increase about 2%, and their
+partial updates increase about 2%; the late-mixed partial control adds roughly
+nine nanoseconds. Plain snapshots remain close to baseline. All ten warmed
+snapshot controls allocate zero times.
+
+The initial candidate scanned a uniform prefix twice when a difference appeared
+late in the row, causing a 37% regression in that control. It was replaced by a
+prefix fill followed by resolution of only the mixed remainder. Twenty shaping
+controls preserve raster checks and allocation counts; paired median changes
+range from roughly 2.4% faster to 0.8% slower. These controls support a snapshot
+storage improvement, not a broad shaping speedup. Validation passes 565 terminal
+tests, seventeen grid tests, two frontend snapshot tests, and the integration
+check including `libsugarloaf`. New checks cover frozen uniform values after
+style-ID reuse and hint-style expansion without losing the surrounding style.
+Five debug application replays also pass with compositor captures covering dense
+text, Unicode, cursor changes, palette navigation, and repeated tab selection.
+
 ## Retained artifacts
 
 `target/data-flow-implementation` contains the immutable before/after binaries,

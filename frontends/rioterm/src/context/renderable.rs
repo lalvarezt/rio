@@ -79,8 +79,8 @@ pub struct RenderableContent {
     /// Per-row resolved cell styles, index-parallel to `visible_rows`.
     /// Values, not ids: rows copied on earlier frames can't be
     /// retinted by later style-table mutations.
-    /// Empty inner vectors represent rows of default styles.
-    pub row_styles: Vec<Vec<rio_backend::crosswords::style::Style>>,
+    /// Uniform rows keep one value; mixed rows keep per-cell values.
+    pub row_styles: Vec<rio_backend::crosswords::snapshot::RowStyles>,
     /// Per-frame snapshot of extras (zero-width chars, hyperlinks,
     /// sixel/iterm graphics) actually referenced by visible cells —
     /// keyed by the cell's `extras_id`. Refreshed per-dirty-row by
@@ -291,7 +291,7 @@ mod pipeline_tests {
     /// painted mirror standing in for the GPU grid.
     struct Frame {
         visible_rows: Vec<Row<Square>>,
-        row_styles: Vec<Vec<rio_backend::crosswords::style::Style>>,
+        row_styles: Vec<rio_backend::crosswords::snapshot::RowStyles>,
         extras: rio_backend::crosswords::snapshot::SnapshotExtras,
         painted: Vec<String>,
     }

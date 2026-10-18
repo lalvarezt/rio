@@ -4179,7 +4179,7 @@ impl Screen<'_> {
                         rio_backend::crosswords::square::Square,
                     >,
                 >,
-                row_styles: Vec<Vec<rio_backend::crosswords::style::Style>>,
+                row_styles: Vec<rio_backend::crosswords::snapshot::RowStyles>,
                 /// Snapshot of the grid's extras table — needed to hash
                 /// per-cell zero-width combining codepoints into the run
                 /// shape key so cells with the same base codepoint but
@@ -4510,8 +4510,7 @@ impl Screen<'_> {
                         let Some(row) = p.visible_rows.get(y) else {
                             return;
                         };
-                        let row_styles =
-                            p.row_styles.get(y).map(Vec::as_slice).unwrap_or(&[]);
+                        let row_styles = &p.row_styles[y];
                         let row_sel = rio_grid::row_selection_for(
                             p.selection,
                             y,
@@ -4543,7 +4542,7 @@ impl Screen<'_> {
                                     Some((r, styles)) => {
                                         label_row = r;
                                         label_styles = styles;
-                                        (&label_row, label_styles.as_slice())
+                                        (&label_row, &label_styles)
                                     }
                                     None => (row, row_styles),
                                 }

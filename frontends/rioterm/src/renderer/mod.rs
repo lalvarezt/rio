@@ -1019,11 +1019,7 @@ impl Renderer {
             // discontinuity, etc.) we flush the run as one overlay and
             // start a new one. Mirrors `PlacementIterator.next`.
             let mut run: Option<(IncompletePlacement, usize)> = None;
-            let row_styles = rc
-                .row_styles
-                .get(line_idx)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
+            let row_styles = &rc.row_styles[line_idx];
 
             for (col_idx, square) in row.inner.iter().enumerate() {
                 if square.c() != PLACEHOLDER {
@@ -1046,7 +1042,7 @@ impl Renderer {
                     continue;
                 }
 
-                let style = rio_grid::resolve_style(row_styles, col_idx);
+                let style = row_styles.at(col_idx);
                 let combining: &[char] = square
                     .extras_id()
                     .and_then(|eid| rc.extras.get(&eid))
