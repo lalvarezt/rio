@@ -61,6 +61,50 @@ Validation passes 563 terminal tests, including last-reference removal and
 ID-reuse checks. Both frontend snapshot-convergence tests pass. Compilation
 checks pass for the terminal frontend, shared grid, and library frontend.
 
+## Native foreground uploads
+
+The Vulkan and Metal row writers now compare foreground bytes before
+invalidating buffers, matching the existing WebGPU behavior. Three alternating
+Linux Vulkan pairs reduce identical-row recording from 16.1 to 2.9 us at
+48 rows with one atlas, and from 131.7 to 3.1 us at 192 rows with two atlases.
+The median paired reductions span 82–98%. Other changed-row operations show
+no consistent improvement from this gate alone.
+
+A separately built Vulkan candidate gives cursor glyphs their own buffer per
+frame slot, preserving block-cursor, content, and overlay-cursor ordering.
+It shares buffer allocation/upload code with content instead of fixing an
+arbitrary cursor glyph capacity. Against the equality-gate candidate, cursor
+blink recording falls from 15.0 to 2.9 us at 48 rows with one atlas and from
+126.5 to 3.1 us at 192 rows with two atlases. Paired reductions span 81–98%.
+Unchanged recording adds about 20–35 ns in the median runs.
+
+The retained Vulkan layout stores row offsets while all content uses one
+atlas page. Same-length writes patch that staging range and union its dirty
+range independently for each GPU frame slot. A new buffer receives the full
+staging data. Length changes, atlas changes, resize, and atlas resets rebuild
+the packed layout and invalidate every slot. Mixed-atlas content keeps the
+existing grouped layout. Cursor and content buffers share allocation logic;
+redundant per-slot foreground live counts are removed.
+
+Against the separate-cursor candidate, a one-row edit falls from 15.1 to
+3.1 us at 48 rows and from 82.9 to 3.1 us at 192 rows with one atlas. Full
+same-atlas updates improve by 9–14% in paired medians. The 48-row variable-
+length case is 3.5% slower (roughly 0.8 us); the 192-row result is within
+noise. Mixed-atlas operations keep their full packing path. All 24 warmed
+recording cases allocate zero times.
+
+These probes rotate all three frame slots and measure CPU storage and Vulkan
+command recording. Zero-area glyphs isolate that work. They do not measure
+submitted GPU text rendering or establish whole-application speedups.
+
+A diagnostic build independently compares mapped GPU buffer contents against
+the current packed data after each slot catches up, compares the packed glyph
+multiset against source rows, and checks bucket coverage and atlas membership.
+Its 36 cases add atlas changes, cleared rows, and varying block/overlay cursor
+shapes to the timing fixtures. All checks pass. The native renderer library
+passes 119 tests; eight existing ignored tests remain ignored. Metal receives
+only the equality gate in this stage; no Metal runtime measurements are claimed.
+
 ## Retained artifacts
 
 `target/data-flow-implementation` contains the immutable before/after binaries,

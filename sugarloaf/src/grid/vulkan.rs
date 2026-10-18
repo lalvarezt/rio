@@ -5,6 +5,7 @@
 
 use ash::vk;
 use rustc_hash::FxHashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 use super::atlas::{AtlasSlot, GlyphKey, RasterizedGlyph};
@@ -60,6 +61,77 @@ struct TextBucket {
     page: u8,
     start: u32,
     count: u32,
+}
+
+#[derive(Default)]
+struct TextBuffer {
+    buffer: Option<VulkanBuffer>,
+    capacity: usize,
+}
+
+impl TextBuffer {
+    fn reserve(&mut self, ctx: &VulkanContext, needed: usize) -> bool {
+        if needed > self.capacity {
+            self.capacity = needed.next_power_of_two().max(64);
+            self.buffer = Some(ctx.allocate_host_visible_buffer(
+                (self.capacity * std::mem::size_of::<CellText>()) as u64,
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+            ));
+            return true;
+        }
+        false
+    }
+
+    fn upload(&mut self, ctx: &VulkanContext, parts: &[&[CellText]]) {
+        let needed = parts.iter().map(|part| part.len()).sum::<usize>();
+        self.reserve(ctx, needed);
+        if needed != 0 {
+            let mut dst = self.buffer.as_ref().unwrap().as_mut_ptr() as *mut CellText;
+            for part in parts {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(part.as_ptr(), dst, part.len());
+                    dst = dst.add(part.len());
+                }
+            }
+        }
+    }
+
+    fn upload_range(
+        &mut self,
+        ctx: &VulkanContext,
+        cells: &[CellText],
+        mut range: Range<usize>,
+    ) {
+        if self.reserve(ctx, cells.len()) {
+            range = 0..cells.len();
+        }
+        if !range.is_empty() {
+            unsafe {
+                let dst = self.buffer.as_ref().unwrap().as_mut_ptr() as *mut CellText;
+                std::ptr::copy_nonoverlapping(
+                    cells.as_ptr().add(range.start),
+                    dst.add(range.start),
+                    range.len(),
+                );
+            }
+        }
+    }
+}
+
+fn text_runs(cells: &[CellText], offset: u32) -> impl Iterator<Item = TextBucket> + '_ {
+    let mut start = offset;
+    cells
+        .chunk_by(|a, b| (a.atlas, a.page) == (b.atlas, b.page))
+        .map(move |run| {
+            let bucket = TextBucket {
+                kind: run[0].atlas,
+                page: run[0].page,
+                start,
+                count: run.len() as u32,
+            };
+            start += bucket.count;
+            bucket
+        })
 }
 
 /// One atlas page: backing image, slot allocator, per-page upload
@@ -633,11 +705,14 @@ pub struct VulkanGridRenderer {
     fg_rows: Vec<Vec<CellText>>,
     fg_staging: Vec<CellText>,
     fg_staging_dirty: bool,
+    /// Prefix offsets for a single-atlas layout. Atlas regrouping and row
+    /// length changes rebuild the layout; same-length edits patch one range.
+    fg_row_offsets: Vec<usize>,
     fg_bucket_scratch: Vec<((u8, u8), Vec<CellText>)>,
-    fg_buffers: [Option<VulkanBuffer>; FRAMES_IN_FLIGHT],
-    fg_capacity: [usize; FRAMES_IN_FLIGHT],
-    fg_live_count: [u32; FRAMES_IN_FLIGHT],
-    fg_dirty: [bool; FRAMES_IN_FLIGHT],
+    fg_buffers: [TextBuffer; FRAMES_IN_FLIGHT],
+    fg_dirty: [Option<Range<usize>>; FRAMES_IN_FLIGHT],
+    cursor_buffers: [TextBuffer; FRAMES_IN_FLIGHT],
+    cursor_dirty: [bool; FRAMES_IN_FLIGHT],
     /// Layout of the current CPU staging data. Each dirty GPU slot receives
     /// this same layout before drawing, so grouping happens once per edit.
     fg_buckets: Vec<TextBucket>,
@@ -775,11 +850,12 @@ impl VulkanGridRenderer {
             fg_rows: init_fg_rows(rows),
             fg_staging: Vec::new(),
             fg_staging_dirty: true,
+            fg_row_offsets: Vec::new(),
             fg_bucket_scratch: Vec::with_capacity(4),
-            fg_buffers: std::array::from_fn(|_| None),
-            fg_capacity: [0; FRAMES_IN_FLIGHT],
-            fg_live_count: [0; FRAMES_IN_FLIGHT],
-            fg_dirty: [true; FRAMES_IN_FLIGHT],
+            fg_buffers: std::array::from_fn(|_| TextBuffer::default()),
+            fg_dirty: std::array::from_fn(|_| None),
+            cursor_buffers: std::array::from_fn(|_| TextBuffer::default()),
+            cursor_dirty: [true; FRAMES_IN_FLIGHT],
             fg_buckets: Vec::new(),
             text_uniform_descriptor_set_layout,
             text_atlas_descriptor_set_layout,
@@ -846,25 +922,48 @@ impl VulkanGridRenderer {
 
         // Reset fg state — emit loop will re-populate after resize.
         self.fg_rows = init_fg_rows(rows);
-        self.fg_dirty = [true; FRAMES_IN_FLIGHT];
         self.fg_staging_dirty = true;
-        self.fg_live_count = [0; FRAMES_IN_FLIGHT];
+        self.cursor_dirty = [true; FRAMES_IN_FLIGHT];
         self.needs_full_rebuild = true;
     }
 
     pub fn write_row(&mut self, row: u32, bg: &[CellBg], fg: &[CellText]) {
-        // FG: stash in CPU per-row vec, mark all slots dirty.
-        let idx = (row as usize) + 1;
-        if let Some(slot) = self.fg_rows.get_mut(idx) {
-            slot.clear();
-            slot.extend_from_slice(fg);
-            self.fg_dirty = [true; FRAMES_IN_FLIGHT];
-            self.fg_staging_dirty = true;
-        }
-
         if row >= self.rows {
             return;
         }
+        // Identical row writes must not invalidate every frame-slot upload.
+        let idx = (row as usize) + 1;
+        if let Some(slot) = self.fg_rows.get_mut(idx) {
+            if bytemuck::cast_slice::<_, u8>(slot.as_slice()) != bytemuck::cast_slice(fg)
+            {
+                if !self.fg_staging_dirty
+                    && slot.len() == fg.len()
+                    && self.fg_row_offsets.len() == self.rows as usize + 1
+                    && self.fg_buckets.first().is_some_and(|bucket| {
+                        fg.iter().all(|cell| {
+                            (cell.atlas, cell.page) == (bucket.kind, bucket.page)
+                        })
+                    })
+                {
+                    let range = self.fg_row_offsets[row as usize]
+                        ..self.fg_row_offsets[row as usize + 1];
+                    self.fg_staging[range.clone()].copy_from_slice(fg);
+                    for dirty in &mut self.fg_dirty {
+                        *dirty = Some(match dirty.take() {
+                            Some(old) => {
+                                old.start.min(range.start)..old.end.max(range.end)
+                            }
+                            None => range.clone(),
+                        });
+                    }
+                } else {
+                    self.fg_staging_dirty = true;
+                }
+                slot.clear();
+                slot.extend_from_slice(fg);
+            }
+        }
+
         let row_start = (row as usize) * (self.cols as usize);
         let row_len = (self.cols as usize).min(bg.len());
         let cpu = &mut self.bg_cpu[row_start..row_start + self.cols as usize];
@@ -885,16 +984,15 @@ impl VulkanGridRenderer {
     }
 
     pub fn clear_row(&mut self, row: u32) {
+        if row >= self.rows {
+            return;
+        }
         let idx = (row as usize) + 1;
         if let Some(slot) = self.fg_rows.get_mut(idx) {
             if !slot.is_empty() {
-                self.fg_dirty = [true; FRAMES_IN_FLIGHT];
                 self.fg_staging_dirty = true;
             }
             slot.clear();
-        }
-        if row >= self.rows {
-            return;
         }
         let row_start = (row as usize) * (self.cols as usize);
         let cpu = &mut self.bg_cpu[row_start..row_start + self.cols as usize];
@@ -925,8 +1023,7 @@ impl VulkanGridRenderer {
             }
         }
         if changed {
-            self.fg_dirty = [true; FRAMES_IN_FLIGHT];
-            self.fg_staging_dirty = true;
+            self.cursor_dirty = [true; FRAMES_IN_FLIGHT];
         }
     }
 
@@ -946,8 +1043,8 @@ impl VulkanGridRenderer {
         self.atlas_grayscale.clear();
         self.atlas_color.clear();
         self.needs_full_rebuild = true;
-        self.fg_dirty = [true; FRAMES_IN_FLIGHT];
         self.fg_staging_dirty = true;
+        self.cursor_dirty = [true; FRAMES_IN_FLIGHT];
         self.bg_dirty = [true; FRAMES_IN_FLIGHT];
     }
 
@@ -964,7 +1061,7 @@ impl VulkanGridRenderer {
         }
         self.atlas_grayscale.clear();
         self.needs_full_rebuild = true;
-        self.fg_dirty = [true; FRAMES_IN_FLIGHT];
+        self.cursor_dirty = [true; FRAMES_IN_FLIGHT];
         self.fg_staging_dirty = true;
         self.atlas_grayscale.insert(key, glyph)
     }
@@ -979,7 +1076,7 @@ impl VulkanGridRenderer {
         }
         self.atlas_color.clear();
         self.needs_full_rebuild = true;
-        self.fg_dirty = [true; FRAMES_IN_FLIGHT];
+        self.cursor_dirty = [true; FRAMES_IN_FLIGHT];
         self.fg_staging_dirty = true;
         self.atlas_color.insert(key, glyph)
     }
@@ -1067,6 +1164,7 @@ impl VulkanGridRenderer {
     ) {
         debug_assert!(frame_slot < FRAMES_IN_FLIGHT);
         let slot = frame_slot;
+        let content_end = self.fg_rows.len() - 1;
 
         if self.fg_staging_dirty {
             // Bucket cells by (atlas_kind, page) before uploading.
@@ -1077,19 +1175,21 @@ impl VulkanGridRenderer {
             // the linear-search bucketing here is cheap.
             self.fg_staging.clear();
             self.fg_buckets.clear();
-            let first_key = self
-                .fg_rows
+            self.fg_row_offsets.clear();
+            let rows = &self.fg_rows[1..content_end];
+            let first_key = rows
                 .iter()
                 .find_map(|row| row.first())
                 .map(|cell| (cell.atlas, cell.page));
             if let Some((kind, page)) = first_key.filter(|&key| {
-                self.fg_rows
-                    .iter()
+                rows.iter()
                     .flatten()
                     .all(|cell| (cell.atlas, cell.page) == key)
             }) {
-                for row in &self.fg_rows {
+                self.fg_row_offsets.push(0);
+                for row in rows {
                     self.fg_staging.extend_from_slice(row);
+                    self.fg_row_offsets.push(self.fg_staging.len());
                 }
                 self.fg_buckets.push(TextBucket {
                     kind,
@@ -1100,7 +1200,7 @@ impl VulkanGridRenderer {
             } else {
                 let scratch = &mut self.fg_bucket_scratch;
                 let mut used = 0;
-                for row in &self.fg_rows {
+                for row in rows {
                     for cell in row {
                         let key = (cell.atlas, cell.page);
                         let bucket =
@@ -1132,32 +1232,21 @@ impl VulkanGridRenderer {
                     });
                 }
             }
+            for dirty in &mut self.fg_dirty {
+                *dirty = Some(0..self.fg_staging.len());
+            }
             self.fg_staging_dirty = false;
         }
-        if self.fg_dirty[slot] {
-            let needed = self.fg_staging.len();
-
-            if needed > self.fg_capacity[slot] {
-                let new_cap = needed.next_power_of_two().max(64);
-                self.fg_buffers[slot] = Some(ctx.allocate_host_visible_buffer(
-                    (new_cap * std::mem::size_of::<CellText>()) as u64,
-                    vk::BufferUsageFlags::VERTEX_BUFFER,
-                ));
-                self.fg_capacity[slot] = new_cap;
-            }
-
-            if needed > 0 {
-                let buf = self.fg_buffers[slot].as_ref().unwrap();
-                unsafe {
-                    let dst = buf.as_mut_ptr() as *mut CellText;
-                    std::ptr::copy_nonoverlapping(self.fg_staging.as_ptr(), dst, needed);
-                }
-            }
-            self.fg_live_count[slot] = needed as u32;
-            self.fg_dirty[slot] = false;
+        if let Some(range) = self.fg_dirty[slot].take() {
+            self.fg_buffers[slot].upload_range(ctx, &self.fg_staging, range);
         }
-
-        if self.fg_live_count[slot] == 0 {
+        let block = &self.fg_rows[0];
+        let non_block = &self.fg_rows[content_end];
+        if self.cursor_dirty[slot] {
+            self.cursor_buffers[slot].upload(ctx, &[block, non_block]);
+            self.cursor_dirty[slot] = false;
+        }
+        if self.fg_staging.is_empty() && block.is_empty() && non_block.is_empty() {
             return;
         }
 
@@ -1176,14 +1265,37 @@ impl VulkanGridRenderer {
                 &[self.text_uniform_descriptor_sets[slot]],
                 &[],
             );
-            let buf = self.fg_buffers[slot].as_ref().unwrap();
+        }
+        if !block.is_empty() {
+            self.draw_text(cmd, &self.cursor_buffers[slot], text_runs(block, 0));
+        }
+        if !self.fg_staging.is_empty() {
+            self.draw_text(cmd, &self.fg_buffers[slot], self.fg_buckets.iter().copied());
+        }
+        if !non_block.is_empty() {
+            self.draw_text(
+                cmd,
+                &self.cursor_buffers[slot],
+                text_runs(non_block, block.len() as u32),
+            );
+        }
+    }
+
+    fn draw_text(
+        &self,
+        cmd: vk::CommandBuffer,
+        buffer: &TextBuffer,
+        buckets: impl Iterator<Item = TextBucket>,
+    ) {
+        unsafe {
+            let buf = buffer.buffer.as_ref().unwrap();
             self.shared
                 .cmd_bind_vertex_buffers(cmd, 0, &[buf.handle()], &[0]);
 
             // One draw per `(kind, page)` bucket. Each draw binds
             // that page's descriptor set at slot 1 and pushes the
             // sampling-mode flag for the fragment shader.
-            for bucket in &self.fg_buckets {
+            for bucket in buckets {
                 let set = if bucket.kind == CellText::ATLAS_COLOR {
                     self.atlas_color.page_descriptor_set(bucket.page)
                 } else {

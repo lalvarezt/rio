@@ -546,9 +546,12 @@ impl MetalGridRenderer {
         // re-uploads when it becomes the active frame.
         let idx = (row as usize) + 1;
         if let Some(slot) = self.fg_rows.get_mut(idx) {
-            slot.clear();
-            slot.extend_from_slice(fg);
-            self.fg_dirty = [true; FRAMES_IN_FLIGHT];
+            if bytemuck::cast_slice::<_, u8>(slot.as_slice()) != bytemuck::cast_slice(fg)
+            {
+                slot.clear();
+                slot.extend_from_slice(fg);
+                self.fg_dirty = [true; FRAMES_IN_FLIGHT];
+            }
         }
 
         if row >= self.rows {
