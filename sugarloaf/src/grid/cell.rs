@@ -179,6 +179,11 @@ impl GridUniforms {
     pub const PADDING_EXTEND_RIGHT: u32 = 1 << 1;
     pub const PADDING_EXTEND_UP: u32 = 1 << 2;
     pub const PADDING_EXTEND_DOWN: u32 = 1 << 3;
+
+    /// Continue side backgrounds without making top/bottom status rows taller.
+    /// Vertical padding and fractional rows retain the window backdrop.
+    pub const PADDING_EXTEND_HORIZONTAL: u32 =
+        Self::PADDING_EXTEND_LEFT | Self::PADDING_EXTEND_RIGHT;
 }
 
 const _: () = {

@@ -1,9 +1,11 @@
 use super::*;
 use wgpu::util::DeviceExt;
 
-#[test]
-#[ignore = "requires a graphics adapter; run explicitly with --ignored"]
-fn rounded_panel_extends_edge_cells_without_painting_neighbors() {
+fn render_panel_background(
+    uniforms: crate::grid::GridUniforms,
+    cells: &[u8],
+    clear: wgpu::Color,
+) -> Vec<u8> {
     let instance =
         wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter =
@@ -42,14 +44,6 @@ fn rounded_panel_extends_edge_cells_without_painting_neighbors() {
         multiview_mask: None,
         cache: None,
     });
-    let mut uniforms: crate::grid::GridUniforms = bytemuck::Zeroable::zeroed();
-    uniforms.grid_padding = [16.0, 0.0, 0.0, 16.0];
-    uniforms.grid_size = [2, 2];
-    uniforms.cell_size = [16.0; 2];
-    uniforms.padding_extend = 15;
-    uniforms.input_colorspace = 1;
-    uniforms.panel_rect = [8.0, 8.0, 48.0, 48.0];
-    uniforms.panel_radius = 8.0;
     let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: None,
         contents: bytemuck::bytes_of(&uniforms),
@@ -57,7 +51,7 @@ fn rounded_panel_extends_edge_cells_without_painting_neighbors() {
     });
     let cells = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: None,
-        contents: &[40, 190, 70, 128].repeat(4),
+        contents: cells,
         usage: wgpu::BufferUsages::STORAGE,
     });
     let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -105,7 +99,7 @@ fn rounded_panel_extends_edge_cells_without_painting_neighbors() {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    load: wgpu::LoadOp::Clear(clear),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -135,6 +129,74 @@ fn rounded_panel_extends_edge_cells_without_painting_neighbors() {
     slice.map_async(wgpu::MapMode::Read, |result| result.unwrap());
     device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
     let pixels = slice.get_mapped_range().unwrap();
+    pixels.to_vec()
+}
+
+fn panel_uniforms() -> crate::grid::GridUniforms {
+    let mut uniforms: crate::grid::GridUniforms = bytemuck::Zeroable::zeroed();
+    uniforms.grid_padding = [16.0, 0.0, 0.0, 16.0];
+    uniforms.grid_size = [2, 2];
+    uniforms.cell_size = [16.0; 2];
+    uniforms.padding_extend = crate::grid::GridUniforms::PADDING_EXTEND_HORIZONTAL;
+    uniforms.input_colorspace = 1;
+    uniforms.panel_rect = [8.0, 8.0, 48.0, 48.0];
+    uniforms.panel_radius = 8.0;
+    uniforms
+}
+
+#[test]
+#[ignore = "requires a graphics adapter; run explicitly with --ignored"]
+fn status_line_background_does_not_stretch_into_bottom_padding() {
+    let mut cells = [40, 190, 70, 255].repeat(2);
+    cells.extend([200, 40, 30, 255].repeat(2));
+    // The shorter cells leave six extra pixels after the last complete row,
+    // in addition to the pane's configured eight-pixel bottom padding.
+    for cell_height in [16, 13] {
+        let mut uniforms = panel_uniforms();
+        uniforms.cell_size[1] = cell_height as f32;
+        let pixels = render_panel_background(
+            uniforms,
+            &cells,
+            wgpu::Color {
+                r: 10.0 / 255.0,
+                g: 20.0 / 255.0,
+                b: 30.0 / 255.0,
+                a: 1.0,
+            },
+        );
+        let status_top = 16 + cell_height;
+        let status_bottom = status_top + cell_height;
+        for y in status_top..status_bottom {
+            let offset = (y * 64 + 32) * 4;
+            assert_eq!(
+                &pixels[offset..offset + 4],
+                &[200, 40, 30, 255],
+                "status row height={cell_height} y={y}"
+            );
+        }
+        for y in (8..16).chain(status_bottom..55) {
+            let offset = (y * 64 + 32) * 4;
+            assert_eq!(
+                &pixels[offset..offset + 4],
+                &[10, 20, 30, 255],
+                "padding height={cell_height} y={y}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a graphics adapter; run explicitly with --ignored"]
+fn rounded_panel_extends_edge_cells_without_painting_neighbors() {
+    let mut uniforms = panel_uniforms();
+    // Explicit extension remains supported for renderers that request it.
+    uniforms.padding_extend |= crate::grid::GridUniforms::PADDING_EXTEND_UP
+        | crate::grid::GridUniforms::PADDING_EXTEND_DOWN;
+    let pixels = render_panel_background(
+        uniforms,
+        &[40, 190, 70, 128].repeat(4),
+        wgpu::Color::TRANSPARENT,
+    );
     for (x, y) in [(0, 32), (63, 32), (8, 8), (55, 55)] {
         let offset = (y * 64 + x) * 4;
         assert_eq!(
