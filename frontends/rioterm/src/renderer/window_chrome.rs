@@ -13,6 +13,8 @@ const GLYPH_SIZE: f32 = 10.0;
 const CLOSE_HOVER: [f32; 4] = [196.0 / 255.0, 43.0 / 255.0, 28.0 / 255.0, 1.0];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Other platforms keep their native caption controls.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub enum HeaderAction {
     Minimize,
     Maximize,

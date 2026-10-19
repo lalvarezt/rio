@@ -586,7 +586,9 @@ impl Screen<'_> {
         let was_focused = self.renderer.is_window_focused;
         self.renderer = Renderer::new(config);
         self.renderer.is_window_focused = was_focused;
-        if let Some(mut island) = old_island {
+        // Preserve motion only while tabs remain enabled; restoring a disabled
+        // strip would disagree with the new terminal margins and hit targets.
+        if let Some(mut island) = old_island.filter(|_| config.navigation.is_enabled()) {
             island.update_colors(&config.colors);
             island.configure(&config.navigation);
             self.renderer.island = Some(island);
@@ -2981,44 +2983,40 @@ impl Screen<'_> {
         let num_tabs = self.context_manager.len();
         let scale_factor = self.sugarloaf.scale_factor();
 
-        {
-            let pointer = (self.renderer.navigation.island_visible(num_tabs)
-                && mouse_y >= 0.0
-                && mouse_y <= (self.chrome_height() * scale_factor) as f64)
-                .then_some([
-                    mouse_x as f32 / scale_factor,
-                    mouse_y as f32 / scale_factor,
-                ]);
-            let changed = self
-                .renderer
-                .island
-                .as_mut()
-                .is_some_and(|island| island.set_tab_hover(pointer));
-            if changed {
-                self.mark_dirty();
-            }
-            changed
+        let pointer = (self.renderer.navigation.island_visible(num_tabs)
+            && mouse_y >= 0.0
+            && mouse_y <= (self.chrome_height() * scale_factor) as f64)
+            .then_some([
+                mouse_x as f32 / scale_factor,
+                mouse_y as f32 / scale_factor,
+            ]);
+        let changed = self
+            .renderer
+            .island
+            .as_mut()
+            .is_some_and(|island| island.set_tab_hover(pointer));
+        if changed {
+            self.mark_dirty();
         }
+        changed
     }
 
     #[inline]
     pub fn clear_close_button_hover(&mut self) -> bool {
-        {
-            let header_changed = self
-                .renderer
-                .island
-                .as_mut()
-                .is_some_and(|island| island.window_header.clear_hover());
-            let tab_changed = self
-                .renderer
-                .island
-                .as_mut()
-                .is_some_and(|island| island.set_tab_hover(None));
-            if tab_changed || header_changed {
-                self.mark_dirty();
-            }
-            return tab_changed || header_changed;
+        let header_changed = self
+            .renderer
+            .island
+            .as_mut()
+            .is_some_and(|island| island.window_header.clear_hover());
+        let tab_changed = self
+            .renderer
+            .island
+            .as_mut()
+            .is_some_and(|island| island.set_tab_hover(None));
+        if tab_changed || header_changed {
+            self.mark_dirty();
         }
+        tab_changed || header_changed
     }
 
     pub fn handle_island_click(

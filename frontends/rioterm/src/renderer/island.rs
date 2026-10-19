@@ -210,8 +210,7 @@ fn tab_fills(bg: [f32; 4]) -> IslandFills {
 
 fn draw_tab_icon(
     sugarloaf: &mut Sugarloaf,
-    x: f32,
-    cy: f32,
+    [x, cy]: [f32; 2],
     color: [f32; 4],
     order: u8,
     icon: super::app_icons::Icon,
@@ -579,6 +578,7 @@ impl Island {
         &mut self,
         navigation: &rio_backend::config::navigation::Navigation,
     ) {
+        self.hide_if_single = navigation.hide_if_single;
         self.animation = navigation.animation;
         self.tabs.appearance = TabAppearance {
             geometry: navigation.tab_geometry(),
@@ -596,14 +596,12 @@ impl Island {
         self.tab_status_width = rio_backend::config::navigation::clamp_tab_status_width(
             navigation.tab_status_width,
         );
-        {
-            self.app_icons.configure(&navigation.app_icons);
-            self.tabs.invalidate_measurements();
-            self.tab_glass_intensity =
-                rio_backend::config::navigation::clamp_tab_glass_intensity(
-                    navigation.tab_glass_intensity,
-                );
-        }
+        self.app_icons.configure(&navigation.app_icons);
+        self.tabs.invalidate_measurements();
+        self.tab_glass_intensity =
+            rio_backend::config::navigation::clamp_tab_glass_intensity(
+                navigation.tab_glass_intensity,
+            );
     }
 
     pub fn shows_close_button(&self, count: usize) -> bool {
@@ -664,8 +662,7 @@ impl Island {
         if tab.remote {
             draw_tab_icon(
                 sugarloaf,
-                x,
-                self.tabs.appearance.center_y(),
+                [x, self.tabs.appearance.center_y()],
                 color,
                 order,
                 super::app_icons::SSH_ICON,
@@ -676,8 +673,7 @@ impl Island {
         }
         draw_tab_icon(
             sugarloaf,
-            x,
-            self.tabs.appearance.center_y(),
+            [x, self.tabs.appearance.center_y()],
             color,
             order,
             tab.icon,
@@ -686,9 +682,8 @@ impl Island {
         );
     }
 
-    /// Set whether the cursor hovers the active island's close button.
+    /// Update the pointer used for tab and close-button hover.
     /// Returns true when the state changed (the caller redraws).
-
     pub fn set_tab_hover(&mut self, pointer: Option<[f32; 2]>) -> bool {
         let changed =
             self.tabs.pointer_target(self.pointer) != self.tabs.pointer_target(pointer);
@@ -794,7 +789,7 @@ impl Island {
         if tab_index == context_manager.current_index() {
             self.program_status.clone()
         } else {
-            return context_manager.program_status_for_tab(tab_index);
+            context_manager.program_status_for_tab(tab_index)
         }
     }
 
@@ -1545,6 +1540,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn configure_updates_single_tab_visibility() {
+        let mut island = test_island();
+        let mut navigation = rio_backend::config::navigation::Navigation::default();
+        for hidden in [true, false] {
+            navigation.hide_if_single = hidden;
+            island.configure(&navigation);
+            assert_eq!(island.hide_if_single, hidden);
+        }
+    }
+
+    #[test]
     fn island_geometry_invariants() {
         use rio_backend::config::navigation::{Navigation, NavigationMode};
 
@@ -1790,10 +1796,12 @@ mod tests {
             .and_then(|r| island.status_color(r))
             .is_some());
         assert!(island.progress_state.is_none());
-        let mut colors = Colors::default();
-        colors.green = [0.1, 0.8, 0.4, 1.0];
-        colors.yellow = [0.9, 0.8, 0.2, 1.0];
-        colors.red = [0.9, 0.2, 0.3, 1.0];
+        let colors = Colors {
+            green: [0.1, 0.8, 0.4, 1.0],
+            yellow: [0.9, 0.8, 0.2, 1.0],
+            red: [0.9, 0.2, 0.3, 1.0],
+            ..Colors::default()
+        };
         island.update_colors(&colors);
         let rim = island
             .status_rim(island.program_status.as_ref(), 1.0)

@@ -1741,14 +1741,12 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 route.window.screen.mouse.y = y;
                 route.window.screen.mouse.raw_y = position.y;
 
-                {
-                    if route.window.screen.update_header_hover(x, y) {
-                        route.request_overlay_redraw();
-                    }
-                    if route.window.screen.header_action().is_some() {
-                        route.window.winit_window.set_cursor(CursorIcon::Default);
-                        return;
-                    }
+                if route.window.screen.update_header_hover(x, y) {
+                    route.request_overlay_redraw();
+                }
+                if route.window.screen.header_action().is_some() {
+                    route.window.winit_window.set_cursor(CursorIcon::Default);
+                    return;
                 }
 
                 if route.path != RoutePath::Terminal
