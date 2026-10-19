@@ -250,6 +250,40 @@
     "width": 1440,
     "height": 900
   },
+  "native_screen_retry": {
+    "checked_at_utc": "2026-10-19T11:53:33.883Z",
+    "method": "BitBlt",
+    "foreground_verified": true,
+    "adapter_unchanged": "DX12 / Microsoft Basic Render Driver / Cpu",
+    "alpha_modes": [
+      "Opaque"
+    ],
+    "timings_repeated": false,
+    "cases": [
+      [
+        "dx12",
+        "opaque",
+        39799
+      ],
+      [
+        "dx12",
+        "blur",
+        39799
+      ],
+      [
+        "auto",
+        "opaque",
+        39799
+      ],
+      [
+        "auto",
+        "blur",
+        39799
+      ]
+    ],
+    "raw_archive": "target/backend-selection-20261019/retry-visible.zip",
+    "raw_archive_sha256": "20f495ab9178b8405ec0971c631cbcfbbb91e609af257390066a5f662baccd66"
+  },
   "configuration_changed": false,
   "production_source_changed": false
 }

@@ -88,6 +88,16 @@ after timing; foreground activation and desktop `BitBlt` capture were unavailabl
 The DX12 image was also inspected directly. These checks validate rendered window
 content, not RDP delivery cadence, foreground behavior, or desktop transparency.
 
+A later retry on 2026-10-19 confirmed foreground activation and direct desktop
+`BitBlt` capture for explicit DX12 and automatic selection, with opaque and
+requested-blur configurations. All four checks contained visible terminal glyphs;
+the DX12 screen capture was inspected directly. Both paths still selected the
+Microsoft Basic Render Driver CPU adapter with only opaque composition support.
+The retry collected no additional timing measurements. Its images, logs, and
+checks are in `target/backend-selection-20261019/retry-visible.zip` on Linux and
+`E:\rio-backend-setup\retry-visible.zip` on Windows; the machine-readable results
+record the archive hash. The temporary retry task and processes were removed.
+
 [Machine-readable results](windows-vm-renderer-selection.json) record the medians,
 paired startup savings, adapter identities, and capture checks. Raw profiles,
 configs, drivers, images, and the executable remain in
