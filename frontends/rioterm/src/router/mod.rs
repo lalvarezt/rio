@@ -819,7 +819,7 @@ impl<'a> RouteWindow<'a> {
                 config.window.columns,
                 config.window.rows,
                 &config.panel(),
-                &screen.ctx().current().dimension,
+                &screen.ctx().current_grid().grid_dimension(),
                 winit_window.inner_size(),
             );
             let _ = winit_window.request_inner_size(PhysicalSize {

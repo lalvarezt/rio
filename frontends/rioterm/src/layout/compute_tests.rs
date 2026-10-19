@@ -1,6 +1,37 @@
 use super::*;
 
 #[test]
+fn new_tabs_keep_window_size_after_padded_layout() {
+    use crate::context::ContextManager;
+    use rio_backend::event::{VoidListener, WindowId};
+
+    let mut manager =
+        ContextManager::start_with_capacity(4, VoidListener {}, WindowId::from(0))
+            .unwrap();
+    let grid = manager.current_grid_mut();
+    grid.width = 1200.0;
+    grid.height = 800.0;
+    grid.try_update_size(grid.width, grid.height).unwrap();
+    grid.calculate_positions();
+    let expected_bounds = grid.current_item().unwrap().layout_rect;
+    // Model the applied pane layout: terminal dimensions describe its padded
+    // content viewport, while the grid retains the complete window dimensions.
+    grid.current_mut().dimension.margin = Margin::all(0.0);
+    grid.current_mut().dimension.update_width(expected_bounds[2]);
+    grid.current_mut().dimension.update_height(expected_bounds[3]);
+
+    for count in 2..=4 {
+        manager.add_context(true, 0);
+        assert_eq!(manager.len(), count);
+        let grid = manager.current_grid();
+        assert_eq!([grid.width, grid.height], [1200.0, 800.0]);
+        assert_eq!(grid.current_item().unwrap().layout_rect, expected_bounds);
+        assert_eq!(grid.current().dimension.width, expected_bounds[2]);
+        assert_eq!(grid.current().dimension.height, expected_bounds[3]);
+    }
+}
+
+#[test]
 fn hide_single_frame_keeps_split_frames_and_pane_geometry() {
     use crate::context::{create_dead_context, ContextManager};
     use rio_backend::event::{VoidListener, WindowId};

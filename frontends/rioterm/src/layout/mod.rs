@@ -215,6 +215,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             root_node,
         };
         grid.calculate_positions();
+        grid.update_context_dimensions();
         grid
     }
 
@@ -854,6 +855,11 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             return false;
         }
 
+        self.update_context_dimensions();
+        true
+    }
+
+    fn update_context_dimensions(&mut self) {
         for item in self.inner.values_mut() {
             let [_, _, width, height] = item.layout_rect;
 
@@ -876,7 +882,6 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             // that. Mark it dirty so an idle terminal still presents.
             item.val.renderable_content.pending_update.set_dirty();
         }
-        true
     }
 
     #[inline]
