@@ -38,101 +38,6 @@ const ATLAS_MAX_SIZE: u16 = 4096;
 /// cells. Matches the Metal layout in `metal::init_fg_rows`.
 const CURSOR_ROW_SLOTS: usize = 2;
 
-#[cfg(test)]
-mod panel_tests {
-    use super::*;
-    use bytemuck::Zeroable;
-
-    #[test]
-    fn terminal_background_stays_out_of_all_padding_and_margins() {
-        let mut grid = CpuGridRenderer::new(2, 2);
-        let red = CellBg {
-            rgba: [200, 40, 30, 255],
-        };
-        grid.write_row(0, &[red; 2], &[]);
-        grid.write_row(1, &[red; 2], &[]);
-        for radius in [0.0, 8.0] {
-            let uniforms = GridUniforms {
-                grid_padding: [18.0, 0.0, 0.0, 21.0],
-                cell_size: [13.0, 11.0],
-                grid_size: [2; 2],
-                padding_extend: GridUniforms::PADDING_EXTEND_NONE,
-                panel_rect: [8.0, 8.0, 48.0, 48.0],
-                panel_radius: radius,
-                ..GridUniforms::zeroed()
-            };
-            let clear = 0x000a141e;
-            let mut pixels = vec![clear; 64 * 64];
-            grid.render_bg(&mut pixels, 64, 64, &uniforms);
-            for y in 0..64 {
-                for x in 0..64 {
-                    let expected = if (21..47).contains(&x) && (18..40).contains(&y) {
-                        0x00c8281e
-                    } else {
-                        clear
-                    };
-                    assert_eq!(
-                        pixels[y * 64 + x] & 0x00ffffff,
-                        expected,
-                        "radius={radius} x={x} y={y}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn backgrounds_respect_panel_padding_corners_and_cursor_bounds() {
-        let mut grid = CpuGridRenderer::new(2, 2);
-        let red = CellBg {
-            rgba: [200, 40, 30, 255],
-        };
-        grid.write_row(0, &[red; 2], &[]);
-        grid.write_row(1, &[red; 2], &[]);
-        let uniforms = GridUniforms {
-            grid_padding: [16.0, 0.0, 0.0, 16.0],
-            cell_size: [16.0; 2],
-            grid_size: [2; 2],
-            padding_extend: GridUniforms::PADDING_EXTEND_LEFT
-                | GridUniforms::PADDING_EXTEND_RIGHT,
-            panel_rect: [8.0, 8.0, 48.0, 48.0],
-            panel_radius: 20.0,
-            cursor_pos: [0, 0],
-            cursor_bg_color: [0.0, 1.0, 0.0, 1.0],
-            ..GridUniforms::zeroed()
-        };
-        let clear = 0x000a141e;
-        let mut pixels = vec![clear; 64 * 64];
-        grid.render_bg(&mut pixels, 64, 64, &uniforms);
-        let pixel = |x: usize, y: usize| pixels[y * 64 + x] & 0x00ffffff;
-        assert_eq!(pixel(8, 32), 0x00c8281e, "edge color fills side padding");
-        assert_eq!(pixel(8, 16), clear, "rounded corner stays outside the pane");
-        assert_eq!(pixel(16, 20), 0x0000ff00, "cursor fills its cell");
-        assert_eq!(
-            pixel(10, 20),
-            0x00c8281e,
-            "cursor does not extend into padding"
-        );
-        assert_eq!(pixel(32, 12), clear, "top padding retains the backdrop");
-        assert_eq!(pixel(32, 50), clear, "bottom padding retains the backdrop");
-        assert_eq!(pixel(4, 32), clear, "neighboring panes stay untouched");
-
-        let mut uniforms = uniforms;
-        uniforms.cursor_bg_color[3] = 0.5;
-        pixels.fill(clear);
-        grid.render_bg(&mut pixels, 64, 64, &uniforms);
-        let cursor_on_color = pixels[20 * 64 + 16];
-        grid.write_row(0, &[CellBg::TRANSPARENT; 2], &[]);
-        pixels.fill(clear);
-        grid.render_bg(&mut pixels, 64, 64, &uniforms);
-        assert_eq!(
-            pixels[20 * 64 + 16],
-            cursor_on_color,
-            "translucent cursor replaces the original background"
-        );
-    }
-}
-
 /// CPU-side glyph atlas. R8 for grayscale masks, RGBA8 premultiplied
 /// for color emoji. Uses the same shelf allocator as the GPU atlases
 /// so `AtlasSlot` coords round-trip.
@@ -883,5 +788,100 @@ fn blit_color(
             let idx = buf_row + (dst_x as usize);
             buf[idx] = blend_over(src, buf[idx]);
         }
+    }
+}
+
+#[cfg(test)]
+mod panel_tests {
+    use super::*;
+    use bytemuck::Zeroable;
+
+    #[test]
+    fn terminal_background_stays_out_of_all_padding_and_margins() {
+        let mut grid = CpuGridRenderer::new(2, 2);
+        let red = CellBg {
+            rgba: [200, 40, 30, 255],
+        };
+        grid.write_row(0, &[red; 2], &[]);
+        grid.write_row(1, &[red; 2], &[]);
+        for radius in [0.0, 8.0] {
+            let uniforms = GridUniforms {
+                grid_padding: [18.0, 0.0, 0.0, 21.0],
+                cell_size: [13.0, 11.0],
+                grid_size: [2; 2],
+                padding_extend: GridUniforms::PADDING_EXTEND_NONE,
+                panel_rect: [8.0, 8.0, 48.0, 48.0],
+                panel_radius: radius,
+                ..GridUniforms::zeroed()
+            };
+            let clear = 0x000a141e;
+            let mut pixels = vec![clear; 64 * 64];
+            grid.render_bg(&mut pixels, 64, 64, &uniforms);
+            for y in 0..64 {
+                for x in 0..64 {
+                    let expected = if (21..47).contains(&x) && (18..40).contains(&y) {
+                        0x00c8281e
+                    } else {
+                        clear
+                    };
+                    assert_eq!(
+                        pixels[y * 64 + x] & 0x00ffffff,
+                        expected,
+                        "radius={radius} x={x} y={y}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn backgrounds_respect_panel_padding_corners_and_cursor_bounds() {
+        let mut grid = CpuGridRenderer::new(2, 2);
+        let red = CellBg {
+            rgba: [200, 40, 30, 255],
+        };
+        grid.write_row(0, &[red; 2], &[]);
+        grid.write_row(1, &[red; 2], &[]);
+        let uniforms = GridUniforms {
+            grid_padding: [16.0, 0.0, 0.0, 16.0],
+            cell_size: [16.0; 2],
+            grid_size: [2; 2],
+            padding_extend: GridUniforms::PADDING_EXTEND_LEFT
+                | GridUniforms::PADDING_EXTEND_RIGHT,
+            panel_rect: [8.0, 8.0, 48.0, 48.0],
+            panel_radius: 20.0,
+            cursor_pos: [0, 0],
+            cursor_bg_color: [0.0, 1.0, 0.0, 1.0],
+            ..GridUniforms::zeroed()
+        };
+        let clear = 0x000a141e;
+        let mut pixels = vec![clear; 64 * 64];
+        grid.render_bg(&mut pixels, 64, 64, &uniforms);
+        let pixel = |x: usize, y: usize| pixels[y * 64 + x] & 0x00ffffff;
+        assert_eq!(pixel(8, 32), 0x00c8281e, "edge color fills side padding");
+        assert_eq!(pixel(8, 16), clear, "rounded corner stays outside the pane");
+        assert_eq!(pixel(16, 20), 0x0000ff00, "cursor fills its cell");
+        assert_eq!(
+            pixel(10, 20),
+            0x00c8281e,
+            "cursor does not extend into padding"
+        );
+        assert_eq!(pixel(32, 12), clear, "top padding retains the backdrop");
+        assert_eq!(pixel(32, 50), clear, "bottom padding retains the backdrop");
+        assert_eq!(pixel(4, 32), clear, "neighboring panes stay untouched");
+
+        let mut uniforms = uniforms;
+        uniforms.cursor_bg_color[3] = 0.5;
+        pixels.fill(clear);
+        grid.render_bg(&mut pixels, 64, 64, &uniforms);
+        let cursor_on_color = pixels[20 * 64 + 16];
+        grid.write_row(0, &[CellBg::TRANSPARENT; 2], &[]);
+        pixels.fill(clear);
+        grid.render_bg(&mut pixels, 64, 64, &uniforms);
+        assert_eq!(
+            pixels[20 * 64 + 16],
+            cursor_on_color,
+            "translucent cursor replaces the original background"
+        );
     }
 }

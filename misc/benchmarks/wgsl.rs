@@ -44,8 +44,7 @@ fn main() {
         .join("sugarloaf/src/grid/shaders/grid.wgsl"),
     )
     .unwrap();
-    let optimized =
-        std::fs::read_to_string("sugarloaf/src/grid/shaders/grid.wgsl").unwrap();
+    let optimized = include_str!("../../sugarloaf/src/grid/shaders/grid.wgsl");
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: None,
         entries: &[0, 1].map(|binding| wgpu::BindGroupLayoutEntry {
@@ -69,7 +68,7 @@ fn main() {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-    let pipelines: Vec<_> = [source, optimized]
+    let pipelines: Vec<_> = [source.as_str(), optimized]
         .iter()
         .map(|source| {
             let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -141,170 +140,164 @@ fn main() {
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    for colorspace in 0..3u32 {
-        for case in [
-            "sparse",
-            "opaque",
-            "cursor",
-            "transparent-rgb",
-            "mixed",
-            "faint",
-            "cursor-half",
-        ] {
-            let name = format!("wgsl/background/{case}/{colorspace}");
-            if std::env::var("RIO_BENCH_FILTER")
-                .is_ok_and(|filter| !name.contains(&filter))
-            {
-                continue;
-            }
-            let mut cells = vec![0u32; 160 * 48];
-            match case {
-                "sparse" => {
-                    for row in 0..48 {
-                        cells[row * 160] = 0xa0c86428;
-                    }
+    // Only Display P3 input is output-equivalent: upstream converted other
+    // gamuts despite wgpu's drawable-encoded UI. Pixel tests cover that correction.
+    let colorspace = 1;
+    for case in [
+        "sparse",
+        "opaque",
+        "cursor",
+        "transparent-rgb",
+        "mixed",
+        "faint",
+        "cursor-half",
+    ] {
+        let name = format!("wgsl/background/{case}/{colorspace}");
+        if std::env::var("RIO_BENCH_FILTER").is_ok_and(|filter| !name.contains(&filter)) {
+            continue;
+        }
+        let mut cells = vec![0u32; 160 * 48];
+        match case {
+            "sparse" => {
+                for row in 0..48 {
+                    cells[row * 160] = 0xa0c86428;
                 }
-                "opaque" => cells.fill(0xffc86428),
-                "transparent-rgb" => cells.fill(0x00c86428),
-                "mixed" => {
-                    for (i, cell) in cells.iter_mut().enumerate() {
-                        *cell = if i % 2 == 0 { 0xa0c86428 } else { 0x00ff2301 };
-                    }
-                }
-                "faint" => cells.fill(0x01c86428),
-                _ => (),
             }
-            let mut uniforms = [0u32; 40];
-            uniforms[28] = 9.6f32.to_bits();
-            uniforms[29] = 20f32.to_bits();
-            uniforms[30] = 160;
-            uniforms[31] = 48;
-            uniforms[32] = 4;
-            uniforms[33] = 4;
-            uniforms[39] = colorspace;
-            if case.starts_with("cursor") {
-                for (i, c) in [
-                    0.8f32,
-                    0.5,
-                    0.3,
-                    if case == "cursor-half" { 0.25 } else { 1.0 },
-                ]
+            "opaque" => cells.fill(0xffc86428),
+            "transparent-rgb" => cells.fill(0x00c86428),
+            "mixed" => {
+                for (i, cell) in cells.iter_mut().enumerate() {
+                    *cell = if i % 2 == 0 { 0xa0c86428 } else { 0x00ff2301 };
+                }
+            }
+            "faint" => cells.fill(0x01c86428),
+            _ => (),
+        }
+        // The baseline reads the shared prefix; the candidate also needs
+        // pane bounds. Use the production ABI instead of a fixed byte count.
+        let mut uniforms = sugarloaf::grid::GridUniforms {
+            cell_size: [9.6, 20.0],
+            grid_size: [160, 48],
+            cursor_pos: [4, 4],
+            input_colorspace: colorspace,
+            ..bytemuck::Zeroable::zeroed()
+        };
+        if case.starts_with("cursor") {
+            uniforms.cursor_bg_color = [
+                0.8f32,
+                0.5,
+                0.3,
+                if case == "cursor-half" { 0.25 } else { 1.0 },
+            ];
+        }
+        let bytes = |values: &[u32]| {
+            values
                 .iter()
-                .enumerate()
+                .flat_map(|x| x.to_ne_bytes())
+                .collect::<Vec<_>>()
+        };
+        let ub = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::bytes_of(&uniforms),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let cb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: &bytes(&cells),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ub.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: cb.as_entire_binding(),
+                },
+            ],
+        });
+        let mut expected = None;
+        for repeat in 0..40 {
+            for variant in if repeat % 2 == 0 { [0, 1] } else { [1, 0] } {
+                let mut encoder = device.create_command_encoder(&Default::default());
                 {
-                    uniforms[24 + i] = c.to_bits();
-                }
-            }
-            let bytes = |values: &[u32]| {
-                values
-                    .iter()
-                    .flat_map(|x| x.to_ne_bytes())
-                    .collect::<Vec<_>>()
-            };
-            let ub = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: &bytes(&uniforms),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-            let cb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: &bytes(&cells),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: ub.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: cb.as_entire_binding(),
-                    },
-                ],
-            });
-            let mut expected = None;
-            for repeat in 0..40 {
-                for variant in if repeat % 2 == 0 { [0, 1] } else { [1, 0] } {
-                    let mut encoder = device.create_command_encoder(&Default::default());
-                    {
-                        let attachments = [Some(wgpu::RenderPassColorAttachment {
-                            view: &view,
-                            depth_slice: None,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color {
-                                    r: 0.1,
-                                    g: 0.1,
-                                    b: 0.15,
-                                    a: 1.0,
-                                }),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })];
-                        let mut pass =
-                            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: None,
-                                color_attachments: &attachments,
-                                depth_stencil_attachment: None,
-                                timestamp_writes: Some(wgpu::RenderPassTimestampWrites {
-                                    query_set: &query,
-                                    beginning_of_pass_write_index: Some(0),
-                                    end_of_pass_write_index: Some(1),
-                                }),
-                                occlusion_query_set: None,
-                                multiview_mask: None,
-                            });
-                        pass.set_pipeline(&pipelines[variant]);
-                        pass.set_bind_group(0, &group, &[]);
-                        for _ in 0..16 {
-                            pass.draw(0..3, 0..1);
-                        }
-                    }
-                    encoder.resolve_query_set(&query, 0..2, &resolve, 0);
-                    encoder.copy_buffer_to_buffer(&resolve, 0, &timing, 0, 16);
-                    if repeat == 0 {
-                        encoder.copy_texture_to_buffer(
-                            texture.as_image_copy(),
-                            wgpu::TexelCopyBufferInfo {
-                                buffer: &pixels,
-                                layout: wgpu::TexelCopyBufferLayout {
-                                    offset: 0,
-                                    bytes_per_row: Some(1536 * 4),
-                                    rows_per_image: None,
-                                },
-                            },
-                            texture.size(),
-                        );
-                    }
-                    queue.submit([encoder.finish()]);
-                    let data = read(&device, &timing);
-                    let start = u64::from_ne_bytes(data[..8].try_into().unwrap());
-                    let end = u64::from_ne_bytes(data[8..].try_into().unwrap());
-                    if repeat == 0 {
-                        let data = read(&device, &pixels);
-                        let hash = data.iter().fold(0xcbf29ce484222325u64, |a, b| {
-                            (a ^ *b as u64).wrapping_mul(0x100000001b3)
+                    let attachments = [Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.1,
+                                g: 0.1,
+                                b: 0.15,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })];
+                    let mut pass =
+                        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: None,
+                            color_attachments: &attachments,
+                            depth_stencil_attachment: None,
+                            timestamp_writes: Some(wgpu::RenderPassTimestampWrites {
+                                query_set: &query,
+                                beginning_of_pass_write_index: Some(0),
+                                end_of_pass_write_index: Some(1),
+                            }),
+                            occlusion_query_set: None,
+                            multiview_mask: None,
                         });
-                        if let Some(expected) = expected {
-                            assert_eq!(hash, expected);
-                        } else {
-                            expected = Some(hash);
-                        }
-                        println!(
-                            "RIO_CHECK {{\"case\":\"wgsl/background/{case}/{colorspace}\",\"variant\":{variant},\"value\":\"{hash:016x}\"}}"
-                        );
+                    pass.set_pipeline(&pipelines[variant]);
+                    pass.set_bind_group(0, &group, &[]);
+                    for _ in 0..16 {
+                        pass.draw(0..3, 0..1);
                     }
-                    if repeat >= 10 {
-                        let ns = (end - start) as f64
-                            * queue.get_timestamp_period() as f64
-                            / 16.0;
-                        println!(
-                            "RIO_BENCH {{\"case\":\"wgsl/background/{case}/{colorspace}\",\"sample\":{repeat},\"variant\":{variant},\"iterations\":16,\"units\":1,\"ns\":{ns}}}"
-                        );
+                }
+                encoder.resolve_query_set(&query, 0..2, &resolve, 0);
+                encoder.copy_buffer_to_buffer(&resolve, 0, &timing, 0, 16);
+                if repeat == 0 {
+                    encoder.copy_texture_to_buffer(
+                        texture.as_image_copy(),
+                        wgpu::TexelCopyBufferInfo {
+                            buffer: &pixels,
+                            layout: wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(1536 * 4),
+                                rows_per_image: None,
+                            },
+                        },
+                        texture.size(),
+                    );
+                }
+                queue.submit([encoder.finish()]);
+                let data = read(&device, &timing);
+                let start = u64::from_ne_bytes(data[..8].try_into().unwrap());
+                let end = u64::from_ne_bytes(data[8..].try_into().unwrap());
+                if repeat == 0 {
+                    let data = read(&device, &pixels);
+                    let hash = data.iter().fold(0xcbf29ce484222325u64, |a, b| {
+                        (a ^ *b as u64).wrapping_mul(0x100000001b3)
+                    });
+                    if let Some(expected) = expected {
+                        assert_eq!(hash, expected);
+                    } else {
+                        expected = Some(hash);
                     }
+                    println!(
+                        "RIO_CHECK {{\"case\":\"wgsl/background/{case}/{colorspace}\",\"variant\":{variant},\"value\":\"{hash:016x}\"}}"
+                    );
+                }
+                if repeat >= 10 {
+                    let ns =
+                        (end - start) as f64 * queue.get_timestamp_period() as f64 / 16.0;
+                    println!(
+                        "RIO_BENCH {{\"case\":\"wgsl/background/{case}/{colorspace}\",\"sample\":{repeat},\"variant\":{variant},\"iterations\":16,\"units\":1,\"ns\":{ns}}}"
+                    );
                 }
             }
         }

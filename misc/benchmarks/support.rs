@@ -1,4 +1,6 @@
 //! Shared measurement code for the branch benchmarks. No production code uses it.
+// Each benchmark executable imports only the helpers it needs.
+#![allow(dead_code)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
