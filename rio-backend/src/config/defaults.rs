@@ -36,7 +36,7 @@ pub fn default_title_content() -> String {
 
 #[inline]
 pub fn default_margin() -> crate::config::layout::Margin {
-    crate::config::layout::Margin::all(2.0)
+    crate::config::layout::Margin::all(4.0)
 }
 
 #[inline]

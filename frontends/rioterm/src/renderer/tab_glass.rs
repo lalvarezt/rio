@@ -15,7 +15,7 @@ pub(super) struct Status {
     pub width: f32,
 }
 
-/// A reflective rim over the existing tab. Only the border receives color;
+/// A reflective rim over an existing surface. Only the border receives color;
 /// the fill and the native backdrop inside it remain untouched.
 pub(super) fn draw(
     sugarloaf: &mut Sugarloaf,
@@ -89,6 +89,7 @@ fn draw_rim<const HAS_STATUS: bool>(
     let mut span = |column: f32,
                     row: f32,
                     length: f32,
+                    height: f32,
                     alpha: f32,
                     normal: [f32; 2],
                     travel: f32,
@@ -124,7 +125,7 @@ fn draw_rim<const HAS_STATUS: bool>(
                 x + column * pixel,
                 y + row * pixel,
                 length * pixel,
-                pixel,
+                height * pixel,
                 color,
                 0.05,
                 order,
@@ -153,7 +154,18 @@ fn draw_rim<const HAS_STATUS: bool>(
             emit(column, length, base_strength);
         }
     };
-    for row in 0..height as usize {
+    let mut row = 0;
+    while row < height as usize {
+        // Along the straight sides, static rims have identical coverage and
+        // lighting. One vertical strip also keeps tall pane frames compact.
+        let row_height = if progress_end.is_none()
+            && row >= columns
+            && row < height as usize - columns
+        {
+            height as usize - columns - row
+        } else {
+            1
+        };
         let py = row as f32 + 0.5;
         let edge_y = py.min(height - py);
         let normal_y = if py < height / 2.0 { -1.0 } else { 1.0 };
@@ -164,6 +176,7 @@ fn draw_rim<const HAS_STATUS: bool>(
             left,
             row as f32,
             length,
+            row_height as f32,
             alpha,
             [0.0, normal_y],
             if normal_y < 0.0 {
@@ -221,6 +234,7 @@ fn draw_rim<const HAS_STATUS: bool>(
                 column as f32,
                 row as f32,
                 1.0,
+                row_height as f32,
                 alpha,
                 [-nx, ny],
                 left_travel,
@@ -230,11 +244,13 @@ fn draw_rim<const HAS_STATUS: bool>(
                 width - column as f32 - 1.0,
                 row as f32,
                 1.0,
+                row_height as f32,
                 alpha,
                 [nx, ny],
                 right_travel,
                 1.0,
             );
         }
+        row += row_height;
     }
 }

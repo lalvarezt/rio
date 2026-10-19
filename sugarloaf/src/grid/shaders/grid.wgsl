@@ -14,7 +14,7 @@
 // come in already sRGB-encoded from the CPU).
 //
 // Bindings:
-// @group(0) @binding(0) Uniforms (140+4 = 144 bytes)
+// @group(0) @binding(0) Uniforms (192 bytes)
 // @group(0) @binding(1) CellBg[] (cols * rows entries)
 //
 // Must match `WgpuGridRenderer`'s bind group layout in
@@ -33,6 +33,11 @@ struct Uniforms {
     flags:            u32,           //       148
     padding_extend:   u32,           //       152
     input_colorspace: u32,           //       156
+    panel_rect: vec4<f32>,           //       160
+    panel_radius: f32,               //       176
+    _pad_panel0: f32,
+    _pad_panel1: f32,
+    _pad_panel2: f32,
 };
 
 // Color space / transfer curve helpers. Matrices match the Metal
@@ -124,6 +129,15 @@ fn load_cell_bg(idx: u32) -> vec4<f32> {
 
 @fragment
 fn grid_bg_fragment(in: VsOut) -> @location(0) vec4<f32> {
+    var coverage = 1.0;
+    if (all(uniforms.panel_rect.zw > vec2<f32>(0.0))) {
+        let half_size = uniforms.panel_rect.zw * 0.5;
+        let radius = min(uniforms.panel_radius, min(half_size.x, half_size.y));
+        let q = abs(in.position.xy - uniforms.panel_rect.xy - half_size) - half_size + vec2<f32>(radius);
+        let distance = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+        coverage = clamp(0.5 - distance, 0.0, 1.0);
+        if (coverage == 0.0) { discard; }
+    }
  // `grid_padding` is (top, right, bottom, left).
  // Use .w (left) + .x (top) to find the grid origin, same as Metal port.
     let cell_fx = (in.position.xy - vec2<f32>(uniforms.grid_padding.w, uniforms.grid_padding.x))
@@ -174,7 +188,7 @@ fn grid_bg_fragment(in: VsOut) -> @location(0) vec4<f32> {
             uniforms.input_colorspace,
         );
         let a = uniforms.cursor_bg_color.a;
-        return vec4<f32>(rgb * a, a);
+        return vec4<f32>(rgb * a, a) * coverage;
     }
 
  // Load cell, convert to output color space, then premultiply.
@@ -193,7 +207,7 @@ fn grid_bg_fragment(in: VsOut) -> @location(0) vec4<f32> {
     let b = f32((word >> 16u) & 0xFFu) / 255.0;
     let a = f32((word >> 24u) & 0xFFu) / 255.0;
     let rgb = grid_prepare_output_rgb(vec3<f32>(r, g, b), uniforms.input_colorspace);
-    return vec4<f32>(rgb * a, a);
+    return vec4<f32>(rgb * a, a) * coverage;
 }
 
 // -------------------------------------------------------------------

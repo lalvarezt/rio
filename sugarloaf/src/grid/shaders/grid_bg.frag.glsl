@@ -11,7 +11,7 @@
 // Metal `Uniforms` struct in grid.metal — std140 layout naturally
 // matches the hand-packed byte layout used over there.
 
-// `Uniforms` mirrors `GridUniforms` (144B + pad to 160B = 10 × vec4
+// `Uniforms` mirrors `GridUniforms` (192B = 12 × vec4
 // blocks under std140). See cell.rs for offsets / sizes; the fields
 // here are listed in the same order.
 layout(set = 0, binding = 0, std140) uniform Uniforms {
@@ -27,6 +27,11 @@ layout(set = 0, binding = 0, std140) uniform Uniforms {
     uint flags;             // offset 148
     uint padding_extend;    // offset 152
     uint input_colorspace;  // offset 156
+    vec4 panel_rect;        // offset 160
+    float panel_radius;    // offset 176
+    float _pad_panel0;
+    float _pad_panel1;
+    float _pad_panel2;
 } uniforms;
 
 // `CellBg` is 4 bytes (uchar4 rgba) in cell.rs. We expose the storage
@@ -85,6 +90,15 @@ vec3 grid_prepare_output_rgb(vec3 srgb, uint input_colorspace) {
 }
 
 void main() {
+    float coverage = 1.0;
+    if (all(greaterThan(uniforms.panel_rect.zw, vec2(0.0)))) {
+        vec2 half_size = uniforms.panel_rect.zw * 0.5;
+        float radius = min(uniforms.panel_radius, min(half_size.x, half_size.y));
+        vec2 q = abs(gl_FragCoord.xy - uniforms.panel_rect.xy - half_size) - half_size + radius;
+        float distance = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+        coverage = clamp(0.5 - distance, 0.0, 1.0);
+        if (coverage == 0.0) { discard; }
+    }
     // `gl_FragCoord.xy` is the pixel center in framebuffer pixels.
     // Locate the owning grid cell relative to the grid origin
     // (top-left = grid_padding.w / .x).
@@ -137,7 +151,7 @@ void main() {
         vec4 c = uniforms.cursor_bg_color;
         c.rgb = grid_prepare_output_rgb(c.rgb, uniforms.input_colorspace);
         c.rgb *= c.a;
-        out_color = c;
+        out_color = c * coverage;
         return;
     }
 
@@ -151,5 +165,5 @@ void main() {
     color.rgb = grid_prepare_output_rgb(color.rgb, uniforms.input_colorspace);
     color.rgb *= color.a;
 
-    out_color = color;
+    out_color = color * coverage;
 }

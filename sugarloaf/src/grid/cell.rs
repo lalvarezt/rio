@@ -106,7 +106,7 @@ const _: () = {
 /// - Group scalars into 16-byte blocks or add explicit `_pad` fields.
 /// - Struct size must be a multiple of 16 bytes.
 ///
-/// Current layout: 144 bytes, 16-byte aligned.
+/// Current layout: 192 bytes, 16-byte aligned.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct GridUniforms {
@@ -162,6 +162,13 @@ pub struct GridUniforms {
     /// grid bg appears brighter/more saturated than the window bg
     /// fill, which runs through `prepare_output_rgb`.
     pub input_colorspace: u32,
+    /// Rounded pane bounds in framebuffer pixels (x, y, width, height).
+    /// Zero width/height keeps the legacy unbounded grid path for callers
+    /// that do not supply a panel, including offscreen renderers.
+    pub panel_rect: [f32; 4],
+    /// Physical corner radius; edge-cell backgrounds extend only inside this pane.
+    pub panel_radius: f32,
+    pub _pad_panel: [f32; 3],
 }
 
 impl GridUniforms {

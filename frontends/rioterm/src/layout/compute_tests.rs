@@ -1,6 +1,101 @@
 use super::*;
 
 #[test]
+fn panel_settings_update_existing_and_future_tabs() {
+    use crate::context::ContextManager;
+    use rio_backend::event::{VoidListener, WindowId};
+    let mut manager =
+        ContextManager::start_with_capacity(2, VoidListener {}, WindowId::from(0))
+            .unwrap();
+    let panel = rio_backend::config::layout::Panel {
+        padding: Margin::all(12.0),
+        border_radius: 4.0,
+        ..Default::default()
+    };
+    manager.update_panel_config(panel);
+    manager.add_context(true, 0);
+    for grid in manager.contexts_mut() {
+        assert_eq!(grid.panel_config(), &panel);
+        grid.update_scale(2.0);
+        grid.calculate_positions();
+        let layout = grid.tree.layout(grid.current).unwrap();
+        assert_eq!(layout.padding.left, 24.0);
+        assert_eq!(layout.padding.top, 24.0);
+    }
+}
+
+#[test]
+fn panel_content_honors_padding_after_nested_splits() {
+    use crate::context::{create_dead_context, ContextManager};
+    use rio_backend::event::{VoidListener, WindowId};
+
+    let mut manager =
+        ContextManager::start_with_capacity(1, VoidListener {}, WindowId::from(0))
+            .unwrap();
+    for split in 0..3 {
+        let grid = manager.current_grid_mut();
+        grid.try_update_size(1600.0, 1000.0).unwrap();
+        if split > 0 {
+            let context = create_dead_context(
+                VoidListener {},
+                WindowId::from(0),
+                usize::MAX - split,
+                0,
+                grid.current().dimension,
+            );
+            let node = if split == 1 {
+                grid.try_split_right().unwrap()
+            } else {
+                grid.try_split_down().unwrap()
+            };
+            grid.inner.insert(node, ContextGridItem::new(context));
+            grid.current = node;
+        }
+        grid.calculate_positions();
+        for (&node, item) in &grid.inner {
+            let layout = grid.tree.layout(node).unwrap();
+            let mut outer_x = layout.location.x;
+            let mut outer_y = layout.location.y;
+            let mut parent = grid.tree.parent(node);
+            while let Some(node) = parent {
+                let layout = grid.tree.layout(node).unwrap();
+                outer_x += layout.location.x;
+                outer_y += layout.location.y;
+                parent = grid.tree.parent(node);
+            }
+            assert_eq!(
+                item.layout_rect,
+                [
+                    outer_x + layout.padding.left,
+                    outer_y + layout.padding.top,
+                    layout.size.width - layout.padding.left - layout.padding.right,
+                    layout.size.height - layout.padding.top - layout.padding.bottom
+                ]
+            );
+            // Padding belongs to the pane for focusing, even though it is not
+            // part of the terminal's cell viewport.
+            assert_eq!(
+                grid.find_context_at_position(
+                    outer_x + grid.scaled_margin.left + 1.0,
+                    outer_y + grid.scaled_margin.top + 1.0
+                ),
+                Some(node)
+            );
+        }
+        let (_, mouse_margin) = grid.current_context_with_computed_dimension();
+        let item = grid.current_item().unwrap();
+        assert_eq!(
+            mouse_margin.left,
+            grid.scaled_margin.left + item.layout_rect[0]
+        );
+        assert_eq!(
+            mouse_margin.top,
+            grid.scaled_margin.top + item.layout_rect[1]
+        );
+    }
+}
+
+#[test]
 fn program_status_each_tab_uses_only_its_own_focused_split() {
     use crate::context::{create_dead_context, ContextManager};
     use rio_backend::event::{VoidListener, WindowId};

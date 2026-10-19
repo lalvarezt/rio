@@ -37,6 +37,11 @@ layout(set = 0, binding = 0, std140) uniform Uniforms {
     uint flags;
     uint padding_extend;
     uint input_colorspace;
+    vec4 panel_rect;
+    float panel_radius;
+    float _pad_panel0;
+    float _pad_panel1;
+    float _pad_panel2;
 } uniforms;
 
 layout(location = 0) in uvec2 in_glyph_pos;

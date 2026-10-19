@@ -798,33 +798,23 @@ impl Renderer {
             // Within-grid comparison: taffy keys are only meaningful
             // inside a single tab's tree.
             let active_key = grid.current;
+            let panel_radius = grid.panel_config().border_radius;
             for (key, grid_context) in grid.contexts_mut().iter() {
                 if &active_key == key {
                     continue;
                 }
-                // Match the grid renderer's actual paint region —
-                // `.round()`ed integer-pixel origin +
-                // `cols * round(cell_w)` × `rows * round(cell_h)`
-                // content size (same math as `GridUniforms.grid_padding`
-                // / `cell_size` in `screen/mod.rs:~3717`). Using raw
-                // `layout_rect` leaves a sub-pixel un-dimmed fringe at
-                // the right/bottom edges of inactive splits because
-                // taffy allocates fractional sizes while the grid
-                // snaps to whole cells.
-                let dim = grid_context.val.dimension;
-                let cell_w = dim.cell.cell_width as f32;
-                let cell_h = dim.cell.cell_height as f32;
-                let cols = dim.columns.max(1) as f32;
-                let rows = dim.lines.max(1) as f32;
-                let panel_left =
-                    (grid_context.layout_rect[0] + grid_scaled_margin.left).round();
-                let panel_top =
-                    (grid_context.layout_rect[1] + grid_scaled_margin.top).round();
-                let x = panel_left / scale_factor;
-                let y = panel_top / scale_factor;
-                let w = (cols * cell_w) / scale_factor;
-                let h = (rows * cell_h) / scale_factor;
-                sugarloaf.rect(None, x, y, w, h, dim_color, 0.0, 3);
+                let [left, top, width, height] = grid_context.panel_rect;
+                sugarloaf.rounded_rect(
+                    None,
+                    (left + grid_scaled_margin.left) / scale_factor,
+                    (top + grid_scaled_margin.top) / scale_factor,
+                    width / scale_factor,
+                    height / scale_factor,
+                    dim_color,
+                    0.0,
+                    panel_radius,
+                    3,
+                );
             }
         }
 
@@ -897,17 +887,37 @@ impl Renderer {
             );
         }
 
-        // Render panel borders (on top of terminal content). Borders
-        // are flat rects today — the previous `Object` enum
-        // (Rect / Quad / RichText) was only ever populated with the
-        // Rect variant, so the dispatch is direct now.
-        let grid_scaled_margin = context_manager.get_current_grid_scaled_margin();
-        for rect in context_manager.get_panel_borders() {
-            let x = (rect.x + grid_scaled_margin.left) / scale_factor;
-            let y = (rect.y + grid_scaled_margin.top) / scale_factor;
-            let width = rect.width / scale_factor;
-            let height = rect.height / scale_factor;
-            sugarloaf.rect(None, x, y, width, height, rect.color, 0.0, 1);
+        // Pane frames share the tabs' reflective border and the palette theme.
+        // Layout reserves padding inside these bounds, keeping chrome off cells.
+        let grid = context_manager.current_grid();
+        {
+            let theme = window_chrome::Theme::new(&self.named_colors);
+            let margin = grid.get_scaled_margin();
+            let panel = grid.panel_config();
+            for (key, item) in grid.contexts() {
+                let [x, y, width, height] = item.panel_rect;
+                tab_glass::draw(
+                    sugarloaf,
+                    [
+                        (x + margin.left) / scale_factor,
+                        (y + margin.top) / scale_factor,
+                        width / scale_factor,
+                        height / scale_factor,
+                    ],
+                    panel.border_radius,
+                    self.navigation.tab_glass_intensity,
+                    Some(tab_glass::Status {
+                        color: if grid.should_draw_borders() && *key == grid.current {
+                            theme.accent
+                        } else {
+                            theme.border
+                        },
+                        progress: None,
+                        width: panel.border_width,
+                    }),
+                    4,
+                );
+            }
         }
 
         // Derive the window bg color from the currently-active panel's

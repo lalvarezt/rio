@@ -32,12 +32,12 @@ impl Default for Panel {
 
 #[inline]
 fn default_panel_margin() -> Margin {
-    Margin::all(2.0)
+    Margin::all(4.0)
 }
 
 #[inline]
 fn default_panel_padding() -> Margin {
-    Margin::all(5.0)
+    Margin::all(8.0)
 }
 
 #[inline]
@@ -57,7 +57,7 @@ fn default_border_width() -> f32 {
 
 #[inline]
 fn default_border_radius() -> f32 {
-    0.0
+    8.0
 }
 
 // CSS-like margin structure
@@ -229,11 +229,11 @@ mod tests {
     #[test]
     fn test_panel_default() {
         let panel = Panel::default();
-        assert_eq!(panel.margin, Margin::all(2.0));
+        assert_eq!(panel.margin, Margin::all(4.0));
         assert_eq!(panel.row_gap, 0.0);
         assert_eq!(panel.column_gap, 0.0);
         assert_eq!(panel.border_width, 2.0);
-        assert_eq!(panel.border_radius, 0.0);
+        assert_eq!(panel.border_radius, 8.0);
     }
 
     #[test]

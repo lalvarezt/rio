@@ -272,8 +272,6 @@ impl Screen<'_> {
             use_fork: config.use_fork,
             shell_integration: config.shell_integration,
             is_native,
-            split_color: config.colors.split,
-            split_active_color: config.colors.split_active,
             panel: config.panel,
             title: config.title.clone(),
             keyboard: config.keyboard.clone(),
@@ -593,6 +591,7 @@ impl Screen<'_> {
         }
 
         let scale = self.sugarloaf.scale_factor();
+        self.context_manager.update_panel_config(config.panel);
         for context_grid in self.context_manager.contexts_mut() {
             context_grid.update_line_height(config.line_height);
 
@@ -4182,6 +4181,7 @@ impl Screen<'_> {
             struct PanelFrame {
                 route_id: usize,
                 layout_rect: [f32; 4],
+                panel_rect: [f32; 4],
                 cols: u32,
                 rows: u32,
                 cell_w: f32,
@@ -4386,6 +4386,7 @@ impl Screen<'_> {
                 panels.push(PanelFrame {
                     route_id: ctx.route_id,
                     layout_rect: item.layout_rect,
+                    panel_rect: item.panel_rect,
                     cols: ctx.renderable_content.columns.max(1) as u32,
                     rows: ctx.renderable_content.screen_lines.max(1) as u32,
                     cell_w,
@@ -4437,6 +4438,12 @@ impl Screen<'_> {
                 rio_backend::sugarloaf::grid::GridUniforms,
             )> = Vec::with_capacity(panels.len());
 
+            let panel_radius = self
+                .context_manager
+                .current_grid()
+                .panel_config()
+                .border_radius
+                * self.sugarloaf.scale_factor();
             let rasterizer = &mut self.grid_rasterizer;
             let renderer_ref = &self.renderer;
             let bg_scratch = &mut self.grid_bg_scratch;
@@ -4788,15 +4795,9 @@ impl Screen<'_> {
                             window_size.width,
                             window_size.height,
                         ),
-                    // grid_padding = (top, right, bottom, left). The
-                    // bg shader only reads `.w` (left) + `.x` (top)
-                    // to anchor the grid, so right/bottom can stay
-                    // 0. padding_extend is 0 too — each panel's
-                    // grid must stay bounded to its own rect so
-                    // sibling panels / the window margin aren't
-                    // painted by this grid. The full-window bg fill
-                    // (re-enabled in sugarloaf's render_metal) now
-                    // handles the space outside all panels.
+                    // Edge cells fill the pane's padding and fractional-cell
+                    // remainder. The rounded panel bounds keep that extension
+                    // away from siblings, window margins, and the tab strip.
                     grid_padding: [panel_top, 0.0, 0.0, panel_left],
                     cursor_color: cursor_col_u,
                     cursor_bg_color: cursor_bg_u,
@@ -4806,8 +4807,18 @@ impl Screen<'_> {
                     _pad_cursor: [0; 2],
                     min_contrast: 0.0,
                     flags: 0,
-                    padding_extend: 0,
+                    padding_extend: rio_backend::sugarloaf::grid::GridUniforms::PADDING_EXTEND_LEFT
+                        | rio_backend::sugarloaf::grid::GridUniforms::PADDING_EXTEND_RIGHT
+                        | rio_backend::sugarloaf::grid::GridUniforms::PADDING_EXTEND_UP
+                        | rio_backend::sugarloaf::grid::GridUniforms::PADDING_EXTEND_DOWN,
                     input_colorspace,
+                    panel_rect: [
+                        (scaled_margin.left + p.panel_rect[0]).round(),
+                        (scaled_margin.top + p.panel_rect[1]).round(),
+                        p.panel_rect[2], p.panel_rect[3],
+                    ],
+                    panel_radius,
+                    _pad_panel: [0.0; 3],
                 };
 
                 frame_grids.push((grid, uniforms));

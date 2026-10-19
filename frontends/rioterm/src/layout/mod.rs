@@ -6,7 +6,7 @@ use crate::mouse::Mouse;
 use rio_backend::config::layout::Margin;
 use rio_backend::crosswords::grid::Dimensions;
 use rio_backend::event::EventListener;
-use rio_backend::sugarloaf::{layout::TextDimensions, Rect, Sugarloaf};
+use rio_backend::sugarloaf::{layout::TextDimensions, Sugarloaf};
 use rustc_hash::FxHashMap;
 
 use taffy::{
@@ -84,27 +84,6 @@ fn compute(
     (visible_columns, visible_lines)
 }
 
-#[inline]
-fn create_border(color: [f32; 4], position: [f32; 2], size: [f32; 2]) -> Rect {
-    Rect::new(position[0], position[1], size[0], size[1], color)
-}
-
-/// Separator configuration for split panels
-#[derive(Debug, Clone, Copy)]
-pub struct BorderConfig {
-    pub width: f32,
-    pub color: [f32; 4],
-}
-
-impl Default for BorderConfig {
-    fn default() -> Self {
-        Self {
-            width: 2.0,
-            color: [0.8, 0.8, 0.8, 1.0],
-        }
-    }
-}
-
 pub struct ContextGrid<T: EventListener> {
     /// Tab identity remains stable when panes are focused, added, or removed.
     pub tab_id: usize,
@@ -125,11 +104,13 @@ pub struct ContextGrid<T: EventListener> {
     panel_config: rio_backend::config::layout::Panel,
     tree: TaffyTree<()>,
     root_node: NodeId,
-    border_config: BorderConfig,
 }
 
 pub struct ContextGridItem<T: EventListener> {
     pub val: Context<T>,
+    /// Outer panel bounds, including padding, used by chrome and focus hit tests.
+    pub panel_rect: [f32; 4],
+    /// Terminal content bounds inside the panel padding.
     pub layout_rect: [f32; 4],
 }
 
@@ -137,6 +118,7 @@ impl<T: rio_backend::event::EventListener> ContextGridItem<T> {
     pub fn new(context: Context<T>) -> Self {
         Self {
             val: context,
+            panel_rect: [0.0; 4],
             layout_rect: [0.0; 4],
         }
     }
@@ -150,20 +132,12 @@ impl<T: rio_backend::event::EventListener> ContextGridItem<T> {
     pub fn context_mut(&mut self) -> &mut Context<T> {
         &mut self.val
     }
-
-    /// Previously stashed panel position into the rich-text object's
-    /// render_data; that object tree is gone with the Content drop.
-    /// The grid renderer reads panel positions directly from
-    /// `layout_rect`.
-    fn set_position(&mut self, _position: [f32; 2]) {}
 }
 
 impl<T: rio_backend::event::EventListener> ContextGrid<T> {
     pub fn new(
         context: Context<T>,
         scaled_margin: Margin,
-        border_color: [f32; 4],
-        _border_active_color: [f32; 4],
         panel_config: rio_backend::config::layout::Panel,
     ) -> Self {
         let width = context.dimension.width;
@@ -224,11 +198,6 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         let mut inner = FxHashMap::default();
         inner.insert(panel_node, ContextGridItem::new(context));
 
-        let border_config = BorderConfig {
-            width: panel_config.border_width,
-            color: border_color,
-        };
-
         let mut grid = Self {
             tab_id,
             inner,
@@ -244,7 +213,6 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             panel_config,
             tree,
             root_node,
-            border_config,
         };
         grid.calculate_positions();
         grid
@@ -278,6 +246,10 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
 
     pub fn should_draw_borders(&self) -> bool {
         self.panel_count() > 1
+    }
+
+    pub fn panel_config(&self) -> &rio_backend::config::layout::Panel {
+        &self.panel_config
     }
 
     fn try_update_size(&mut self, width: f32, height: f32) -> Result<(), TaffyError> {
@@ -321,7 +293,15 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
 
             // Update layout_rect if this node is a panel (exists in inner)
             if let Some(item) = self.inner.get_mut(&node) {
-                item.layout_rect = [abs_x, abs_y, layout.size.width, layout.size.height];
+                item.panel_rect = [abs_x, abs_y, layout.size.width, layout.size.height];
+                item.layout_rect = [
+                    abs_x + layout.padding.left,
+                    abs_y + layout.padding.top,
+                    (layout.size.width - layout.padding.left - layout.padding.right)
+                        .max(0.0),
+                    (layout.size.height - layout.padding.top - layout.padding.bottom)
+                        .max(0.0),
+                ];
             }
 
             // Add children to stack
@@ -339,7 +319,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         let adj_y = y - self.scaled_margin.top;
 
         for (&node_id, item) in &self.inner {
-            let [left, top, width, height] = item.layout_rect;
+            let [left, top, width, height] = item.panel_rect;
             if adj_x >= left
                 && adj_x < left + width
                 && adj_y >= top
@@ -360,7 +340,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
 
         let adj_x = x - self.scaled_margin.left;
         let adj_y = y - self.scaled_margin.top;
-        let hit_half = (self.border_config.width / 2.0 + 3.0) * self.scale;
+        let hit_half = (self.panel_config.border_width / 2.0 + 3.0) * self.scale;
 
         self.walk_separators(|dir, center, span, child_a, child_b| {
             let hit = match dir {
@@ -426,39 +406,6 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         }
 
         self.apply_taffy_layout(sugarloaf);
-    }
-
-    /// Get separator lines between adjacent panels for rendering.
-    pub fn get_panel_borders(&self) -> Vec<Rect> {
-        if !self.should_draw_borders() {
-            return vec![];
-        }
-
-        let mut separators = Vec::new();
-        let border_width = self.border_config.width;
-        let color = self.border_config.color;
-
-        self.walk_separators(|dir, center, span, _child_a, _child_b| -> Option<()> {
-            match dir {
-                BorderDirection::Vertical => {
-                    separators.push(create_border(
-                        color,
-                        [center - border_width / 2.0, span[0]],
-                        [border_width, span[1] - span[0]],
-                    ));
-                }
-                BorderDirection::Horizontal => {
-                    separators.push(create_border(
-                        color,
-                        [span[0], center - border_width / 2.0],
-                        [span[1] - span[0], border_width],
-                    ));
-                }
-            }
-            None // continue walking
-        });
-
-        separators
     }
 
     /// Walk the taffy tree visiting every separator between sibling nodes.
@@ -902,19 +849,13 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         None
     }
 
-    fn apply_taffy_layout(&mut self, sugarloaf: &mut Sugarloaf) -> bool {
+    fn apply_taffy_layout(&mut self, _sugarloaf: &mut Sugarloaf) -> bool {
         if self.compute_layout().is_err() {
             return false;
         }
 
-        let scale = sugarloaf.ctx.scale();
-        let is_multi_panel = self.inner.len() > 1;
-
         for item in self.inner.values_mut() {
-            let [abs_x, abs_y, width, height] = item.layout_rect;
-
-            let x = (abs_x + self.scaled_margin.left) / scale;
-            let y = (abs_y + self.scaled_margin.top) / scale;
+            let [_, _, width, height] = item.layout_rect;
 
             // Clear margin since Taffy layout already accounts for spacing
             item.val.dimension.margin = Margin::all(0.0);
@@ -934,12 +875,6 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             // `pending_update.is_dirty()` and skips the panel before reading
             // that. Mark it dirty so an idle terminal still presents.
             item.val.renderable_content.pending_update.set_dirty();
-
-            // Panel position / clipping bounds are tracked rio-side
-            // now; the grid pass reads `panel_rect` from the renderer's
-            // own per-panel iteration. Sugarloaf no longer carries
-            // panel metadata.
-            let _ = (x, y, abs_x, abs_y, width, height, is_multi_panel);
         }
         true
     }
@@ -1095,40 +1030,21 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
     }
 
     pub fn current_context_with_computed_dimension(&self) -> (&Context<T>, Margin) {
-        let len = self.inner.len();
-        if len <= 1 {
-            if let Some(item) = self.inner.get(&self.current) {
-                return (&item.val, self.scaled_margin);
-            } else if let Some(root) = self.root {
-                if let Some(item) = self.inner.get(&root) {
-                    return (&item.val, self.scaled_margin);
-                }
-            }
-            panic!("Grid is in an invalid state - no contexts available");
-        }
-
-        if let Some(current_item) = self.inner.get(&self.current) {
-            // For multi-panel layouts, the margin must include the panel's
-            // absolute offset so that mouse coordinates (which are relative
-            // to the window) are correctly translated to panel-local grid
-            // positions.
-            let [abs_x, abs_y, _, _] = current_item.layout_rect;
-            let margin = Margin {
+        let item = self
+            .inner
+            .get(&self.current)
+            .or_else(|| self.root.and_then(|root| self.inner.get(&root)))
+            .expect("Grid is in an invalid state - no contexts available");
+        let [abs_x, abs_y, _, _] = item.layout_rect;
+        (
+            &item.val,
+            Margin {
                 left: self.scaled_margin.left + abs_x,
                 top: self.scaled_margin.top + abs_y,
                 right: self.scaled_margin.right,
                 bottom: self.scaled_margin.bottom,
-            };
-            (&current_item.val, margin)
-        } else {
-            tracing::error!("Current key {:?} not found in grid", self.current);
-            if let Some(root) = self.root {
-                if let Some(item) = self.inner.get(&root) {
-                    return (&item.val, self.scaled_margin);
-                }
-            }
-            panic!("Grid is in an invalid state - no contexts available");
-        }
+            },
+        )
     }
 
     #[inline]
@@ -1205,6 +1121,18 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             return;
         }
         self.scale = new_scale;
+        self.update_panel_styles();
+    }
+
+    pub fn update_panel_config(&mut self, panel: rio_backend::config::layout::Panel) {
+        if self.panel_config != panel {
+            self.panel_config = panel;
+            self.update_panel_styles();
+        }
+    }
+
+    fn update_panel_styles(&mut self) {
+        let new_scale = self.scale;
 
         let gap = geometry::Size {
             width: length(self.panel_config.column_gap * new_scale),
@@ -1288,16 +1216,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         }
 
         // Compute Taffy layout (also updates layout_rect via update_layout_rects)
-        if self.compute_layout().is_err() {
-            return;
-        }
-
-        // Update positions from layout_rect for all panels
-        for item in self.inner.values_mut() {
-            let x = item.layout_rect[0] + self.scaled_margin.left;
-            let y = item.layout_rect[1] + self.scaled_margin.top;
-            item.set_position([x, y]);
-        }
+        let _ = self.compute_layout();
     }
 
     /// Remove the panel owning `route_id`, wherever it sits in the

@@ -9,6 +9,9 @@ use crate::font::FontLibrary;
 #[path = "../../misc/benchmarks/text_cache.rs"]
 mod branch_benchmarks;
 use rustc_hash::FxHashMap;
+
+#[cfg(all(test, feature = "wgpu", not(target_os = "macos")))]
+mod wgpu_tests;
 use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock};
 
@@ -133,8 +136,8 @@ struct TextWgpuState {
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
     atlas_bind_group: wgpu::BindGroup,
-    #[allow(dead_code)] // retained for future atlas-bind-group recreation on atlas grow
     atlas_bind_group_layout: wgpu::BindGroupLayout,
+    bound_color_atlas_size: u32,
     pipeline: wgpu::RenderPipeline,
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
@@ -1196,6 +1199,7 @@ impl Text {
         let instance_capacity: usize = 256;
         let instance_buffer = alloc_instance_buffer_wgpu(device, instance_capacity);
 
+        let bound_color_atlas_size = atlas_color.size();
         self.wgpu = Some(TextWgpuState {
             device: device.to_owned(),
             queue: queue.to_owned(),
@@ -1205,6 +1209,7 @@ impl Text {
             uniform_bind_group,
             atlas_bind_group,
             atlas_bind_group_layout: atlas_bgl,
+            bound_color_atlas_size,
             pipeline,
             instance_buffer,
             instance_capacity,
@@ -1227,6 +1232,18 @@ impl Text {
         let Some(state) = self.wgpu.as_mut() else {
             return;
         };
+
+        // Both font glyphs and SVG icons can promote the deferred color atlas
+        // while building this frame. Bind its current view before drawing either.
+        if state.bound_color_atlas_size != state.atlas_color.size() {
+            state.atlas_bind_group = create_text_atlas_bg_wgpu(
+                &state.device,
+                &state.atlas_bind_group_layout,
+                state.atlas_grayscale.view(),
+                state.atlas_color.view(),
+            );
+            state.bound_color_atlas_size = state.atlas_color.size();
+        }
 
         // Upload uniforms (viewport + 8 bytes pad).
         let uniforms: [f32; 4] = [viewport[0], viewport[1], 0.0, 0.0];

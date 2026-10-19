@@ -38,6 +38,15 @@ const TAB_ICON_GAP: f32 = 8.0;
 const TAB_GAP: f32 = 6.0;
 const TAB_INSET_BOTTOM: f32 = 6.0;
 const TAB_INSET_TOP: f32 = TAB_INSET_BOTTOM;
+
+/// Bottom of the tab shape; pane spacing starts here for either tab style.
+pub fn content_top(style: TabStyle) -> f32 {
+    if style == TabStyle::Windows {
+        ISLAND_HEIGHT
+    } else {
+        ISLAND_HEIGHT - TAB_INSET_BOTTOM
+    }
+}
 const TAB_RADIUS: f32 = 19.0;
 /// Bell dot for tabs that rang while in the background, and the gap
 /// between it and the tab title. A dot, not a glyph: the UI text layer

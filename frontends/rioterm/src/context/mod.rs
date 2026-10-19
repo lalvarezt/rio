@@ -23,7 +23,7 @@ use rio_backend::error::{RioError, RioErrorLevel, RioErrorType};
 use rio_backend::event::EventListener;
 use rio_backend::event::WindowId;
 use rio_backend::selection::SelectionRange;
-use rio_backend::sugarloaf::{font::SugarloafFont, Rect, Sugarloaf, SugarloafErrors};
+use rio_backend::sugarloaf::{font::SugarloafFont, Sugarloaf, SugarloafErrors};
 use std::error::Error;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -141,8 +141,6 @@ pub struct ContextManagerConfig {
     pub spawn_performer: bool,
     pub cwd: bool,
     pub is_native: bool,
-    pub split_color: [f32; 4],
-    pub split_active_color: [f32; 4],
     pub panel: rio_backend::config::layout::Panel,
     pub title: rio_backend::config::title::Title,
     pub keyboard: rio_backend::config::keyboard::Keyboard,
@@ -495,8 +493,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             contexts: smallvec![ContextGrid::new(
                 initial_context,
                 scaled_margin,
-                ctx_config.split_color,
-                ctx_config.split_active_color,
                 ctx_config.panel,
             )],
             capacity: DEFAULT_CONTEXT_CAPACITY,
@@ -537,8 +533,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             contexts: smallvec![ContextGrid::new(
                 initial_context,
                 Margin::default(),
-                config.split_color,
-                config.split_active_color,
                 config.panel,
             )],
             capacity,
@@ -1132,9 +1126,11 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         &self.contexts[self.current_index]
     }
 
-    #[inline]
-    pub fn get_panel_borders(&self) -> Vec<Rect> {
-        self.contexts[self.current_index].get_panel_borders()
+    pub fn update_panel_config(&mut self, panel: rio_backend::config::layout::Panel) {
+        self.config.panel = panel;
+        for grid in &mut self.contexts {
+            grid.update_panel_config(panel);
+        }
     }
 
     #[inline]
@@ -1388,8 +1384,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             is_native: config.navigation.is_native(),
             // When navigation is collapsed and does not contain any color rule
             // does not make sense fetch for foreground process names
-            split_color: config.colors.split,
-            split_active_color: config.colors.split_active,
             panel: config.panel,
             title: config.title,
             keyboard: config.keyboard,
@@ -1488,8 +1482,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                     self.contexts.push(ContextGrid::new(
                         new_context,
                         previous_scaled_margin,
-                        self.config.split_color,
-                        self.config.split_active_color,
                         self.config.panel,
                     ));
                     if redirect {

@@ -182,6 +182,10 @@ impl WgpuGlyphAtlas {
     pub fn view(&self) -> &wgpu::TextureView {
         &self.view
     }
+
+    pub(crate) fn size(&self) -> u32 {
+        self.texture.width()
+    }
 }
 
 /// Immutable grid state shared by panels using one context and target format.
