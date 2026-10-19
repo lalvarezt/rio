@@ -69,9 +69,10 @@ pub(crate) fn parse_report(body: &[u8]) -> Option<ProgramStatusRecord> {
             b"id"
                 if value.len() > 128
                     || value.split(|b| *b == b'/').count() > 8
-                    || value.split(|b| *b == b'/').any(|s| s.len() > 32) =>
+                    || !value.split(|b| *b == b'/').all(valid_segment) =>
             {
-                return None
+                // Reject before skipping invalid fields: a bad id must not clear root.
+                return None;
             }
             _ => (),
         }
@@ -116,10 +117,6 @@ pub(crate) fn parse_report(body: &[u8]) -> Option<ProgramStatusRecord> {
             b"msg" => msg = Some(decode_text(value, 2048)?),
             _ => (),
         }
-    }
-    // An explicitly empty or malformed id must never address the root.
-    if id.is_some_and(|id| !id.as_bytes().split(|b| *b == b'/').all(valid_segment)) {
-        return None;
     }
     let state = state?;
     Some(ProgramStatusRecord {
@@ -304,6 +301,9 @@ mod tests {
             "state=done:id=",
             "state=done:id=a//b",
             "state=done:id=a,b",
+            "state=clear:id=build!",
+            "state=clear:id=build test",
+            "state=clear:id=build\u{00e9}",
         ] {
             assert!(parse_report(body.as_bytes()).is_none(), "{body}");
         }
