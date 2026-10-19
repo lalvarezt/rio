@@ -38,6 +38,62 @@ const ATLAS_MAX_SIZE: u16 = 4096;
 /// cells. Matches the Metal layout in `metal::init_fg_rows`.
 const CURSOR_ROW_SLOTS: usize = 2;
 
+#[cfg(test)]
+mod panel_tests {
+    use super::*;
+    use bytemuck::Zeroable;
+
+    #[test]
+    fn backgrounds_respect_panel_padding_corners_and_cursor_bounds() {
+        let mut grid = CpuGridRenderer::new(2, 2);
+        let red = CellBg {
+            rgba: [200, 40, 30, 255],
+        };
+        grid.write_row(0, &[red; 2], &[]);
+        grid.write_row(1, &[red; 2], &[]);
+        let uniforms = GridUniforms {
+            grid_padding: [16.0, 0.0, 0.0, 16.0],
+            cell_size: [16.0; 2],
+            grid_size: [2; 2],
+            padding_extend: GridUniforms::PADDING_EXTEND_HORIZONTAL,
+            panel_rect: [8.0, 8.0, 48.0, 48.0],
+            panel_radius: 20.0,
+            cursor_pos: [0, 0],
+            cursor_bg_color: [0.0, 1.0, 0.0, 1.0],
+            ..GridUniforms::zeroed()
+        };
+        let clear = 0x000a141e;
+        let mut pixels = vec![clear; 64 * 64];
+        grid.render_bg(&mut pixels, 64, 64, &uniforms);
+        let pixel = |x: usize, y: usize| pixels[y * 64 + x] & 0x00ffffff;
+        assert_eq!(pixel(8, 32), 0x00c8281e, "edge color fills side padding");
+        assert_eq!(pixel(8, 16), clear, "rounded corner stays outside the pane");
+        assert_eq!(pixel(16, 20), 0x0000ff00, "cursor fills its cell");
+        assert_eq!(
+            pixel(10, 20),
+            0x00c8281e,
+            "cursor does not extend into padding"
+        );
+        assert_eq!(pixel(32, 12), clear, "top padding retains the backdrop");
+        assert_eq!(pixel(32, 50), clear, "bottom padding retains the backdrop");
+        assert_eq!(pixel(4, 32), clear, "neighboring panes stay untouched");
+
+        let mut uniforms = uniforms;
+        uniforms.cursor_bg_color[3] = 0.5;
+        pixels.fill(clear);
+        grid.render_bg(&mut pixels, 64, 64, &uniforms);
+        let cursor_on_color = pixels[20 * 64 + 16];
+        grid.write_row(0, &[CellBg::TRANSPARENT; 2], &[]);
+        pixels.fill(clear);
+        grid.render_bg(&mut pixels, 64, 64, &uniforms);
+        assert_eq!(
+            pixels[20 * 64 + 16],
+            cursor_on_color,
+            "translucent cursor replaces the original background"
+        );
+    }
+}
+
 /// CPU-side glyph atlas. R8 for grayscale masks, RGBA8 premultiplied
 /// for color emoji. Uses the same shelf allocator as the GPU atlases
 /// so `AtlasSlot` coords round-trip.
@@ -397,6 +453,11 @@ impl CpuGridRenderer {
         let cursor_y = uniforms.cursor_pos[1];
         let cursor_bg_active = uniforms.cursor_bg_color[3] > 0.0;
         let cursor_bg = normalize_color(uniforms.cursor_bg_color);
+        let panel = if uniforms.panel_rect[2] > 0.0 && uniforms.panel_rect[3] > 0.0 {
+            uniforms.panel_rect
+        } else {
+            [0.0, 0.0, buf_w as f32, buf_h as f32]
+        };
 
         let buf_cols = self.cols as usize;
         let row_count = (rows as usize).min(self.rows as usize);
@@ -404,19 +465,70 @@ impl CpuGridRenderer {
         for row in 0..row_count {
             let row_off = row * buf_cols;
             for col in 0..col_count {
-                let mut rgba = self.bg_cells[row_off + col].rgba;
-                if cursor_bg_active && cursor_x == col as u32 && cursor_y == row as u32 {
-                    rgba = cursor_bg;
-                }
-                if rgba[3] == 0 {
+                let rgba = self.bg_cells[row_off + col].rgba;
+                let is_cursor =
+                    cursor_bg_active && cursor_x == col as u32 && cursor_y == row as u32;
+                if rgba[3] == 0 && !is_cursor {
                     continue;
                 }
-
                 let x0 = (pad_left + (col as f32) * cell_w).round() as i32;
                 let y0 = (pad_top + (row as f32) * cell_h).round() as i32;
                 let x1 = (pad_left + ((col + 1) as f32) * cell_w).round() as i32;
                 let y1 = (pad_top + ((row + 1) as f32) * cell_h).round() as i32;
-                fill_rect(buf, buf_w_i, buf_h_i, x0, y0, x1, y1, rgba);
+                let extend = uniforms.padding_extend;
+                let bounds = [
+                    if col == 0 && extend & GridUniforms::PADDING_EXTEND_LEFT != 0 {
+                        panel[0].round() as i32
+                    } else {
+                        x0
+                    },
+                    if row == 0 && extend & GridUniforms::PADDING_EXTEND_UP != 0 {
+                        panel[1].round() as i32
+                    } else {
+                        y0
+                    },
+                    if col + 1 == col_count
+                        && extend & GridUniforms::PADDING_EXTEND_RIGHT != 0
+                    {
+                        (panel[0] + panel[2]).round() as i32
+                    } else {
+                        x1
+                    },
+                    if row + 1 == row_count
+                        && extend & GridUniforms::PADDING_EXTEND_DOWN != 0
+                    {
+                        (panel[1] + panel[3]).round() as i32
+                    } else {
+                        y1
+                    },
+                ];
+                let mut paint = |bounds, color| {
+                    fill_panel_rect(
+                        buf,
+                        buf_w_i,
+                        buf_h_i,
+                        bounds,
+                        color,
+                        panel,
+                        uniforms.panel_radius,
+                    );
+                };
+                if is_cursor {
+                    // Cursor backgrounds belong to the cell, never its padding.
+                    // Paint only the surrounding strips with the original color
+                    // so translucent cursors replace, rather than blend over, it.
+                    for strip in [
+                        [bounds[0], bounds[1], bounds[2], y0],
+                        [bounds[0], y1, bounds[2], bounds[3]],
+                        [bounds[0], y0, x0, y1],
+                        [x1, y0, bounds[2], y1],
+                    ] {
+                        paint(strip, rgba);
+                    }
+                    paint([x0, y0, x1, y1], cursor_bg);
+                } else {
+                    paint(bounds, rgba);
+                }
             }
         }
     }
@@ -547,21 +659,57 @@ fn premul(c: [u8; 4]) -> [u8; 4] {
 
 use crate::premul::{blend_premul_over as blend_over, pack_opaque};
 
-#[allow(clippy::too_many_arguments)]
-fn fill_rect(
+fn fill_panel_rect(
     buf: &mut [u32],
     buf_w: i32,
     buf_h: i32,
-    x0: i32,
-    y0: i32,
-    x1: i32,
-    y1: i32,
+    bounds: [i32; 4],
     rgba: [u8; 4],
+    panel: [f32; 4],
+    radius: f32,
 ) {
-    let x0 = x0.max(0);
-    let y0 = y0.max(0);
-    let x1 = x1.min(buf_w);
-    let y1 = y1.min(buf_h);
+    if rgba[3] == 0 {
+        return;
+    }
+    let x0 = bounds[0].max(panel[0].round() as i32);
+    let y0 = bounds[1].max(panel[1].round() as i32);
+    let x1 = bounds[2].min((panel[0] + panel[2]).round() as i32);
+    let y1 = bounds[3].min((panel[1] + panel[3]).round() as i32);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let radius = radius.max(0.0).min(panel[2] * 0.5).min(panel[3] * 0.5);
+    // Most cells lie entirely inside the straight part of the pane.
+    if radius == 0.0
+        || (y0 as f32 >= panel[1] + radius && y1 as f32 <= panel[1] + panel[3] - radius)
+        || (x0 as f32 >= panel[0] + radius && x1 as f32 <= panel[0] + panel[2] - radius)
+    {
+        fill_rect(buf, buf_w, buf_h, [x0, y0, x1, y1], rgba);
+        return;
+    }
+    for y in y0.max(0)..y1.min(buf_h) {
+        let center_y = y as f32 + 0.5;
+        let dy = (panel[1] + radius - center_y)
+            .max(center_y - (panel[1] + panel[3] - radius))
+            .max(0.0);
+        let inset = radius - (radius * radius - dy * dy).max(0.0).sqrt();
+        let left = (panel[0] + inset - 0.5).ceil() as i32;
+        let right = (panel[0] + panel[2] - inset - 0.5).ceil() as i32;
+        fill_rect(
+            buf,
+            buf_w,
+            buf_h,
+            [x0.max(left), y, x1.min(right), y + 1],
+            rgba,
+        );
+    }
+}
+
+fn fill_rect(buf: &mut [u32], buf_w: i32, buf_h: i32, bounds: [i32; 4], rgba: [u8; 4]) {
+    let x0 = bounds[0].max(0);
+    let y0 = bounds[1].max(0);
+    let x1 = bounds[2].min(buf_w);
+    let y1 = bounds[3].min(buf_h);
     if x1 <= x0 || y1 <= y0 {
         return;
     }
