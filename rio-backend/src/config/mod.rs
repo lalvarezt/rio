@@ -21,7 +21,7 @@ use crate::config::bindings::Bindings;
 use crate::config::defaults::*;
 use crate::config::hints::Hints;
 use crate::config::keyboard::Keyboard;
-use crate::config::layout::{Margin, Panel};
+use crate::config::layout::{Margin, Panel, PanelOverrides};
 use crate::config::navigation::Navigation;
 use crate::config::platform::{Platform, PlatformConfig};
 use crate::config::renderer::Renderer;
@@ -140,8 +140,8 @@ pub struct Config {
     pub editor: Shell,
     #[serde(default = "default_margin", alias = "margin")]
     pub margin: Margin,
-    #[serde(default = "Panel::default")]
-    pub panel: Panel,
+    #[serde(default)]
+    pub panel: PanelOverrides,
     #[serde(default = "Vec::default", rename = "env-vars")]
     pub env_vars: Vec<String>,
     #[serde(default = "default_option_as_alt", rename = "option-as-alt")]
@@ -297,6 +297,10 @@ pub fn create_config_file(path: Option<PathBuf>) {
 }
 
 impl Config {
+    pub fn panel(&self) -> Panel {
+        self.panel.resolve(self.navigation.tab_style)
+    }
+
     #[cfg(test)]
     fn load_from_path(path: &PathBuf) -> Self {
         if path.exists() {
@@ -622,6 +626,7 @@ impl Config {
             if let Some(style) = navigation_overwrite.tab_style {
                 self.navigation.tab_style = style;
             }
+            self.navigation.tabs.merge(navigation_overwrite.tabs);
             if let Some(intensity) = navigation_overwrite.tab_glass_intensity {
                 self.navigation.tab_glass_intensity = intensity;
             }
@@ -634,6 +639,10 @@ impl Config {
             if let Some(icons) = &navigation_overwrite.app_icons {
                 self.navigation.app_icons.extend(icons.clone());
             }
+        }
+
+        if let Some(panel) = platform_config.panel {
+            self.panel.merge(panel);
         }
 
         // Clamp after platform merge so both the base and any override go
@@ -712,7 +721,7 @@ impl Default for Config {
             navigation: Navigation::default(),
             option_as_alt: default_option_as_alt(),
             margin: default_margin(),
-            panel: Panel::default(),
+            panel: PanelOverrides::default(),
             renderer: Renderer::default(),
             shell: default_shell(),
             platform: Platform::default(),
@@ -745,6 +754,9 @@ impl Default for CursorConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod ui_tests;
 
 #[cfg(test)]
 mod tests {

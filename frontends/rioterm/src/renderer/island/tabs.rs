@@ -98,8 +98,11 @@ impl Tabs {
             tab.measurement = None;
         }
     }
-    pub(super) fn pointer_target(&self, x: Option<f32>) -> Option<(usize, bool)> {
-        let x = x?;
+    pub(super) fn pointer_target(
+        &self,
+        pointer: Option<[f32; 2]>,
+    ) -> Option<(usize, bool)> {
+        let [x, y] = pointer?;
         let floating = self.floating.filter(|id| self.order.contains(id));
         floating
             .iter()
@@ -108,12 +111,9 @@ impl Tabs {
                 let tab = &self.tabs[id];
                 let left = tab.left.value();
                 let width = tab.width.value();
-                (x >= left && x < left + width).then(|| {
+                self.appearance.contains(left, width, x, y).then(|| {
                     let close = floating != Some(*id)
-                        && self
-                            .appearance
-                            .close_center(left, width)
-                            .is_some_and(|cx| (x - cx).abs() <= CLOSE_HIT_HALF_WIDTH);
+                        && self.appearance.close_hit(left, width, x, y);
                     (*id, close)
                 })
             })
@@ -121,7 +121,7 @@ impl Tabs {
     pub(super) fn next_frame_in(
         &self,
         scale: f32,
-        hovered: Option<f32>,
+        hovered: Option<[f32; 2]>,
     ) -> Option<Duration> {
         if self.animating {
             let geometry_settled =
@@ -248,7 +248,7 @@ impl Tabs {
         limits: (f32, f32),
         icon_size: f32,
         selected: usize,
-        hovered: Option<f32>,
+        hovered: Option<[f32; 2]>,
         drag: Option<usize>,
         dt: f32,
         now: Instant,
@@ -277,7 +277,7 @@ impl Tabs {
         let end_inset = self.appearance.title_end_inset(false);
         let measurement = Some([scale, min, max, icon_size, end_inset]);
         let opts = DrawOpts {
-            font_size: snap(TITLE_FONT_SIZE, scale),
+            font_size: snap(self.appearance.geometry.font_size, scale),
             font_id: Some(rio_backend::sugarloaf::font::FONT_ID_REGULAR),
             ..DrawOpts::default()
         };
@@ -518,7 +518,7 @@ impl Island {
             };
             self.drag = None;
             let y = if cfg!(any(target_os = "windows", target_os = "macos")) {
-                ISLAND_HEIGHT
+                self.height()
             } else {
                 0.0
             };
@@ -581,7 +581,7 @@ impl Island {
             (self.min_tab_width, self.max_tab_width),
             self.tab_icon_size,
             context_manager.tab_id(selected),
-            self.hover_x,
+            self.pointer,
             self.drag_index(),
             dt,
             now,
@@ -611,9 +611,9 @@ impl Island {
         let title_y = crate::renderer::window_chrome::centered_text_y(
             sugarloaf,
             "Mg",
-            appearance.center_y() + 2.0,
+            appearance.center_y() + appearance.geometry.text_offset_y,
             &DrawOpts {
-                font_size: snap(TITLE_FONT_SIZE, scale),
+                font_size: snap(appearance.geometry.font_size, scale),
                 font_id: Some(rio_backend::sugarloaf::font::FONT_ID_REGULAR),
                 ..DrawOpts::default()
             },
@@ -641,7 +641,7 @@ impl Island {
                     } else {
                         bounds.tabs_width
                     },
-                    ISLAND_HEIGHT,
+                    self.height(),
                 ];
                 sugarloaf.with_shape_clip(clip, |sugarloaf| {
                     for offset in copies.iter().take(if period > 0.0 { 3 } else { 1 }) {
@@ -704,7 +704,7 @@ impl Island {
                 context_manager.custom_color(index),
             );
         }
-        self.render_progress_bar(sugarloaf, window_width, scale, ISLAND_HEIGHT);
+        self.render_progress_bar(sugarloaf, window_width, scale, self.height());
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -789,9 +789,9 @@ impl Island {
         let end_inset = appearance
             .title_end_inset(count > 1 && tab.hover > 0.0 && floating.is_none());
         let budget = (width - padding - end_inset - bell_width).max(0.0);
-        if budget >= TITLE_FONT_SIZE {
+        if budget >= appearance.geometry.font_size {
             let opts = DrawOpts {
-                font_size: snap(TITLE_FONT_SIZE, sugarloaf.scale_factor()),
+                font_size: snap(appearance.geometry.font_size, sugarloaf.scale_factor()),
                 font_id: Some(rio_backend::sugarloaf::font::FONT_ID_REGULAR),
                 color: color_u8(color),
                 ..DrawOpts::default()
@@ -806,7 +806,8 @@ impl Island {
                 sugarloaf.rounded_rect(
                     None,
                     text_x,
-                    title_y + TITLE_FONT_SIZE * (2.0 / 3.0) - BELL_DOT_SIZE / 2.0,
+                    title_y + appearance.geometry.font_size * (2.0 / 3.0)
+                        - BELL_DOT_SIZE / 2.0,
                     BELL_DOT_SIZE,
                     BELL_DOT_SIZE,
                     color,
@@ -820,21 +821,24 @@ impl Island {
                 .draw(text_x + bell_width, title_y, &title, &opts);
         }
         let close_center = appearance.close_center(left, width);
-        let icon_width = if appearance.persistent_close {
-            close_center
-                .map_or(w, |cx| (cx - CLOSE_HOVER_HALF - TAB_ICON_GAP - x).max(0.0))
+        let persistent_close = appearance.geometry.close_button == CloseButton::Always;
+        let close_half = appearance.geometry.close_button_size / 2.0;
+        let icon_width = if persistent_close {
+            close_center.map_or(w, |cx| {
+                (cx - close_half - appearance.geometry.close_button_gap - x).max(0.0)
+            })
         } else {
             w
         };
         self.render_tab_icons(sugarloaf, &tab.content, x, icon_width, color, order + 1);
         if appearance.shows_close(count)
             && tab.live
-            && (appearance.persistent_close || (floating.is_none() && tab.hover > 0.0))
+            && (persistent_close || (floating.is_none() && tab.hover > 0.0))
         {
             if let Some(cx) = close_center {
                 let cx = snap(cx, sugarloaf.scale_factor());
                 if occlusion.is_some_and(|[start, end]| {
-                    cx + CLOSE_HOVER_HALF > start && cx - CLOSE_HOVER_HALF < end
+                    cx + close_half > start && cx - close_half < end
                 }) {
                     sugarloaf
                         .text_mut()
@@ -842,26 +846,23 @@ impl Island {
                     return;
                 }
                 let hot = floating.is_none()
-                    && self.hover_x.is_some_and(|pointer| {
-                        (pointer - cx).abs() <= CLOSE_HIT_HALF_WIDTH
+                    && self.pointer.is_some_and(|[px, py]| {
+                        (px - cx).abs() <= close_half
+                            && (py - appearance.center_y()).abs() <= close_half
                     });
                 if hot {
                     sugarloaf.rounded_rect(
                         None,
-                        cx - CLOSE_HOVER_HALF,
-                        appearance.center_y() - CLOSE_HOVER_HALF,
-                        CLOSE_SPACE,
-                        CLOSE_SPACE,
+                        cx - close_half,
+                        appearance.center_y() - close_half,
+                        close_half * 2.0,
+                        close_half * 2.0,
                         alpha(
                             fills.close_hover,
-                            if appearance.persistent_close {
-                                1.0
-                            } else {
-                                tab.hover
-                            },
+                            if persistent_close { 1.0 } else { tab.hover },
                         ),
                         0.05,
-                        appearance.radius(CLOSE_HOVER_CORNER_RADIUS),
+                        appearance.radius(close_half / 2.0),
                         order + 1,
                     );
                 }
@@ -869,14 +870,8 @@ impl Island {
                     sugarloaf,
                     cx,
                     appearance.center_y(),
-                    alpha(
-                        color,
-                        if appearance.persistent_close {
-                            1.0
-                        } else {
-                            tab.hover
-                        },
-                    ),
+                    appearance.geometry.close_button_size,
+                    alpha(color, if persistent_close { 1.0 } else { tab.hover }),
                     hot,
                     order + 2,
                 );

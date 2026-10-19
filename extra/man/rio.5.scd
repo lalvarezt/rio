@@ -310,6 +310,28 @@ Navigation display mode.
 
 Default: _"Tab"_
 
+*preset* = _"pill"_ | _"square"_
+
+	Supply defaults for tab and split geometry. Explicit settings override the
+	preset. Square tabs touch the upper-left edge, have no gaps, and keep close
+	buttons visible. Square splits use rectangular corners and one-pixel borders.
+	The legacy *tab-style* key and _"windows"_ value remain accepted aliases.
+
+	Default: _"pill"_
+
+The optional *[navigation.tabs]* table overrides *height*, *margin*, *padding*,
+*gap*, *radius*, *font-size*, *text-offset-y*, *icon-gap*, *close-button*,
+*close-button-size*, *close-button-inset*, and *close-button-gap*.
+Close-button modes are _"always"_, _"hover"_, and _"never"_. Geometry is in
+logical pixels. Margins and padding accept arrays of one, two, or four values
+in CSS order. Width and icon size remain configured with *min-tab-width*,
+*max-tab-width*, and *tab-icon-size* in *[navigation]*.
+
+Root *margin* controls the pane layout's distance from the window edge and
+tabs. The existing *[panel]* table controls per-pane *margin*, *padding*,
+*row-gap*, *column-gap*, *border-width*, and *border-radius*. These settings
+also override preset defaults. Geometry changes reload for existing panes.
+
 *clickable* = _true_ | _false_
 
 	Enable clickable navigation elements.

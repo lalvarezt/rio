@@ -5,7 +5,6 @@ use rio_backend::sugarloaf::font::FontLibrary;
 use rio_backend::sugarloaf::text::DrawOpts;
 use rio_backend::sugarloaf::Sugarloaf;
 
-pub const HEADER_HEIGHT: f32 = 54.0;
 const BUTTON_WIDTH: f32 = 46.0;
 const BUTTON_HEIGHT: f32 = 32.0;
 const CONTROL_ORDER: u8 = 16;

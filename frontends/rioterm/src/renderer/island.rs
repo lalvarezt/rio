@@ -12,7 +12,7 @@ use crate::context::ContextManager;
 use crate::renderer::helpers::spring::Spring;
 use crate::renderer::tab_glass::Status;
 use rio_backend::config::colors::Colors;
-use rio_backend::config::navigation::TabStyle;
+use rio_backend::config::navigation::{CloseButton, TabGeometry, TabStyle};
 use rio_backend::event::{EventProxy, ProgressReport, ProgressState};
 use rio_backend::program_status::{
     BlockedKind, ProgramState, ProgramStatusRecord, ProgramStatusStore,
@@ -22,26 +22,12 @@ use rio_backend::sugarloaf::Sugarloaf;
 use rustc_hash::FxHashMap;
 use std::time::Instant;
 
-pub const ISLAND_HEIGHT: f32 = crate::renderer::window_chrome::HEADER_HEIGHT;
-
 #[cfg(test)]
 #[path = "../../../../misc/benchmarks/frontend_status.rs"]
 mod branch_benchmarks;
 const PROGRESS_BAR_HEIGHT: f32 = 3.0;
 
 const PROGRESS_BAR_TIMEOUT_SECS: u64 = 15;
-const TITLE_FONT_SIZE: f32 = 15.0;
-
-const TAB_TITLE_PADDING_RIGHT: f32 = 14.0;
-const TAB_ICON_INSET_X: f32 = 12.0;
-const TAB_ICON_GAP: f32 = 8.0;
-const TAB_GAP: f32 = 6.0;
-const TAB_INSET_BOTTOM: f32 = 6.0;
-const TAB_INSET_TOP: f32 = TAB_INSET_BOTTOM;
-
-/// Bottom of the tab shape; pane spacing starts here for either tab style.
-pub const CONTENT_TOP: f32 = ISLAND_HEIGHT - TAB_INSET_BOTTOM;
-const TAB_RADIUS: f32 = 19.0;
 /// Bell dot for tabs that rang while in the background, and the gap
 /// between it and the tab title. A dot, not a glyph: the UI text layer
 /// resolves one font per run, so a bell glyph exists only where an
@@ -53,7 +39,6 @@ const BELL_DOT_SIZE: f32 = 6.0;
 const BELL_GAP: f32 = 4.0;
 const DRAG_THRESHOLD: f32 = 4.0;
 const DRAG_MAX_DT: f32 = 0.05;
-const ISLAND_MARGIN_RIGHT: f32 = 8.0;
 
 /// Color picker constants
 const PICKER_SWATCH_SIZE: f32 = 18.0;
@@ -88,17 +73,11 @@ const PICKER_COLORS: [[f32; 4]; 6] = [
 #[cfg(target_os = "macos")]
 const ISLAND_MARGIN_LEFT_MACOS: f32 = 76.0;
 
-const CLOSE_MARGIN_RIGHT: f32 = 22.0;
-const CLOSE_GLYPH_HALF: f32 = 3.5;
+const CLOSE_GLYPH_RATIO: f32 = 0.175;
 const CLOSE_MIN_ISLAND_WIDTH: f32 = 64.0;
-const CLOSE_HOVER_HALF: f32 = 10.0;
-const CLOSE_SPACE: f32 = CLOSE_HOVER_HALF * 2.0;
-const CLOSE_TITLE_INSET: f32 = CLOSE_MARGIN_RIGHT + CLOSE_HOVER_HALF + TAB_ICON_GAP;
-const CLOSE_HOVER_CORNER_RADIUS: f32 = 5.0;
-const CLOSE_HIT_HALF_WIDTH: f32 = 10.0;
 const CLOSE_ALPHA_IDLE: f32 = 0.55;
 const CLOSE_ALPHA_HOVER: f32 = 0.95;
-const CLOSE_STROKE_WIDTH: f32 = 1.2;
+const CLOSE_STROKE_RATIO: f32 = 0.06;
 const INACTIVE_CUSTOM_MUTE: f32 = 0.55;
 
 /// Status strings are plain text. Strip invisible direction/format controls
@@ -321,9 +300,7 @@ fn draw_island(
 /// Style geometry shared by measurement, drawing, and pointer targets.
 #[derive(Clone, Copy)]
 struct TabAppearance {
-    inset_top: f32,
-    rounded: bool,
-    persistent_close: bool,
+    geometry: TabGeometry,
 }
 
 impl Default for TabAppearance {
@@ -334,37 +311,32 @@ impl Default for TabAppearance {
 
 impl From<TabStyle> for TabAppearance {
     fn from(style: TabStyle) -> Self {
-        let windows = style == TabStyle::Windows;
         Self {
-            inset_top: if windows { 0.0 } else { TAB_INSET_TOP },
-            rounded: !windows,
-            persistent_close: windows,
+            geometry: style.geometry(),
         }
     }
 }
 
 impl TabAppearance {
-    fn gap(self) -> f32 {
-        if self.rounded {
-            TAB_GAP
-        } else {
-            0.0
-        }
+    fn gap(&self) -> f32 {
+        self.geometry.gap
     }
 
     fn layout(
-        self,
+        &self,
         window_width: f32,
         scale_factor: f32,
         num_tabs: usize,
         max_tab_width: f32,
     ) -> TabStripLayout {
         #[cfg(target_os = "macos")]
-        let left_margin = ISLAND_MARGIN_LEFT_MACOS;
+        let left_margin = (ISLAND_MARGIN_LEFT_MACOS + self.gap() / 2.0)
+            .max(self.geometry.margin.left)
+            - self.gap() / 2.0;
         #[cfg(not(target_os = "macos"))]
-        let left_margin = self.gap();
-        let right_margin =
-            ISLAND_MARGIN_RIGHT + crate::renderer::window_chrome::controls_width();
+        let left_margin = self.geometry.margin.left - self.gap() / 2.0;
+        let right_margin = self.geometry.margin.right - self.gap() / 2.0
+            + crate::renderer::window_chrome::controls_width();
         let available_width =
             (window_width / scale_factor - right_margin - left_margin).max(0.0);
         let tab_width =
@@ -379,68 +351,104 @@ impl TabAppearance {
         }
     }
 
-    fn icon_padding(self, remote: bool, icon_size: f32) -> f32 {
+    fn icon_padding(&self, remote: bool, icon_size: f32) -> f32 {
         let icons = if remote { 2.0 } else { 1.0 };
-        TAB_ICON_INSET_X + icons * (icon_size + TAB_ICON_GAP)
+        self.geometry.padding.left + icons * (icon_size + self.geometry.icon_gap)
     }
 
-    fn title_padding(self, remote: bool, icon_size: f32) -> f32 {
+    fn title_padding(&self, remote: bool, icon_size: f32) -> f32 {
         self.gap() / 2.0 + self.icon_padding(remote, icon_size)
     }
 
-    fn radius(self, pill_radius: f32) -> f32 {
-        if self.rounded {
-            pill_radius
-        } else {
-            0.0
-        }
+    fn radius(&self, pill_radius: f32) -> f32 {
+        self.geometry.radius.min(pill_radius)
     }
 
-    fn center_y(self) -> f32 {
-        (self.inset_top + CONTENT_TOP) / 2.0
+    fn center_y(&self) -> f32 {
+        (self.geometry.margin.top
+            + self.geometry.padding.top
+            + self.geometry.content_top()
+            - self.geometry.padding.bottom)
+            / 2.0
     }
 
-    fn rect(self, slot_x: f32, tab_width: f32) -> (f32, f32, f32, f32, f32) {
+    fn rect(&self, slot_x: f32, tab_width: f32) -> (f32, f32, f32, f32, f32) {
         let x = slot_x + self.gap() / 2.0;
         let w = (tab_width - self.gap()).max(0.0);
-        let h = CONTENT_TOP - self.inset_top;
+        let h = self.geometry.content_top() - self.geometry.margin.top;
         (
             x,
-            self.inset_top,
+            self.geometry.margin.top,
             w,
             h,
-            self.radius(TAB_RADIUS.min(w / 2.0).min(h / 2.0)),
+            self.radius(w.min(h) / 2.0),
         )
     }
 
-    fn shows_close(self, count: usize) -> bool {
-        self.persistent_close || count > 1
-    }
-
-    fn title_end_inset(self, hovered_close: bool) -> f32 {
-        if self.persistent_close || hovered_close {
-            self.gap() / 2.0 + CLOSE_TITLE_INSET
-        } else {
-            TAB_TITLE_PADDING_RIGHT
+    fn shows_close(&self, count: usize) -> bool {
+        match self.geometry.close_button {
+            CloseButton::Always => true,
+            CloseButton::Hover => count > 1,
+            CloseButton::Never => false,
         }
     }
 
-    fn close_center(self, slot_x: f32, tab_width: f32) -> Option<f32> {
-        let (x, _, w, _, _) = self.rect(slot_x, tab_width);
-        let minimum = if self.persistent_close {
-            CLOSE_SPACE
+    fn contains(&self, slot_x: f32, tab_width: f32, x: f32, y: f32) -> bool {
+        let (left, top, width, height, radius) = self.rect(slot_x, tab_width);
+        if x < left || x >= left + width || y < top || y >= top + height {
+            return false;
+        }
+        let dx = ((x - left - width / 2.0).abs() - (width / 2.0 - radius)).max(0.0);
+        let dy = ((y - top - height / 2.0).abs() - (height / 2.0 - radius)).max(0.0);
+        dx * dx + dy * dy <= radius * radius
+    }
+
+    fn title_end_inset(&self, hovered_close: bool) -> f32 {
+        if self.geometry.close_button == CloseButton::Always
+            || (self.geometry.close_button == CloseButton::Hover && hovered_close)
+        {
+            self.gap() / 2.0
+                + self.geometry.close_button_inset
+                + self.geometry.close_button_size
+                + self.geometry.close_button_gap
         } else {
-            CLOSE_MIN_ISLAND_WIDTH
+            self.gap() / 2.0 + self.geometry.padding.right
+        }
+    }
+
+    fn close_center(&self, slot_x: f32, tab_width: f32) -> Option<f32> {
+        let (x, _, w, _, _) = self.rect(slot_x, tab_width);
+        if self.geometry.close_button == CloseButton::Never {
+            return None;
+        }
+        let minimum = if self.geometry.close_button == CloseButton::Always {
+            self.geometry.close_button_size
+        } else {
+            CLOSE_MIN_ISLAND_WIDTH.max(
+                self.geometry.close_button_size + self.geometry.close_button_inset * 2.0,
+            )
         };
-        (w >= minimum).then_some(x + w - CLOSE_MARGIN_RIGHT.min(w / 2.0))
+        (w >= minimum).then_some(
+            x + w
+                - (self.geometry.close_button_inset
+                    + self.geometry.close_button_size / 2.0)
+                    .min(w / 2.0),
+        )
     }
 
     fn close_button_center_x(
-        self,
+        &self,
         layout: &TabStripLayout,
         tab_index: usize,
     ) -> Option<f32> {
         self.close_center(layout.left(tab_index), layout.width(tab_index))
+    }
+
+    fn close_hit(&self, slot_x: f32, width: f32, x: f32, y: f32) -> bool {
+        self.close_center(slot_x, width).is_some_and(|cx| {
+            let half = self.geometry.close_button_size / 2.0;
+            (x - cx).abs() <= half && (y - self.center_y()).abs() <= half
+        })
     }
 }
 
@@ -448,11 +456,12 @@ fn draw_close_button(
     sugarloaf: &mut Sugarloaf,
     cx: f32,
     cy: f32,
+    size: f32,
     color: [f32; 4],
     hover: bool,
     order: u8,
 ) {
-    let r = CLOSE_GLYPH_HALF;
+    let r = size * CLOSE_GLYPH_RATIO;
     let alpha = if hover {
         CLOSE_ALPHA_HOVER
     } else {
@@ -464,7 +473,7 @@ fn draw_close_button(
         cy - r,
         cx + r,
         cy + r,
-        CLOSE_STROKE_WIDTH,
+        size * CLOSE_STROKE_RATIO,
         0.0,
         color,
         order,
@@ -474,7 +483,7 @@ fn draw_close_button(
         cy + r,
         cx + r,
         cy - r,
-        CLOSE_STROKE_WIDTH,
+        size * CLOSE_STROKE_RATIO,
         0.0,
         color,
         order,
@@ -524,7 +533,7 @@ pub struct Island {
     drag: Option<TabDrag>,
     /// Timestamp of the last spring advance, for per-frame dt.
     last_anim_frame: Instant,
-    hover_x: Option<f32>,
+    pointer: Option<[f32; 2]>,
 }
 
 impl Island {
@@ -563,7 +572,7 @@ impl Island {
             rename_caret_time: Instant::now(),
             drag: None,
             last_anim_frame: Instant::now(),
-            hover_x: None,
+            pointer: None,
         }
     }
 
@@ -572,7 +581,9 @@ impl Island {
         navigation: &rio_backend::config::navigation::Navigation,
     ) {
         self.animation = navigation.animation;
-        self.tabs.appearance = TabAppearance::from(navigation.tab_style);
+        self.tabs.appearance = TabAppearance {
+            geometry: navigation.tab_geometry(),
+        };
         self.max_tab_width = rio_backend::config::navigation::clamp_max_tab_width(
             navigation.max_tab_width,
         );
@@ -605,13 +616,15 @@ impl Island {
         layout: &TabStripLayout,
         index: usize,
         x: f32,
+        y: f32,
     ) -> bool {
         layout.topmost != Some(index)
-            && self
-                .tabs
-                .appearance
-                .close_button_center_x(layout, index)
-                .is_some_and(|cx| (x - cx).abs() <= CLOSE_HIT_HALF_WIDTH)
+            && self.tabs.appearance.close_hit(
+                layout.left(index),
+                layout.width(index),
+                x,
+                y,
+            )
     }
 
     /// Share per-tab geometry between rendering, dragging, and hit testing.
@@ -648,7 +661,7 @@ impl Island {
         {
             return;
         }
-        let mut x = x + TAB_ICON_INSET_X;
+        let mut x = x + self.tabs.appearance.geometry.padding.left;
         if tab.remote {
             draw_tab_icon(
                 sugarloaf,
@@ -660,7 +673,7 @@ impl Island {
                 self.window_header.app_font,
                 self.tab_icon_size,
             );
-            x += self.tab_icon_size + TAB_ICON_GAP;
+            x += self.tab_icon_size + self.tabs.appearance.geometry.icon_gap;
         }
         draw_tab_icon(
             sugarloaf,
@@ -677,10 +690,10 @@ impl Island {
     /// Set whether the cursor hovers the active island's close button.
     /// Returns true when the state changed (the caller redraws).
 
-    pub fn set_tab_hover(&mut self, x: Option<f32>) -> bool {
+    pub fn set_tab_hover(&mut self, pointer: Option<[f32; 2]>) -> bool {
         let changed =
-            self.tabs.pointer_target(self.hover_x) != self.tabs.pointer_target(x);
-        self.hover_x = x;
+            self.tabs.pointer_target(self.pointer) != self.tabs.pointer_target(pointer);
+        self.pointer = pointer;
         changed
     }
 
@@ -853,7 +866,7 @@ impl Island {
         if matches!(self.progress_state, Some(ProgressState::Indeterminate)) {
             Some(std::time::Duration::ZERO)
         } else {
-            self.tabs.next_frame_in(scale, self.hover_x).map(|delay| {
+            self.tabs.next_frame_in(scale, self.pointer).map(|delay| {
                 if self.is_dragging() {
                     std::time::Duration::ZERO
                 } else if self.animation
@@ -1086,7 +1099,19 @@ impl Island {
     /// Get the height of the island
     #[inline]
     pub fn height(&self) -> f32 {
-        ISLAND_HEIGHT
+        self.tabs.appearance.geometry.height
+    }
+
+    pub fn content_top(&self) -> f32 {
+        self.tabs.appearance.geometry.content_top()
+    }
+
+    pub fn tab_at(&self, layout: &TabStripLayout, x: f32, y: f32) -> Option<usize> {
+        let index = layout.tab_at(x)?;
+        self.tabs
+            .appearance
+            .contains(layout.left(index), layout.width(index), x, y)
+            .then_some(index)
     }
 
     /// Render the platform's tab strip.
@@ -1237,7 +1262,7 @@ impl Island {
         let tab_width = layout.width(picker_tab);
 
         // Picker is rendered just below the island
-        let picker_y = ISLAND_HEIGHT;
+        let picker_y = self.height();
 
         // Check if click is within picker vertical range
         if mouse_y_unscaled < picker_y || mouse_y_unscaled > picker_y + PICKER_HEIGHT {
@@ -1298,7 +1323,7 @@ impl Island {
         selected_color: Option<[f32; 4]>,
     ) {
         let padding = PICKER_PADDING;
-        let bg_y = ISLAND_HEIGHT;
+        let bg_y = self.height();
 
         // Compute total swatches width to derive the consistent inner content width
         // N color swatches + 1 reset swatch
@@ -1524,15 +1549,13 @@ mod tests {
     fn island_geometry_invariants() {
         use rio_backend::config::navigation::{Navigation, NavigationMode};
 
-        const {
-            assert!(TAB_INSET_TOP + TAB_INSET_BOTTOM < ISLAND_HEIGHT);
-            assert!(CLOSE_MARGIN_RIGHT + CLOSE_HIT_HALF_WIDTH < CLOSE_MIN_ISLAND_WIDTH);
+        for style in [TabStyle::Pill, TabStyle::Square] {
+            let geometry = style.geometry();
+            assert!(geometry.margin.top + geometry.margin.bottom < geometry.height);
             assert!(
-                CLOSE_HOVER_HALF * 2.0
-                    <= ISLAND_HEIGHT - TAB_INSET_TOP - TAB_INSET_BOTTOM
+                geometry.close_button_size
+                    <= geometry.content_top() - geometry.margin.top
             );
-        }
-        for style in [TabStyle::Pill, TabStyle::Windows] {
             let (_, y, _, height, _) = TabAppearance::from(style).rect(0.0, 180.0);
             let navigation = Navigation {
                 mode: NavigationMode::Tab,
@@ -1552,12 +1575,13 @@ mod tests {
         // Slot at x=100, width 180 → island inset by half the gap on
         // each side and the configured top and bottom insets.
         let appearance = TabAppearance::default();
+        let geometry = appearance.geometry;
         let (x, y, w, h, radius) = appearance.rect(100.0, 180.0);
-        assert_eq!(x, 100.0 + TAB_GAP / 2.0);
-        assert_eq!(y, TAB_INSET_TOP);
-        assert_eq!(w, 180.0 - TAB_GAP);
-        assert_eq!(h, ISLAND_HEIGHT - TAB_INSET_TOP - TAB_INSET_BOTTOM);
-        assert_eq!(radius, TAB_RADIUS);
+        assert_eq!(x, 100.0 + geometry.gap / 2.0);
+        assert_eq!(y, geometry.margin.top);
+        assert_eq!(w, 180.0 - geometry.gap);
+        assert_eq!(h, geometry.content_top() - geometry.margin.top);
+        assert_eq!(radius, geometry.radius);
 
         let (_, _, w, h, radius) = appearance.rect(0.0, 4.0);
         assert_eq!(w, 0.0);
@@ -1589,7 +1613,7 @@ mod tests {
     fn test_island_height() {
         let island =
             Island::new([0.8, 0.8, 0.8, 1.0], [1.0, 1.0, 1.0, 1.0], false, 240.0);
-        assert_eq!(island.height(), ISLAND_HEIGHT);
+        assert_eq!(island.height(), 54.0);
     }
 
     fn test_island() -> Island {
@@ -1896,10 +1920,10 @@ mod tests {
     #[test]
     fn tab_strip_layout_geometry() {
         let layout = tab_strip_layout(1000.0, 2.0, 4, 240.0);
-        let available = 500.0
-            - layout.left_margin
-            - ISLAND_MARGIN_RIGHT
-            - crate::renderer::window_chrome::controls_width();
+        let available =
+            500.0 - layout.left_margin - TabStyle::Pill.geometry().margin.right
+                + TabStyle::Pill.geometry().gap / 2.0
+                - crate::renderer::window_chrome::controls_width();
         assert_eq!(layout.tab_width, available / 4.0);
         assert_eq!(layout.tabs_width, available);
         assert!(tab_strip_layout(1000.0, 2.0, 0, 240.0)
@@ -1974,7 +1998,7 @@ mod tests {
     #[test]
     fn close_button_anchors_to_island_right_edge() {
         // Full-width slot: slot 1 spans 180..360, island 183..354, so
-        // the button centers at 354 - CLOSE_MARGIN_RIGHT.
+        // the button center stays inside the shape's right inset.
         let layout = TabStripLayout {
             left_margin: 0.0,
             tab_width: 180.0,
@@ -1983,15 +2007,17 @@ mod tests {
             positions: Vec::new(),
             topmost: None,
         };
-        let cx = TabAppearance::default()
-            .close_button_center_x(&layout, 1)
-            .unwrap();
+        let appearance = TabAppearance::default();
+        let geometry = appearance.geometry;
+        let cx = appearance.close_button_center_x(&layout, 1).unwrap();
         assert_eq!(
             cx,
-            180.0 + TAB_GAP / 2.0 + (180.0 - TAB_GAP) - CLOSE_MARGIN_RIGHT
+            180.0 + geometry.gap / 2.0 + (180.0 - geometry.gap)
+                - geometry.close_button_inset
+                - geometry.close_button_size / 2.0
         );
         // The whole forgiving hit box stays inside the island.
-        assert!(cx + CLOSE_HIT_HALF_WIDTH <= 360.0 - TAB_GAP / 2.0);
+        assert!(cx + geometry.close_button_size / 2.0 <= 360.0 - geometry.gap / 2.0);
 
         // Narrow islands (many tabs) drop the button — no hit box, so
         // rendering and click handling agree via the shared helper.
@@ -2043,5 +2069,72 @@ mod tests {
         assert!(island.progress_value.is_none());
         assert!(island.progress_started_at.is_none());
         assert!(island.progress_last_seen.is_none());
+    }
+
+    #[test]
+    fn custom_geometry_shares_paint_input_and_terminal_bounds() {
+        use rio_backend::config::layout::Margin;
+        use rio_backend::config::navigation::{Navigation, Tabs};
+        let navigation = Navigation {
+            tab_style: TabStyle::Square,
+            tabs: Tabs {
+                height: Some(82.0),
+                margin: Some(Margin::new(12.0, 14.0, 10.0, 16.0)),
+                padding: Some(Margin::new(2.0, 13.0, 4.0, 17.0)),
+                gap: Some(8.0),
+                radius: Some(16.0),
+                close_button_size: Some(28.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut island = test_island();
+        island.configure(&navigation);
+        let appearance = island.tabs.appearance;
+        let layout = appearance.layout(1000.0, 1.0, 2, 240.0);
+        let (x, y, width, height, radius) =
+            appearance.rect(layout.left(0), layout.width(0));
+        assert_eq!((y, height, radius), (12.0, 60.0, 16.0));
+        assert_eq!(island.content_top(), y + height);
+        assert_eq!(
+            super::super::utils::padding_top_from_config(&navigation, 4.0, 2, false),
+            y + height + 4.0
+        );
+        assert_eq!(island.tab_at(&layout, x + width / 2.0, y + 1.0), Some(0));
+        assert_eq!(island.tab_at(&layout, x + 1.0, y + 1.0), None);
+        assert_eq!(island.tab_at(&layout, x - 1.0, y + 1.0), None);
+        assert_eq!(island.tab_at(&layout, x + width / 2.0, y - 1.0), None);
+        let close = appearance.close_button_center_x(&layout, 0).unwrap();
+        assert!(island.close_button_hit(&layout, 0, close, appearance.center_y()));
+        assert!(!island.close_button_hit(
+            &layout,
+            0,
+            close,
+            appearance.center_y() + 15.0
+        ));
+        assert!(!island.close_button_hit(
+            &layout,
+            0,
+            close + 15.0,
+            appearance.center_y()
+        ));
+        let mut hidden = navigation;
+        hidden.tabs.close_button = Some(CloseButton::Never);
+        island.configure(&hidden);
+        assert!(!island.shows_close_button(2));
+        assert!(!island.close_button_hit(&layout, 0, close, appearance.center_y()));
+
+        hidden.tabs.margin = Some(Margin::all(0.0));
+        hidden.tabs.gap = Some(10.0);
+        hidden.tabs.radius = Some(0.0);
+        island.configure(&hidden);
+        let edge_layout = island.tabs.appearance.layout(600.0, 1.0, 4, 240.0);
+        let (edge, _, _, _, _) = island
+            .tabs
+            .appearance
+            .rect(edge_layout.left(0), edge_layout.width(0));
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(edge, 0.0);
+        assert_eq!(island.tab_at(&edge_layout, edge, 1.0), Some(0));
     }
 }

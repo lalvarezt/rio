@@ -818,7 +818,7 @@ impl<'a> RouteWindow<'a> {
             let (physical_width, physical_height) = compute_window_size_from_grid(
                 config.window.columns,
                 config.window.rows,
-                &config.panel,
+                &config.panel(),
                 &screen.ctx().current().dimension,
                 winit_window.inner_size(),
             );

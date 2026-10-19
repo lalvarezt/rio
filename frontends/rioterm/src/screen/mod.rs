@@ -25,7 +25,7 @@ use crate::crosswords::{
 use crate::hints::HintState;
 use crate::layout::ContextDimension;
 use crate::mouse::{calculate_mouse_position, Mouse};
-use crate::renderer::island::{self, TabStripLayout, ISLAND_HEIGHT};
+use crate::renderer::island::{self, TabStripLayout};
 use crate::renderer::{utils::padding_top_from_config, Renderer};
 use crate::selection::{Selection, SelectionType};
 use core::fmt::Debug;
@@ -272,7 +272,7 @@ impl Screen<'_> {
             use_fork: config.use_fork,
             shell_integration: config.shell_integration,
             is_native,
-            panel: config.panel,
+            panel: config.panel(),
             title: config.title.clone(),
             keyboard: config.keyboard.clone(),
             scrollback_history_limit: config.scrollback_history_limit,
@@ -591,7 +591,7 @@ impl Screen<'_> {
         }
 
         let scale = self.sugarloaf.scale_factor();
-        self.context_manager.update_panel_config(config.panel);
+        self.context_manager.update_panel_config(config.panel());
         for context_grid in self.context_manager.contexts_mut() {
             context_grid.update_line_height(config.line_height);
 
@@ -1661,9 +1661,6 @@ impl Screen<'_> {
     pub fn split_right_with_config(&mut self, config: rio_backend::config::Config) {
         // Allocate panel id; position lands on `ContextDimension`
         // through the Taffy layout pass (`apply_taffy_layout`).
-        let _ = self.renderer.margin.top
-            + self.renderer.island.as_ref().map_or(0.0, |i| i.height());
-        let _ = config.margin.left;
         let rich_text_id = next_rich_text_id();
         self.context_manager.split_from_config(
             rich_text_id,
@@ -1759,9 +1756,6 @@ impl Screen<'_> {
 
         // Allocate panel id; the layout pass handles positioning via
         // `ContextDimension` once the new tab's grid is built.
-        let _ = self.context_manager.current_grid().scaled_margin.left;
-        let _ = self.renderer.margin.top
-            + self.renderer.island.as_ref().map_or(0.0, |i| i.height());
         let rich_text_id = next_rich_text_id();
         self.context_manager.add_context(redirect, rich_text_id);
         let new_index = self.context_manager.current_index();
@@ -2974,6 +2968,13 @@ impl Screen<'_> {
         })
     }
 
+    pub fn chrome_height(&self) -> f32 {
+        self.renderer.island.as_ref().map_or_else(
+            || self.renderer.navigation.tab_geometry().content_top(),
+            |island| island.content_top(),
+        )
+    }
+
     pub fn update_close_button_hover(&mut self, mouse_x: f64, mouse_y: f64) -> bool {
         let num_tabs = self.context_manager.len();
         let scale_factor = self.sugarloaf.scale_factor();
@@ -2981,8 +2982,11 @@ impl Screen<'_> {
         {
             let pointer = (self.renderer.navigation.island_visible(num_tabs)
                 && mouse_y >= 0.0
-                && mouse_y <= (ISLAND_HEIGHT * scale_factor) as f64)
-                .then_some(mouse_x as f32 / scale_factor);
+                && mouse_y <= (self.chrome_height() * scale_factor) as f64)
+                .then_some([
+                    mouse_x as f32 / scale_factor,
+                    mouse_y as f32 / scale_factor,
+                ]);
             let changed = self
                 .renderer
                 .island
@@ -3031,7 +3035,7 @@ impl Screen<'_> {
         let mouse_y = self.mouse.y;
 
         let scale_factor = self.sugarloaf.scale_factor();
-        let island_height_px = (ISLAND_HEIGHT * scale_factor) as f64;
+        let island_height_px = (self.chrome_height() * scale_factor) as f64;
 
         let window_width = self.sugarloaf.window_size().width;
         let num_tabs = self.context_manager.len();
@@ -3102,9 +3106,16 @@ impl Screen<'_> {
 
         let close_under_pointer = self.renderer.island.as_ref().is_some_and(|island| {
             island.shows_close_button(num_tabs)
-                && layout.tab_at(mouse_x_unscaled).is_some_and(|index| {
-                    island.close_button_hit(&layout, index, mouse_x_unscaled)
-                })
+                && island
+                    .tab_at(&layout, mouse_x_unscaled, mouse_y as f32 / scale_factor)
+                    .is_some_and(|index| {
+                        island.close_button_hit(
+                            &layout,
+                            index,
+                            mouse_x_unscaled,
+                            mouse_y as f32 / scale_factor,
+                        )
+                    })
         });
         if !is_right_click
             && self.is_close_press_tail(mouse_x_unscaled)
@@ -3120,7 +3131,9 @@ impl Screen<'_> {
             return true;
         }
 
-        let clicked_tab = match layout.tab_at(mouse_x_unscaled) {
+        let clicked_tab = match self.renderer.island.as_ref().and_then(|island| {
+            island.tab_at(&layout, mouse_x_unscaled, mouse_y as f32 / scale_factor)
+        }) {
             Some(index) => index,
             None => {
                 if !is_right_click {

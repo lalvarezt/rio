@@ -22,6 +22,8 @@ pub struct PlatformConfig {
     pub shell: Option<Shell>,
     #[serde(default = "Option::default")]
     pub navigation: Option<PlatformNavigation>,
+    #[serde(default)]
+    pub panel: Option<super::layout::PanelOverrides>,
     #[serde(default = "Option::default")]
     pub window: Option<PlatformWindow>,
     #[serde(default = "Option::default")]
@@ -108,8 +110,10 @@ pub struct PlatformNavigation {
     pub min_tab_width: Option<f32>,
     #[serde(default = "Option::default", rename = "tab-icon-size")]
     pub tab_icon_size: Option<f32>,
-    #[serde(default, rename = "tab-style")]
+    #[serde(default, rename = "preset", alias = "tab-style")]
     pub tab_style: Option<navigation::TabStyle>,
+    #[serde(default)]
+    pub tabs: navigation::Tabs,
     #[serde(default = "Option::default", rename = "tab-glass-intensity")]
     pub tab_glass_intensity: Option<f32>,
     #[serde(default = "Option::default", rename = "tab-status-width")]

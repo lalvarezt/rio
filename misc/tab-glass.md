@@ -5,17 +5,19 @@ shape and reflection strength in `config.toml`:
 
 ```toml
 [navigation]
-tab-style = "pill"
+preset = "pill"
 tab-glass-intensity = 0.5
 ```
 
-`tab-style` defaults to `"pill"`, the existing rounded shape. `"windows"`
+`preset` defaults to `"pill"`, the existing rounded shape. `"square"`
 uses square corners, touches the upper-left edge, and places tabs directly
 next to each other. Its close buttons stay visible, including on a single tab,
 and their space is included in the preferred tab width. On macOS, the native
 traffic-light area remains reserved. Both styles share colors, icons,
 reflections, status borders, and animations.
-The style reloads with the configuration and supports platform overrides.
+The preset reloads with the configuration and supports platform overrides.
+The old `tab-style` key and `"windows"` name remain accepted aliases.
+See [UI presets and geometry](ui-presets.md) for tab and split overrides.
 
 The default glass intensity is `0.5`. Use `0.0` for a flat tab or `1.0` for the strongest
 reflections. Values outside this range are clamped. Changes reload with the

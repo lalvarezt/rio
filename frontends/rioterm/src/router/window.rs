@@ -139,7 +139,6 @@ pub fn create_window_builder(
                     .with_unified_titlebar(config.window.macos_use_unified_titlebar);
             }
         } else {
-            use crate::constants::TRAFFIC_LIGHT_PADDING;
             window_builder = window_builder
                 .with_title_hidden(true)
                 .with_titlebar_transparent(true)
@@ -147,7 +146,12 @@ pub fn create_window_builder(
 
             if config.navigation.is_enabled() {
                 window_builder = window_builder
-                    .with_traffic_light_position(12.0, TRAFFIC_LIGHT_PADDING)
+                    .with_traffic_light_position(
+                        config.window.macos_traffic_light_position_x.unwrap_or(12.0),
+                        config.window.macos_traffic_light_position_y.unwrap_or(
+                            (config.navigation.tab_geometry().height as f64 - 14.0) / 2.0,
+                        ),
+                    )
                     .with_mouse_down_can_move_window(false);
             }
         }

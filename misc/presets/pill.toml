@@ -1,0 +1,25 @@
+# Fully explicit pill geometry. Remove a key to inherit it from the preset.
+[navigation]
+preset = "pill"
+
+[navigation.tabs]
+height = 54
+margin = [6, 11, 6, 9]
+padding = [0, 14, 0, 12]
+gap = 6
+radius = 19
+font-size = 15
+text-offset-y = 2
+icon-gap = 8
+close-button = "hover"
+close-button-size = 20
+close-button-inset = 12
+close-button-gap = 8
+
+[panel]
+margin = [4]
+padding = [8]
+row-gap = 0
+column-gap = 0
+border-width = 2
+border-radius = 8

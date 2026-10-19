@@ -20,7 +20,7 @@ pub fn padding_top_from_config(
             return constants::PADDING_Y + padding_y_top;
         }
 
-        return crate::renderer::island::CONTENT_TOP + padding_y_top;
+        return navigation.tab_geometry().content_top() + padding_y_top;
     }
 
     let default_padding = constants::PADDING_Y + padding_y_top;

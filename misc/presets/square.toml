@@ -1,0 +1,25 @@
+# Fully explicit square geometry. Remove a key to inherit it from the preset.
+[navigation]
+preset = "square"
+
+[navigation.tabs]
+height = 54
+margin = [0, 8, 6, 0]
+padding = [0, 14, 0, 12]
+gap = 0
+radius = 0
+font-size = 15
+text-offset-y = 2
+icon-gap = 8
+close-button = "always"
+close-button-size = 20
+close-button-inset = 12
+close-button-gap = 8
+
+[panel]
+margin = [0]
+padding = [8]
+row-gap = 0
+column-gap = 0
+border-width = 1
+border-radius = 0

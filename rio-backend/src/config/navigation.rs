@@ -2,6 +2,9 @@ use crate::config::colors::{deserialize_to_arr, deserialize_to_arr_opt, ColorArr
 use crate::config::default_bool_true;
 use serde::{Deserialize, Serialize};
 
+pub mod tabs;
+pub use tabs::{CloseButton, TabGeometry, Tabs};
+
 #[inline]
 pub fn default_unfocused_split_opacity() -> f32 {
     0.7
@@ -200,7 +203,8 @@ pub enum Animation {
 pub enum TabStyle {
     #[default]
     Pill,
-    Windows,
+    #[serde(alias = "windows")]
+    Square,
 }
 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
@@ -257,9 +261,11 @@ pub struct Navigation {
     /// Desktop tab icon size in logical pixels, clamped to `[8.0, 32.0]`.
     #[serde(default = "default_tab_icon_size", rename = "tab-icon-size")]
     pub tab_icon_size: f32,
-    /// Tab shape; both styles share colors, reflections, status, and motion.
-    #[serde(default, rename = "tab-style")]
+    /// UI preset; explicit tab and panel settings override its defaults.
+    #[serde(default, rename = "preset", alias = "tab-style")]
     pub tab_style: TabStyle,
+    #[serde(default)]
+    pub tabs: Tabs,
     /// Desktop tab border reflections, from `0.0` (off) to `1.0`.
     #[serde(
         default = "default_tab_glass_intensity",
@@ -295,6 +301,7 @@ impl Default for Navigation {
             min_tab_width: default_min_tab_width(),
             tab_icon_size: default_tab_icon_size(),
             tab_style: TabStyle::default(),
+            tabs: Tabs::default(),
             tab_glass_intensity: default_tab_glass_intensity(),
             tab_status_width: default_tab_status_width(),
             animation: Animation::default(),
@@ -304,6 +311,11 @@ impl Default for Navigation {
 }
 
 impl Navigation {
+    pub fn tab_geometry(&self) -> TabGeometry {
+        self.tabs
+            .resolve(self.tab_style, clamp_tab_icon_size(self.tab_icon_size))
+    }
+
     #[inline]
     pub fn is_native(&self) -> bool {
         #[cfg(target_os = "macos")]

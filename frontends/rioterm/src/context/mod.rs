@@ -1384,7 +1384,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             is_native: config.navigation.is_native(),
             // When navigation is collapsed and does not contain any color rule
             // does not make sense fetch for foreground process names
-            panel: config.panel,
+            panel: config.panel(),
             title: config.title,
             keyboard: config.keyboard,
             scrollback_history_limit: config.scrollback_history_limit,
