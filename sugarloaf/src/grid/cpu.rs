@@ -44,6 +44,44 @@ mod panel_tests {
     use bytemuck::Zeroable;
 
     #[test]
+    fn terminal_background_stays_out_of_all_padding_and_margins() {
+        let mut grid = CpuGridRenderer::new(2, 2);
+        let red = CellBg {
+            rgba: [200, 40, 30, 255],
+        };
+        grid.write_row(0, &[red; 2], &[]);
+        grid.write_row(1, &[red; 2], &[]);
+        for radius in [0.0, 8.0] {
+            let uniforms = GridUniforms {
+                grid_padding: [18.0, 0.0, 0.0, 21.0],
+                cell_size: [13.0, 11.0],
+                grid_size: [2; 2],
+                padding_extend: GridUniforms::PADDING_EXTEND_NONE,
+                panel_rect: [8.0, 8.0, 48.0, 48.0],
+                panel_radius: radius,
+                ..GridUniforms::zeroed()
+            };
+            let clear = 0x000a141e;
+            let mut pixels = vec![clear; 64 * 64];
+            grid.render_bg(&mut pixels, 64, 64, &uniforms);
+            for y in 0..64 {
+                for x in 0..64 {
+                    let expected = if (21..47).contains(&x) && (18..40).contains(&y) {
+                        0x00c8281e
+                    } else {
+                        clear
+                    };
+                    assert_eq!(
+                        pixels[y * 64 + x] & 0x00ffffff,
+                        expected,
+                        "radius={radius} x={x} y={y}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn backgrounds_respect_panel_padding_corners_and_cursor_bounds() {
         let mut grid = CpuGridRenderer::new(2, 2);
         let red = CellBg {
@@ -55,7 +93,8 @@ mod panel_tests {
             grid_padding: [16.0, 0.0, 0.0, 16.0],
             cell_size: [16.0; 2],
             grid_size: [2; 2],
-            padding_extend: GridUniforms::PADDING_EXTEND_HORIZONTAL,
+            padding_extend: GridUniforms::PADDING_EXTEND_LEFT
+                | GridUniforms::PADDING_EXTEND_RIGHT,
             panel_rect: [8.0, 8.0, 48.0, 48.0],
             panel_radius: 20.0,
             cursor_pos: [0, 0],

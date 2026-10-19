@@ -4786,9 +4786,8 @@ impl Screen<'_> {
                             window_size.width,
                             window_size.height,
                         ),
-                    // Extend side backgrounds within the rounded pane bounds.
-                    // Keep vertical padding and fractional rows on the backdrop;
-                    // repeating an edge row makes TUI status/tab bars taller.
+                    // Padding and fractional cells belong to the pane backdrop.
+                    // Extending edge cells stretches TUI bars into that spacing.
                     grid_padding: [panel_top, 0.0, 0.0, panel_left],
                     cursor_color: cursor_col_u,
                     cursor_bg_color: cursor_bg_u,
@@ -4798,7 +4797,7 @@ impl Screen<'_> {
                     _pad_cursor: [0; 2],
                     min_contrast: 0.0,
                     flags: 0,
-                    padding_extend: rio_backend::sugarloaf::grid::GridUniforms::PADDING_EXTEND_HORIZONTAL,
+                    padding_extend: rio_backend::sugarloaf::grid::GridUniforms::PADDING_EXTEND_NONE,
                     input_colorspace,
                     panel_rect: [
                         (scaled_margin.left + p.panel_rect[0]).round(),

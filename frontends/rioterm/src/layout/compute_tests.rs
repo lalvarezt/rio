@@ -1,6 +1,73 @@
 use super::*;
 
 #[test]
+fn pane_spacing_stays_consistent_on_every_edge_and_scale() {
+    use crate::context::{create_dead_context, ContextManager};
+    use rio_backend::config::layout::Panel;
+    use rio_backend::config::navigation::Navigation;
+    use rio_backend::event::{VoidListener, WindowId};
+
+    let header = Navigation::default().tab_geometry().content_top();
+    // Both configurations produce ten logical pixels around the pane area.
+    // The second matches the asymmetric root/panel overrides in the report.
+    for (root_margin, panel_margin) in [
+        (Margin::all(6.0), Margin::all(4.0)),
+        (Margin::new(6.0, 6.0, 2.0, 6.0), Margin::new(4.0, 4.0, 8.0, 4.0)),
+    ] {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let mut manager = ContextManager::start_with_capacity(1, VoidListener {}, WindowId::from(0)).unwrap();
+            let grid = manager.current_grid_mut();
+            grid.width = 1600.0 * scale;
+            grid.height = 1000.0 * scale;
+            grid.update_scale(scale);
+            grid.update_scaled_margin(Margin::new(
+                (header + root_margin.top) * scale,
+                root_margin.right * scale,
+                root_margin.bottom * scale,
+                root_margin.left * scale,
+            ));
+            let panel = Panel {
+                margin: panel_margin,
+                padding: Margin::new(8.0, 13.0, 17.0, 80.0),
+                row_gap: 9.0,
+                column_gap: 15.0,
+                ..Panel::default()
+            };
+            grid.update_panel_config(panel);
+            let mut nodes = vec![grid.current];
+            for horizontal in [true, false] {
+                let context = create_dead_context(VoidListener {}, WindowId::from(0), nodes.len(), 0, grid.current().dimension);
+                let node = if horizontal { grid.try_split_right().unwrap() } else { grid.try_split_down().unwrap() };
+                grid.inner.insert(node, ContextGridItem::new(context));
+                grid.current = node;
+                nodes.push(node);
+            }
+            grid.calculate_positions();
+            // Taffy snaps physical positions to pixels; fractional DPI may
+            // distribute a rounding pixel between neighboring edges.
+            let near = |actual: f32, expected: f32| assert!((actual - expected).abs() <= 1.0, "scale={scale}: {actual} != {expected}");
+            let left = grid.inner[&nodes[0]].panel_rect;
+            let top = grid.inner[&nodes[1]].panel_rect;
+            let bottom = grid.inner[&nodes[2]].panel_rect;
+            near(grid.scaled_margin.left + left[0], 10.0 * scale);
+            near(grid.scaled_margin.top + left[1] - header * scale, 10.0 * scale);
+            near(grid.height - grid.scaled_margin.top - left[1] - left[3], 10.0 * scale);
+            near(grid.width - grid.scaled_margin.left - bottom[0] - bottom[2], 10.0 * scale);
+            near(top[0] - left[0] - left[2], (panel.margin.right + panel.column_gap + panel.margin.left) * scale);
+            near(bottom[1] - top[1] - top[3], (panel.margin.bottom + panel.row_gap + panel.margin.top) * scale);
+            for item in grid.inner.values() {
+                let [x, y, width, height] = item.panel_rect;
+                let content = item.layout_rect;
+                near(content[0] - x, panel.padding.left * scale);
+                near(content[1] - y, panel.padding.top * scale);
+                near(x + width - content[0] - content[2], panel.padding.right * scale);
+                near(y + height - content[1] - content[3], panel.padding.bottom * scale);
+            }
+        }
+    }
+}
+
+#[test]
 fn new_tabs_keep_window_size_after_padded_layout() {
     use crate::context::ContextManager;
     use rio_backend::event::{VoidListener, WindowId};
