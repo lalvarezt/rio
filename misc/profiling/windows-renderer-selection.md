@@ -1,180 +1,163 @@
 # Renderer selection on the Windows laptop
 
-This comparison uses the NVIDIA RTX A500 Laptop GPU, driver 596.71, and Intel
-Iris Xe graphics, driver 32.0.101.7088. Windows uses the WDDM driver model and
-the Balanced power plan. The Rio window is opaque, with blur disabled.
+Measured on 2026-10-19, from `96e6157459141d4d91890c027726d5b192457a29`.
 
-NVIDIA Vulkan is selected for this machine. It combines near-identical startup
-to DX12 with tighter frame pacing in these runs, and keeps the branch's Vulkan
-path for translucent Windows surfaces. This is a choice for the measured laptop
-and workload, rather than a change to Rio's default on other machines.
+Keep **NVIDIA Vulkan** on BASLTOFF0370. The existing Windows configuration
+already selects it. It provides correct transparency and low frame-interval
+tails on this laptop. No application source, user configuration, power policy,
+or global GPU preference was changed by this comparison.
 
-## Results
+The machine has an i7-1370P, NVIDIA RTX A500 Laptop GPU (596.71), and Intel
+Iris Xe (32.0.101.7088). Tests ran in the unlocked console session at
+1920 × 1080, 60 Hz, DPI 96, with the Balanced power plan.
 
-The initial five-run startup comparison gives 1655 ms for NVIDIA Vulkan,
-1662 ms for NVIDIA DX12, 800 ms for Intel OpenGL, and 1747 ms for Intel Vulkan.
-Selecting only NVIDIA's Vulkan driver gives 1677 ms, with no startup improvement.
-Adapter identity was checked in separate diagnostic launches with logging enabled.
-Disabling implicit Vulkan layers gives 1694 ms, also without an improvement.
-Loader diagnostics identify NVIDIA's `VK_LAYER_NV_present` and
-`VK_LAYER_NV_optimus`; neither driver nor layer filtering is retained.
+## Matched comparisons
 
-The table uses eight-tab, 600-frame text redraws. CPU time includes startup and
-the entire capture; it is not CPU time per frame. All times are milliseconds.
+Each row summarizes three repetitions. Startup uses one cmd tab and waits for
+a submitted frame after the shell-ready marker. Dense redraws use four cmd
+tabs and 240 full redraws, with Consolas 14 in a 1440 × 900 client area.
+Opaque means opacity 1 and no blur; translucent means opacity 0.5 and blur.
 
-| Renderer and GPU | Frame interval | Frame interval p95 | Screen render scope | Process CPU |
-| --- | ---: | ---: | ---: | ---: |
-| Vulkan, NVIDIA | 16.680 | 19.212 | 1.301 | 656.25 |
-| DX12, NVIDIA | 16.702 | 20.317 | 2.065 | 484.38 |
-| OpenGL, NVIDIA | 16.653 | 22.659 | 6.458 | 2671.88 |
-| OpenGL, Intel | 16.862 | 21.680 | 3.810 | 640.63 |
-| Vulkan, Intel only | 16.649 | 19.159 | 1.117 | 500.00 |
+All values are milliseconds. CPU is total Rio process CPU time for the entire
+dense capture, including initialization and shutdown; it excludes child shells.
+Frame p95 is the median of each run's frame-interval p95.
 
-NVIDIA Vulkan and DX12 deliver about 60 frames per second. Intel OpenGL averages
-about 58.4 frames per second across each run's complete workload interval.
-Intel Vulkan's rendering is fast, but its eight-tab startup is slower and more
-variable: the median is 3789 ms, compared with 2819 ms for default Vulkan.
-NVIDIA OpenGL starts in 1613 ms. It averages about 59.7 frames per second, but
-has worse frame-interval tails and uses about four times Vulkan's process CPU
-time. DX12 uses less CPU than Vulkan; the selection favors the measured frame
-pacing and the Windows UI's transparency path.
+| Backend and adapter | Startup median (range) | Opaque CPU | Opaque frame p95 | Translucent CPU | Translucent frame p95 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Vulkan, NVIDIA | 2226 (1535–2316) | 312.5 | 2.89 | 437.5 | 2.42 |
+| DX12, NVIDIA | 2261 (1959–2783) | 343.8 | 1.98 | 546.9 | 2.36 |
+| OpenGL, Intel | 723 (645–924) | 234.4 | 18.43 | 250.0 | 18.69 |
+| Vulkan, Intel only | 2100 (1601–2781) | 296.9 | 17.64 | 234.4 | 17.90 |
+| Vulkan, NVIDIA driver only | 1824 (1628–2058) | 328.1 | 2.30 | 421.9 | 2.60 |
+| OpenGL, NVIDIA | 1884 (1782–2723) | 1078.1 | 17.26 | 937.5 | 17.24 |
+| Automatic, selected NVIDIA Vulkan | 3000 (2529–4972) | 421.9 | 3.05 | 500.0 | 3.14 |
 
-The OpenGL comparison explicitly tests both GPUs. Without an OS preference,
-OpenGL selects Intel despite Rio's high-performance adapter request. A temporary
-Windows high-performance preference for `rio-profile.exe` selects NVIDIA. The
-experiment restores the original preference afterward. The additional NVIDIA
-OpenGL series uses five consecutive launches rather than alternating backend order.
+These are CPU wall-time intervals and driver waits, not GPU timestamps or
+input-to-display latency. NVIDIA Vulkan and DX12 use Mailbox presentation;
+the Intel paths and OpenGL use FIFO. Their different presentation policies
+affect cadence and total CPU work. This capacity workload does not imply
+that animations should run above the display refresh rate.
 
-## Remaining costs
+Intel OpenGL starts fastest but does not render the requested transparency
+correctly. DX12's slightly lower opaque interval tail also does not make it a
+replacement for the current translucent Vulkan configuration.
 
-In the one-tab NVIDIA Vulkan startup captures, GPU instance setup takes 769 ms,
-device creation takes 46 ms, and surface configuration takes 232 ms. Adapter
-selection takes about 12 ms. These nested scopes account for much of startup.
+## Opacity validation
 
-Eight-tab Vulkan captures spend a median of 1211 ms creating eight ConPTY
-sessions, about 151 ms each. This is separate from PowerShell startup: the
-profiling shell is cmd. One-tab startup spends about 87 ms loading fonts and
-115 ms creating the native window. The warm tab strip takes about 0.072 ms per frame.
+Separate foreground screen captures used two controlled backgrounds,
+RGB (32, 96, 168) and (168, 96, 32). Two clear terminal-body patches were
+sampled after visible text appeared. Eighteen of 21 combinations produced
+foreground captures; the three Intel Vulkan combinations failed foreground
+acquisition on both attempts. That is a capture limitation, not evidence of
+a driver crash or a measured opacity result.
 
-The next substantial startup improvement would come from reusing the running
-Rio process and its initialized graphics state. Eight new tabs also pay for
-eight independent console hosts; optimizing tab painting cannot remove that
-cost. The current workload does not identify tab UI work as a frame-rate limit.
+| Path | Opacity 1 | Opacity 0.5 with blur | Opacity 0 without blur |
+| --- | --- | --- | --- |
+| NVIDIA Vulkan, including driver-only and automatic | Opaque | Background changes visible | Exact background RGB |
+| NVIDIA DX12 | Opaque | Remains opaque | Remains opaque |
+| Intel OpenGL | Opaque | Background visible with tint | Background RGB plus Rio's (15, 13, 14) clear color |
+| NVIDIA OpenGL | Opaque | Remains opaque | Remains opaque |
+| Intel Vulkan | Capture unavailable | Capture unavailable | Capture unavailable |
 
-## Method
+NVIDIA Vulkan advertises and selects `PreMultiplied` surface alpha.
+DX12 and both OpenGL drivers advertise only `Opaque`; Intel Vulkan advertises
+`Opaque` and `Inherit`. Rio already favors an alpha-capable hardware adapter
+when transparency is requested. Automatic selection chose NVIDIA Vulkan in
+both diagnostic styles.
 
-The profiling executable runs in the logged-in desktop session with cmd shells.
-Startup captures use one tab and wait for a successfully submitted frame after
-the shell's title marker. Drawing captures use eight tabs and submit 600 frames.
-Before readiness, cmd fills the terminal with ASCII text. Each requested redraw
-then rebuilds all visible terminal rows and draws the Windows tab strip.
-This exercises row processing and presentation, without continuous PTY output.
+The Intel OpenGL tint is consistent with straight clear-color RGB reaching a
+compositor that still uses alpha, despite the advertised opaque surface.
+Premultiplying every Windows OpenGL clear would also change the NVIDIA opaque
+fallback, so this experiment does not apply that workaround. The selected
+Vulkan path passes the zero-opacity check. Uniform backdrops validate alpha
+composition; they do not quantify the operating system's blur radius or tint.
 
-Each sustained comparison has five repetitions. The DX12 and Vulkan variants
-rotate order between repetitions. OpenGL and Intel-only Vulkan alternate order
-in a separate batch. No builds run during capture. The comparison retains first
-launches; no reboot or shader-cache purge is performed.
+## Startup filtering and residency
 
-Reported frame timings are medians of per-run medians. Reported p95 values are
-medians of per-run 95th percentiles. They measure CPU wall time and driver waits,
-not GPU execution or input-to-display latency. Whole-process CPU time comes
-from Windows `GetProcessTimes` and excludes child shells. The frame workload
-uses normal display pacing, so it compares delivered frame cadence rather than
-maximum uncapped GPU throughput.
+The three-run startup medians are noisy. A follow-up alternated six pairs of
+default Vulkan and NVIDIA-only Vulkan with the process-local filter
+`VK_LOADER_DRIVERS_SELECT=nv-vk64.json`. Their medians were 1735 and 1810 ms.
+NVIDIA-only won two pairs and lost four; paired savings were 1295, −13, −15,
+−161, 11, and −123 ms. The first-pair outlier does not establish a repeatable
+filtering benefit. Leave the driver filter unset.
 
-The profiling executable is built from `0407f9e0e2` with the release settings
-in the guide. Its SHA-256 is
-`6e58ff08de866f8525e59c240d34976ac7f95015c40fe95e34432d8c62f8f61f`.
+Keeping another idle NVIDIA Vulkan Rio context alive helped every one of
+three paired startup comparisons:
 
-## Machine configuration
+| Startup condition | Shell-ready median | GPU instance median | GPU context median |
+| --- | ---: | ---: | ---: |
+| No benchmark keeper | 2903 | 1998 | 2300 |
+| Idle NVIDIA context resident | 1172 | 302 | 590 |
 
-The Windows file `%LOCALAPPDATA%\rio\config.toml` selects Vulkan through the
-existing platform override:
+Paired shell-ready savings were 1086, 1786, and 1733 ms. The median startup
+fell by 60%. The no-keeper condition waited five seconds; it does not prove a
+physically cold GPU. The keeper remained alive through each subject capture
+and was closed afterward. No persistent helper remains.
 
-```toml
-[platform]
-windows.renderer.backend = "Vulkan"
-```
+This establishes a graphics-residency benefit, not the effect of a changed
+NVIDIA power setting. Fresh processes still pay for their graphics resources.
+Reusing an existing Rio process can also reuse the branch's cached GPU instance.
+Neither a clock policy nor a GPU preference retains a terminated process's
+graphics objects.
 
-The original configuration is backed up beside it as
-`config.toml.before-renderer-profiling-2026-10-15`. No driver filters, clock locks,
-global GPU preferences, or power-plan changes are retained. The temporary
-high-performance preference for the profiling executable is restored to its
-original absent value.
+NVIDIA's [power-management reference](https://www.nvidia.com/content/Control-Panel-Help/vLatest/en-us/mergedProjects/3D%20Settings/Manage_3D_Settings_%28reference%29.htm)
+describes **Prefer maximum performance** while an application runs. This
+comparison does not benchmark that policy. Linux persistence mode addresses
+a different driver lifecycle; see NVIDIA's
+[driver-persistence overview](https://docs.nvidia.com/deploy/driver-persistence/overview.html).
 
-## Validation and capture locations
+## Measurement controls and priority correction
 
-The new comparison and configuration checks contain 84 successful captures.
-Each capture satisfies shell readiness and requested frame counts. Acquisition,
-queue submission, presentation, and the frontend presentation scope have matching
-call counts in every capture.
+The authoritative dataset contains **81 timing captures**: 63 main comparisons,
+12 driver-filter follow-ups, and six residency captures. Main comparisons
+rotate order forward, backward, then by three positions. Adapter identities
+and alpha capabilities were checked in 14 separate diagnostic launches.
+No builds ran during timing; there was no reboot or shader-cache purge.
 
-After applying the Windows configuration, three startup captures and three
-600-frame text captures pass without a backend environment override. The selected
-adapter log identifies NVIDIA Vulkan. The startup median is 1744 ms; text captures
-have a 16.587 ms median frame interval and a 19.514 ms p95.
+All authoritative jobs launch through Task Scheduler COM with priority 4 in
+the user's interactive session. The driver verifies Normal CPU class (32),
+Normal memory priority (5), and Normal I/O priority (2) before measurement.
+Earlier temporary jobs used task priority 7 and then reset only CPU priority.
+A direct probe found that memory and I/O priority remained low. Those initial
+timings are archived but excluded from these results. The
+[VM report](windows-vm-renderer-selection.md) now states the same limitation
+for its earlier launcher; its I/O and memory priorities were not measured.
 
-Both release executables compile on Windows. The rebuilt normal `rio.exe`
-selects NVIDIA Vulkan, runs `cmd /d /c echo RIO_NORMAL_BUILD_OK`, and exits with
-code zero. It creates no profiling report even with `RIO_PROFILE_OUTPUT` set.
-The interactive profiling task is removed after validation.
+Microsoft documents priorities 4–6 for interactive tasks and 7–8 for background
+tasks in [TaskSettings.Priority](https://learn.microsoft.com/en-us/windows/win32/taskschd/tasksettings-priority).
+Merely reporting Normal CPU class was insufficient validation of this launcher.
 
-Raw captures, summaries, and adapter logs are under
-`D:\git-repos\rio\target\profiles\renderer-selection` and
-`D:\git-repos\rio\target\profiles\renderer-selection-extra`.
-Copies are in this checkout's `target/profiles` directory. The first folder
-contains default Vulkan, DX12, NVIDIA-only Vulkan, and the resident-client
-experiment. The second contains Intel Vulkan, both OpenGL adapters, the layer
-experiment, and the configuration validation. The original one-run Intel OpenGL
-probe is excluded from the five-run results table.
+Every timing capture satisfies its shell/tab/frame targets. The same executable
+was used throughout, built once as an optimized Cargo benchmark artifact
+(optimization 3, LTO off, 16 codegen units). Temporary benchmark-target and
+adapter/alpha logging changes were restored after building. Executable SHA-256:
 
-## GPU initialization and power settings
+`fb29d8c76fdc70687596f6a1898edc97ad8f6ebc7beca6b367fabea249478a66`
 
-Keeping another Rio process open changes the result. Five fresh NVIDIA-only
-Vulkan launches fall from a median of 1677 ms to 1147 ms, a 32% reduction.
-Their instance setup falls from 765 ms to 162 ms. During this experiment,
-`nvidia-smi` reports P0, graphics clocks of 1537 MHz, memory clocks of 6001 MHz,
-and power draw of 10.39 W. The resident Rio remains open and idle during these
-launches, then is terminated after measurement.
+NVIDIA OpenGL was selected with an isolated per-executable Windows GPU
+preference, restored to its original absent value. Driver-filter cases used
+process-local variables and verified the adapter. The user's Vulkan/opacity
+0.5/blur configuration was preserved byte for byte. Cleanup verified no benchmark
+processes remained, removed nine temporary tasks, and confirmed clean Windows
+sources.
 
-This demonstrates a benefit from GPU residency, but does not establish the
-same saving from a power-plan change. Even with the resident client, fresh
-processes still take about 1.15 seconds to submit the shell frame. Reusing
-the existing process for additional windows also benefits from the branch's GPU-instance
-cache and avoids loading fonts again.
+## Evidence and reproduction
 
-NVIDIA documents that the Windows kernel driver stays loaded from Windows
-startup until shutdown. Linux persistence mode addresses a different driver
-lifecycle; this machine reports persistence mode as unavailable under WDDM.
-See [NVIDIA's driver-persistence overview](https://docs.nvidia.com/deploy/driver-persistence/overview.html).
+[Machine-readable results](windows-renderer-selection.json) include individual
+timings, aggregates, adapter logs, pixel samples, scheduler probes, and cleanup.
+The full executable, exact temporary scripts, configs, reports, logs, captures,
+and machine metadata are archived on both machines at:
 
-NVIDIA's **Prefer maximum performance** setting controls GPU performance while
-applications run. It can reduce clock changes, but does not retain a terminated
-Rio process's graphics instance, device, swapchain, or pipelines. The setting is
-available in NVIDIA Control Panel under **Manage 3D settings**, **Program Settings**.
-See [NVIDIA's power-management reference](https://www.nvidia.com/content/Control-Panel-Help/vLatest/en-us/mergedProjects/3D%20Settings/Manage_3D_Settings_%28reference%29.htm).
-This comparison does not benchmark a changed NVIDIA power-management policy.
+`target/backend-selection-laptop-20261019.zip`
 
-Windows also provides a per-application GPU preference. Rio's wgpu adapter
-request already asks for high performance; a preference setting cannot skip
-graphics API initialization. See [Microsoft's graphics-settings description](https://devblogs.microsoft.com/directx/navigating-the-redesigned-graphics-settings-page/).
+On Windows this is under `D:\git-repos\rio`. Archive SHA-256:
 
-The process-local `VK_LOADER_DRIVERS_SELECT` experiments select driver manifest
-names discovered on this machine: `nv-vk64.json` and `igvk64.json`. Such a filter
-can prevent Vulkan startup if a future installation has no matching driver.
-See [Khronos's driver-filtering documentation](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md#driver-filtering).
+`fc573a611a6cfdf89db07c05bf16a0e0dc2d78cb2d0c96e191a65a67ccadf256`
 
-## Reproduction
-
-Build instructions and metric definitions are in [the profiling guide](README.md).
-For each backend, substitute `dx12`, `vulkan`, or `gl`:
-
-```cmd
-python misc\profiling\run-windows.py target\release\rio-profile.exe --runs 5 --backend vulkan --output target\profiles\startup-vulkan
-python misc\profiling\run-windows.py target\release\rio-profile.exe --runs 1 --frames 600 --tabs 8 --full-redraw --backend vulkan --output target\profiles\text-vulkan-1
-```
-
-Repeat the drawing command with a unique output directory for each repetition,
-rotating backend order. To select a single Vulkan driver, add
-`--env VK_LOADER_DRIVERS_SELECT=nv-vk64.json` or
-`--env VK_LOADER_DRIVERS_SELECT=igvk64.json`.
+The archive's `normal.py`, `filter_pairs.py`, and `resident.py` define the
+authoritative workloads. Their `start-*.ps1` launchers use interactive task
+priority 4. Build settings and the temporary diagnostic patch are in
+`build.json`; `machine.json` records the interactive display. General capture
+instructions and metric definitions are in the [profiling guide](README.md).
+The earlier 2026-10-15 laptop experiment remains available in Git history;
+its different workload is not combined with this dataset.

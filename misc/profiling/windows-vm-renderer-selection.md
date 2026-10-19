@@ -35,6 +35,14 @@ of the same ASCII fixture. The driver rejected incomplete frame or shell
 workloads. Opaque means opacity 1 with blur off; blur means requested opacity 0.5
 with blur on. Processes ran at Normal priority without CPU affinity pinning.
 
+Launcher correction: the VM task used Task Scheduler priority 7 and then reset
+only CPU priority to Normal. Later laptop probes showed that this launcher can
+retain low I/O priority and below-normal memory priority after that reset. Those
+two priorities were not recorded on the VM. Treat the VM startup figures,
+including the 26% difference below, as specific to that launch policy. The new
+laptop measurements use interactive task priority 4 and verify normal CPU,
+I/O, and memory priorities before timing.
+
 The initial comparison used three repetitions with rotating API order. Automatic
 selection and the experimental CPU renderer were measured in a separate followup,
 alternating their order. Values below are medians across three runs. Frame p95 is

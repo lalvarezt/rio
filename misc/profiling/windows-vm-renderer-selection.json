@@ -284,6 +284,13 @@
     "raw_archive": "target/backend-selection-20261019/retry-visible.zip",
     "raw_archive_sha256": "20f495ab9178b8405ec0971c631cbcfbbb91e609af257390066a5f662baccd66"
   },
+  "scheduler_caveat": {
+    "task_priority": 7,
+    "cpu_priority": "Normal after explicit reset",
+    "io_priority": null,
+    "memory_priority": null,
+    "note": "I/O and memory priorities were not measured on the VM. Subsequent laptop probes found that this launcher retains background I/O and memory priorities after resetting only CPU priority. Startup comparisons are specific to that launch policy."
+  },
   "configuration_changed": false,
   "production_source_changed": false
 }
