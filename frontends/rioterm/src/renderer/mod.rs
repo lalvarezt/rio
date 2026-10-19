@@ -890,7 +890,7 @@ impl Renderer {
         // Pane frames share the tabs' reflective border and the palette theme.
         // Layout reserves padding inside these bounds, keeping chrome off cells.
         let grid = context_manager.current_grid();
-        {
+        if grid.should_draw_borders() {
             let theme = window_chrome::Theme::new(&self.named_colors);
             let margin = grid.get_scaled_margin();
             let panel = grid.panel_config();
@@ -907,7 +907,7 @@ impl Renderer {
                     panel.border_radius,
                     self.navigation.tab_glass_intensity,
                     Some(tab_glass::Status {
-                        color: if grid.should_draw_borders() && *key == grid.current {
+                        color: if *key == grid.current {
                             theme.accent
                         } else {
                             theme.border

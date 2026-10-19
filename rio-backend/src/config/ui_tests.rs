@@ -16,6 +16,19 @@ fn default_preset_preserves_upstream_panel_settings() {
 }
 
 #[test]
+fn single_pane_frame_visibility_merges_without_overriding_preset_geometry() {
+    for preset in ["pill", "square"] {
+        let mut c = config(&format!("[navigation]\npreset='{preset}'\n[panel]\nhide-if-single=true\n[platform.windows.panel]\nhide-if-single=false"));
+        assert!(c.panel().hide_if_single);
+        let geometry = c.panel();
+        c.overwrite_with_platform_config(c.platform.windows.clone().unwrap());
+        assert!(!c.panel().hide_if_single);
+        assert_eq!(c.panel().margin, geometry.margin);
+        assert_eq!(c.panel().border_radius, geometry.border_radius);
+    }
+}
+
+#[test]
 fn square_and_legacy_name_share_defaults() {
     for text in [
         "preset = 'square'",

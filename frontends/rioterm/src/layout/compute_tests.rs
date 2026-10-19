@@ -1,6 +1,41 @@
 use super::*;
 
 #[test]
+fn hide_single_frame_keeps_split_frames_and_pane_geometry() {
+    use crate::context::{create_dead_context, ContextManager};
+    use rio_backend::event::{VoidListener, WindowId};
+
+    let mut manager =
+        ContextManager::start_with_capacity(1, VoidListener {}, WindowId::from(0))
+            .unwrap();
+    let grid = manager.current_grid_mut();
+    grid.try_update_size(1600.0, 1000.0).unwrap();
+    grid.calculate_positions();
+    let bounds = grid.current_item().unwrap().layout_rect;
+    assert!(grid.should_draw_borders());
+    let panel = rio_backend::config::layout::Panel {
+        hide_if_single: true,
+        ..Default::default()
+    };
+    manager.update_panel_config(panel);
+    let grid = manager.current_grid_mut();
+    grid.calculate_positions();
+    assert!(!grid.should_draw_borders());
+    assert_eq!(grid.current_item().unwrap().layout_rect, bounds);
+
+    let context = create_dead_context(
+        VoidListener {},
+        WindowId::from(0),
+        usize::MAX - 1,
+        0,
+        grid.current().dimension,
+    );
+    let node = grid.try_split_right().unwrap();
+    grid.inner.insert(node, ContextGridItem::new(context));
+    assert!(grid.should_draw_borders());
+}
+
+#[test]
 fn panel_settings_update_existing_and_future_tabs() {
     use crate::context::ContextManager;
     use rio_backend::event::{VoidListener, WindowId};

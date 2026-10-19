@@ -3,6 +3,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 // Panel configuration for split layouts
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Panel {
+    #[serde(default, rename = "hide-if-single")]
+    pub hide_if_single: bool,
     #[serde(default = "default_panel_margin")]
     pub margin: Margin,
     #[serde(default = "default_panel_padding")]
@@ -20,6 +22,7 @@ pub struct Panel {
 impl Default for Panel {
     fn default() -> Self {
         Self {
+            hide_if_single: false,
             margin: default_panel_margin(),
             padding: default_panel_padding(),
             row_gap: default_row_gap(),
@@ -35,6 +38,8 @@ impl Default for Panel {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct PanelOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hide_if_single: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub margin: Option<Margin>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -62,6 +67,7 @@ impl PanelOverrides {
             base.border_radius = 0.0;
         }
         Panel {
+            hide_if_single: self.hide_if_single.unwrap_or(base.hide_if_single),
             margin: margin(self.margin.unwrap_or(base.margin), base.margin),
             padding: margin(self.padding.unwrap_or(base.padding), base.padding),
             row_gap: spacing(self.row_gap.unwrap_or(base.row_gap), base.row_gap),
@@ -81,6 +87,7 @@ impl PanelOverrides {
     }
 
     pub fn merge(&mut self, other: Self) {
+        self.hide_if_single = other.hide_if_single.or(self.hide_if_single);
         self.margin = other.margin.or(self.margin);
         self.padding = other.padding.or(self.padding);
         self.row_gap = other.row_gap.or(self.row_gap);

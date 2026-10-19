@@ -17,6 +17,7 @@ close-button-inset = 12
 close-button-gap = 8
 
 [panel]
+hide-if-single = false
 margin = [4]
 padding = [8]
 row-gap = 0

@@ -331,6 +331,7 @@ Root *margin* controls the pane layout's distance from the window edge and
 tabs. The existing *[panel]* table controls per-pane *margin*, *padding*,
 *row-gap*, *column-gap*, *border-width*, and *border-radius*. These settings
 also override preset defaults. Geometry changes reload for existing panes.
+Set *[panel].hide-if-single* to _true_ to hide a lone pane's frame. Default: _false_.
 
 *clickable* = _true_ | _false_
 

@@ -245,7 +245,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
     }
 
     pub fn should_draw_borders(&self) -> bool {
-        self.panel_count() > 1
+        !self.panel_config.hide_if_single || self.panel_count() > 1
     }
 
     pub fn panel_config(&self) -> &rio_backend::config::layout::Panel {
