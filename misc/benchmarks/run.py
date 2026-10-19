@@ -270,17 +270,16 @@ def execute(path, arguments, env, cpu, log):
 
 def run(args):
     if git("status", "--porcelain"):
-        raise RuntimeError("Commit the benchmark suite and document before measuring")
+        raise RuntimeError("Commit benchmark inputs before measuring")
     metadata = json.loads((OUT / "build.json").read_text())
     driver_revision = git("rev-parse","HEAD")
     if metadata["fixtures_sha256"] != fixture_hash():
         raise RuntimeError("Rebuild after changing compiled benchmark fixtures")
     if metadata["branch"] != driver_revision:
         driver_files = {path.relative_to(ROOT).as_posix() for path in (ROOT/"misc/benchmarks").glob("*.py")}
-        driver_files.add("misc/benchmarks/README.md")
         changed = git("diff","--name-only",metadata["branch"],driver_revision).splitlines()
-        if any(path not in driver_files and not (path.startswith("misc/profiling/") and path.endswith((".md",".csv"))) for path in changed):
-            raise RuntimeError("Rebuild after changing compiled sources; only Python drivers and reports can change without rebuilding")
+        if any(path not in driver_files for path in changed):
+            raise RuntimeError("Rebuild after changing compiled sources; only Python drivers can change without rebuilding")
     if args.cpu not in application.available_cpus():
         raise RuntimeError(f"CPU {args.cpu} is unavailable")
     env = dict(os.environ, RIO_BENCH_SAMPLES=str(args.samples), RIO_BENCH_MS=str(args.ms),

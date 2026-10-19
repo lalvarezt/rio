@@ -1285,18 +1285,14 @@ struct ShapedRun {
 }
 
 struct RunCacheEntry {
-    /// Hash of the run text, source-cell boundaries, font and size.
-    /// We key on the hash alone — no stored run string, no equality
-    /// check on lookup. `CellCacheTable` pattern
-    ///: rapidhash / wyhash pass
-    /// SMHasher, so a random collision costs a wrong-glyph frame
-    /// until the next row rebuild but never corrupts state. Birthday
-    /// bound at N=10k concurrent cache entries ≈ 2.7×10⁻¹².
+    /// Hash-only keys avoid retaining run text. A collision can reuse an
+    /// incorrect shape until eviction, without affecting terminal state.
     hash: u64,
     run: Arc<ShapedRun>,
 }
 
 fn source_cell(starts: &[u32], cell: &mut u16, cluster: u32) -> u16 {
+    // Reuse the source-cell cursor instead of searching the boundary table per glyph.
     while (*cell as usize + 1) < starts.len() && starts[*cell as usize + 1] <= cluster {
         *cell = cell.saturating_add(1);
     }
@@ -1359,6 +1355,7 @@ pub struct GridGlyphRasterizer {
     shape_ctx: rio_backend::sugarloaf::swash::shape::ShapeContext,
     #[cfg(not(target_os = "macos"))]
     scale_ctx: rio_backend::sugarloaf::swash::scale::ScaleContext,
+    // Raster misses reuse one bitmap allocation across glyphs.
     #[cfg(not(target_os = "macos"))]
     glyph_bytes: Vec<u8>,
     #[cfg(not(target_os = "macos"))]
@@ -1769,7 +1766,8 @@ fn shape_cached(
     size_bucket: u16,
     font_library: &FontLibrary,
 ) -> Option<Arc<ShapedRun>> {
-    // The text alone does not identify how clusters map back to source cells.
+    // Hash completed buffers once; incremental per-character hashing slowed run building.
+    // Include cell boundaries because identical text can have different cluster mappings.
     let mut hasher = rapidhash::fast::RapidHasher::default();
     font_id.hash(&mut hasher);
     size_bucket.hash(&mut hasher);

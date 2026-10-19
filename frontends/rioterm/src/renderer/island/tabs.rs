@@ -82,6 +82,7 @@ struct Selection {
 #[derive(Default)]
 pub(super) struct Tabs {
     pub(super) appearance: TabAppearance,
+    // Stable IDs keep motion attached to a tab when dragging changes its index.
     tabs: FxHashMap<usize, Tab>,
     order: Vec<usize>,
     selection: Option<Selection>,
@@ -136,6 +137,7 @@ impl Tabs {
                 (tab.opacity - flag(tab.live)).abs() < 0.01
                     && (tab.hover - flag(Some(id) == hovered_id)).abs() < 0.01
             }) && self.elevation < 0.01;
+            // Subpixel spring tails need no display-rate redraws; finish them at 30 Hz.
             if geometry_settled && fades_settled {
                 return Some(Duration::from_millis(33));
             }
@@ -289,12 +291,15 @@ impl Tabs {
             let id = content.id;
             self.order.push(id);
             let existing = self.tabs.get(&id);
+            // Motion changes positions, not text width; reuse measurements while animating.
             let changed = existing.is_none_or(|tab| {
                 tab.measurement != measurement
                     || tab.content.title != content.title
                     || tab.content.remote != content.remote
                     || tab.content.bell != content.bell
             });
+            // Measure prefix icons and any reserved close button before width bounds;
+            // adding an SSH badge must grow the tab before any title is ellipsized.
             let measured = if changed {
                 let padding = self.appearance.title_padding(content.remote, icon_size)
                     + end_inset
@@ -316,6 +321,8 @@ impl Tabs {
                     tab.content = content;
                     tab.live = true;
                     tab.measurement = measurement;
+                    // Grow immediately for new content; debounce shortening titles to
+                    // prevent shell reports from making neighboring tabs oscillate.
                     if animation == Animation::None || measured >= tab.preferred_width {
                         tab.preferred_width = measured;
                         tab.pending_shrink = None;

@@ -22,6 +22,7 @@ function __rio_report_pwd --on-variable PWD --on-event fish_prompt \
 end
 __rio_report_pwd
 
+# Shell reports identify remote apps that local process inspection cannot see.
 function __rio_report_app --argument-names app
     set -l transport MA==
     if set -q SSH_CONNECTION; or set -q SSH_CLIENT; or set -q SSH_TTY

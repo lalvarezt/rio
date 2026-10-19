@@ -16,8 +16,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock};
 
 const MAX_SHAPED_RUNS: usize = 2048;
-// Ordinary title churn retains about 2.4 MiB. Bound payload bytes as well as
-// entry count so long labels cannot multiply that footprint without limit.
+// Bound glyph payload as well as entry count; a few long titles can dwarf the cache.
 const MAX_SHAPED_BYTES: usize = 4 * 1024 * 1024;
 
 // `pos` is **pixel-space top-left** of the glyph's text bounding box.
@@ -182,6 +181,7 @@ pub struct Text {
     #[cfg(not(target_os = "macos"))]
     wght_variation_cache: FxHashMap<u32, Option<f32>>,
     ascent_cache: FxHashMap<(u32, u16), i16>,
+    // Measurement and drawing share immutable runs instead of cloning glyph vectors.
     shape_cache: FxHashMap<u64, Arc<ShapedRun>>,
     shape_cache_order: VecDeque<u64>,
     shape_cache_bytes: usize,

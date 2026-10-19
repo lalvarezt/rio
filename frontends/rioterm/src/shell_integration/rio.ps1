@@ -9,6 +9,7 @@ $Global:__RioShellIntegration = $true
 
 $Global:__RioOriginalPrompt = $Function:Prompt
 
+# Shell reports identify remote apps that local process inspection cannot see.
 function Global:__RioReportApp([string]$App) {
     $remote = if ($env:SSH_CONNECTION -or $env:SSH_CLIENT -or $env:SSH_TTY) { '1' } else { '0' }
     $program = [IO.Path]::GetFileNameWithoutExtension($App)

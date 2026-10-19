@@ -102,6 +102,7 @@ pub fn draw(
     } else {
         [1.0, 1.0, 1.0, color[3]]
     };
+    // The shared UI atlas rasterizes only on a miss; tint and clipping stay per draw.
     sugarloaf.text_mut().draw_icon(
         logo.name,
         cx,

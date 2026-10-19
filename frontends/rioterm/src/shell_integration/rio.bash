@@ -17,6 +17,7 @@ _rio_report_app() {
 _rio_preexec() {
     local previous_status=$? line="${1-}" app
     local -a words
+    # DEBUG fires inside compound commands too; report once per prompt cycle.
     [[ ${_rio_at_prompt-0} == 1 ]] || return "$previous_status"
     [[ ${BASH_SOURCE[1]-} == "${BASH_SOURCE[0]}" ]] && return "$previous_status"
     case "$line" in _rio_*|PROMPT_COMMAND*|trap\ *) return "$previous_status" ;; esac

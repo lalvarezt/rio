@@ -276,6 +276,7 @@ struct SnapshotExtra {
 /// Immutable extras referenced by the snapshot, with dependencies per row.
 /// Terminal IDs can be recycled, so a dirty row refreshes its IDs against the
 /// live table once per update, even when the snapshot already contains them.
+/// Row references release offscreen payloads without cloning shared extras per cell.
 #[derive(Clone, Debug, Default)]
 pub struct SnapshotExtras {
     entries: FxHashMap<u16, SnapshotExtra>,

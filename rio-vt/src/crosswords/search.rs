@@ -117,6 +117,7 @@ impl RegexSearch {
     /// Literal queries reuse unchanged logical groups. Patterns with regex
     /// syntax keep the full iterator, including its complexity limits,
     /// anchors, and empty-match handling.
+    /// Content keys survive scrolling without adding revision work to PTY writes.
     pub fn visible_matches<T: event::EventListener>(
         &mut self,
         term: &Crosswords<T>,

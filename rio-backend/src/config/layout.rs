@@ -131,6 +131,7 @@ pub struct Margin {
 
 impl Serialize for Margin {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // The deserializer accepts CSS arrays, so map serialization cannot round-trip.
         [self.top, self.right, self.bottom, self.left].serialize(serializer)
     }
 }

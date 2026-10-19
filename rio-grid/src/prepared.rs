@@ -1,6 +1,8 @@
 //! Prepared row geometry, bounded to the last viewport. Callers clear it when
 //! the atlas or palette changes and bypass it for registered custom glyph rows and
 //! composition. Ordinary partial updates keep their existing direct emit path.
+//! Content keys reuse scrolled rows without tracking mutations in the VT writer;
+//! exact comparisons validate hashes and recycled extras IDs before reuse.
 
 use crate::{ExtrasMap, RowHint, RowSelection};
 use rio_backend::config::colors::term::TermColors;

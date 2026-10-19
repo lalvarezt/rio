@@ -99,6 +99,7 @@ impl<T: EventListener> Context<T> {
 
         if has_updated {
             let mut terminal = self.terminal.lock();
+            // Only the old and new visible selection rows need repainting, not all text.
             let top = -(terminal.display_offset() as i32);
             let bottom = top + terminal.screen_lines() as i32 - 1;
             for selection in [old_selection, selection_range].into_iter().flatten() {

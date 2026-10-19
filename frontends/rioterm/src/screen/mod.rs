@@ -106,6 +106,7 @@ pub struct Screen<'screen> {
     last_close_press: Option<(std::time::Instant, f32)>,
     grids: rustc_hash::FxHashMap<usize, PanelGrid>,
     pub grid_rasterizer: rio_grid::GridGlyphRasterizer,
+    // Reuse row-emission storage across panes and frames instead of allocating per row.
     grid_bg_scratch: Vec<rio_backend::sugarloaf::grid::CellBg>,
     grid_fg_scratch: Vec<rio_backend::sugarloaf::grid::CellText>,
     grid_hint_scratch: Vec<rio_grid::RowHint>,
@@ -393,6 +394,7 @@ impl Screen<'_> {
     }
 
     pub(crate) fn remove_terminal_resources(&mut self, route_id: usize) {
+        // Grids own GPU atlases; removing only glyph registrations retained closed panes.
         self.sugarloaf
             .font_library()
             .remove_glyph_registry(route_id);
@@ -4471,18 +4473,7 @@ impl Screen<'_> {
                     prepared,
                 } = grid;
 
-                // Decide which rows to rebuild.
-                //
-                // `force_full` short-circuits damage to "rebuild all":
-                // - grid was just created or resized (CPU buffers
-                // are zeroed, so whatever damage says we have to
-                // do a full fill).
-                // - damage == Full (the terminal explicitly asked).
-                //
-                // `Noop` / `CursorOnly` → no row rebuilds, uniforms
-                // alone carry the frame's state change.
-                //
-                // `Partial(lines)` → rebuild only those row indices.
+                // New buffers need every row even if terminal damage is partial.
                 let force_full = grid.needs_full_rebuild()
                     || matches!(p.damage, rio_backend::event::TerminalDamage::Full);
 
@@ -4492,6 +4483,8 @@ impl Screen<'_> {
                 if grid.needs_full_rebuild() {
                     prepared.clear();
                 }
+                // Full damage can mean scrolling, not new text. Reuse content there,
+                // but keep fully rewritten viewports on the cheaper direct emit path.
                 let reuse_rows =
                     force_full && (prepared.is_empty() || !p.all_rows_modified);
                 if reuse_rows {
@@ -4764,28 +4757,13 @@ impl Screen<'_> {
                 }
                 grid.set_cursor(block_cursor.as_slice(), tail_cursor.as_slice());
 
-                // Panel's grid origin in drawable-pixel space =
-                // window scaled_margin + the panel's layout rect
-                // offset inside the root container. Snap to integer
-                // pixels so `cell_size * grid_pos + grid_padding`
-                // always lands on pixel boundaries. Without this, a
-                // fractional margin (e.g. Taffy layout computing
-                // 10.5px offsets) shifts the whole grid half a pixel
-                // and the bg fragment's
-                // `floor((pixel - padding) / cell_size)` disagrees
-                // with the text vertex's `cell_size * grid_pos`
-                // about where cell boundaries are → visible seams.
+                // Snap the shared origin so background lookup and text placement
+                // agree on cell boundaries; fractional layout offsets caused seams.
                 let panel_left = (scaled_margin.left + p.layout_rect[0]).round();
                 let panel_top = (scaled_margin.top + p.layout_rect[1]).round();
 
-                // Bg-tint uniforms fire ONLY for the active block
-                // style — the bg shader paints the cursor cell in
-                // `cursor_bg_color` and the text shader swaps glyph
-                // fg to `cursor_color` (so the character inverts on
-                // top of the block). All other styles (bar /
-                // underline / hollow) draw via the sprite emitted
-                // above; their bg/text stays untouched. Same gate as
-                // .
+                // Only block cursors invert the underlying cell. Other cursor
+                // shapes are sprites and must leave the text/background unchanged.
                 let (cursor_pos, cursor_col_u, cursor_bg_u) =
                     if matches!(render_style, Some(rio_grid::CursorRenderStyle::Block)) {
                         (
@@ -4864,12 +4842,8 @@ impl Screen<'_> {
                 self.sugarloaf.discard_frame();
             }
 
-            // Return each panel's snapshot buffers to the matching
-            // context's `renderable_content` so the next frame's
-            // `Renderer::run` can reuse the existing allocations
-            // (rows, per-cell styles, extras table). Closed routes
-            // simply drop their PanelFrame; the context (and its
-            // renderable_content) is gone too.
+            // Return snapshots to their route so the next frame reuses storage.
+            // Unmatched frames belong to closed terminals and release their payloads.
             for (_, item) in self
                 .context_manager
                 .current_grid_mut()

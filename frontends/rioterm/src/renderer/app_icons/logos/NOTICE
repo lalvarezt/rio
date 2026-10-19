@@ -1,0 +1,29 @@
+OpenAI and Claude: Microsoft Codicons, CC BY 4.0, unchanged.
+https://github.com/microsoft/vscode-codicons/tree/main/src/icons
+https://creativecommons.org/licenses/by/4.0/
+
+Neovim and Git: Jason Long, CC BY 3.0, unchanged geometry.
+https://github.com/neovim/neovim.github.io/blob/5801b2318a1b1fd880e54985cce8357affe855f0/static/logos/neovim-mark.svg
+https://git-scm.com/community/logos
+https://creativecommons.org/licenses/by/3.0/
+
+Simple Icons contributors, CC0 collection. Geometry unchanged; brand colors added.
+https://github.com/simple-icons/simple-icons/tree/4d29a35c954699b389a834aacc97dd6e7e74143c
+See LICENSE-SIMPLE-ICONS.md. Source metadata lists original artwork licenses.
+Original artwork license exceptions:
+bash.svg, copilot.svg: MIT.
+nix.svg: https://creativecommons.org/licenses/by/4.0/
+php.svg, rust.svg: https://creativecommons.org/licenses/by-sa/4.0/
+ruby.svg: https://creativecommons.org/licenses/by-sa/2.5/
+git.svg: Jason Long, CC BY 3.0 as attributed above.
+
+Goose: Block, Inc. and contributors, Apache-2.0. See LICENSE-GOOSE.txt.
+https://github.com/block/goose/blob/716bb92ce7726090fa46ee360c38f783897f1beb/documentation/static/img/goose.svg
+Helix contributors, MPL-2.0. See LICENSE-HELIX.txt.
+https://github.com/helix-editor/helix/blob/ba40e547426b0f9896c8bdc699a4ab11f2b37dbc/logo.svg
+Jujutsu contributors, Apache-2.0. See LICENSE-JJ.txt.
+https://github.com/jj-vcs/jj/blob/df92b83d7d1141cd51aabf0dd744bb365d62ae3b/docs/images/jj-logo.svg
+Superfile contributors, MIT. See LICENSE-SUPERFILE.txt.
+https://github.com/yorukot/superfile/blob/2f7d9a6207526c1c580cfdf5bea083e712d203c0/website/public/logo.svg
+Television contributors, MIT. See LICENSE-TELEVISION.txt.
+https://github.com/alexpasmantier/television/blob/d4a7ab397209866dbc7be3209c031879f13310f8/website/static/img/logo.svg

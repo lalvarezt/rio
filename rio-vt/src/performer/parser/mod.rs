@@ -810,6 +810,8 @@ impl Parser {
         if self.osc_discarded {
             return;
         }
+        // Bound reports during collection, before an unterminated OSC can grow
+        // the buffer indefinitely. Leave image protocols' payload limits unchanged.
         if self.osc_program_status
             && self.osc_raw.len().saturating_add(bytes.len())
                 > crate::program_status::MAX_SEQUENCE_BYTES

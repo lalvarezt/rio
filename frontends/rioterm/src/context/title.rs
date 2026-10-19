@@ -20,15 +20,13 @@ impl Default for ContextTitle {
 // - `TITLE`: terminal title via OSC sequences for setting terminal title
 // - `PROGRAM`: the command the pane spawned (e.g `fish`, `zsh`, `bash`)
 // - `ABSOLUTE_PATH`: working directory via OSC 7 (e.g `/Users/rapha/Documents/a/rio`)
-// - `RELATIVE_PATH`: OSC 7 directory, home-relative (e.g `~/Documents/a/rio` or `…/a/psone/starpsx`)
+// - `RELATIVE_PATH`: OSC 7 directory, home-relative (e.g `~/Documents/a/rio`)
 // - `COLUMNS`: current columns
 // - `LINES`: current lines
 
-/// Shorten an absolute path for display:
-/// - Replace home directory prefix with `~`
-/// The tab renderer fits the result to the measured width.
+/// Replace the home prefix only; character-count truncation here would hide
+/// paths that still fit after the renderer measures the title and its icons.
 fn shorten_path(absolute: &str) -> String {
-    // Replace home prefix with ~
     #[cfg(unix)]
     let display_path = {
         let path = Path::new(absolute);
@@ -54,16 +52,9 @@ fn shorten_path(absolute: &str) -> String {
     display_path
 }
 
+/// Use event-known metadata instead of polling foreground processes. A supplied
+/// OSC title avoids locking; templates needing the directory take one shared lock.
 #[inline]
-/// Render the title template. Every variable is event-known, so this
-/// NEVER inspects the foreground process: `{{ title }}` is OSC 0/2,
-/// the path variables are OSC 7 (empty for shells without
-/// integration), `{{ program }}` is the name of the command the pane
-/// spawned, and columns/lines are the pane's own dimensions.
-/// `prefetched_title` reuses the OSC title string the caller already
-/// holds (a `Title` event carries it), so a `{{ title }}` render off
-/// an event never locks the terminal; otherwise one lock fetches
-/// title and cwd together.
 pub fn update_title<T: rio_backend::event::EventListener>(
     template: &str,
     context: &Context<T>,

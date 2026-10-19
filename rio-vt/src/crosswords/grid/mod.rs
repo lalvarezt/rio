@@ -137,6 +137,8 @@ pub(crate) const ID_BITSET_WORDS: usize = (u16::MAX as usize + 1).div_ceil(64);
 /// reused via a free list when cells are cleared.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ExtrasTable {
+    // Snapshots and the interning key share immutable payloads instead of
+    // cloning hyperlink targets and combining characters for each visible cell.
     slots: Vec<Option<std::sync::Arc<crate::crosswords::square::Extras>>>,
     free: Vec<u16>,
     /// Content-hash interning: identical extras share one slot.

@@ -966,6 +966,7 @@ impl VulkanGridRenderer {
     }
 
     pub fn set_cursor(&mut self, block: &[CellText], non_block: &[CellText]) {
+        // Cursor motion must not repack or upload the resident terminal text.
         let mut changed = false;
         if let Some(slot) = self.fg_rows.first_mut() {
             if slot.as_slice() != block {
@@ -1138,6 +1139,7 @@ impl VulkanGridRenderer {
             self.fg_buckets.clear();
             self.fg_row_offsets.clear();
             let rows = &self.fg_rows[1..content_end];
+            // One atlas page keeps rows contiguous, allowing later row-range uploads.
             let first_key = rows
                 .iter()
                 .find_map(|row| row.first())

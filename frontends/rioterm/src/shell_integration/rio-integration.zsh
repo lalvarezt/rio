@@ -15,6 +15,7 @@ add-zsh-hook chpwd _rio_report_pwd
 add-zsh-hook precmd _rio_report_pwd
 _rio_report_pwd
 
+# Shell reports identify remote apps that local process inspection cannot see.
 _rio_report_app() {
     local app="${1:t}" transport=MA==
     [[ -n "${SSH_CONNECTION-}${SSH_CLIENT-}${SSH_TTY-}" ]] && transport=MQ==

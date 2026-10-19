@@ -18,6 +18,7 @@ pub enum Icon {
 pub const DEFAULT_ICON: Icon = Icon::Glyph('\u{ea85}');
 pub const SSH_ICON: Icon = Icon::Glyph('\u{f08c0}');
 
+// A dedicated symbol face keeps terminal font changes from changing tab icons.
 pub fn load_font(library: &FontLibrary) -> Option<usize> {
     #[cfg(feature = "profiling")]
     let _timing = crate::profiling::span("header.load_app_font");

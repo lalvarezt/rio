@@ -188,7 +188,8 @@ impl WgpuGlyphAtlas {
     }
 }
 
-/// Immutable grid state shared by panels using one context and target format.
+/// Share compiled pipelines across panes; uniforms and atlases stay per grid so
+/// resizing or clearing one pane cannot invalidate another pane's frame.
 pub(crate) struct GridPipelines {
     bg_layout: wgpu::BindGroupLayout,
     bg: wgpu::RenderPipeline,
@@ -402,6 +403,7 @@ impl WgpuGridRenderer {
         let row_start = (row as usize) * (self.cols as usize);
         let row_len = (self.cols as usize).min(bg.len());
         let cpu = &mut self.bg_cpu[row_start..row_start + self.cols as usize];
+        // Packed comparison skips unchanged uploads; clear the tail when a row shrinks.
         if bytemuck::cast_slice::<_, u8>(&cpu[..row_len])
             != bytemuck::cast_slice(&bg[..row_len])
             || cpu[row_len..]
@@ -518,6 +520,7 @@ impl WgpuGridRenderer {
         render_pass: &mut wgpu::RenderPass<'_>,
         uniforms: &GridUniforms,
     ) {
+        // UI-only redraws still record grid passes; resident uniforms need no queue write.
         if self
             .last_uniforms
             .as_ref()

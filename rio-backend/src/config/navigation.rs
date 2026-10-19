@@ -189,6 +189,8 @@ pub struct ColorAutomation {
     pub color: ColorArray,
 }
 
+/// Medium keeps geometric motion but skips fades; Full adds hover and opacity
+/// transitions. Both stop requesting frames once the visible motion settles.
 #[derive(Debug, Default, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Animation {

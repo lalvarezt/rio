@@ -60,6 +60,8 @@ pub struct TabGeometry {
 }
 
 impl TabStyle {
+    // Presets only supply defaults; renderers consume one resolved geometry so
+    // individual overrides do not create separate pill/square drawing paths.
     pub fn geometry(self) -> TabGeometry {
         let square = self == Self::Square;
         TabGeometry {
@@ -184,6 +186,7 @@ impl Tabs {
 
 impl TabGeometry {
     pub fn content_top(&self) -> f32 {
+        // The pane gap is controlled by root margin, not another tab-bottom gap.
         self.height - self.margin.bottom
     }
 }

@@ -193,6 +193,7 @@ struct IslandFills {
 }
 
 fn tab_fills(bg: [f32; 4]) -> IslandFills {
+    // Translucent contrast overlays preserve the window's blur and opacity.
     let light = 0.2126 * bg[0] + 0.7152 * bg[1] + 0.0722 * bg[2] > 0.5;
     if light {
         IslandFills {
@@ -318,10 +319,6 @@ impl From<TabStyle> for TabAppearance {
 }
 
 impl TabAppearance {
-    fn gap(&self) -> f32 {
-        self.geometry.gap
-    }
-
     fn layout(
         &self,
         window_width: f32,
@@ -330,12 +327,12 @@ impl TabAppearance {
         max_tab_width: f32,
     ) -> TabStripLayout {
         #[cfg(target_os = "macos")]
-        let left_margin = (ISLAND_MARGIN_LEFT_MACOS + self.gap() / 2.0)
+        let left_margin = (ISLAND_MARGIN_LEFT_MACOS + self.geometry.gap / 2.0)
             .max(self.geometry.margin.left)
-            - self.gap() / 2.0;
+            - self.geometry.gap / 2.0;
         #[cfg(not(target_os = "macos"))]
-        let left_margin = self.geometry.margin.left - self.gap() / 2.0;
-        let right_margin = self.geometry.margin.right - self.gap() / 2.0
+        let left_margin = self.geometry.margin.left - self.geometry.gap / 2.0;
+        let right_margin = self.geometry.margin.right - self.geometry.gap / 2.0
             + crate::renderer::window_chrome::controls_width();
         let available_width =
             (window_width / scale_factor - right_margin - left_margin).max(0.0);
@@ -357,7 +354,7 @@ impl TabAppearance {
     }
 
     fn title_padding(&self, remote: bool, icon_size: f32) -> f32 {
-        self.gap() / 2.0 + self.icon_padding(remote, icon_size)
+        self.geometry.gap / 2.0 + self.icon_padding(remote, icon_size)
     }
 
     fn radius(&self, pill_radius: f32) -> f32 {
@@ -373,8 +370,9 @@ impl TabAppearance {
     }
 
     fn rect(&self, slot_x: f32, tab_width: f32) -> (f32, f32, f32, f32, f32) {
-        let x = slot_x + self.gap() / 2.0;
-        let w = (tab_width - self.gap()).max(0.0);
+        // Slot halves carry the gap so visible margins stay independent of tab spacing.
+        let x = slot_x + self.geometry.gap / 2.0;
+        let w = (tab_width - self.geometry.gap).max(0.0);
         let h = self.geometry.content_top() - self.geometry.margin.top;
         (
             x,
@@ -407,12 +405,12 @@ impl TabAppearance {
         if self.geometry.close_button == CloseButton::Always
             || (self.geometry.close_button == CloseButton::Hover && hovered_close)
         {
-            self.gap() / 2.0
+            self.geometry.gap / 2.0
                 + self.geometry.close_button_inset
                 + self.geometry.close_button_size
                 + self.geometry.close_button_gap
         } else {
-            self.gap() / 2.0 + self.geometry.padding.right
+            self.geometry.gap / 2.0 + self.geometry.padding.right
         }
     }
 

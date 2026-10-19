@@ -151,6 +151,7 @@ pub fn snap(value: f32, scale: f32) -> f32 {
     (value * scale).round() / scale
 }
 
+// Visible glyph bounds, rather than line metrics, align mixed UI fonts and symbols.
 pub fn centered_text_y(
     sugarloaf: &mut Sugarloaf,
     text: &str,

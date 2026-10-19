@@ -2257,29 +2257,21 @@ impl<U: EventListener> Crosswords<U> {
 
     /// Half-open grid line range currently on screen, as `(start, end)`.
     ///
-    /// This is the full screen height offset by the scrollback position, and
-    /// deliberately has nothing to do with `scroll_region`: DECSTBM bounds
-    /// where scrolling happens, not what is displayed. Both were once read
-    /// from `scroll_region`, so an app that narrowed it (vim, less, htop,
-    /// tmux, man) lost rows off the snapshot.
+    /// DECSTBM limits scrolling, not visibility; using it here drops rows when
+    /// a TUI narrows the scrolling region.
     #[inline]
     fn visible_line_bounds(&self) -> (i32, i32) {
         let scroll = self.display_offset() as i32;
         (-scroll, self.grid.screen_lines() as i32 - scroll)
     }
 
-    /// Copy the visible viewport into `dst` in place. Reuses both the
-    /// outer `Vec`'s capacity and each inner `Row`'s `Vec<Square>`
-    /// allocation (via [`Row::copy_from`]) so the renderer's frame
-    /// buffer doesn't reallocate every frame at steady state.
+    /// Retain the viewport and each row's allocation across full redraws, so
+    /// scrolling and tab switches do not allocate another screen of cells.
     #[inline]
     pub fn fill_visible_rows(&self, dst: &mut Vec<Row<Square>>) {
         let (start, end) = self.visible_line_bounds();
         let count = (end - start) as usize;
 
-        // Copy each visible row into the matching slot. Excess slots
-        // get truncated; missing ones get pushed (with a fresh `Row`
-        // each — first-frame allocation only).
         for (i, row_idx) in (start..end).enumerate() {
             let src = &self.grid[Line(row_idx)];
             if let Some(dst_row) = dst.get_mut(i) {
@@ -3742,7 +3734,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
         if clustering {
             let mut remaining = codepoints;
             while !remaining.is_empty() {
-                // Keep Unicode on the scalar loop until ASCII needs run detection.
+                // Avoid repeated ASCII-run detection on Unicode-only input.
                 let scalar_len = remaining
                     .iter()
                     .position(|cp| (0x20..=0x7e).contains(cp))

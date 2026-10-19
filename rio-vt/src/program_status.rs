@@ -1,4 +1,7 @@
 //! OSC 7501 reports and the bounded, per-terminal program status store.
+//! Protocol: https://www.superlogical.com/rex/docs/build/program-status
+//! Keep task state outside either screen buffer so TUIs and SSH can switch
+//! screens without losing it. Prompt completion clears activity, not results.
 
 use crate::event::{ProgressReport, ProgressState};
 use crate::time::Instant;

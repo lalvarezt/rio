@@ -87,6 +87,7 @@ impl SearchOverlay {
 
     #[inline]
     pub fn set_active_search(&mut self, active_search: Option<&str>) -> bool {
+        // Frame synchronization must not allocate another copy of an unchanged query.
         if self.active_search.as_deref() == active_search {
             return false;
         }
