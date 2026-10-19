@@ -40,13 +40,7 @@ const TAB_INSET_BOTTOM: f32 = 6.0;
 const TAB_INSET_TOP: f32 = TAB_INSET_BOTTOM;
 
 /// Bottom of the tab shape; pane spacing starts here for either tab style.
-pub fn content_top(style: TabStyle) -> f32 {
-    if style == TabStyle::Windows {
-        ISLAND_HEIGHT
-    } else {
-        ISLAND_HEIGHT - TAB_INSET_BOTTOM
-    }
-}
+pub const CONTENT_TOP: f32 = ISLAND_HEIGHT - TAB_INSET_BOTTOM;
 const TAB_RADIUS: f32 = 19.0;
 /// Bell dot for tabs that rang while in the background, and the gap
 /// between it and the tab title. A dot, not a glyph: the UI text layer
@@ -403,13 +397,13 @@ impl TabAppearance {
     }
 
     fn center_y(self) -> f32 {
-        (self.inset_top + ISLAND_HEIGHT - TAB_INSET_BOTTOM) / 2.0
+        (self.inset_top + CONTENT_TOP) / 2.0
     }
 
     fn rect(self, slot_x: f32, tab_width: f32) -> (f32, f32, f32, f32, f32) {
         let x = slot_x + self.gap() / 2.0;
         let w = (tab_width - self.gap()).max(0.0);
-        let h = ISLAND_HEIGHT - self.inset_top - TAB_INSET_BOTTOM;
+        let h = CONTENT_TOP - self.inset_top;
         (
             x,
             self.inset_top,
@@ -1528,12 +1522,27 @@ mod tests {
 
     #[test]
     fn island_geometry_invariants() {
+        use rio_backend::config::navigation::{Navigation, NavigationMode};
+
         const {
             assert!(TAB_INSET_TOP + TAB_INSET_BOTTOM < ISLAND_HEIGHT);
             assert!(CLOSE_MARGIN_RIGHT + CLOSE_HIT_HALF_WIDTH < CLOSE_MIN_ISLAND_WIDTH);
             assert!(
                 CLOSE_HOVER_HALF * 2.0
                     <= ISLAND_HEIGHT - TAB_INSET_TOP - TAB_INSET_BOTTOM
+            );
+        }
+        for style in [TabStyle::Pill, TabStyle::Windows] {
+            let (_, y, _, height, _) = TabAppearance::from(style).rect(0.0, 180.0);
+            let navigation = Navigation {
+                mode: NavigationMode::Tab,
+                tab_style: style,
+                hide_if_single: false,
+                ..Default::default()
+            };
+            assert_eq!(
+                super::super::utils::padding_top_from_config(&navigation, 0.0, 2, false),
+                y + height
             );
         }
     }
