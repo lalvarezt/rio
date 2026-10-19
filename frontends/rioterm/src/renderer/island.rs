@@ -434,6 +434,7 @@ impl TabAppearance {
         )
     }
 
+    #[cfg(test)]
     fn close_button_center_x(
         &self,
         layout: &TabStripLayout,

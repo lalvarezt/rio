@@ -1,5 +1,6 @@
 [package]
 name = "rioterm"
+autobins = false
 description = "Rio terminal is a hardware-accelerated GPU terminal emulator, focusing to run in desktops and browsers."
 version.workspace = true
 authors.workspace = true
@@ -14,11 +15,11 @@ readme.workspace = true
 
 [[bin]]
 name = "rio"
-path = "src/main.rs"
+path = "src/bin/rio.rs"
 
 [[bin]]
 name = "rio-profile"
-path = "src/main.rs"
+path = "src/bin/rio-profile.rs"
 required-features = ["profiling"]
 
 [dependencies]

@@ -1,9 +1,3 @@
-// With the default subsystem, 'console', windows creates an additional console
-// window for the program.
-// This is silently ignored on non-windows systems.
-// See https://msdn.microsoft.com/en-us/library/4cc7ya5b.aspx for more details.
-#![windows_subsystem = "windows"]
-
 mod application;
 mod bindings;
 mod cli;

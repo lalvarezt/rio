@@ -610,7 +610,7 @@ impl WgpuGridRenderer {
 // ---------- buffer / layout / pipeline helpers ----------
 
 fn extend_damage(damage: &mut std::ops::Range<usize>, range: std::ops::Range<usize>) {
-    if damage.is_empty() {
+    if damage.start >= damage.end {
         *damage = range;
     } else {
         damage.start = damage.start.min(range.start);

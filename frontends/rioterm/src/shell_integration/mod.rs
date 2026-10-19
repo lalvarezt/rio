@@ -161,7 +161,10 @@ fn powershell_command(
         return None;
     }
     #[cfg(target_os = "windows")]
-    let program = Some(resolved_program.to_string());
+    let program = {
+        let _ = configured_program;
+        Some(resolved_program.to_string())
+    };
     #[cfg(not(target_os = "windows"))]
     let program = {
         let _ = resolved_program;
