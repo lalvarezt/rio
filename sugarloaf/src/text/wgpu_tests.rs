@@ -146,6 +146,37 @@ fn panel_uniforms() -> crate::grid::GridUniforms {
 
 #[test]
 #[ignore = "requires a graphics adapter; run explicitly with --ignored"]
+fn opaque_terminal_background_matches_window_clear() {
+    // The wgpu UI uses drawable-encoded colors for every input gamut.
+    for (input_colorspace, rgb) in
+        [(0, [30, 30, 46]), (1, [24, 24, 37]), (2, [240, 80, 20])]
+    {
+        let mut uniforms = panel_uniforms();
+        uniforms.input_colorspace = input_colorspace;
+        let [r, g, b] = rgb.map(|v| v as f64 / 255.0);
+        uniforms.cursor_pos = [0, 0];
+        uniforms.cursor_bg_color = [r as f32, g as f32, b as f32, 1.0];
+        let pixels = render_panel_background(
+            uniforms,
+            &[rgb[0], rgb[1], rgb[2], 255].repeat(4),
+            wgpu::Color { r, g, b, a: 1.0 },
+        );
+        let pixel = |x: usize, y: usize| &pixels[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4];
+        assert_eq!(
+            pixel(40, 40),
+            pixel(32, 12),
+            "terminal background must match the window clear"
+        );
+        assert_eq!(
+            pixel(24, 24),
+            pixel(32, 12),
+            "cursor background must use the same color encoding"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a graphics adapter; run explicitly with --ignored"]
 fn status_line_background_does_not_stretch_into_bottom_padding() {
     let mut cells = [40, 190, 70, 255].repeat(2);
     cells.extend([200, 40, 30, 255].repeat(2));
