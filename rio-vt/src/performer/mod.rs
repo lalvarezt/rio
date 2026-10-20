@@ -504,6 +504,36 @@ where
         }
     }
 
+    fn drain_after_exit(
+        &mut self,
+        state: &mut State,
+        buf: &mut [u8],
+        quiet: std::time::Duration,
+    ) {
+        // ConPTY's pump can publish after the child-exit event. Retry its live
+        // empty queue, but stop at real EOF. Unix supplies a zero quiet window
+        // so descendants retaining the slave cannot delay exit.
+        let deadline = Instant::now() + std::time::Duration::from_millis(100);
+        let mut quiet_deadline = Instant::now() + quiet;
+        loop {
+            match self.pty_read(state, buf) {
+                Ok(ReadOutcome::Budget) if Instant::now() < deadline => {
+                    quiet_deadline = Instant::now() + quiet;
+                    continue;
+                }
+                Ok(ReadOutcome::Idle)
+                    if Instant::now() < deadline && Instant::now() < quiet_deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    continue;
+                }
+                Err(err) => tracing::debug!("PTY final drain: {err}"),
+                _ => (),
+            }
+            break;
+        }
+    }
+
     /// All reader exits, including partial registration failures, finalize here.
     fn finish(
         &mut self,
@@ -512,38 +542,12 @@ where
         reason: io::Result<ExitReason>,
     ) {
         if matches!(reason, Ok(ExitReason::ChildExited(_))) {
-            // Do not wait for descendants to close the slave. Drain across
-            // parsing budgets, limiting continuously available output to 100 ms
-            // between batches (terminal lock waits can extend this interval).
-            let deadline = Instant::now() + std::time::Duration::from_millis(100);
-            // Windows Closed means the ConPTY ring is momentarily empty
-            // (never WouldBlock, and no real EOF exists until the drain's
-            // own shutdown closes the pseudoconsole), while the pump
-            // thread delivers final output after the exit event. Retry it
-            // through a short quiet window, refreshed by each batch of
-            // data, so a close is not taxed the full deadline. Unix
-            // Closed is a real EOF and ends the drain at once.
-            let quiet = std::time::Duration::from_millis(25);
-            let mut quiet_deadline = Instant::now() + quiet;
-            loop {
-                match self.pty_read(state, buf) {
-                    Ok(ReadOutcome::Budget) if Instant::now() < deadline => {
-                        quiet_deadline = Instant::now() + quiet;
-                        continue;
-                    }
-                    Ok(ReadOutcome::Closed)
-                        if cfg!(windows)
-                            && Instant::now() < deadline
-                            && Instant::now() < quiet_deadline =>
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(2));
-                        continue;
-                    }
-                    Err(err) => tracing::debug!("PTY final drain: {err}"),
-                    _ => (),
-                }
-                break;
-            }
+            let quiet = if cfg!(windows) {
+                std::time::Duration::from_millis(25)
+            } else {
+                std::time::Duration::ZERO
+            };
+            self.drain_after_exit(state, buf, quiet);
         }
 
         // Flush exactly once before publishing any exit notification.

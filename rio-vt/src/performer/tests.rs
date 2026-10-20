@@ -18,10 +18,17 @@ struct TestPty {
     shutdown_calls: usize,
     deregister_calls: usize,
     raw_error: Option<i32>,
+    idle_reads: usize,
+    read_calls: usize,
 }
 
 impl Read for TestPty {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.read_calls += 1;
+        if self.idle_reads != 0 {
+            self.idle_reads -= 1;
+            return Err(ErrorKind::WouldBlock.into());
+        }
         let got = self.bytes.read(buf)?;
         if got != 0 {
             return Ok(got);
@@ -134,6 +141,8 @@ fn machine(bytes: Vec<u8>, ending: Option<ErrorKind>) -> Machine<TestPty, VoidLi
             shutdown_calls: 0,
             deregister_calls: 0,
             raw_error: None,
+            idle_reads: 0,
+            read_calls: 0,
         },
         VoidListener,
         WindowId::from(0),
@@ -209,6 +218,71 @@ fn final_output_can_be_drained_across_multiple_parse_budgets() {
         ReadOutcome::Closed
     );
     assert_eq!(first_line(&machine, 12), "final output");
+}
+
+#[test]
+fn final_drain_waits_for_a_delayed_pump() {
+    let mut machine = machine(b"final output".to_vec(), Some(ErrorKind::WouldBlock));
+    machine.pty.idle_reads = 2;
+    machine.drain_after_exit(
+        &mut State::default(),
+        &mut vec![0; READ_BUFFER_SIZE],
+        Duration::from_millis(25),
+    );
+    assert_eq!(first_line(&machine, 12), "final output");
+}
+
+#[test]
+fn final_drain_stops_at_real_eof() {
+    let mut machine = machine(b"final output".to_vec(), None);
+    machine.drain_after_exit(
+        &mut State::default(),
+        &mut vec![0; READ_BUFFER_SIZE],
+        Duration::from_secs(1),
+    );
+    assert_eq!(machine.pty.read_calls, 2);
+}
+
+#[cfg(windows)]
+#[test]
+fn conpty_exit_preserves_final_output() {
+    for _ in 0..5 {
+        let terminal = Crosswords::new(
+            CrosswordsSize::new(80, 24),
+            CursorShape::Block,
+            VoidListener,
+            WindowId::from(0),
+            0,
+            0,
+        );
+        let pty = teletypewriter::create_pty(
+            Some("cmd.exe"),
+            vec!["/d".into(), "/c".into(), "echo FINAL_OUTPUT_MARKER".into()],
+            &None,
+            None,
+            80,
+            24,
+        )
+        .unwrap();
+        let machine = Machine::new(
+            Arc::new(FairMutex::new(terminal)),
+            pty,
+            VoidListener,
+            WindowId::from(0),
+            0,
+        )
+        .unwrap();
+        let (machine, _) = machine.spawn().join().unwrap();
+        let terminal = machine.terminal.lock();
+        let output: String = (0..24)
+            .flat_map(|row| (0..80).map(move |column| (row, column)))
+            .map(|(row, column)| terminal.grid[Line(row)][Column(column)].c())
+            .collect();
+        assert!(
+            output.contains("FINAL_OUTPUT_MARKER"),
+            "final ConPTY output was lost: {output:?}"
+        );
+    }
 }
 
 #[test]
