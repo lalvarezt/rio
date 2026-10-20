@@ -716,26 +716,11 @@ impl<'a> RouteWindow<'a> {
 
         #[cfg(not(target_os = "macos"))]
         {
-            let now = Instant::now();
-            let elapsed = now.duration_since(self.render_timestamp);
-            let vblank = self.vblank_interval;
-
-            // Calculate how many complete frames have elapsed
-            let frames_elapsed = elapsed.as_nanos() / vblank.as_nanos();
-
-            // Calculate when the next frame should occur
-            let next_frame_time = self.render_timestamp
-                + Duration::from_nanos(
-                    (frames_elapsed + 1) as u64 * vblank.as_nanos() as u64,
-                );
-
-            if next_frame_time > now {
-                // Return the time to wait until the next ideal frame time
-                Some(next_frame_time.duration_since(now))
-            } else {
-                // We've missed the target frame time, render immediately
-                None
-            }
+            // An overdue frame should render immediately, rather than waiting
+            // for another refresh boundary after an idle period.
+            self.vblank_interval
+                .checked_sub(self.render_timestamp.elapsed())
+                .filter(|remaining| !remaining.is_zero())
         }
     }
 

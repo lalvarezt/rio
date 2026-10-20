@@ -449,7 +449,9 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     route.request_overlay_redraw();
                 }
             }
-            RioEventType::Rio(RioEvent::RenderRoute(route_id)) => {
+            RioEventType::Rio(
+                RioEvent::RenderRoute(route_id) | RioEvent::TerminalDamaged(route_id),
+            ) => {
                 if self.config.renderer.strategy.is_event_based() {
                     if let Some(route) = self.router.routes.get_mut(&window_id) {
                         // Skip rendering for unfocused windows if configured
@@ -481,6 +483,8 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                             route.window.screen.ctx_mut().get_by_route_id(route_id)
                         {
                             ctx_item.val.renderable_content.pending_update.set_dirty();
+                        } else {
+                            return;
                         }
 
                         // Check if we need to throttle based on timing
@@ -509,33 +513,6 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 }
             }
 
-            RioEventType::Rio(RioEvent::TerminalDamaged(route_id)) => {
-                if self.config.renderer.strategy.is_event_based() {
-                    if let Some(route) = self.router.routes.get_mut(&window_id) {
-                        if self.config.renderer.disable_unfocused_render
-                            && !route.window.is_focused
-                            && route.window.focus_seen
-                        {
-                            return;
-                        }
-                        if self.config.renderer.disable_occluded_render
-                            && route.window.is_occluded
-                            && !route.window.needs_render_after_occlusion
-                        {
-                            return;
-                        }
-
-                        if let Some(ctx_item) =
-                            route.window.screen.ctx_mut().get_by_route_id(route_id)
-                        {
-                            // Just mark dirty — damage will be extracted from
-                            // the terminal when the renderer locks it.
-                            ctx_item.val.renderable_content.pending_update.set_dirty();
-                            route.request_redraw();
-                        }
-                    }
-                }
-            }
             RioEventType::Rio(RioEvent::UpdateGraphics { route_id, queues }) => {
                 use rio_backend::sugarloaf::route_image_key;
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
