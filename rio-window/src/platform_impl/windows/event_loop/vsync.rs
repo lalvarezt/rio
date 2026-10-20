@@ -14,6 +14,7 @@
 //! same gate macOS / Wayland / X11 use via `InputRateTracker`.
 //! Single keystrokes / lone mouse events no longer force a
 //! 1-second redraw storm.
+//! With no dirty window or input sustain, the worker parks until new work arrives.
 //!
 //! When DWM is disabled, the monitor is unplugged, or under some
 //! RDP modes, `DwmFlush` returns immediately. The 1 ms threshold
@@ -23,8 +24,8 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::thread::JoinHandle;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::thread::{JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
 use crate::platform_impl::input_rate::InputRateTracker;
@@ -54,6 +55,7 @@ pub(crate) struct VSyncSharedState {
     /// `Mutex` because the worker thread and the window-message
     /// thread both touch this. See `platform_impl::input_rate`.
     input_rate_tracker: Mutex<InputRateTracker>,
+    worker: OnceLock<Thread>,
 }
 
 impl VSyncSharedState {
@@ -61,6 +63,7 @@ impl VSyncSharedState {
         Arc::new(Self {
             windows: RwLock::new(HashMap::new()),
             input_rate_tracker: Mutex::new(InputRateTracker::new()),
+            worker: OnceLock::new(),
         })
     }
 
@@ -76,6 +79,7 @@ impl VSyncSharedState {
     pub(crate) fn request_redraw(&self, hwnd: HWND) {
         if let Some(flag) = self.windows.read().unwrap().get(&(hwnd as usize)) {
             flag.store(true, Ordering::Release);
+            self.wake();
         }
     }
 
@@ -85,12 +89,35 @@ impl VSyncSharedState {
 
     #[inline]
     pub(crate) fn mark_input_received(&self) {
-        self.input_rate_tracker.lock().unwrap().record_input();
+        let high_rate = {
+            let mut tracker = self.input_rate_tracker.lock().unwrap();
+            tracker.record_input();
+            tracker.is_high_rate()
+        };
+        if high_rate {
+            self.wake();
+        }
     }
 
     #[inline]
     pub(crate) fn should_present_after_input(&self) -> bool {
         self.input_rate_tracker.lock().unwrap().is_high_rate()
+    }
+
+    fn has_work(&self) -> bool {
+        self.should_present_after_input()
+            || self
+                .windows
+                .read()
+                .unwrap()
+                .values()
+                .any(|flag| flag.load(Ordering::Acquire))
+    }
+
+    fn wake(&self) {
+        if let Some(worker) = self.worker.get() {
+            worker.unpark();
+        }
     }
 }
 
@@ -108,8 +135,18 @@ impl VSyncThread {
         let handle = std::thread::Builder::new()
             .name("rio-window::vsync".to_owned())
             .spawn(move || {
+                state
+                    .worker
+                    .set(std::thread::current())
+                    .expect("vsync worker already registered");
                 let provider = VSyncProvider::new();
                 while !stop_worker.load(Ordering::Acquire) {
+                    if !state.has_work() {
+                        // unpark retains a token if work arrives before park,
+                        // so an idle worker cannot lose a repaint request.
+                        std::thread::park();
+                        continue;
+                    }
                     provider.wait_for_vsync();
                     if stop_worker.load(Ordering::Acquire) {
                         break;
@@ -161,6 +198,7 @@ impl Drop for VSyncThread {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
             // Worker exits at the start of the next iteration after
             // the current DwmFlush returns (typically <16 ms).
             let _ = handle.join();
