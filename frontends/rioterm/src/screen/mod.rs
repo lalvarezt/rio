@@ -659,8 +659,6 @@ impl Screen<'_> {
         } else {
             self.sugarloaf.clear_background_image();
         }
-
-        self.resize_all_contexts();
     }
 
     #[inline]
@@ -690,7 +688,6 @@ impl Screen<'_> {
             .update_dimensions(&mut self.sugarloaf);
 
         self.mark_dirty();
-        self.resize_all_contexts();
         self.refresh_titles();
         // Reflowed cursor displacement is layout, not travel.
         self.renderer.trail_cursor.snap();
@@ -792,24 +789,6 @@ impl Screen<'_> {
         self.renderer.trail_cursor.snap();
 
         self
-    }
-
-    #[inline]
-    pub fn resize_all_contexts(&mut self) {
-        // whenever a resize update happens: it will stored in
-        // the next layout, so once the messenger.send_resize triggers
-        // the wakeup from pty it will also trigger a sugarloaf.render()
-        // and then eventually a render with the new layout computation.
-        for context_grid in self.context_manager.contexts_mut() {
-            for context in context_grid.contexts_mut().values_mut() {
-                let ctx = context.context_mut();
-                let mut terminal = ctx.terminal.lock();
-                terminal.resize::<ContextDimension>(ctx.dimension);
-                drop(terminal);
-                let winsize = crate::renderer::utils::terminal_dimensions(&ctx.dimension);
-                let _ = ctx.messenger.send_resize(winsize);
-            }
-        }
     }
 
     #[inline]
@@ -2741,14 +2720,13 @@ impl Screen<'_> {
         let mouse_y = self.mouse.y as f32 / scale_factor;
 
         let grid = self.context_manager.current_grid_mut();
-        let grid_margin = (grid.scaled_margin.left, grid.scaled_margin.top);
 
         let item = match grid.current_item() {
             Some(item) => item,
             None => return false,
         };
 
-        let panel_rect = item.layout_rect;
+        let panel_rect = item.geometry.content;
         let rich_text_id = item.context().rich_text_id;
 
         let terminal = item.context().terminal.lock();
@@ -2765,7 +2743,6 @@ impl Screen<'_> {
             display_offset,
             history_size,
             screen_lines,
-            grid_margin,
         ) {
             self.renderer.scrollbar.start_drag(
                 rich_text_id,
@@ -2822,14 +2799,13 @@ impl Screen<'_> {
         let mouse_y = self.mouse.y as f32 / scale_factor;
 
         let grid = self.context_manager.current_grid();
-        let grid_margin = (grid.scaled_margin.left, grid.scaled_margin.top);
 
         let item = match grid.current_item() {
             Some(item) => item,
             None => return false,
         };
 
-        let panel_rect = item.layout_rect;
+        let panel_rect = item.geometry.content;
 
         let terminal = item.context().terminal.lock();
         let display_offset = terminal.display_offset();
@@ -2847,7 +2823,6 @@ impl Screen<'_> {
                 display_offset,
                 history_size,
                 screen_lines,
-                grid_margin,
             )
             .is_some()
     }
@@ -4122,7 +4097,6 @@ impl Screen<'_> {
 
         if self.renderer.trail_cursor_enabled {
             let current_grid = self.context_manager.current_grid();
-            let scaled_margin = current_grid.get_scaled_margin();
 
             if let Some(current_item) = current_grid.current_item() {
                 let layout = current_item.val.dimension;
@@ -4132,9 +4106,9 @@ impl Screen<'_> {
                 let cell_height = layout.cell.cell_height as f32;
                 let scale_factor = self.sugarloaf.scale_factor();
 
-                let panel_rect = current_item.layout_rect;
-                let origin_x = panel_rect[0] + scaled_margin.left;
-                let origin_y = panel_rect[1] + scaled_margin.top;
+                let panel_rect = current_item.geometry.content;
+                let origin_x = panel_rect[0];
+                let origin_y = panel_rect[1];
 
                 let current = self.context_manager.current();
                 let cursor = &current.renderable_content.cursor;
@@ -4193,8 +4167,7 @@ impl Screen<'_> {
         {
             struct PanelFrame {
                 route_id: usize,
-                layout_rect: [f32; 4],
-                panel_rect: [f32; 4],
+                geometry: crate::layout::PaneGeometry,
                 cols: u32,
                 rows: u32,
                 cell_w: f32,
@@ -4276,10 +4249,7 @@ impl Screen<'_> {
                 preedit_line: Option<rio_grid::preedit::PreeditLine>,
             }
 
-            let (active_key, scaled_margin) = {
-                let grid = self.context_manager.current_grid();
-                (grid.current, grid.scaled_margin)
-            };
+            let active_key = self.context_manager.current_grid().current;
             // Snapshot the window's focused search match before the
             // per-context borrow below. `search_state` lives on
             // `Screen`, so we can't reach for it from inside the
@@ -4398,8 +4368,7 @@ impl Screen<'_> {
                     .unwrap_or(self.renderer.named_colors.cursor);
                 panels.push(PanelFrame {
                     route_id: ctx.route_id,
-                    layout_rect: item.layout_rect,
-                    panel_rect: item.panel_rect,
+                    geometry: item.geometry,
                     cols: ctx.renderable_content.columns.max(1) as u32,
                     rows: ctx.renderable_content.screen_lines.max(1) as u32,
                     cell_w,
@@ -4451,12 +4420,6 @@ impl Screen<'_> {
                 rio_backend::sugarloaf::grid::GridUniforms,
             )> = Vec::with_capacity(panels.len());
 
-            let panel_radius = self
-                .context_manager
-                .current_grid()
-                .panel_config()
-                .border_radius
-                * self.sugarloaf.scale_factor();
             let rasterizer = &mut self.grid_rasterizer;
             let renderer_ref = &self.renderer;
             let bg_scratch = &mut self.grid_bg_scratch;
@@ -4755,10 +4718,9 @@ impl Screen<'_> {
                 }
                 grid.set_cursor(block_cursor.as_slice(), tail_cursor.as_slice());
 
-                // Snap the shared origin so background lookup and text placement
-                // agree on cell boundaries; fractional layout offsets caused seams.
-                let panel_left = (scaled_margin.left + p.layout_rect[0]).round();
-                let panel_top = (scaled_margin.top + p.layout_rect[1]).round();
+                // Layout has already snapped the shared cell and image origin.
+                let panel_left = p.geometry.content[0];
+                let panel_top = p.geometry.content[1];
 
                 // Only block cursors invert the underlying cell. Other cursor
                 // shapes are sprites and must leave the text/background unchanged.
@@ -4795,14 +4757,11 @@ impl Screen<'_> {
                     _pad_cursor: [0; 2],
                     min_contrast: 0.0,
                     flags: 0,
-                    padding_extend: rio_backend::sugarloaf::grid::GridUniforms::PADDING_EXTEND_NONE,
+                    padding_extend:
+                        rio_backend::sugarloaf::grid::GridUniforms::PADDING_EXTEND_NONE,
                     input_colorspace,
-                    panel_rect: [
-                        (scaled_margin.left + p.panel_rect[0]).round(),
-                        (scaled_margin.top + p.panel_rect[1]).round(),
-                        p.panel_rect[2], p.panel_rect[3],
-                    ],
-                    panel_radius,
+                    panel_rect: p.geometry.frame,
+                    panel_radius: p.geometry.radius,
                     _pad_panel: [0.0; 3],
                 };
 
@@ -4908,7 +4867,6 @@ impl Screen<'_> {
         }
 
         let current_grid = self.context_manager.current_grid();
-        let scaled_margin = current_grid.get_scaled_margin();
 
         let Some(current_item) = current_grid.current_item() else {
             return;
@@ -4965,11 +4923,10 @@ impl Screen<'_> {
             return;
         }
 
-        // Panel origin: layout_rect is relative to root container,
-        // add scaled_margin to get absolute screen position
-        let panel_rect = current_item.layout_rect;
-        let origin_x = panel_rect[0] + scaled_margin.left;
-        let origin_y = panel_rect[1] + scaled_margin.top;
+        // IME and cursor use the same resolved origin as the terminal grid.
+        let panel_rect = current_item.geometry.content;
+        let origin_x = panel_rect[0];
+        let origin_y = panel_rect[1];
 
         // Convert grid position to pixel position
         let pixel_x = origin_x + (anchor_col as f32 * cell_width) + (cell_width * 0.5);

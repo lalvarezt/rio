@@ -471,12 +471,11 @@ impl Renderer {
         let mut any_panel_dirty = false;
         let grid = context_manager.current_grid_mut();
         let active_route = grid.current().route_id;
-        let grid_scaled_margin = grid.get_scaled_margin();
         let has_active_changed = self.active_route_changed(active_route);
         self.last_active = Some(active_route);
 
         for (_key, grid_context) in grid.contexts_mut().iter_mut() {
-            let panel_rect = grid_context.layout_rect;
+            let panel_rect = grid_context.geometry.content;
             let context = grid_context.context_mut();
 
             let force_full_damage = has_active_changed || self.is_game_mode_enabled;
@@ -592,8 +591,8 @@ impl Renderer {
                 // (screen/mod.rs panel_left/panel_top), so image quads
                 // and the clip rect sit exactly on the painted cell
                 // grid instead of up to half a pixel off.
-                let origin_x = (panel_rect[0] + grid_scaled_margin.left).round();
-                let origin_y = (panel_rect[1] + grid_scaled_margin.top).round();
+                let origin_x = panel_rect[0];
+                let origin_y = panel_rect[1];
 
                 // Images clip to the panel's cell grid, exactly like
                 // text: without this a wide image paints across split
@@ -763,7 +762,7 @@ impl Renderer {
         if self.scrollbar.is_enabled() {
             self.scrollbar.clear_panel_states();
             for grid_context in grid.contexts_mut().values() {
-                let panel_rect = grid_context.layout_rect;
+                let panel_rect = grid_context.geometry.content;
                 let ctx = grid_context.context();
                 let rc = &ctx.renderable_content;
                 self.scrollbar
@@ -798,21 +797,20 @@ impl Renderer {
             // Within-grid comparison: taffy keys are only meaningful
             // inside a single tab's tree.
             let active_key = grid.current;
-            let panel_radius = grid.panel_config().border_radius;
             for (key, grid_context) in grid.contexts_mut().iter() {
                 if &active_key == key {
                     continue;
                 }
-                let [left, top, width, height] = grid_context.panel_rect;
+                let [left, top, width, height] = grid_context.geometry.frame;
                 sugarloaf.rounded_rect(
                     None,
-                    (left + grid_scaled_margin.left) / scale_factor,
-                    (top + grid_scaled_margin.top) / scale_factor,
+                    left / scale_factor,
+                    top / scale_factor,
                     width / scale_factor,
                     height / scale_factor,
                     dim_color,
                     0.0,
-                    panel_radius,
+                    grid_context.geometry.radius / scale_factor,
                     3,
                 );
             }
@@ -870,8 +868,6 @@ impl Renderer {
         );
 
         // Render scrollbars for each panel
-        let grid_scaled_margin_sb = context_manager.get_current_grid_scaled_margin();
-        let grid_margin_sb = (grid_scaled_margin_sb.left, grid_scaled_margin_sb.top);
         let panel_count = self.scrollbar.panel_states().len();
         for i in 0..panel_count {
             let state = self.scrollbar.panel_states()[i];
@@ -883,28 +879,25 @@ impl Renderer {
                 state.history_size,
                 state.screen_lines,
                 state.rich_text_id,
-                grid_margin_sb,
             );
         }
 
         // Pane frames share the tabs' reflective border and the palette theme.
-        // Layout reserves padding inside these bounds, keeping chrome off cells.
+        // The frame and grid clip share the same resolved pane bounds.
         let grid = context_manager.current_grid();
-        if grid.should_draw_borders() {
-            let theme = window_chrome::Theme::new(&self.named_colors);
-            let margin = grid.get_scaled_margin();
-            let panel = grid.panel_config();
-            for (key, item) in grid.contexts() {
-                let [x, y, width, height] = item.panel_rect;
+        let theme = window_chrome::Theme::new(&self.named_colors);
+        for (key, item) in grid.contexts() {
+            if item.geometry.border_width > 0.0 {
+                let [x, y, width, height] = item.geometry.frame;
                 tab_glass::draw(
                     sugarloaf,
                     [
-                        (x + margin.left) / scale_factor,
-                        (y + margin.top) / scale_factor,
+                        x / scale_factor,
+                        y / scale_factor,
                         width / scale_factor,
                         height / scale_factor,
                     ],
-                    panel.border_radius,
+                    item.geometry.radius / scale_factor,
                     self.navigation.tab_glass_intensity,
                     Some(tab_glass::Status {
                         color: if *key == grid.current {
@@ -913,12 +906,24 @@ impl Renderer {
                             theme.border
                         },
                         progress: None,
-                        width: panel.border_width,
+                        width: item.geometry.border_width,
                     }),
                     4,
                 );
             }
         }
+        grid.for_each_divider(|[x, y, width, height]| {
+            sugarloaf.rect(
+                None,
+                x / scale_factor,
+                y / scale_factor,
+                width / scale_factor,
+                height / scale_factor,
+                theme.border,
+                0.0,
+                4,
+            );
+        });
 
         // Derive the window bg color from the currently-active panel's
         // OSC 11 state (sticky on `renderable_content.background`) on

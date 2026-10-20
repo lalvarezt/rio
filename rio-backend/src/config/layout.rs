@@ -1,8 +1,11 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
-// Panel configuration for split layouts
+// Pane box model: root margin -> panel margin -> border -> padding -> cells.
+// Margins, padding, gaps, and radius are logical pixels. Border width stays in
+// physical pixels to match the shared chrome stroke renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Panel {
+    /// Hides only the single pane's border and its inset, retaining margin and padding.
     #[serde(default, rename = "hide-if-single")]
     pub hide_if_single: bool,
     #[serde(default = "default_panel_margin")]
@@ -13,6 +16,9 @@ pub struct Panel {
     pub row_gap: f32,
     #[serde(default = "default_column_gap", rename = "column-gap")]
     pub column_gap: f32,
+    /// Paint centered on the gap; thickness never reserves layout space.
+    #[serde(default = "default_divider_width", rename = "divider-width")]
+    pub divider_width: f32,
     #[serde(default = "default_border_width", rename = "border-width")]
     pub border_width: f32,
     #[serde(default = "default_border_radius", rename = "border-radius")]
@@ -27,6 +33,7 @@ impl Default for Panel {
             padding: default_panel_padding(),
             row_gap: default_row_gap(),
             column_gap: default_column_gap(),
+            divider_width: default_divider_width(),
             border_width: default_border_width(),
             border_radius: default_border_radius(),
         }
@@ -48,6 +55,8 @@ pub struct PanelOverrides {
     pub row_gap: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub column_gap: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub divider_width: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub border_width: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -75,6 +84,10 @@ impl PanelOverrides {
                 self.column_gap.unwrap_or(base.column_gap),
                 base.column_gap,
             ),
+            divider_width: spacing(
+                self.divider_width.unwrap_or(base.divider_width),
+                base.divider_width,
+            ),
             border_width: spacing(
                 self.border_width.unwrap_or(base.border_width),
                 base.border_width,
@@ -92,6 +105,7 @@ impl PanelOverrides {
         self.padding = other.padding.or(self.padding);
         self.row_gap = other.row_gap.or(self.row_gap);
         self.column_gap = other.column_gap.or(self.column_gap);
+        self.divider_width = other.divider_width.or(self.divider_width);
         self.border_width = other.border_width.or(self.border_width);
         self.border_radius = other.border_radius.or(self.border_radius);
     }
@@ -115,6 +129,11 @@ fn default_row_gap() -> f32 {
 #[inline]
 fn default_column_gap() -> f32 {
     0.0
+}
+
+#[inline]
+fn default_divider_width() -> f32 {
+    1.0
 }
 
 #[inline]

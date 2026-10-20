@@ -11,11 +11,12 @@ use rustc_hash::FxHashMap;
 
 use taffy::{
     geometry, style_helpers::length, AvailableSpace, Display, NodeId, Style, TaffyError,
-    TaffyTree,
+    TaffyTree, TraversePartialTree,
 };
 
 const MIN_COLS: usize = 2;
 const MIN_LINES: usize = 1;
+const MIN_RESIZE_SIZE: f32 = 50.0;
 
 /// Direction of a draggable panel border
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -104,22 +105,109 @@ pub struct ContextGrid<T: EventListener> {
     panel_config: rio_backend::config::layout::Panel,
     tree: TaffyTree<()>,
     root_node: NodeId,
+    dividers: Vec<Divider>,
+}
+
+/// Resolved window coordinates in physical pixels. Rendering and input consume
+/// these boxes directly; only layout knows about root margins or Taffy offsets.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PaneGeometry {
+    pub frame: [f32; 4],
+    pub content: [f32; 4],
+    pub radius: f32,
+    pub border_width: f32,
+}
+
+impl PaneGeometry {
+    fn resolve(
+        slot: [f32; 4],
+        root: [f32; 4],
+        panel: &rio_backend::config::layout::Panel,
+        scale: f32,
+        framed: bool,
+    ) -> Self {
+        // Half of each gap belongs to either side of its divider center. Outer
+        // edges have only the configured margin, regardless of split depth.
+        let gap_x = panel.column_gap * scale / 2.0;
+        let gap_y = panel.row_gap * scale / 2.0;
+        let frame = Self::inset(
+            slot,
+            Margin::new(
+                panel.margin.top * scale + if slot[1] > root[1] { gap_y } else { 0.0 },
+                panel.margin.right * scale
+                    + if slot[0] + slot[2] < root[0] + root[2] {
+                        gap_x
+                    } else {
+                        0.0
+                    },
+                panel.margin.bottom * scale
+                    + if slot[1] + slot[3] < root[1] + root[3] {
+                        gap_y
+                    } else {
+                        0.0
+                    },
+                panel.margin.left * scale + if slot[0] > root[0] { gap_x } else { 0.0 },
+            ),
+        );
+        let border_width = if framed {
+            panel.border_width.min(frame[2].min(frame[3]) / 2.0)
+        } else {
+            0.0
+        };
+        let content = Self::inset(
+            frame,
+            Margin::new(
+                border_width + panel.padding.top * scale,
+                border_width + panel.padding.right * scale,
+                border_width + panel.padding.bottom * scale,
+                border_width + panel.padding.left * scale,
+            ),
+        );
+        Self {
+            frame,
+            content,
+            radius: (panel.border_radius * scale).min(frame[2].min(frame[3]) / 2.0),
+            border_width,
+        }
+    }
+
+    fn inset(rect: [f32; 4], margin: Margin) -> [f32; 4] {
+        // When a window is smaller than its chrome, reduce opposing insets
+        // proportionally. Content stays inside its pane with nonnegative size.
+        let fit = |available: f32, total: f32| {
+            if total > available {
+                available / total
+            } else {
+                1.0
+            }
+        };
+        let horizontal = fit(rect[2], margin.left + margin.right);
+        let vertical = fit(rect[3], margin.top + margin.bottom);
+        let left = (rect[0] + margin.left * horizontal).round();
+        let top = (rect[1] + margin.top * vertical).round();
+        let right = (rect[0] + rect[2] - margin.right * horizontal).round();
+        let bottom = (rect[1] + rect[3] - margin.bottom * vertical).round();
+        [left, top, (right - left).max(0.0), (bottom - top).max(0.0)]
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Divider {
+    border: PanelBorder,
+    center: f32,
+    span: [f32; 2],
 }
 
 pub struct ContextGridItem<T: EventListener> {
     pub val: Context<T>,
-    /// Outer panel bounds, including padding, used by chrome and focus hit tests.
-    pub panel_rect: [f32; 4],
-    /// Terminal content bounds inside the panel padding.
-    pub layout_rect: [f32; 4],
+    pub geometry: PaneGeometry,
 }
 
 impl<T: rio_backend::event::EventListener> ContextGridItem<T> {
     pub fn new(context: Context<T>) -> Self {
         Self {
             val: context,
-            panel_rect: [0.0; 4],
-            layout_rect: [0.0; 4],
+            geometry: PaneGeometry::default(),
         }
     }
 
@@ -148,16 +236,15 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         let mut tree: TaffyTree<()> = TaffyTree::new();
 
         // Calculate available size after window margin (already scaled)
-        let available_width = width - scaled_margin.left - scaled_margin.right;
-        let available_height = height - scaled_margin.top - scaled_margin.bottom;
+        let available_width =
+            ((width - scaled_margin.right).round() - scaled_margin.left.round()).max(0.0);
+        let available_height = ((height - scaled_margin.bottom).round()
+            - scaled_margin.top.round())
+        .max(0.0);
 
         // Create root container (window margin handled separately via position offset)
         let root_style = Style {
             display: Display::Flex,
-            gap: geometry::Size {
-                width: length(panel_config.column_gap * scale),
-                height: length(panel_config.row_gap * scale),
-            },
             size: geometry::Size {
                 width: length(available_width),
                 height: length(available_height),
@@ -169,24 +256,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             .new_leaf(root_style)
             .expect("Failed to create root node");
 
-        let panel_style = Style {
-            display: Display::Flex,
-            flex_grow: 1.0,
-            flex_shrink: 1.0,
-            padding: geometry::Rect {
-                left: length(panel_config.padding.left * scale),
-                right: length(panel_config.padding.right * scale),
-                top: length(panel_config.padding.top * scale),
-                bottom: length(panel_config.padding.bottom * scale),
-            },
-            margin: geometry::Rect {
-                left: length(panel_config.margin.left * scale),
-                right: length(panel_config.margin.right * scale),
-                top: length(panel_config.margin.top * scale),
-                bottom: length(panel_config.margin.bottom * scale),
-            },
-            ..Default::default()
-        };
+        let panel_style = Self::panel_style();
 
         let panel_node = tree
             .new_leaf(panel_style)
@@ -213,6 +283,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             panel_config,
             tree,
             root_node,
+            dividers: Vec::new(),
         };
         grid.calculate_positions();
         grid.update_context_dimensions();
@@ -249,15 +320,14 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         !self.panel_config.hide_if_single || self.panel_count() > 1
     }
 
-    pub fn panel_config(&self) -> &rio_backend::config::layout::Panel {
-        &self.panel_config
-    }
-
     fn try_update_size(&mut self, width: f32, height: f32) -> Result<(), TaffyError> {
         // Subtract window margin from available size
-        let available_width = width - self.scaled_margin.left - self.scaled_margin.right;
-        let available_height =
-            height - self.scaled_margin.top - self.scaled_margin.bottom;
+        let available_width = ((width - self.scaled_margin.right).round()
+            - self.scaled_margin.left.round())
+        .max(0.0);
+        let available_height = ((height - self.scaled_margin.bottom).round()
+            - self.scaled_margin.top.round())
+        .max(0.0);
 
         let mut style = self.tree.style(self.root_node)?.clone();
         style.size = geometry::Size {
@@ -274,58 +344,100 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             height: AvailableSpace::MaxContent,
         };
         self.tree.compute_layout(self.root_node, available)?;
-        self.update_layout_rects();
-        Ok(())
+        self.resolve_geometry()
     }
 
-    /// Update layout_rect for all panel items in a single top-down traversal.
-    /// O(n) where n is total nodes in tree.
-    fn update_layout_rects(&mut self) {
-        let mut stack: Vec<(NodeId, f32, f32)> = vec![(self.root_node, 0.0, 0.0)];
-
+    /// One traversal resolves the pane boxes and the partition centers used by
+    /// divider painting, pointer resizing, and keyboard resizing.
+    fn resolve_geometry(&mut self) -> Result<(), TaffyError> {
+        self.dividers.clear();
+        let root = self.tree.layout(self.root_node)?;
+        let x = self.scaled_margin.left.round();
+        let y = self.scaled_margin.top.round();
+        let root_bounds = [
+            x + root.location.x,
+            y + root.location.y,
+            root.size.width,
+            root.size.height,
+        ];
+        let mut stack = Vec::with_capacity(self.inner.len());
+        stack.push((self.root_node, x, y));
+        let framed = self.should_draw_borders();
         while let Some((node, parent_x, parent_y)) = stack.pop() {
-            let layout = match self.tree.layout(node) {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
-
+            let layout = self.tree.layout(node)?;
             let abs_x = parent_x + layout.location.x;
             let abs_y = parent_y + layout.location.y;
-
-            // Update layout_rect if this node is a panel (exists in inner)
             if let Some(item) = self.inner.get_mut(&node) {
-                item.panel_rect = [abs_x, abs_y, layout.size.width, layout.size.height];
-                item.layout_rect = [
-                    abs_x + layout.padding.left,
-                    abs_y + layout.padding.top,
-                    (layout.size.width - layout.padding.left - layout.padding.right)
-                        .max(0.0),
-                    (layout.size.height - layout.padding.top - layout.padding.bottom)
-                        .max(0.0),
-                ];
+                item.geometry = PaneGeometry::resolve(
+                    [abs_x, abs_y, layout.size.width, layout.size.height],
+                    root_bounds,
+                    &self.panel_config,
+                    self.scale,
+                    framed,
+                );
+                continue;
             }
 
-            // Add children to stack
-            if let Ok(children) = self.tree.children(node) {
-                for child in children {
-                    stack.push((child, abs_x, abs_y));
+            let child_count = self.tree.child_count(node);
+            let style = self.tree.style(node)?;
+            let is_row = matches!(
+                style.flex_direction,
+                taffy::FlexDirection::Row | taffy::FlexDirection::RowReverse
+            );
+            let reverse = matches!(
+                style.flex_direction,
+                taffy::FlexDirection::RowReverse | taffy::FlexDirection::ColumnReverse
+            );
+            let child_at = |index| {
+                self.tree.get_child_id(
+                    node,
+                    if reverse {
+                        child_count - 1 - index
+                    } else {
+                        index
+                    },
+                )
+            };
+            for index in 0..child_count {
+                let child = child_at(index);
+                stack.push((child, abs_x, abs_y));
+                if index + 1 < child_count {
+                    let next = child_at(index + 1);
+                    let child_layout = self.tree.layout(child)?;
+                    let (direction, center, span) = if is_row {
+                        (
+                            BorderDirection::Vertical,
+                            abs_x + child_layout.location.x + child_layout.size.width,
+                            [abs_y, abs_y + layout.size.height],
+                        )
+                    } else {
+                        (
+                            BorderDirection::Horizontal,
+                            abs_y + child_layout.location.y + child_layout.size.height,
+                            [abs_x, abs_x + layout.size.width],
+                        )
+                    };
+                    // Regions meet at divider centers. Nested lines therefore
+                    // join their parent even when their painted panes have gaps.
+                    self.dividers.push(Divider {
+                        border: PanelBorder {
+                            direction,
+                            left_or_top: child,
+                            right_or_bottom: next,
+                        },
+                        center,
+                        span,
+                    });
                 }
             }
         }
+        Ok(())
     }
 
     pub fn find_context_at_position(&self, x: f32, y: f32) -> Option<NodeId> {
-        // Adjust for window margin - layout_rect is relative to root container
-        let adj_x = x - self.scaled_margin.left;
-        let adj_y = y - self.scaled_margin.top;
-
         for (&node_id, item) in &self.inner {
-            let [left, top, width, height] = item.panel_rect;
-            if adj_x >= left
-                && adj_x < left + width
-                && adj_y >= top
-                && adj_y < top + height
-            {
+            let [left, top, width, height] = item.geometry.frame;
+            if x >= left && x < left + width && y >= top && y < top + height {
                 return Some(node_id);
             }
         }
@@ -339,33 +451,41 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             return None;
         }
 
-        let adj_x = x - self.scaled_margin.left;
-        let adj_y = y - self.scaled_margin.top;
-        let hit_half = (self.panel_config.border_width / 2.0 + 3.0) * self.scale;
+        const RESIZE_SLOP: f32 = 3.0;
+        let hit_half = (self.panel_config.divider_width / 2.0 + RESIZE_SLOP) * self.scale;
+        self.dividers.iter().find_map(|divider| {
+            let (axis, cross) = match divider.border.direction {
+                BorderDirection::Vertical => (x, y),
+                BorderDirection::Horizontal => (y, x),
+            };
+            ((axis - divider.center).abs() < hit_half
+                && cross >= divider.span[0]
+                && cross <= divider.span[1])
+                .then_some(divider.border)
+        })
+    }
 
-        self.walk_separators(|dir, center, span, child_a, child_b| {
-            let hit = match dir {
+    /// Divider width affects paint only, never pane allocation or spacing.
+    pub fn for_each_divider(&self, mut draw: impl FnMut([f32; 4])) {
+        let width = self.panel_config.divider_width * self.scale;
+        if width <= 0.0 {
+            return;
+        }
+        for divider in &self.dividers {
+            let Divider {
+                center,
+                span,
+                border,
+            } = *divider;
+            draw(match border.direction {
                 BorderDirection::Vertical => {
-                    (adj_x - center).abs() < hit_half
-                        && adj_y >= span[0]
-                        && adj_y <= span[1]
+                    [center - width / 2.0, span[0], width, span[1] - span[0]]
                 }
                 BorderDirection::Horizontal => {
-                    (adj_y - center).abs() < hit_half
-                        && adj_x >= span[0]
-                        && adj_x <= span[1]
+                    [span[0], center - width / 2.0, span[1] - span[0], width]
                 }
-            };
-            if hit {
-                Some(PanelBorder {
-                    direction: dir,
-                    left_or_top: child_a,
-                    right_or_bottom: child_b,
-                })
-            } else {
-                None
-            }
-        })
+            });
+        }
     }
 
     /// Get the current size of a node along the relevant axis for a border direction.
@@ -390,155 +510,57 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         delta: f32,
         sugarloaf: &mut Sugarloaf,
     ) {
-        let min_size = 50.0 * self.scale;
-
-        let new_a = (original_sizes.0 + delta).max(min_size);
-        let new_b = (original_sizes.1 - delta).max(min_size);
-
-        match border.direction {
-            BorderDirection::Vertical => {
-                let _ = self.set_panel_size(border.left_or_top, Some(new_a), None);
-                let _ = self.set_panel_size(border.right_or_bottom, Some(new_b), None);
-            }
-            BorderDirection::Horizontal => {
-                let _ = self.set_panel_size(border.left_or_top, None, Some(new_a));
-                let _ = self.set_panel_size(border.right_or_bottom, None, Some(new_b));
-            }
+        if self.set_border_delta(border, original_sizes, delta) {
+            self.apply_taffy_layout(sugarloaf);
         }
-
-        self.apply_taffy_layout(sugarloaf);
     }
 
-    /// Walk the taffy tree visiting every separator between sibling nodes.
-    ///
-    /// For each separator, calls `visitor(direction, center, [span_min, span_max], child_a, child_b)`.
-    /// - `center`: the main-axis midpoint of the gap (x for vertical, y for horizontal)
-    /// - `span`: the cross-axis extent [min, max]
-    /// - `child_a`/`child_b`: the two sibling NodeIds (left/top, right/bottom)
-    ///
-    /// If the visitor returns `Some(R)`, the walk stops and returns that value.
-    fn walk_separators<R>(
-        &self,
-        mut visitor: impl FnMut(BorderDirection, f32, [f32; 2], NodeId, NodeId) -> Option<R>,
-    ) -> Option<R> {
-        let mut stack: Vec<(NodeId, f32, f32)> = vec![(self.root_node, 0.0, 0.0)];
-
-        while let Some((node, parent_x, parent_y)) = stack.pop() {
-            let children = match self.tree.children(node) {
-                Ok(c) => c,
-                _ => continue,
-            };
-
-            let node_layout = match self.tree.layout(node) {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
-            let abs_x = parent_x + node_layout.location.x;
-            let abs_y = parent_y + node_layout.location.y;
-
-            for &child in &children {
-                stack.push((child, abs_x, abs_y));
-            }
-
-            if children.len() < 2 {
-                continue;
-            }
-
-            let is_row = match self.tree.style(node) {
-                Ok(s) => matches!(
-                    s.flex_direction,
-                    taffy::FlexDirection::Row | taffy::FlexDirection::RowReverse
-                ),
-                Err(_) => continue,
-            };
-
-            for i in 0..children.len() - 1 {
-                let la = match self.tree.layout(children[i]) {
-                    Ok(l) => l,
-                    Err(_) => continue,
-                };
-                let lb = match self.tree.layout(children[i + 1]) {
-                    Ok(l) => l,
-                    Err(_) => continue,
-                };
-
-                if is_row {
-                    let (left, right, left_id, right_id) =
-                        if la.location.x < lb.location.x {
-                            (la, lb, children[i], children[i + 1])
-                        } else {
-                            (lb, la, children[i + 1], children[i])
-                        };
-                    let left_edge = abs_x + left.location.x + left.size.width;
-                    let right_start = abs_x + right.location.x;
-                    let center = (left_edge + right_start) / 2.0;
-                    let min_y = abs_y + left.location.y.min(right.location.y);
-                    let max_y = abs_y
-                        + (left.location.y + left.size.height)
-                            .max(right.location.y + right.size.height);
-
-                    if let Some(r) = visitor(
-                        BorderDirection::Vertical,
-                        center,
-                        [min_y, max_y],
-                        left_id,
-                        right_id,
-                    ) {
-                        return Some(r);
-                    }
-                } else {
-                    let (top, bottom, top_id, bottom_id) =
-                        if la.location.y < lb.location.y {
-                            (la, lb, children[i], children[i + 1])
-                        } else {
-                            (lb, la, children[i + 1], children[i])
-                        };
-                    let top_edge = abs_y + top.location.y + top.size.height;
-                    let bottom_start = abs_y + bottom.location.y;
-                    let center = (top_edge + bottom_start) / 2.0;
-                    let min_x = abs_x + top.location.x.min(bottom.location.x);
-                    let max_x = abs_x
-                        + (top.location.x + top.size.width)
-                            .max(bottom.location.x + bottom.size.width);
-
-                    if let Some(r) = visitor(
-                        BorderDirection::Horizontal,
-                        center,
-                        [min_x, max_x],
-                        top_id,
-                        bottom_id,
-                    ) {
-                        return Some(r);
-                    }
-                }
-            }
+    fn set_border_delta(
+        &mut self,
+        border: &PanelBorder,
+        sizes: (f32, f32),
+        delta: f32,
+    ) -> bool {
+        let min_size = MIN_RESIZE_SIZE * self.scale;
+        if sizes.0 + sizes.1 < 2.0 * min_size {
+            return false;
         }
-
-        None
+        let delta = delta.clamp(min_size - sizes.0, sizes.1 - min_size);
+        let sizes = (sizes.0 + delta, sizes.1 - delta);
+        if sizes
+            == (
+                self.get_panel_size(border.left_or_top, border.direction),
+                self.get_panel_size(border.right_or_bottom, border.direction),
+            )
+        {
+            return false;
+        }
+        let result = match border.direction {
+            BorderDirection::Vertical => self
+                .set_panel_size(border.left_or_top, Some(sizes.0), None)
+                .and_then(|_| {
+                    self.set_panel_size(border.right_or_bottom, Some(sizes.1), None)
+                }),
+            BorderDirection::Horizontal => self
+                .set_panel_size(border.left_or_top, None, Some(sizes.0))
+                .and_then(|_| {
+                    self.set_panel_size(border.right_or_bottom, None, Some(sizes.1))
+                }),
+        };
+        result.is_ok()
     }
 
-    #[inline]
-    pub fn get_scaled_margin(&self) -> Margin {
-        self.scaled_margin
-    }
-
-    fn create_panel_style(&self) -> Style {
-        let scale = self.scale;
+    fn panel_style() -> Style {
+        // Flex allocates regions only. Visual insets would otherwise change
+        // sibling weights when a leaf is replaced by a nested split container.
         Style {
             display: Display::Flex,
+            flex_basis: length(0.0),
             flex_grow: 1.0,
             flex_shrink: 1.0,
-            padding: geometry::Rect {
-                left: length(self.panel_config.padding.left * scale),
-                right: length(self.panel_config.padding.right * scale),
-                top: length(self.panel_config.padding.top * scale),
-                bottom: length(self.panel_config.padding.bottom * scale),
-            },
-            margin: geometry::Rect {
-                left: length(self.panel_config.margin.left * scale),
-                right: length(self.panel_config.margin.right * scale),
-                top: length(self.panel_config.margin.top * scale),
-                bottom: length(self.panel_config.margin.bottom * scale),
+            min_size: geometry::Size {
+                width: length(0.0),
+                height: length(0.0),
             },
             ..Default::default()
         }
@@ -568,16 +590,15 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         // Inherit the current panel's flex properties so the container
         // keeps the same proportion in its parent (e.g. 80/20 split).
         let current_style = self.tree.style(current_node)?.clone();
-        let scale = self.scale;
         let container_style = Style {
             display: Display::Flex,
             flex_direction: direction,
             flex_basis: current_style.flex_basis,
             flex_grow: current_style.flex_grow,
             flex_shrink: current_style.flex_shrink,
-            gap: geometry::Size {
-                width: length(self.panel_config.column_gap * scale),
-                height: length(self.panel_config.row_gap * scale),
+            min_size: geometry::Size {
+                width: length(0.0),
+                height: length(0.0),
             },
             ..Default::default()
         };
@@ -585,13 +606,13 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
 
         // Reset the current panel to flexible sizing inside the new container
         let mut reset_style = current_style;
-        reset_style.flex_basis = taffy::Dimension::auto();
+        reset_style.flex_basis = length(0.0);
         reset_style.flex_grow = 1.0;
         reset_style.flex_shrink = 1.0;
         self.tree.set_style(current_node, reset_style)?;
 
         // Create the new panel node
-        let new_node = self.tree.new_leaf(self.create_panel_style())?;
+        let new_node = self.tree.new_leaf(Self::panel_style())?;
 
         // Get the index of current_node in its parent
         let children = self.tree.children(parent_node)?;
@@ -623,15 +644,9 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
     ) -> Result<(), TaffyError> {
         let mut style = self.tree.style(node)?.clone();
 
-        // Use flex_grow proportional to the desired size so panels
-        // scale correctly when the window is resized.
-        if let Some(w) = width {
+        if let Some(size) = width.or(height) {
             style.flex_basis = length(0.0);
-            style.flex_grow = w;
-            style.flex_shrink = 1.0;
-        } else if let Some(h) = height {
-            style.flex_basis = length(0.0);
-            style.flex_grow = h;
+            style.flex_grow = size;
             style.flex_shrink = 1.0;
         }
 
@@ -645,7 +660,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         let mut stack = vec![self.root_node];
         while let Some(node) = stack.pop() {
             if let Ok(mut style) = self.tree.style(node).cloned() {
-                style.flex_basis = taffy::Dimension::auto();
+                style.flex_basis = length(0.0);
                 style.flex_grow = 1.0;
                 style.flex_shrink = 1.0;
                 let _ = self.tree.set_style(node, style);
@@ -730,124 +745,21 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         }
     }
 
-    fn find_horizontal_neighbors(&self, node_id: NodeId) -> Option<(NodeId, NodeId)> {
-        if !self.inner.contains_key(&node_id) {
-            return None;
+    fn neighboring_divider(
+        &self,
+        mut node: NodeId,
+        direction: BorderDirection,
+    ) -> Option<(PanelBorder, bool)> {
+        loop {
+            if let Some(divider) = self.dividers.iter().find(|divider| {
+                divider.border.direction == direction
+                    && (divider.border.left_or_top == node
+                        || divider.border.right_or_bottom == node)
+            }) {
+                return Some((divider.border, divider.border.right_or_bottom == node));
+            }
+            node = self.tree.parent(node)?;
         }
-        let current_layout = self.tree.layout(node_id).ok()?;
-
-        let gap = self.panel_config.column_gap * self.scale;
-
-        // Find panel directly to the left (overlapping Y range, touching on X axis)
-        for &other_id in self.inner.keys() {
-            if other_id == node_id {
-                continue;
-            }
-
-            let other_layout = self.tree.layout(other_id).ok()?;
-
-            // Check if vertically overlapping (Y ranges overlap)
-            let current_y_end = current_layout.location.y + current_layout.size.height;
-            let other_y_end = other_layout.location.y + other_layout.size.height;
-            let y_overlap = current_layout.location.y < other_y_end
-                && other_layout.location.y < current_y_end;
-
-            if y_overlap {
-                // Check if other panel is directly to the left (touching with gap)
-                let other_right = other_layout.location.x + other_layout.size.width;
-                let distance = current_layout.location.x - other_right;
-
-                if distance >= 0.0 && distance <= gap + 1.0 {
-                    return Some((other_id, node_id));
-                }
-            }
-        }
-
-        // Try finding panel to the right
-        let current_right = current_layout.location.x + current_layout.size.width;
-        for &other_id in self.inner.keys() {
-            if other_id == node_id {
-                continue;
-            }
-
-            let other_layout = self.tree.layout(other_id).ok()?;
-
-            // Check if vertically overlapping
-            let current_y_end = current_layout.location.y + current_layout.size.height;
-            let other_y_end = other_layout.location.y + other_layout.size.height;
-            let y_overlap = current_layout.location.y < other_y_end
-                && other_layout.location.y < current_y_end;
-
-            if y_overlap {
-                let distance = other_layout.location.x - current_right;
-
-                if distance >= 0.0 && distance <= gap + 1.0 {
-                    return Some((node_id, other_id));
-                }
-            }
-        }
-
-        None
-    }
-
-    fn find_vertical_neighbors(&self, node_id: NodeId) -> Option<(NodeId, NodeId)> {
-        if !self.inner.contains_key(&node_id) {
-            return None;
-        }
-        let current_layout = self.tree.layout(node_id).ok()?;
-
-        let gap = self.panel_config.row_gap * self.scale;
-
-        // Find panel directly above (overlapping X range, touching on Y axis)
-        for &other_id in self.inner.keys() {
-            if other_id == node_id {
-                continue;
-            }
-
-            let other_layout = self.tree.layout(other_id).ok()?;
-
-            // Check if horizontally overlapping (X ranges overlap)
-            let current_x_end = current_layout.location.x + current_layout.size.width;
-            let other_x_end = other_layout.location.x + other_layout.size.width;
-            let x_overlap = current_layout.location.x < other_x_end
-                && other_layout.location.x < current_x_end;
-
-            if x_overlap {
-                // Check if other panel is directly above (touching with gap)
-                let other_bottom = other_layout.location.y + other_layout.size.height;
-                let distance = current_layout.location.y - other_bottom;
-
-                if distance >= 0.0 && distance <= gap + 1.0 {
-                    return Some((other_id, node_id));
-                }
-            }
-        }
-
-        // Try finding panel below
-        let current_bottom = current_layout.location.y + current_layout.size.height;
-        for &other_id in self.inner.keys() {
-            if other_id == node_id {
-                continue;
-            }
-
-            let other_layout = self.tree.layout(other_id).ok()?;
-
-            // Check if horizontally overlapping
-            let current_x_end = current_layout.location.x + current_layout.size.width;
-            let other_x_end = other_layout.location.x + other_layout.size.width;
-            let x_overlap = current_layout.location.x < other_x_end
-                && other_layout.location.x < current_x_end;
-
-            if x_overlap {
-                let distance = other_layout.location.y - current_bottom;
-
-                if distance >= 0.0 && distance <= gap + 1.0 {
-                    return Some((node_id, other_id));
-                }
-            }
-        }
-
-        None
     }
 
     fn apply_taffy_layout(&mut self, _sugarloaf: &mut Sugarloaf) -> bool {
@@ -861,14 +773,15 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
 
     fn update_context_dimensions(&mut self) {
         for item in self.inner.values_mut() {
-            let [_, _, width, height] = item.layout_rect;
+            let [_, _, width, height] = item.geometry.content;
 
             // Clear margin since Taffy layout already accounts for spacing
             item.val.dimension.margin = Margin::all(0.0);
             item.val.dimension.update_width(width);
             item.val.dimension.update_height(height);
 
-            // Update terminal size
+            // Layout owns both reflow and the PTY notification; config/font
+            // updates already reach this path and must not notify a second time.
             let mut terminal = item.val.terminal.lock();
             terminal.resize::<ContextDimension>(item.val.dimension);
             drop(terminal);
@@ -904,7 +817,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         let mut panels: Vec<(NodeId, f32, f32)> = self
             .inner
             .iter()
-            .map(|(&id, item)| (id, item.layout_rect[1], item.layout_rect[0])) // (id, y, x)
+            .map(|(&id, item)| (id, item.geometry.content[1], item.geometry.content[0])) // (id, y, x)
             .collect();
 
         // Sort by Y first (top to bottom), then X (left to right)
@@ -1040,12 +953,12 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             .get(&self.current)
             .or_else(|| self.root.and_then(|root| self.inner.get(&root)))
             .expect("Grid is in an invalid state - no contexts available");
-        let [abs_x, abs_y, _, _] = item.layout_rect;
+        let [abs_x, abs_y, _, _] = item.geometry.content;
         (
             &item.val,
             Margin {
-                left: self.scaled_margin.left + abs_x,
-                top: self.scaled_margin.top + abs_y,
+                left: abs_x,
+                top: abs_y,
                 right: self.scaled_margin.right,
                 bottom: self.scaled_margin.bottom,
             },
@@ -1115,62 +1028,12 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         let _ = self.try_update_size(self.width, self.height);
     }
 
-    /// Refresh the grid's DPI scale and every scale-derived value baked
-    /// into the taffy tree at creation time: container gaps, panel
-    /// padding/margins, and the live reads (border hit-boxes, divider
-    /// math) that go through `self.scale`. Without this a grid created on
-    /// one display keeps its creation-time DPI for paddings and gaps
-    /// forever, even though the cell metrics update.
     pub fn update_scale(&mut self, new_scale: f32) {
-        if (self.scale - new_scale).abs() < f32::EPSILON {
-            return;
-        }
         self.scale = new_scale;
-        self.update_panel_styles();
     }
 
     pub fn update_panel_config(&mut self, panel: rio_backend::config::layout::Panel) {
-        if self.panel_config != panel {
-            self.panel_config = panel;
-            self.update_panel_styles();
-        }
-    }
-
-    fn update_panel_styles(&mut self) {
-        let new_scale = self.scale;
-
-        let gap = geometry::Size {
-            width: length(self.panel_config.column_gap * new_scale),
-            height: length(self.panel_config.row_gap * new_scale),
-        };
-        let padding = geometry::Rect {
-            left: length(self.panel_config.padding.left * new_scale),
-            right: length(self.panel_config.padding.right * new_scale),
-            top: length(self.panel_config.padding.top * new_scale),
-            bottom: length(self.panel_config.padding.bottom * new_scale),
-        };
-        let margin = geometry::Rect {
-            left: length(self.panel_config.margin.left * new_scale),
-            right: length(self.panel_config.margin.right * new_scale),
-            top: length(self.panel_config.margin.top * new_scale),
-            bottom: length(self.panel_config.margin.bottom * new_scale),
-        };
-
-        let mut stack = vec![self.root_node];
-        while let Some(node) = stack.pop() {
-            if let Ok(mut style) = self.tree.style(node).cloned() {
-                if self.inner.contains_key(&node) {
-                    style.padding = padding;
-                    style.margin = margin;
-                } else {
-                    style.gap = gap;
-                }
-                let _ = self.tree.set_style(node, style);
-            }
-            if let Ok(children) = self.tree.children(node) {
-                stack.extend(children);
-            }
-        }
+        self.panel_config = panel;
     }
 
     pub fn update_line_height(&mut self, line_height: f32) {
@@ -1220,7 +1083,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             return;
         }
 
-        // Compute Taffy layout (also updates layout_rect via update_layout_rects)
+        // Resolve the complete layout, including pane boxes and divider geometry.
         let _ = self.compute_layout();
     }
 
@@ -1364,210 +1227,39 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         }
     }
 
-    pub fn move_divider_up(&mut self, amount: f32, sugarloaf: &mut Sugarloaf) -> bool {
-        if self.panel_count() <= 1 {
+    fn move_divider(
+        &mut self,
+        direction: BorderDirection,
+        amount: f32,
+        sugarloaf: &mut Sugarloaf,
+    ) -> bool {
+        let Some((border, current_is_second)) =
+            self.neighboring_divider(self.current, direction)
+        else {
             return false;
-        }
+        };
+        let sizes = (
+            self.get_panel_size(border.left_or_top, direction),
+            self.get_panel_size(border.right_or_bottom, direction),
+        );
+        let delta = if current_is_second { -amount } else { amount };
+        self.set_border_delta(&border, sizes, delta) && self.apply_taffy_layout(sugarloaf)
+    }
 
-        let current_node = self.current;
-
-        // Find vertically adjacent panels - returns (top_node, bottom_node)
-        if let Some((top_node, bottom_node)) = self.find_vertical_neighbors(current_node)
-        {
-            // Get current sizes
-            let top_layout = match self.tree.layout(top_node).ok() {
-                Some(layout) => layout,
-                None => return false,
-            };
-            let bottom_layout = match self.tree.layout(bottom_node).ok() {
-                Some(layout) => layout,
-                None => return false,
-            };
-
-            let min_height = 50.0;
-
-            // Determine which panel to shrink based on which one is current
-            let new_top_height;
-            let new_bottom_height;
-
-            if current_node == bottom_node {
-                // Current is bottom: shrink bottom, expand top (divider moves up)
-                new_bottom_height = bottom_layout.size.height - amount;
-                new_top_height = top_layout.size.height + amount;
-            } else {
-                // Current is top: shrink top, expand bottom (divider moves up)
-                new_top_height = top_layout.size.height - amount;
-                new_bottom_height = bottom_layout.size.height + amount;
-            }
-
-            if new_top_height < min_height || new_bottom_height < min_height {
-                return false;
-            }
-
-            // Update panel sizes using flex_basis
-            let _ = self.set_panel_size(top_node, None, Some(new_top_height));
-            let _ = self.set_panel_size(bottom_node, None, Some(new_bottom_height));
-
-            // Apply layout and update all contexts
-            return self.apply_taffy_layout(sugarloaf);
-        }
-
-        false
+    pub fn move_divider_up(&mut self, amount: f32, sugarloaf: &mut Sugarloaf) -> bool {
+        self.move_divider(BorderDirection::Horizontal, -amount, sugarloaf)
     }
 
     pub fn move_divider_down(&mut self, amount: f32, sugarloaf: &mut Sugarloaf) -> bool {
-        if self.panel_count() <= 1 {
-            return false;
-        }
-
-        let current_node = self.current;
-
-        // Find vertically adjacent panels - returns (top_node, bottom_node)
-        if let Some((top_node, bottom_node)) = self.find_vertical_neighbors(current_node)
-        {
-            // Get current sizes
-            let top_layout = match self.tree.layout(top_node).ok() {
-                Some(layout) => layout,
-                None => return false,
-            };
-            let bottom_layout = match self.tree.layout(bottom_node).ok() {
-                Some(layout) => layout,
-                None => return false,
-            };
-
-            let min_height = 50.0;
-
-            // Determine which panel to expand based on which one is current
-            let new_top_height;
-            let new_bottom_height;
-
-            if current_node == bottom_node {
-                // Current is bottom: expand bottom, shrink top (divider moves down)
-                new_bottom_height = bottom_layout.size.height + amount;
-                new_top_height = top_layout.size.height - amount;
-            } else {
-                // Current is top: expand top, shrink bottom (divider moves down)
-                new_top_height = top_layout.size.height + amount;
-                new_bottom_height = bottom_layout.size.height - amount;
-            }
-
-            if new_top_height < min_height || new_bottom_height < min_height {
-                return false;
-            }
-
-            // Update panel sizes using flex_basis
-            let _ = self.set_panel_size(top_node, None, Some(new_top_height));
-            let _ = self.set_panel_size(bottom_node, None, Some(new_bottom_height));
-
-            // Apply layout and update all contexts
-            return self.apply_taffy_layout(sugarloaf);
-        }
-
-        false
+        self.move_divider(BorderDirection::Horizontal, amount, sugarloaf)
     }
 
     pub fn move_divider_left(&mut self, amount: f32, sugarloaf: &mut Sugarloaf) -> bool {
-        if self.panel_count() <= 1 {
-            return false;
-        }
-
-        let current_node = self.current;
-
-        // Find horizontally adjacent panels - returns (left_node, right_node)
-        if let Some((left_node, right_node)) =
-            self.find_horizontal_neighbors(current_node)
-        {
-            // Get current sizes
-            let left_layout = match self.tree.layout(left_node).ok() {
-                Some(layout) => layout,
-                None => return false,
-            };
-            let right_layout = match self.tree.layout(right_node).ok() {
-                Some(layout) => layout,
-                None => return false,
-            };
-
-            let min_width = 100.0;
-
-            // Determine which panel to shrink based on which one is current
-            let new_left_width;
-            let new_right_width;
-
-            if current_node == right_node {
-                // Current is right: shrink right, expand left (divider moves left)
-                new_right_width = right_layout.size.width - amount;
-                new_left_width = left_layout.size.width + amount;
-            } else {
-                // Current is left: shrink left, expand right (divider moves left)
-                new_left_width = left_layout.size.width - amount;
-                new_right_width = right_layout.size.width + amount;
-            }
-
-            if new_left_width < min_width || new_right_width < min_width {
-                return false;
-            }
-
-            // Update panel sizes using flex_basis
-            let _ = self.set_panel_size(left_node, Some(new_left_width), None);
-            let _ = self.set_panel_size(right_node, Some(new_right_width), None);
-
-            // Apply layout and update all contexts
-            return self.apply_taffy_layout(sugarloaf);
-        }
-
-        false
+        self.move_divider(BorderDirection::Vertical, -amount, sugarloaf)
     }
 
     pub fn move_divider_right(&mut self, amount: f32, sugarloaf: &mut Sugarloaf) -> bool {
-        if self.panel_count() <= 1 {
-            return false;
-        }
-
-        let current_node = self.current;
-
-        // Find horizontally adjacent panels - returns (left_node, right_node)
-        if let Some((left_node, right_node)) =
-            self.find_horizontal_neighbors(current_node)
-        {
-            // Get current sizes
-            let left_layout = match self.tree.layout(left_node).ok() {
-                Some(layout) => layout,
-                None => return false,
-            };
-            let right_layout = match self.tree.layout(right_node).ok() {
-                Some(layout) => layout,
-                None => return false,
-            };
-
-            let min_width = 100.0;
-
-            // Determine which panel to expand based on which one is current
-            let new_left_width;
-            let new_right_width;
-
-            if current_node == right_node {
-                // Current is right: expand right, shrink left (divider moves right)
-                new_right_width = right_layout.size.width + amount;
-                new_left_width = left_layout.size.width - amount;
-            } else {
-                // Current is left: expand left, shrink right (divider moves right)
-                new_left_width = left_layout.size.width + amount;
-                new_right_width = right_layout.size.width - amount;
-            }
-
-            if new_left_width < min_width || new_right_width < min_width {
-                return false;
-            }
-
-            // Update panel sizes using flex_basis
-            let _ = self.set_panel_size(left_node, Some(new_left_width), None);
-            let _ = self.set_panel_size(right_node, Some(new_right_width), None);
-
-            // Apply layout and update all contexts
-            return self.apply_taffy_layout(sugarloaf);
-        }
-
-        false
+        self.move_divider(BorderDirection::Vertical, amount, sugarloaf)
     }
 
     /// Hide the panel set by clearing per-panel image overlays. The

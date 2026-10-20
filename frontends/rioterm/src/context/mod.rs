@@ -1134,11 +1134,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         }
     }
 
-    #[inline]
-    pub fn get_current_grid_scaled_margin(&self) -> rio_backend::config::layout::Margin {
-        self.contexts[self.current_index].get_scaled_margin()
-    }
-
     #[cfg(test)]
     pub fn increase_capacity(&mut self, inc_val: usize) {
         self.capacity += inc_val;

@@ -67,6 +67,7 @@ margin = [2, 4]
 padding = [10]
 row-gap = 5
 column-gap = 9
+divider-width = 3
 border-width = 0
 border-radius = 12
 ",
@@ -85,6 +86,7 @@ border-radius = 12
     assert_eq!(panel.padding, Margin::all(10.0));
     assert_eq!(panel.row_gap, 5.0);
     assert_eq!(panel.column_gap, 9.0);
+    assert_eq!(panel.divider_width, 3.0);
     assert_eq!(panel.border_width, 0.0);
     assert_eq!(panel.border_radius, 12.0);
 }
@@ -129,6 +131,7 @@ preset = 'square'
 gap = 0
 [platform.linux.panel]
 row-gap = 5
+divider-width = 2
 ",
     );
     c.overwrite_with_platform_config(c.platform.linux.clone().unwrap());
@@ -136,6 +139,7 @@ row-gap = 5
     assert_eq!(c.navigation.tab_geometry().font_size, 20.0);
     assert_eq!(c.panel().column_gap, 9.0);
     assert_eq!(c.panel().row_gap, 5.0);
+    assert_eq!(c.panel().divider_width, 2.0);
     assert_eq!(c.panel().border_radius, 0.0);
 }
 

@@ -330,8 +330,17 @@ in CSS order. Width and icon size remain configured with *min-tab-width*,
 Root *margin* controls the pane layout's distance from the window edge and
 tabs. The existing *[panel]* table controls per-pane *margin*, *padding*,
 *row-gap*, *column-gap*, *border-width*, and *border-radius*. These settings
-also override preset defaults. Geometry changes reload for existing panes.
-Set *[panel].hide-if-single* to _true_ to hide a lone pane's frame. Default: _false_.
+also override preset defaults. Each pane has an outer margin, then its border,
+then inner padding around the terminal cells. Border width is in physical
+pixels; other pane geometry uses logical pixels. Geometry changes reload for
+existing panes.
+*divider-width* sets the horizontal and vertical split line width in logical
+pixels (default: _1_). Set it to _0_ to hide the lines. Lines use the theme's
+neutral border color. Spacing is measured from their center, so changing the
+width does not move or resize panes. A single pane has no dividers.
+Set *[panel].hide-if-single* to _true_ to hide a lone pane's frame and remove
+only the border's inset. Root margin, pane margin, and padding still apply.
+Default: _false_.
 
 *clickable* = _true_ | _false_
 
