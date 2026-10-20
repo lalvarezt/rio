@@ -33,6 +33,7 @@ signature(user,"GetDC",[W.HWND],W.HDC)
 signature(user,"ReleaseDC",[W.HWND,W.HDC],C.c_int)
 signature(user,"SetProcessDpiAwarenessContext",[C.c_void_p],W.BOOL)
 signature(kernel,"GetCurrentProcess",[],W.HANDLE)
+signature(kernel,"GetPriorityClass",[W.HANDLE],W.DWORD)
 signature(kernel,"GetCurrentThreadId",[],W.DWORD)
 signature(kernel,"GetProcessAffinityMask",[W.HANDLE,C.POINTER(C.c_size_t),C.POINTER(C.c_size_t)],W.BOOL)
 signature(kernel,"SetProcessAffinityMask",[W.HANDLE,C.c_size_t],W.BOOL)
@@ -58,6 +59,13 @@ def available_cpus():
 def pin_process(process, cpu):
     if not kernel.SetProcessAffinityMask(int(process._handle),1<<cpu):
         raise C.WinError(C.get_last_error())
+
+
+def priority_class(process=None):
+    handle = int(process._handle) if process is not None else kernel.GetCurrentProcess()
+    value = kernel.GetPriorityClass(handle)
+    if not value: raise C.WinError(C.get_last_error())
+    return value
 
 
 def cpu_ns(process):

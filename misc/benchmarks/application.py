@@ -210,14 +210,16 @@ keys = [{{key='F6',action='CreateTab'}},{{key='F7',action='OpenCommandPalette'}}
     env.pop("WAYLAND_SOCKET",None)
     def pin(): os.sched_setaffinity(0,{cpu})
     if sys.platform=="win32":
-        from desktop_windows import Window
+        from desktop_windows import Window, priority_class
         x = Window()
     else:
         x = X11(env["DISPLAY"])
     with (folder/"application.log").open("w") as log:
         launched = time.monotonic()
-        process = subprocess.Popen([binary],env=env,stdout=log,stderr=log,preexec_fn=pin if sys.platform!="win32" else None)
+        process = subprocess.Popen([binary],env=env,stdout=log,stderr=log,preexec_fn=pin if sys.platform!="win32" else None,
+                                   creationflags=subprocess.NORMAL_PRIORITY_CLASS if sys.platform=="win32" else 0)
         try:
+            priority = {"process_priority_class":priority_class(process), "driver_priority_class":priority_class()} if sys.platform=="win32" else {}
             if sys.platform=="win32": pin_process(process,cpu)
             deadline = time.monotonic()+20
             while not list(folder.glob("ready-*")):
@@ -279,7 +281,7 @@ keys = [{{key='F6',action='CreateTab'}},{{key='F7',action='OpenCommandPalette'}}
                     "wall_ms":elapsed_wall*1000,"ready_ms":ready_ms,"shutdown_ms":shutdown_ms,
                     "updates":UPDATES,"tabs":tabs,"terminal_sizes":sizes,"metric":"process_cpu_ns_per_replay",
                     "cpu_clock":"clock_getcpuclockid" if sys.platform=="linux" else "GetProcessTimes" if sys.platform=="win32" else "proc_stat",
-                    "cycles":elapsed_cycles}
+                    "cycles":elapsed_cycles, **priority}
         finally:
             if process.poll() is None:
                 (folder/"stop").touch(); process.terminate()

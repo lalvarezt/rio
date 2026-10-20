@@ -45,8 +45,11 @@ keys = [{{key='F9',action='SelectNextTab'}}]
     if minimize: env["RIO_PROFILE_SETTLE_MS"] = str(MINIMIZE_SETTLE_MS)
     with (folder/"process.log").open("w") as log:
         launched = time.monotonic()
-        process = subprocess.Popen([str(executable)],env=env,stdout=log,stderr=log)
+        process = subprocess.Popen([str(executable)],env=env,stdout=log,stderr=log,
+                                   creationflags=subprocess.NORMAL_PRIORITY_CLASS)
         try:
+            from desktop_windows import priority_class
+            priority = {"process_priority_class":priority_class(process), "driver_priority_class":priority_class()}
             desktop = Window()
             window = None
             deadline = time.monotonic()+8
@@ -78,7 +81,7 @@ keys = [{{key='F9',action='SelectNextTab'}}]
                 raise RuntimeError("Tab motion was not exercised; do not use this capture as a timing result")
             capture["process_cpu_ms"] = cpu_ns(process)/1_000_000
             capture["process_ms"] = (time.monotonic()-launched)*1000
-            return {"case":"windows/minimize_restore" if minimize else f"windows/motion/{level}","capture":capture}
+            return {"case":"windows/minimize_restore" if minimize else f"windows/motion/{level}","capture":capture, **priority}
         finally:
             if process.poll() is None: process.terminate(); process.wait(timeout=5)
 

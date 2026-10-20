@@ -255,7 +255,8 @@ def execute(path, arguments, env, cpu, log):
         os.sched_setaffinity(0, {cpu})
     with log.open("w") as output:
         with subprocess.Popen([path, *arguments], cwd=ROOT, env=env, stdout=output, stderr=subprocess.STDOUT,
-                              preexec_fn=pin if sys.platform!="win32" else None) as process:
+                              preexec_fn=pin if sys.platform!="win32" else None,
+                              creationflags=subprocess.NORMAL_PRIORITY_CLASS if sys.platform=="win32" else 0) as process:
             if sys.platform=="win32":
                 application.pin_process(process,cpu)
             try:

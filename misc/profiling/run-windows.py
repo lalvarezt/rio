@@ -62,7 +62,8 @@ for index in range(args.runs):
     start = time.perf_counter()
     with (args.output / f"run-{index + 1}.log").open("w") as log:
         with subprocess.Popen([str(args.executable.resolve())], env=env,
-                              stdout=log, stderr=log) as process:
+                              stdout=log, stderr=log,
+                              creationflags=subprocess.NORMAL_PRIORITY_CLASS if os.name == "nt" else 0) as process:
             try:
                 returncode = process.wait(timeout=35)
             except subprocess.TimeoutExpired:
