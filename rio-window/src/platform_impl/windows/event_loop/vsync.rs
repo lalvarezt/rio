@@ -216,6 +216,26 @@ fn query_dwm_interval() -> Option<Duration> {
 
 #[inline]
 fn ticks_to_duration(counts: u64, ticks_per_second: u64) -> Duration {
-    let ticks_per_microsecond = (ticks_per_second / 1_000_000).max(1);
-    Duration::from_micros(counts / ticks_per_microsecond)
+    Duration::from_secs_f64(counts as f64 / ticks_per_second as f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ticks_to_duration;
+    use std::time::Duration;
+
+    #[test]
+    fn refresh_intervals_support_qpc_and_rational_rates() {
+        for (ticks, frequency, expected_nanos) in [
+            (166_667, 10_000_000, 16_666_700),
+            (1, 60, 16_666_667),
+            (1_001, 60_000, 16_683_333),
+            (1, 144, 6_944_444),
+        ] {
+            assert_eq!(
+                ticks_to_duration(ticks, frequency),
+                Duration::from_nanos(expected_nanos),
+            );
+        }
+    }
 }
