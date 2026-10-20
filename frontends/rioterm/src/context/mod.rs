@@ -143,6 +143,7 @@ pub struct ContextManagerConfig {
     pub cwd: bool,
     pub is_native: bool,
     pub panel: rio_backend::config::layout::Panel,
+    pub divider_width: f32,
     pub title: rio_backend::config::title::Title,
     pub keyboard: rio_backend::config::keyboard::Keyboard,
     pub scrollback_history_limit: usize,
@@ -495,6 +496,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 initial_context,
                 scaled_margin,
                 ctx_config.panel,
+                ctx_config.divider_width,
             )],
             capacity: DEFAULT_CONTEXT_CAPACITY,
             event_proxy,
@@ -535,6 +537,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 initial_context,
                 Margin::default(),
                 config.panel,
+                config.divider_width,
             )],
             capacity,
             event_proxy,
@@ -1127,10 +1130,15 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         &self.contexts[self.current_index]
     }
 
-    pub fn update_panel_config(&mut self, panel: rio_backend::config::layout::Panel) {
+    pub fn update_layout_config(
+        &mut self,
+        panel: rio_backend::config::layout::Panel,
+        divider_width: f32,
+    ) {
         self.config.panel = panel;
+        self.config.divider_width = divider_width;
         for grid in &mut self.contexts {
-            grid.update_panel_config(panel);
+            grid.update_layout_config(panel, divider_width);
         }
     }
 
@@ -1381,6 +1389,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             // When navigation is collapsed and does not contain any color rule
             // does not make sense fetch for foreground process names
             panel: config.panel(),
+            divider_width: config.window.divider_width(),
             title: config.title,
             keyboard: config.keyboard,
             scrollback_history_limit: config.scrollback_history_limit,
@@ -1476,6 +1485,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                         new_context,
                         previous_scaled_margin,
                         self.config.panel,
+                        self.config.divider_width,
                     ));
                     if redirect {
                         self.current_index = last_index;

@@ -1,5 +1,5 @@
 use super::{
-    layout::{Margin, Panel},
+    layout::{BorderVisibility, Margin, Panel},
     navigation::{CloseButton, TabStyle},
     Config,
 };
@@ -18,14 +18,39 @@ fn default_preset_preserves_upstream_panel_settings() {
 #[test]
 fn single_pane_frame_visibility_merges_without_overriding_preset_geometry() {
     for preset in ["pill", "square"] {
-        let mut c = config(&format!("[navigation]\npreset='{preset}'\n[panel]\nhide-if-single=true\n[platform.windows.panel]\nhide-if-single=false"));
-        assert!(c.panel().hide_if_single);
+        let mut c = config(&format!("[navigation]\npreset='{preset}'\n[panel]\nborder='when-split'\n[platform.windows.panel]\nborder='always'"));
+        assert_eq!(c.panel().border, BorderVisibility::WhenSplit);
         let geometry = c.panel();
         c.overwrite_with_platform_config(c.platform.windows.clone().unwrap());
-        assert!(!c.panel().hide_if_single);
+        assert_eq!(c.panel().border, BorderVisibility::Always);
         assert_eq!(c.panel().margin, geometry.margin);
         assert_eq!(c.panel().border_radius, geometry.border_radius);
     }
+}
+
+#[test]
+fn borders_and_window_dividers_are_independent_and_round_trip() {
+    for (value, border) in [
+        ("always", BorderVisibility::Always),
+        ("when-split", BorderVisibility::WhenSplit),
+        ("never", BorderVisibility::Never),
+    ] {
+        let c = config(&format!("[window]\ndivider=false\ndivider-width=7\n[panel]\nborder='{value}'\nborder-width=3"));
+        assert_eq!(c.panel().border, border);
+        assert_eq!(c.panel().border_width, 3.0);
+        assert_eq!(c.window.divider_width(), 0.0);
+        let round_trip = config(&toml::to_string(&c).unwrap());
+        assert_eq!(round_trip.panel(), c.panel());
+        assert_eq!(round_trip.window.divider_width(), 0.0);
+    }
+
+    let mut c = config("[window]\ndivider-width=4\n[panel]\nborder='never'\n[platform.linux.window]\ndivider=false\n[platform.linux.panel]\nborder='when-split'");
+    assert_eq!(c.window.divider_width(), 4.0);
+    assert_eq!(c.panel().border, BorderVisibility::Never);
+    c.overwrite_with_platform_config(c.platform.linux.clone().unwrap());
+    assert_eq!(c.window.divider_width(), 0.0);
+    assert_eq!(c.panel().border, BorderVisibility::WhenSplit);
+    assert!(toml::from_str::<Config>("[panel]\nborder='invalid'").is_err());
 }
 
 #[test]
@@ -67,9 +92,10 @@ margin = [2, 4]
 padding = [10]
 row-gap = 5
 column-gap = 9
-divider-width = 3
 border-width = 0
 border-radius = 12
+[window]
+divider-width = 3
 ",
     );
     let tabs = c.navigation.tab_geometry();
@@ -86,7 +112,7 @@ border-radius = 12
     assert_eq!(panel.padding, Margin::all(10.0));
     assert_eq!(panel.row_gap, 5.0);
     assert_eq!(panel.column_gap, 9.0);
-    assert_eq!(panel.divider_width, 3.0);
+    assert_eq!(c.window.divider_width(), 3.0);
     assert_eq!(panel.border_width, 0.0);
     assert_eq!(panel.border_radius, 12.0);
 }
@@ -131,6 +157,7 @@ preset = 'square'
 gap = 0
 [platform.linux.panel]
 row-gap = 5
+[platform.linux.window]
 divider-width = 2
 ",
     );
@@ -139,7 +166,7 @@ divider-width = 2
     assert_eq!(c.navigation.tab_geometry().font_size, 20.0);
     assert_eq!(c.panel().column_gap, 9.0);
     assert_eq!(c.panel().row_gap, 5.0);
-    assert_eq!(c.panel().divider_width, 2.0);
+    assert_eq!(c.window.divider_width(), 2.0);
     assert_eq!(c.panel().border_radius, 0.0);
 }
 
@@ -176,6 +203,14 @@ fn invalid_numbers_are_finite_and_large_content_fits() {
     assert_eq!(tabs.padding.left, 0.0);
     assert_eq!(c.panel().row_gap, 0.0);
     assert_eq!(c.panel().border_radius, 0.0);
+    for (value, expected) in [("nan", 1.0), ("inf", 1.0), ("-5", 0.0)] {
+        assert_eq!(
+            config(&format!("[window]\ndivider-width={value}"))
+                .window
+                .divider_width(),
+            expected
+        );
+    }
 }
 
 #[test]

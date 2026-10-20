@@ -71,7 +71,7 @@ fn splitting_a_resized_pane_preserves_the_existing_partition() {
         panel.row_gap = spacing;
         panel.column_gap = spacing;
         panel.border_width = spacing;
-        grid.update_panel_config(panel);
+        grid.update_layout_config(panel, grid.divider_width);
         grid.calculate_positions();
         assert_eq!(
             grid.dividers
@@ -115,8 +115,8 @@ fn pane_insets_stay_inside_the_allocation_when_space_runs_out() {
 
 #[test]
 fn pane_box_model_reserves_only_the_visible_border() {
-    use crate::context::ContextManager;
-    use rio_backend::config::layout::Panel;
+    use crate::context::{create_dead_context, ContextManager};
+    use rio_backend::config::layout::{BorderVisibility, Panel};
     use rio_backend::event::{VoidListener, WindowId};
 
     for scale in [1.0, 1.25, 1.5, 2.0] {
@@ -137,7 +137,7 @@ fn pane_box_model_reserves_only_the_visible_border() {
         let mut expected_frame = None;
         for width in [0.0, 1.0, 5.0] {
             panel.border_width = width;
-            grid.update_panel_config(panel);
+            grid.update_layout_config(panel, grid.divider_width);
             grid.calculate_positions();
             let geometry = grid.current_item().unwrap().geometry;
             assert_eq!(
@@ -159,8 +159,8 @@ fn pane_box_model_reserves_only_the_visible_border() {
             assert_eq!([mouse_origin.left, mouse_origin.top], geometry.content[..2]);
         }
         let framed = grid.current_item().unwrap().geometry;
-        panel.hide_if_single = true;
-        grid.update_panel_config(panel);
+        panel.border = BorderVisibility::WhenSplit;
+        grid.update_layout_config(panel, grid.divider_width);
         grid.calculate_positions();
         let hidden = grid.current_item().unwrap().geometry;
         assert_eq!(hidden.frame, framed.frame);
@@ -171,6 +171,37 @@ fn pane_box_model_reserves_only_the_visible_border() {
             hidden.content[2],
             framed.content[2] + 2.0 * panel.border_width
         );
+
+        let context = create_dead_context(
+            VoidListener {},
+            WindowId::from(0),
+            grid.len(),
+            0,
+            grid.current().dimension,
+        );
+        let node = grid.try_split_right().unwrap();
+        grid.inner.insert(node, ContextGridItem::new(context));
+        grid.calculate_positions();
+        assert!(grid
+            .inner
+            .values()
+            .all(|item| item.geometry.border_width == panel.border_width));
+
+        panel.border = BorderVisibility::Never;
+        grid.update_layout_config(panel, grid.divider_width);
+        grid.calculate_positions();
+        for item in grid.inner.values() {
+            let geometry = item.geometry;
+            assert_eq!(geometry.border_width, 0.0);
+            assert_eq!(
+                geometry.content[0] - geometry.frame[0],
+                panel.padding.left * scale
+            );
+            assert_eq!(
+                geometry.content[1] - geometry.frame[1],
+                panel.padding.top * scale
+            );
+        }
     }
 }
 
@@ -269,13 +300,13 @@ fn split_dividers_share_centers_and_leave_pane_geometry_unchanged() {
         grid.height = 800.0 * scale;
         grid.update_scale(scale);
         grid.update_scaled_margin(Margin::all(10.0 * scale));
-        let mut panel = Panel {
+        let panel = Panel {
             margin: Margin::new(3.0, 5.0, 7.0, 11.0),
             row_gap: 20.0,
             column_gap: 30.0,
             ..Panel::default()
         };
-        grid.update_panel_config(panel);
+        grid.update_layout_config(panel, grid.divider_width);
         grid.calculate_positions();
         grid.for_each_divider(|_| panic!("a single pane has no divider"));
         let mut nodes = vec![grid.current];
@@ -305,8 +336,7 @@ fn split_dividers_share_centers_and_leave_pane_geometry_unchanged() {
             .collect();
         let mut centers = None;
         for width in [1.0, 7.0, 0.0, 2.0] {
-            panel.divider_width = width;
-            grid.update_panel_config(panel);
+            grid.update_layout_config(panel, width);
             grid.calculate_positions();
             for &(key, rect) in &panes {
                 assert_eq!(grid.inner[&key].geometry.content, rect);
@@ -315,6 +345,15 @@ fn split_dividers_share_centers_and_leave_pane_geometry_unchanged() {
             grid.for_each_divider(|rect| lines.push(rect));
             if width == 0.0 {
                 assert!(lines.is_empty());
+                // Hiding separator paint must not disable split resizing.
+                let divider = &grid.dividers[0];
+                let point = match divider.border.direction {
+                    BorderDirection::Vertical => [divider.center, divider.span[0] + 1.0],
+                    BorderDirection::Horizontal => {
+                        [divider.span[0] + 1.0, divider.center]
+                    }
+                };
+                assert!(grid.find_border_at_position(point[0], point[1]).is_some());
                 continue;
             }
             assert_eq!(lines.len(), 2);

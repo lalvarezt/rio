@@ -539,6 +539,12 @@ impl Config {
             if let Some(mode) = window_overwrite.mode {
                 self.window.mode = mode;
             }
+            if let Some(divider) = window_overwrite.divider {
+                self.window.divider = divider;
+            }
+            if let Some(width) = window_overwrite.divider_width {
+                self.window.divider_width = width;
+            }
             if let Some(opacity) = window_overwrite.opacity {
                 self.window.opacity = opacity;
             }

@@ -43,6 +43,10 @@ pub struct PlatformWindow {
     pub height: Option<i32>,
     #[serde(default = "Option::default")]
     pub mode: Option<window::WindowMode>,
+    #[serde(default)]
+    pub divider: Option<bool>,
+    #[serde(default, rename = "divider-width")]
+    pub divider_width: Option<f32>,
     #[serde(default = "Option::default")]
     pub opacity: Option<f32>,
     #[serde(default = "Option::default")]

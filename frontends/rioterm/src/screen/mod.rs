@@ -274,6 +274,7 @@ impl Screen<'_> {
             shell_integration: config.shell_integration,
             is_native,
             panel: config.panel(),
+            divider_width: config.window.divider_width(),
             title: config.title.clone(),
             keyboard: config.keyboard.clone(),
             scrollback_history_limit: config.scrollback_history_limit,
@@ -595,7 +596,8 @@ impl Screen<'_> {
         }
 
         let scale = self.sugarloaf.scale_factor();
-        self.context_manager.update_panel_config(config.panel());
+        self.context_manager
+            .update_layout_config(config.panel(), config.window.divider_width());
         for context_grid in self.context_manager.contexts_mut() {
             context_grid.update_line_height(config.line_height);
 

@@ -187,6 +187,12 @@ pub struct Window {
     pub height: i32,
     #[serde(default = "WindowMode::default")]
     pub mode: WindowMode,
+    /// Show split separators independently of pane borders. Enabled by default.
+    #[serde(default = "default_bool_true")]
+    pub divider: bool,
+    /// Defaults to 1 logical pixel, centered without reserving layout space.
+    #[serde(default = "default_divider_width", rename = "divider-width")]
+    pub divider_width: f32,
     #[serde(default = "default_opacity")]
     pub opacity: f32,
     /// Apply `window.opacity` to cells that paint an explicit
@@ -251,6 +257,8 @@ impl Default for Window {
             width: default_window_width(),
             height: default_window_height(),
             mode: WindowMode::default(),
+            divider: true,
+            divider_width: default_divider_width(),
             opacity: default_opacity(),
             opacity_cells: false,
             #[cfg(feature = "renderer")]
@@ -272,6 +280,10 @@ impl Default for Window {
             quake_height_percentage: default_quake_height_percentage(),
         }
     }
+}
+
+fn default_divider_width() -> f32 {
+    1.0
 }
 
 fn default_quake_width_percentage() -> f32 {
@@ -308,6 +320,15 @@ impl Colorspace {
 }
 
 impl Window {
+    /// Resolve paint thickness once; hidden separators remain draggable.
+    pub fn divider_width(&self) -> f32 {
+        if self.divider {
+            super::navigation::tabs::spacing(self.divider_width, default_divider_width())
+        } else {
+            0.0
+        }
+    }
+
     pub fn is_fullscreen(&self) -> bool {
         self.mode == WindowMode::Fullscreen
     }

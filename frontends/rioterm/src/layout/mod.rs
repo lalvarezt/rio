@@ -103,6 +103,7 @@ pub struct ContextGrid<T: EventListener> {
     inner: FxHashMap<NodeId, ContextGridItem<T>>,
     pub root: Option<NodeId>,
     panel_config: rio_backend::config::layout::Panel,
+    divider_width: f32,
     tree: TaffyTree<()>,
     root_node: NodeId,
     dividers: Vec<Divider>,
@@ -227,6 +228,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         context: Context<T>,
         scaled_margin: Margin,
         panel_config: rio_backend::config::layout::Panel,
+        divider_width: f32,
     ) -> Self {
         let width = context.dimension.width;
         let height = context.dimension.height;
@@ -281,6 +283,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             height,
             root: Some(panel_node),
             panel_config,
+            divider_width,
             tree,
             root_node,
             dividers: Vec::new(),
@@ -317,7 +320,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
     }
 
     pub fn should_draw_borders(&self) -> bool {
-        !self.panel_config.hide_if_single || self.panel_count() > 1
+        self.panel_config.border.is_visible(self.panel_count())
     }
 
     fn try_update_size(&mut self, width: f32, height: f32) -> Result<(), TaffyError> {
@@ -452,7 +455,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         }
 
         const RESIZE_SLOP: f32 = 3.0;
-        let hit_half = (self.panel_config.divider_width / 2.0 + RESIZE_SLOP) * self.scale;
+        let hit_half = (self.divider_width / 2.0 + RESIZE_SLOP) * self.scale;
         self.dividers.iter().find_map(|divider| {
             let (axis, cross) = match divider.border.direction {
                 BorderDirection::Vertical => (x, y),
@@ -467,7 +470,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
 
     /// Divider width affects paint only, never pane allocation or spacing.
     pub fn for_each_divider(&self, mut draw: impl FnMut([f32; 4])) {
-        let width = self.panel_config.divider_width * self.scale;
+        let width = self.divider_width * self.scale;
         if width <= 0.0 {
             return;
         }
@@ -1032,8 +1035,13 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         self.scale = new_scale;
     }
 
-    pub fn update_panel_config(&mut self, panel: rio_backend::config::layout::Panel) {
+    pub fn update_layout_config(
+        &mut self,
+        panel: rio_backend::config::layout::Panel,
+        divider_width: f32,
+    ) {
         self.panel_config = panel;
+        self.divider_width = divider_width;
     }
 
     pub fn update_line_height(&mut self, line_height: f32) {
