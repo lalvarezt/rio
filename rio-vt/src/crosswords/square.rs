@@ -10,7 +10,7 @@
 // cell itself is 8 bytes.
 
 use crate::crosswords::grid::GridSquare;
-use crate::crosswords::style::{StyleId, DEFAULT_STYLE_ID};
+use crate::crosswords::style::{Style, StyleId, StyleSet, DEFAULT_STYLE_ID};
 use crate::crosswords::Column;
 use crate::crosswords::Row;
 use bitflags::bitflags;
@@ -445,12 +445,52 @@ impl Square {
         *self = Square(0);
     }
 
-    /// Reset the cell using a template. Preserves the template's style id;
-    /// drops any extras the cell currently has (caller must free the slot).
+    /// Erased cells retain only the background, never text attributes.
     #[inline]
-    pub fn reset(&mut self, template: Square) {
-        let new = Square(0).with_style_id(template.style_id());
-        *self = new;
+    pub(crate) fn blank_with_bg(
+        bg: crate::config::colors::AnsiColor,
+        intern: impl FnOnce(Style) -> StyleId,
+    ) -> Self {
+        use crate::config::colors::{AnsiColor, NamedColor};
+
+        let mut cell = Square::default();
+        match bg {
+            // Default background → fully default cell, no encoding needed.
+            AnsiColor::Named(NamedColor::Background) => return cell,
+
+            // Palette index → bg-only cell, inline encoding.
+            AnsiColor::Indexed(idx) => {
+                cell.set_bg_palette(idx);
+                return cell;
+            }
+
+            // RGB spec → bg-only cell, inline encoding.
+            AnsiColor::Spec(rgb) => {
+                cell.set_bg_rgb(rgb.r, rgb.g, rgb.b);
+                return cell;
+            }
+
+            // Named palette colors 0..15 → encode as palette index.
+            AnsiColor::Named(named) => {
+                let n = named as u16;
+                if n < 16 {
+                    cell.set_bg_palette(n as u8);
+                    return cell;
+                }
+                // Special named colors (Foreground, Cursor, Dim*, Light*)
+                // fall through to the style table because their meaning
+                // depends on the active palette and would require lookup
+                // anyway.
+            }
+        }
+
+        // Fallback: intern a regular style. Should be rare in practice.
+        let style = Style {
+            bg,
+            ..Style::default()
+        };
+        let id = intern(style);
+        Square::default().with_style_id(id)
     }
 
     /// Builder helper for tests.
@@ -534,9 +574,18 @@ impl GridSquare for Square {
     }
 
     #[inline]
-    fn reset(&mut self, template: &Self) {
-        let style_id = template.style_id();
-        *self = Square(0).with_style_id(style_id);
+    fn reset(&mut self, template: &Self, styles: &mut StyleSet) {
+        use crate::config::colors::{AnsiColor, ColorRgb};
+        let bg = match template.content_tag() {
+            ContentTag::Codepoint => styles.get(template.style_id()).bg,
+            ContentTag::BgPalette => AnsiColor::Indexed(template.bg_palette_index()),
+            ContentTag::BgRgb => {
+                let (r, g, b) = template.bg_rgb();
+                AnsiColor::Spec(ColorRgb { r, g, b })
+            }
+        };
+        // Foreground-only blanks must remain empty during column reflow.
+        *self = Self::blank_with_bg(bg, |style| styles.intern(style));
     }
 }
 

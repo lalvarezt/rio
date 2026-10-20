@@ -6167,8 +6167,9 @@ mod tests {
         assert!(matches!(damage, TerminalDamage::Full));
         cw.snapshot_visible(&damage, &mut rows, &mut row_styles, &mut extras);
         cw.reset_damage();
-        // The alt screen was cleared with the carried blue bg template.
-        assert_eq!(row_styles[0].at(0).bg, blue);
+        // Erased backgrounds travel inline rather than through the style table.
+        assert_eq!(rows[0][Column(0)].bg_rgb(), (0, 0, 250));
+        assert_eq!(row_styles[0].at(0), Style::default());
     }
 
     #[test]
@@ -8511,6 +8512,55 @@ mod tests {
             0,
             10_000,
         )
+    }
+
+    #[test]
+    fn erased_prompt_rows_do_not_reflow_into_history() {
+        use crate::performer::handler::Processor;
+        let mut term = new_term(150, 36);
+        let mut parser = Processor::default();
+        parser.advance(&mut term, b"cwd\r\n> \x1b[38;2;205;214;244m\x1b[J");
+        let cursor = term.grid.cursor.pos;
+
+        term.resize(CrosswordsSize::new(74, 35));
+        assert_eq!(term.history_size(), 0);
+        term.resize(CrosswordsSize::new(150, 36));
+        assert_eq!(term.history_size(), 0);
+        assert_eq!(term.grid.cursor.pos, cursor);
+    }
+
+    #[test]
+    fn row_erasure_preserves_only_the_background() {
+        use crate::performer::handler::Processor;
+
+        // ED, IL, DL and scrolling all recycle whole rows through the grid.
+        for (erase, rows) in [
+            ("\x1b[J", 0..4),
+            ("\x1b[2J", 0..4),
+            ("\x1b[L", 0..1),
+            ("\x1b[M", 3..4),
+            ("\x1b[S", 3..4),
+            ("\x1b[T", 0..1),
+        ] {
+            for background in ["", "\x1b[48;5;42m", "\x1b[48;2;10;20;30m"] {
+                let mut term = new_term(12, 4);
+                let mut parser = Processor::default();
+                let input = format!("\x1b[1;4;7;38;2;205;214;244m{background}{erase}");
+                parser.advance(&mut term, input.as_bytes());
+                let expected = crate::crosswords::style::Style {
+                    bg: term.grid.template_style().bg,
+                    ..Default::default()
+                };
+                for row in rows.clone() {
+                    for column in 0..12 {
+                        let cell = term.grid[Line(row)][Column(column)];
+                        assert_eq!(term.grid.style_of(&cell), expected, "{input:?}");
+                        assert_eq!(cell.c(), '\0');
+                        assert!(!cell.has_extras());
+                    }
+                }
+            }
+        }
     }
 
     #[test]

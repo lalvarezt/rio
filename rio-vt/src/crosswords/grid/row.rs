@@ -198,9 +198,9 @@ impl<T: Clone + Default> Row<T> {
         }
     }
 
-    /// Reset all cells in the row to the `template` cell.
+    /// Reset the row using the template's background and default text attributes.
     #[inline]
-    pub fn reset(&mut self, template: &T)
+    pub fn reset(&mut self, template: &T, styles: &mut crate::crosswords::style::StyleSet)
     where
         T: GridSquare + PartialEq,
     {
@@ -210,27 +210,17 @@ impl<T: Clone + Default> Row<T> {
         // reset's fill, then defaults appended by `grow`. If both tail
         // ends match what this reset writes, only the prefix needs work.
         let len = self.inner.len();
+        let mut proto = T::default();
+        proto.reset(template, styles);
         let mut occ = self.occ;
-        if occ < len {
-            let mut probe = self.inner[occ].clone();
-            probe.reset(template);
-            if probe != self.inner[occ] || probe != self.inner[len - 1] {
-                occ = len;
-            }
+        if occ < len && (proto != self.inner[occ] || proto != self.inner[len - 1]) {
+            occ = len;
         }
-        if occ == len {
-            let mut proto = T::default();
-            proto.reset(template);
-            self.inner.fill(proto);
-        } else {
-            for item in &mut self.inner[0..occ] {
-                item.reset(template);
-            }
-        }
+        self.has_styles = proto.carries_style();
+        self.inner[..occ].fill(proto);
         self.occ = 0;
         self.kitty_virtual_placeholder = false;
         self.has_extras = false;
-        self.has_styles = template.carries_style();
         self.semantic_prompt = SemanticPrompt::None;
         self.dirty = true;
     }

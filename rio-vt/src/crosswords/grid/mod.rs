@@ -28,7 +28,8 @@ pub enum Scroll {
 
 pub trait GridSquare: Sized {
     fn is_empty(&self) -> bool;
-    fn reset(&mut self, template: &Self);
+    /// Erase using the template background, with all other attributes reset.
+    fn reset(&mut self, template: &Self, styles: &mut crate::crosswords::style::StyleSet);
     /// True when the value carries a non-default style id; drives the
     /// per-row `has_styles` hint.
     fn carries_style(&self) -> bool {
@@ -322,7 +323,7 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
         // When rotating the entire region, just reset everything.
         if region.end - region.start <= positions {
             for i in (region.start.0..region.end.0).map(Line::from) {
-                self.raw[i].reset(&self.cursor.template);
+                self.raw[i].reset(&self.cursor.template, &mut self.style_set);
             }
 
             return;
@@ -351,7 +352,7 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
 
             // Ensure all new lines are fully cleared.
             for i in (0..positions).map(Line::from) {
-                self.raw[i].reset(&self.cursor.template);
+                self.raw[i].reset(&self.cursor.template, &mut self.style_set);
             }
 
             // Swap the fixed lines at the top back into position.
@@ -367,7 +368,7 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
 
             let range = region.start.0..(region.start + positions).0;
             for line in range.rev().map(Line::from) {
-                self.raw[line].reset(&self.cursor.template);
+                self.raw[line].reset(&self.cursor.template, &mut self.style_set);
             }
         }
 
@@ -397,7 +398,7 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
         // When rotating the entire region with fixed lines at the top, just reset everything.
         if region.end - region.start <= positions && region.start != 0 {
             for i in (region.start.0..region.end.0).map(Line::from) {
-                self.raw[i].reset(&self.cursor.template);
+                self.raw[i].reset(&self.cursor.template, &mut self.style_set);
             }
 
             return;
@@ -451,7 +452,7 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
 
         // Ensure all new lines are fully cleared.
         for i in (region.end.0 - positions as i32..region.end.0).map(Line::from) {
-            self.raw[i].reset(&self.cursor.template);
+            self.raw[i].reset(&self.cursor.template, &mut self.style_set);
         }
 
         // Mark every row in the region dirty. Reset rows above already
@@ -483,7 +484,7 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
 
         // Reset rotated lines.
         for line in (0..(self.lines - positions)).map(Line::from) {
-            self.raw[line].reset(&self.cursor.template);
+            self.raw[line].reset(&self.cursor.template, &mut self.style_set);
         }
     }
 
@@ -498,7 +499,7 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
         // Reset all visible lines.
         let range = self.topmost_line().0..(self.screen_lines() as i32);
         for line in range.map(Line::from) {
-            self.raw[line].reset(&self.cursor.template);
+            self.raw[line].reset(&self.cursor.template, &mut self.style_set);
         }
     }
 }
@@ -525,7 +526,7 @@ impl<T> Grid<T> {
         debug_assert!(end <= self.screen_lines() as i32);
 
         for line in (start.0..end.0).map(Line::from) {
-            self.raw[line].reset(&self.cursor.template);
+            self.raw[line].reset(&self.cursor.template, &mut self.style_set);
         }
     }
 
@@ -872,46 +873,7 @@ impl Grid<Square> {
     /// after `clear`, color block fills) essentially free to render.
     #[inline]
     pub fn blank_with_bg(&mut self, bg: crate::config::colors::AnsiColor) -> Square {
-        use crate::config::colors::{AnsiColor, NamedColor};
-
-        let mut cell = Square::default();
-        match bg {
-            // Default background → fully default cell, no encoding needed.
-            AnsiColor::Named(NamedColor::Background) => return cell,
-
-            // Palette index → bg-only cell, inline encoding.
-            AnsiColor::Indexed(idx) => {
-                cell.set_bg_palette(idx);
-                return cell;
-            }
-
-            // RGB spec → bg-only cell, inline encoding.
-            AnsiColor::Spec(rgb) => {
-                cell.set_bg_rgb(rgb.r, rgb.g, rgb.b);
-                return cell;
-            }
-
-            // Named palette colors 0..15 → encode as palette index.
-            AnsiColor::Named(named) => {
-                let n = named as u16;
-                if n < 16 {
-                    cell.set_bg_palette(n as u8);
-                    return cell;
-                }
-                // Special named colors (Foreground, Cursor, Dim*, Light*)
-                // fall through to the style table because their meaning
-                // depends on the active palette and would require lookup
-                // anyway.
-            }
-        }
-
-        // Fallback: intern a regular style. Should be rare in practice.
-        let style = Style {
-            bg,
-            ..Style::default()
-        };
-        let id = self.intern_style(style);
-        Square::default().with_style_id(id)
+        Square::blank_with_bg(bg, |style| self.intern_style(style))
     }
 }
 

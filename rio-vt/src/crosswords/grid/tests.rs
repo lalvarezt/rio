@@ -11,7 +11,7 @@ impl GridSquare for usize {
         *self == 0
     }
 
-    fn reset(&mut self, template: &Self) {
+    fn reset(&mut self, template: &Self, _: &mut crate::crosswords::style::StyleSet) {
         *self = *template;
     }
 }
@@ -507,7 +507,7 @@ fn extras_reclaim_keeps_ids_of_hidden_cached_rows() {
 }
 
 #[test]
-fn row_hint_follows_reset_template() {
+fn row_hint_follows_erased_background() {
     use crate::config::colors::{AnsiColor, NamedColor};
     use crate::crosswords::style::Style;
 
@@ -522,10 +522,18 @@ fn row_hint_follows_reset_template() {
 
     let mut row: Row<Square> = Row::new(4);
     assert!(!row.has_styles);
-    row.reset(&styled_template);
+    row.reset(&styled_template, &mut grid.style_set);
+    assert!(!row.has_styles);
+
+    grid.set_template_style(Style {
+        bg: AnsiColor::Named(NamedColor::Foreground),
+        ..Style::default()
+    });
+    grid.sync_template_style();
+    row.reset(&grid.cursor.template, &mut grid.style_set);
     assert!(row.has_styles);
 
-    row.reset(&Square::default());
+    row.reset(&Square::default(), &mut grid.style_set);
     assert!(!row.has_styles);
 }
 
