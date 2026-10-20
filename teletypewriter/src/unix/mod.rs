@@ -414,35 +414,22 @@ impl ShellUser {
     /// look for shell, username, longname, and home dir in the respective environment variables
     /// before falling back on looking in to `passwd`.
     fn from_env() -> Result<Self, Error> {
+        let user = std::env::var("USER").ok();
+        let home = std::env::var("HOME").ok();
+        let shell = std::env::var("SHELL").ok();
         let mut buf = [0; 1024];
-        let pw = get_pw_entry(&mut buf);
-
-        let user = match std::env::var("USER") {
-            Ok(user) => user,
-            Err(_) => match pw {
-                Ok(ref pw) => pw.name.to_owned(),
-                Err(err) => return Err(err),
-            },
+        // NSS can contact external services. Resolve passwd only if an
+        // environment value is missing, and share that one lookup.
+        let pw = if user.is_none() || home.is_none() || shell.is_none() {
+            Some(get_pw_entry(&mut buf)?)
+        } else {
+            None
         };
-
-        let home = match std::env::var("HOME") {
-            Ok(home) => home,
-            Err(_) => match pw {
-                Ok(ref pw) => pw.dir.to_owned(),
-                Err(err) => return Err(err),
-            },
-        };
-
-        #[allow(unused_mut)]
-        let mut shell = match std::env::var("SHELL") {
-            Ok(env_shell) => env_shell,
-            Err(_) => match pw {
-                Ok(ref pw) => pw.shell.to_owned(),
-                Err(err) => return Err(err),
-            },
-        };
-
-        Ok(Self { user, home, shell })
+        Ok(Self {
+            user: user.unwrap_or_else(|| pw.as_ref().unwrap().name.to_owned()),
+            home: home.unwrap_or_else(|| pw.as_ref().unwrap().dir.to_owned()),
+            shell: shell.unwrap_or_else(|| pw.as_ref().unwrap().shell.to_owned()),
+        })
     }
 }
 
@@ -573,6 +560,7 @@ pub fn create_pty_with_spawn(
 
     // No program means the caller wants the user's default shell, which is the
     // only case that goes through `login`. A named program is spawned as given.
+    #[cfg(target_os = "macos")]
     let uses_default_shell = shell.is_none();
     let shell_program = shell.unwrap_or(&user.shell);
 
@@ -861,18 +849,27 @@ unsafe fn set_nonblocking(fd: libc::c_int) {
 }
 
 pub fn command_per_pid(pid: libc::pid_t) -> String {
-    let current_process_name = Command::new("ps")
-        .arg("-p")
-        .arg(format!("{pid:}"))
-        .arg("-o")
-        .arg("comm=")
-        .output()
-        .expect("failed to execute process")
-        .stdout;
+    #[cfg(target_os = "linux")]
+    {
+        // Reading procfs avoids spawning ps for a value that changes on exec;
+        // caching by PID would retain stale names and mishandle PID reuse.
+        std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let current_process_name = Command::new("ps")
+            .arg("-p")
+            .arg(format!("{pid:}"))
+            .arg("-o")
+            .arg("comm=")
+            .output()
+            .map(|output| output.stdout)
+            .unwrap_or_default();
 
-    std::str::from_utf8(&current_process_name)
-        .unwrap_or("")
-        .to_string()
+        std::str::from_utf8(&current_process_name)
+            .unwrap_or("")
+            .to_string()
+    }
 }
 
 impl EventedPty for Pty {
@@ -911,11 +908,7 @@ struct Passwd<'a> {
 
 /// Return a Passwd struct with pointers into the provided buf.
 ///
-/// # Unsafety
-///
-/// If `buf` is changed while `Passwd` is alive, bad thing will almost certainly happen.
-fn get_pw_entry(buf: &mut [i8; 1024]) -> Result<Passwd<'_>, Error> {
-    // Create zeroed passwd struct.
+fn get_pw_entry(buf: &mut [i8]) -> Result<Passwd<'_>, Error> {
     let mut entry: MaybeUninit<libc::passwd> = MaybeUninit::uninit();
 
     let mut res: *mut libc::passwd = ptr::null_mut();
@@ -931,25 +924,62 @@ fn get_pw_entry(buf: &mut [i8; 1024]) -> Result<Passwd<'_>, Error> {
             &mut res,
         )
     };
-    let entry = unsafe { entry.assume_init() };
-
-    if status < 0 {
-        return Err(Error::other("getpwuid_r failed"));
+    // POSIX returns positive errno values and leaves entry uninitialized on
+    // failure. Check both status and result before reading any fields.
+    if status != 0 {
+        return Err(Error::from_raw_os_error(status));
     }
 
     if res.is_null() {
         return Err(Error::other("pw not found"));
     }
+    let entry = unsafe { entry.assume_init() };
 
     // Sanity check.
     assert_eq!(entry.pw_uid, uid);
 
     // Build a borrowed Passwd struct.
     Ok(Passwd {
-        name: unsafe { CStr::from_ptr(entry.pw_name).to_str().unwrap() },
-        dir: unsafe { CStr::from_ptr(entry.pw_dir).to_str().unwrap() },
-        shell: unsafe { CStr::from_ptr(entry.pw_shell).to_str().unwrap() },
+        name: unsafe { CStr::from_ptr(entry.pw_name) }
+            .to_str()
+            .map_err(Error::other)?,
+        dir: unsafe { CStr::from_ptr(entry.pw_dir) }
+            .to_str()
+            .map_err(Error::other)?,
+        shell: unsafe { CStr::from_ptr(entry.pw_shell) }
+            .to_str()
+            .map_err(Error::other)?,
     })
+}
+
+#[cfg(test)]
+mod account_tests {
+    use super::*;
+
+    #[test]
+    fn passwd_reports_positive_error_codes_before_reading_entry() {
+        let error = get_pw_entry(&mut [0; 1]).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ERANGE));
+    }
+
+    #[test]
+    fn passwd_entry_borrows_initialized_storage() {
+        let mut buffer = [0; 65536];
+        let entry = get_pw_entry(&mut buffer).unwrap();
+        assert!(!entry.name.is_empty());
+        assert!(!entry.dir.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_name_matches_native_comm_and_missing_process_is_empty() {
+        let pid = std::process::id() as libc::pid_t;
+        assert_eq!(
+            command_per_pid(pid),
+            std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap()
+        );
+        assert!(command_per_pid(-1).is_empty());
+    }
 }
 
 /// Unsafe
@@ -1119,7 +1149,7 @@ mod login_argv_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "freebsd")))]
 mod termp_tests {
     use super::*;
 
