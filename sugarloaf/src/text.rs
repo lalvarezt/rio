@@ -638,6 +638,8 @@ impl Text {
         if bytes > MAX_SHAPED_BYTES {
             return Some(run);
         }
+        // FIFO eviction bounds changing titles without maintaining an LRU list
+        // on every measurement and draw. Hits share the same immutable run.
         while self.shape_cache_order.len() == MAX_SHAPED_RUNS
             || self.shape_cache_bytes + bytes > MAX_SHAPED_BYTES
         {
@@ -1374,6 +1376,8 @@ impl Text {
                     start += count;
                 }
             }
+            // Frame slots own separate buffers. Each must receive the new
+            // layout once, even if the next frame reuses identical UI instances.
             state.instance_dirty.fill(true);
         }
 

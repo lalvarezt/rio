@@ -20,16 +20,31 @@ struct TestPty {
     raw_error: Option<i32>,
     idle_reads: usize,
     read_calls: usize,
+    first_read_delay: Option<Duration>,
+    burst_boundary: Option<usize>,
 }
 
 impl Read for TestPty {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.read_calls += 1;
+        if let Some(delay) = self.first_read_delay.take() {
+            std::thread::sleep(delay);
+        }
         if self.idle_reads != 0 {
             self.idle_reads -= 1;
             return Err(ErrorKind::WouldBlock.into());
         }
-        let got = self.bytes.read(buf)?;
+        let limit = if let Some(boundary) = self.burst_boundary {
+            let remaining = boundary - self.bytes.position() as usize;
+            if remaining == 0 {
+                self.burst_boundary = None;
+                return Err(ErrorKind::WouldBlock.into());
+            }
+            remaining.min(buf.len())
+        } else {
+            buf.len()
+        };
+        let got = self.bytes.read(&mut buf[..limit])?;
         if got != 0 {
             return Ok(got);
         }
@@ -143,6 +158,8 @@ fn machine(bytes: Vec<u8>, ending: Option<ErrorKind>) -> Machine<TestPty, VoidLi
             raw_error: None,
             idle_reads: 0,
             read_calls: 0,
+            first_read_delay: None,
+            burst_boundary: None,
         },
         VoidListener,
         WindowId::from(0),
@@ -241,6 +258,21 @@ fn final_drain_stops_at_real_eof() {
         Duration::from_secs(1),
     );
     assert_eq!(machine.pty.read_calls, 2);
+}
+
+#[test]
+fn final_drain_renews_quiet_window_after_a_short_burst() {
+    let mut machine = machine(b"final output".to_vec(), None);
+    // Model a pump publication arriving after the original quiet deadline.
+    // Its confirming WouldBlock must start a new quiet window for the suffix.
+    machine.pty.first_read_delay = Some(Duration::from_millis(10));
+    machine.pty.burst_boundary = Some(5);
+    machine.drain_after_exit(
+        &mut State::default(),
+        &mut vec![0; READ_BUFFER_SIZE],
+        Duration::from_millis(5),
+    );
+    assert_eq!(first_line(&machine, 12), "final output");
 }
 
 #[cfg(windows)]

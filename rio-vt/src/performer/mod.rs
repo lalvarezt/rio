@@ -70,6 +70,7 @@ const MAX_LOCKED_READ: usize = READ_CHUNK * 4;
 #[derive(Debug, PartialEq, Eq)]
 enum ReadOutcome {
     Idle,
+    Progress,
     Closed,
     Budget,
 }
@@ -312,7 +313,14 @@ where
             }
         }
 
-        result
+        // A short burst followed by WouldBlock still made progress. The exit
+        // drain must renew its quiet window for this case, not just for full
+        // parse budgets, since ConPTY can publish final output in small bursts.
+        if processed != 0 && matches!(result, Ok(ReadOutcome::Idle)) {
+            Ok(ReadOutcome::Progress)
+        } else {
+            result
+        }
     }
 
     /// Drain the channel.
@@ -517,7 +525,9 @@ where
         let mut quiet_deadline = Instant::now() + quiet;
         loop {
             match self.pty_read(state, buf) {
-                Ok(ReadOutcome::Budget) if Instant::now() < deadline => {
+                Ok(ReadOutcome::Budget | ReadOutcome::Progress)
+                    if Instant::now() < deadline =>
+                {
                     quiet_deadline = Instant::now() + quiet;
                     continue;
                 }

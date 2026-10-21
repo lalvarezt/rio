@@ -449,6 +449,9 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     route.request_overlay_redraw();
                 }
             }
+            // PTY damage shares the frame throttle with explicit route renders.
+            // Mark damage now, then coalesce busy producers into the next frame
+            // instead of requesting an immediate present for every notification.
             RioEventType::Rio(
                 RioEvent::RenderRoute(route_id) | RioEvent::TerminalDamaged(route_id),
             ) => {

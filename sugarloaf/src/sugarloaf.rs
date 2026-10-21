@@ -255,6 +255,8 @@ impl Sugarloaf<'_> {
         }
         #[cfg(all(feature = "wgpu", not(target_os = "macos")))]
         if let crate::context::ContextType::Wgpu(ctx) = &ctx.inner {
+            // UI drawing uploads icons and resolves glyph slots before the render
+            // pass. Initializing there would discard the first frame's atlas cache.
             text.init_wgpu(&ctx.device, &ctx.queue, ctx.format);
         }
 

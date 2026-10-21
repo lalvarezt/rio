@@ -521,6 +521,8 @@ impl WgpuGridRenderer {
         uniforms: &GridUniforms,
     ) {
         // UI-only redraws still record grid passes; resident uniforms need no queue write.
+        // Keep this before the transparent-background early return: the text pass
+        // shares the buffer and still needs cursor, geometry, and color changes.
         if self
             .last_uniforms
             .as_ref()

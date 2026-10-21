@@ -858,19 +858,28 @@ impl Island {
         frame_interval: std::time::Duration,
     ) -> Option<std::time::Duration> {
         if matches!(self.progress_state, Some(ProgressState::Indeterminate)) {
-            Some(std::time::Duration::ZERO)
-        } else {
-            self.tabs.next_frame_in(scale, self.pointer).map(|delay| {
-                if self.is_dragging() {
-                    std::time::Duration::ZERO
-                } else if self.animation
-                    == rio_backend::config::navigation::Animation::Medium
-                {
-                    delay.max(frame_interval * 2)
-                } else {
-                    delay
-                }
-            })
+            return Some(std::time::Duration::ZERO);
+        }
+        let animation = self.tabs.next_frame_in(scale, self.pointer).map(|delay| {
+            if self.is_dragging() {
+                std::time::Duration::ZERO
+            } else if self.animation == rio_backend::config::navigation::Animation::Medium
+            {
+                delay.max(frame_interval * 2)
+            } else {
+                delay
+            }
+        });
+        // Static OSC 9;4 bars still need one frame at heartbeat expiry. Without
+        // this wakeup, idle rendering leaves them visible until unrelated input.
+        // OSC 7501 status has no heartbeat timeout and never schedules this work.
+        let expiry = self.progress_last_seen.map(|last_seen| {
+            std::time::Duration::from_secs(PROGRESS_BAR_TIMEOUT_SECS)
+                .saturating_sub(last_seen.elapsed())
+        });
+        match (animation, expiry) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         }
     }
 
@@ -1830,6 +1839,55 @@ mod tests {
                 .is_some(),
             "visible legacy indeterminate progress must animate"
         );
+    }
+
+    #[test]
+    fn static_progress_schedules_expiry_without_idle_animation() {
+        let timeout = std::time::Duration::from_secs(PROGRESS_BAR_TIMEOUT_SECS);
+        for state in [
+            ProgressState::Set,
+            ProgressState::Pause,
+            ProgressState::Error,
+        ] {
+            let mut island = test_island();
+            island.set_progress_report(ProgressReport {
+                state,
+                progress: Some(50),
+            });
+            // Leave only one second on the heartbeat deadline, with no tab motion.
+            island.progress_last_seen =
+                Some(Instant::now() - (timeout - std::time::Duration::from_secs(1)));
+            let before =
+                timeout.saturating_sub(island.progress_last_seen.unwrap().elapsed());
+            let delay = island
+                .next_frame_in(1.0, std::time::Duration::ZERO)
+                .expect("a static legacy progress bar must wake up to clear itself");
+            let after =
+                timeout.saturating_sub(island.progress_last_seen.unwrap().elapsed());
+            assert!(after <= delay && delay <= before);
+
+            // Heartbeats extend expiry without requiring continuous redraws.
+            island.set_progress_report(ProgressReport {
+                state,
+                progress: Some(60),
+            });
+            assert!(
+                island
+                    .next_frame_in(1.0, std::time::Duration::ZERO)
+                    .unwrap()
+                    > delay
+            );
+
+            island.progress_last_seen = Some(Instant::now() - timeout);
+            assert_eq!(
+                island.next_frame_in(1.0, std::time::Duration::ZERO),
+                Some(std::time::Duration::ZERO)
+            );
+            island.check_progress_timeout();
+            assert!(island
+                .next_frame_in(1.0, std::time::Duration::ZERO)
+                .is_none());
+        }
     }
 
     #[test]
