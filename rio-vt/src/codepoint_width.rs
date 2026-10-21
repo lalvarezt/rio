@@ -23,6 +23,66 @@ const TABLE_LEN: usize = 0x2_0000;
 const SENTINEL_NONE: u8 = 0xFF;
 
 static WIDTH_TABLE: OnceLock<Box<[u8]>> = OnceLock::new();
+// One additional process-wide 128 KiB table combines the bulk writer's two
+// classifications. The public width table keeps its unencoded byte contract.
+static PRINT_TABLE: OnceLock<Box<[u8]>> = OnceLock::new();
+
+/// Width and eligibility for ordinary bulk cell writes, resolved together.
+/// Latin-1 keeps the input path's legacy break policy; other codepoints
+/// qualify only when their grapheme class is Other.
+#[derive(Clone, Copy)]
+pub(crate) struct PrintProperties(u8);
+
+impl PrintProperties {
+    #[inline]
+    pub(crate) fn width(self) -> Option<u8> {
+        let width = self.0 & 3;
+        (width != 3).then_some(width)
+    }
+
+    #[inline]
+    pub(crate) fn ordinary(self) -> bool {
+        self.0 & 4 != 0
+    }
+}
+
+pub(crate) fn print_table() -> &'static [u8] {
+    PRINT_TABLE.get_or_init(|| {
+        width_table()
+            .iter()
+            .enumerate()
+            .map(|(cp, &width)| {
+                if width == SENTINEL_NONE {
+                    3
+                } else {
+                    pack_print_properties(cp as u32, width)
+                }
+            })
+            .collect()
+    })
+}
+
+fn pack_print_properties(cp: u32, width: u8) -> u8 {
+    let ordinary = cp <= 0xff
+        || char::from_u32(cp).is_some_and(|c| {
+            rio_unicode::grapheme::grapheme_class(c)
+                == rio_unicode::grapheme::GraphemeClass::Other
+        });
+    width | if ordinary { 4 } else { 0 }
+}
+
+#[inline]
+pub(crate) fn print_properties_in(table: &[u8], cp: u32) -> PrintProperties {
+    if (cp as usize) < TABLE_LEN {
+        PrintProperties(table[cp as usize])
+    } else {
+        PrintProperties(
+            char::from_u32(cp)
+                .and_then(UnicodeWidthChar::width)
+                .map_or(3, |width| pack_print_properties(cp, width as u8)),
+        )
+    }
+}
 
 /// The width lookup table. Callers doing bulk lookups should grab this
 /// once and use [`width_in`], hoisting the `OnceLock` access out of
@@ -73,6 +133,26 @@ pub fn codepoint_width(cp: u32) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn print_properties_match_width_and_cluster_policy_for_every_scalar() {
+        let table = print_table();
+        for cp in 0..=0x10ffff {
+            let properties = print_properties_in(table, cp);
+            let width = char::from_u32(cp)
+                .and_then(UnicodeWidthChar::width)
+                .map(|width| width as u8);
+            assert_eq!(properties.width(), width, "width U+{cp:04X}");
+            let ordinary = width.is_some()
+                && (cp <= 0xff
+                    || char::from_u32(cp).is_some_and(|c| {
+                        rio_unicode::grapheme::grapheme_class(c)
+                            == rio_unicode::grapheme::GraphemeClass::Other
+                    }));
+            assert_eq!(properties.ordinary(), ordinary, "class U+{cp:04X}");
+        }
+        assert_eq!(print_properties_in(table, u32::MAX).width(), None);
+    }
 
     #[test]
     fn ascii_printable_is_one() {

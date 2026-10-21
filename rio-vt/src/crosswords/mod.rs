@@ -3898,11 +3898,13 @@ impl<U: EventListener> Handler for Crosswords<U> {
         let template = self.cell_template();
         let template_has_extras = template.extras_id().is_some();
 
+        let table = crate::codepoint_width::print_table();
         let mut i = 0;
         let n = codepoints.len();
         while i < n {
             let cp = codepoints[i];
-            let width = match crate::codepoint_width::width_in(table, cp) {
+            let properties = crate::codepoint_width::print_properties_in(table, cp);
+            let width = match properties.width() {
                 Some(w) => w,
                 None => {
                     // Preserve scalar replacement for non-scalars passed
@@ -3930,14 +3932,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
             // that boundary, then batch ordinary same-width characters.
             // Combining marks, Hangul, emoji and Indic classes keep the full
             // cluster path. Latin-1 retains input()'s existing break policy.
-            let ordinary = |cp| {
-                cp <= 0xff
-                    || char::from_u32(cp).is_some_and(|c| {
-                        crate::grapheme_lut::class_of(c)
-                            == rio_unicode::grapheme::GraphemeClass::Other as u8
-                    })
-            };
-            if clustering && !ordinary(cp) {
+            if clustering && !properties.ordinary() {
                 self.input(char::from_u32(cp).unwrap_or('\u{FFFD}'));
                 i += 1;
                 continue;
@@ -3978,9 +3973,10 @@ impl<U: EventListener> Handler for Crosswords<U> {
             let mut j = i + 1;
             while j < n {
                 let next = codepoints[j];
+                let properties = crate::codepoint_width::print_properties_in(table, next);
                 if next == crate::ansi::kitty_virtual::PLACEHOLDER as u32
-                    || crate::codepoint_width::width_in(table, next) != Some(width)
-                    || (clustering && !ordinary(next))
+                    || properties.width() != Some(width)
+                    || (clustering && !properties.ordinary())
                 {
                     break;
                 }
