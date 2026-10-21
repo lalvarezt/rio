@@ -2279,48 +2279,7 @@ impl<U: EventListener> Crosswords<U> {
         // holds no style ids at all: sweeps reusing ids, table growth,
         // and grid swaps can't affect rows copied on earlier frames.
         if needs_full {
-            let retained = dst.len() == count
-                && row_styles.len() == count
-                && extras.row_count() == count;
-            if !retained {
-                self.fill_visible_rows(dst);
-                row_styles.resize_with(count, snapshot::RowStyles::default);
-            }
-            extras.begin(count, !retained);
-            let top = self
-                .lines_evicted()
-                .saturating_add((self.history_size() - self.display_offset()) as u64);
-            extras.align(dst, row_styles, top, self.columns());
-            for (i, row_idx) in (start..end).enumerate() {
-                let src = &self.grid[Line(row_idx)];
-                // Full redraws include scrolling and UI damage. Reuse the
-                // moved row's dependencies when only glyphs/flags changed;
-                // IDs alone never establish that their values are unchanged.
-                let unchanged = retained && snapshot::metadata_matches(src, &dst[i]);
-                if retained {
-                    dst[i].copy_from(src);
-                }
-                dst[i].dirty = true;
-                if !src.has_styles
-                    || !deferred
-                        .as_mut()
-                        .is_some_and(|styles| styles.capture(i, unchanged))
-                {
-                    if unchanged {
-                        row_styles[i].resolve_unchanged(src, self.grid.styles());
-                    } else {
-                        self.grid.resolve_row_styles(src, &mut row_styles[i]);
-                    }
-                }
-                if unchanged {
-                    extras.refresh_unchanged(i, &self.grid.extras_table);
-                } else {
-                    extras.refresh(i, src, &self.grid.extras_table);
-                }
-            }
-            let all_modified = self.grid.raw.take_lines_dirty(Line(start), count);
-            self.grid.raw.acknowledge_snapshot();
-            return all_modified;
+            return self.snapshot_full(dst, row_styles, extras, deferred);
         }
 
         extras.begin(count, false);
@@ -2359,6 +2318,62 @@ impl<U: EventListener> Crosswords<U> {
         }
         self.grid.raw.acknowledge_snapshot();
         modified == count
+    }
+
+    // Full capture needs rotation and dependency validation scratch. Keep it
+    // out of the small dirty-row path's stack frame and register allocation.
+    #[inline(never)]
+    fn snapshot_full(
+        &mut self,
+        dst: &mut Vec<Row<Square>>,
+        row_styles: &mut Vec<snapshot::RowStyles>,
+        extras: &mut snapshot::SnapshotExtras,
+        mut deferred: Option<&mut snapshot::DeferredStyles>,
+    ) -> bool {
+        let (start, end) = self.visible_line_bounds();
+        let count = (end - start) as usize;
+        let retained = dst.len() == count
+            && row_styles.len() == count
+            && extras.row_count() == count;
+        if !retained {
+            self.fill_visible_rows(dst);
+            row_styles.resize_with(count, snapshot::RowStyles::default);
+        }
+        extras.begin(count, !retained);
+        let top = self
+            .lines_evicted()
+            .saturating_add((self.history_size() - self.display_offset()) as u64);
+        extras.align(dst, row_styles, top, self.columns());
+        for (i, row_idx) in (start..end).enumerate() {
+            let src = &self.grid[Line(row_idx)];
+            // Full redraws include scrolling and UI damage. Reuse the
+            // moved row's dependencies when only glyphs/flags changed;
+            // IDs alone never establish that their values are unchanged.
+            let unchanged = retained && snapshot::metadata_matches(src, &dst[i]);
+            if retained {
+                dst[i].copy_from(src);
+            }
+            dst[i].dirty = true;
+            if !src.has_styles
+                || !deferred
+                    .as_mut()
+                    .is_some_and(|styles| styles.capture(i, unchanged))
+            {
+                if unchanged {
+                    row_styles[i].resolve_unchanged(src, self.grid.styles());
+                } else {
+                    self.grid.resolve_row_styles(src, &mut row_styles[i]);
+                }
+            }
+            if unchanged {
+                extras.refresh_unchanged(i, &self.grid.extras_table);
+            } else {
+                extras.refresh(i, src, &self.grid.extras_table);
+            }
+        }
+        let all_modified = self.grid.raw.take_lines_dirty(Line(start), count);
+        self.grid.raw.acknowledge_snapshot();
+        all_modified
     }
 
     /// Half-open grid line range currently on screen, as `(start, end)`.
