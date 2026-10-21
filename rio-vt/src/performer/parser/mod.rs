@@ -1142,7 +1142,7 @@ impl Parser {
 }
 
 /// Position of the first byte outside printable ASCII (`0x20..=0x7E`),
-/// via a SWAR scan (eight bytes per iteration, little-endian). An
+/// via SSE2 on x86-64 and a portable SWAR scan elsewhere. An
 /// early-exit iterator scan does not vectorize; this does the range
 /// test on a whole word at once.
 #[inline]
@@ -1152,6 +1152,31 @@ fn find_non_printable(bytes: &[u8]) -> usize {
 
     let mut i = 0;
     let len = bytes.len();
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    {
+        use std::arch::x86_64::{
+            _mm_cmpeq_epi8, _mm_cmpgt_epi8, _mm_loadu_si128, _mm_movemask_epi8,
+            _mm_or_si128, _mm_set1_epi8,
+        };
+        // SSE2 is part of the x86-64 baseline. Signed bytes below space also
+        // include every non-ASCII byte; DEL is the only other stop value.
+        // Each unaligned load stays inside the input slice, including tails.
+        unsafe {
+            let space = _mm_set1_epi8(0x20);
+            let delete = _mm_set1_epi8(0x7f);
+            while i + 16 <= len {
+                let word = _mm_loadu_si128(bytes.as_ptr().add(i).cast());
+                let stop = _mm_movemask_epi8(_mm_or_si128(
+                    _mm_cmpgt_epi8(space, word),
+                    _mm_cmpeq_epi8(delete, word),
+                )) as u32;
+                if stop != 0 {
+                    return i + stop.trailing_zeros() as usize;
+                }
+                i += 16;
+            }
+        }
+    }
     while i + 8 <= len {
         let w = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
         let lt20 = w.wrapping_sub(LO * 0x20) & !w & HI;
@@ -1561,6 +1586,31 @@ pub trait Perform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn printable_scanner_checks_every_byte_at_unaligned_boundaries() {
+        for offset in 0..16 {
+            for len in [0, 1, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65] {
+                let mut bytes = vec![b'x'; offset + len];
+                assert_eq!(find_non_printable(&bytes[offset..]), len);
+                for position in 0..len {
+                    for value in 0..=255u8 {
+                        bytes[offset + position] = value;
+                        let expected = if (0x20..=0x7e).contains(&value) {
+                            len
+                        } else {
+                            position
+                        };
+                        assert_eq!(
+                            find_non_printable(&bytes[offset..]), expected,
+                            "offset {offset}, length {len}, position {position}, byte {value:02x}"
+                        );
+                    }
+                    bytes[offset + position] = b'x';
+                }
+            }
+        }
+    }
 
     #[test]
     fn program_status_accumulation_is_bounded_and_recovers_after_oversize() {
