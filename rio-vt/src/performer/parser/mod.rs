@@ -1142,11 +1142,16 @@ impl Parser {
 }
 
 /// Position of the first byte outside printable ASCII (`0x20..=0x7E`),
-/// via SSE2 on x86-64 and a portable SWAR scan elsewhere. An
+/// via AVX2/SSE2 on x86-64 and a portable SWAR scan elsewhere. An
 /// early-exit iterator scan does not vectorize; this does the range
 /// test on a whole word at once.
 #[inline]
 fn find_non_printable(bytes: &[u8]) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if bytes.len() >= 128 && std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: runtime detection guards the AVX2 implementation.
+        return unsafe { find_boundary_avx2::<false>(bytes) };
+    }
     const LO: u64 = 0x0101_0101_0101_0101;
     const HI: u64 = 0x8080_8080_8080_8080;
 
@@ -1233,6 +1238,11 @@ fn find_osc_boundary(bytes: &[u8]) -> usize {
 /// Those states put `0x20..=0xFF` and treat every C0 as terminator,
 /// abort, or ignored.
 fn find_string_c0(bytes: &[u8]) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if bytes.len() >= 128 && std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: runtime detection guards the AVX2 implementation.
+        return unsafe { find_boundary_avx2::<true>(bytes) };
+    }
     const LO: u64 = 0x0101_0101_0101_0101;
     const HI: u64 = 0x8080_8080_8080_8080;
 
@@ -1273,6 +1283,39 @@ fn find_string_c0(bytes: &[u8]) -> usize {
         i += 1;
     }
     len
+}
+
+// Dispatch only long runs here: shorter ones retain the inlined SSE2 path
+// rather than paying for a feature check, function call and AVX transition.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn find_boundary_avx2<const ALLOW_HIGH: bool>(bytes: &[u8]) -> usize {
+    use std::arch::x86_64::*;
+
+    let mut i = 0;
+    let boundary = _mm256_set1_epi8(0x1f);
+    let space = _mm256_set1_epi8(0x20);
+    let del = _mm256_set1_epi8(0x7f);
+    while i + 32 <= bytes.len() {
+        // SAFETY: the loop bounds every unaligned load to the input slice.
+        let word = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(i).cast()) };
+        let stop = if ALLOW_HIGH {
+            _mm256_cmpeq_epi8(_mm256_max_epu8(word, boundary), boundary)
+        } else {
+            _mm256_or_si256(_mm256_cmpgt_epi8(space, word), _mm256_cmpeq_epi8(word, del))
+        };
+        let mask = _mm256_movemask_epi8(stop) as u32;
+        if mask != 0 {
+            return i + mask.trailing_zeros() as usize;
+        }
+        i += 32;
+    }
+    // At most 31 bytes remain, so the dispatch threshold cannot recurse.
+    i + if ALLOW_HIGH {
+        find_string_c0(&bytes[i..])
+    } else {
+        find_non_printable(&bytes[i..])
+    }
 }
 
 /// First index whose byte ends a DCS passthrough run. The put class is
@@ -1609,8 +1652,10 @@ mod tests {
 
     #[test]
     fn byte_scanners_check_every_byte_at_unaligned_boundaries() {
-        for offset in 0..16 {
-            for len in [0, 1, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65] {
+        for offset in 0..32 {
+            for len in [
+                0, 1, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129,
+            ] {
                 let mut bytes = vec![b'x'; offset + len];
                 assert_eq!(find_non_printable(&bytes[offset..]), len);
                 assert_eq!(find_string_c0(&bytes[offset..]), len);
