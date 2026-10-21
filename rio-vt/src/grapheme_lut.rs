@@ -51,6 +51,12 @@ pub fn class_of(c: char) -> u8 {
 /// `state`, which is advanced past `next` in place.
 #[inline]
 pub fn is_break_lut(prev: u8, next: u8, state: &mut u8) -> bool {
+    // GB9b is the only rule joining an ordinary incoming character.
+    // Its new state is always empty, regardless of preceding history.
+    if next == GraphemeClass::Other as u8 {
+        *state = 0;
+        return prev != GraphemeClass::Prepend as u8;
+    }
     let entry = transitions()
         [(prev as usize * CLASSES + next as usize) * STATES + *state as usize];
     *state = entry & !BREAK_BIT;

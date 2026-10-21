@@ -1111,31 +1111,11 @@ impl Parser {
     #[cfg(not(target_arch = "wasm32"))]
     #[inline]
     fn decode_codepoints_simd(&mut self, src: &[u8]) {
-        self.decode_buf.clear();
-        // Worst case: 1 codepoint per source byte. Reserve up-front so the
-        // raw pointer writes simdutf does are always in-bounds.
-        self.decode_buf.reserve(src.len());
-
-        // SAFETY: the output has at least one u32 slot per input byte.
-        let result = unsafe {
-            simdutf::convert_utf8_to_utf32_with_errors(
-                src.as_ptr(),
-                src.len(),
-                self.decode_buf.as_mut_ptr(),
-            )
-        };
-        if result.error == simdutf::ErrorCode::Success {
-            // SAFETY: simdutf wrote `result.count` u32 values.
-            unsafe { self.decode_buf.set_len(result.count) };
-        } else {
-            let valid_prefix = &src[..result.count];
-            let written = simdutf::count_utf8(valid_prefix);
-            // SAFETY: simdutf wrote exactly `written` values before the error.
-            unsafe { self.decode_buf.set_len(written) };
+        if let Err(err) = crate::simd_utf8::decode_to_utf32(src, &mut self.decode_buf) {
             // Dense malformed input otherwise re-enters the SIMD dispatcher
             // once per invalid byte. Decode the rest of this bounded chunk
             // scalarly, retaining maximal-subpart replacement and raw C1s.
-            self.append_codepoints_scalar(&src[result.count..]);
+            self.append_codepoints_scalar(&src[err.valid_up_to()..]);
         }
     }
 

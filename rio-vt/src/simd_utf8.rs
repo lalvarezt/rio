@@ -44,6 +44,60 @@ impl fmt::Display for Utf8Error {
 
 impl std::error::Error for Utf8Error {}
 
+/// Decode the valid UTF-8 prefix into reusable UTF-32 storage. On error,
+/// `output` contains exactly the scalars before `valid_up_to`; the caller
+/// chooses replacement or buffering semantics for the remaining bytes.
+#[inline]
+pub fn decode_to_utf32(bytes: &[u8], output: &mut Vec<u32>) -> Result<(), Utf8Error> {
+    output.clear();
+    output.reserve(bytes.len());
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // SAFETY: at most one scalar is produced per input byte, and the
+        // vector has that many uninitialized slots available for the FFI.
+        let result = unsafe {
+            simdutf::convert_utf8_to_utf32_with_errors(
+                bytes.as_ptr(),
+                bytes.len(),
+                output.as_mut_ptr(),
+            )
+        };
+        if result.error == simdutf::ErrorCode::Success {
+            // SAFETY: simdutf initialized this many valid Unicode scalars.
+            unsafe { output.set_len(result.count) };
+            Ok(())
+        } else {
+            let valid_up_to = result.count;
+            let written = simdutf::count_utf8(&bytes[..valid_up_to]);
+            // SAFETY: simdutf initialized exactly the valid prefix.
+            unsafe { output.set_len(written) };
+            Err(Utf8Error {
+                valid_up_to,
+                error_len: compute_error_len(bytes, valid_up_to),
+            })
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => {
+                output.extend(text.chars().map(|c| c as u32));
+                Ok(())
+            }
+            Err(err) => {
+                // SAFETY: std validated precisely this prefix.
+                let text =
+                    unsafe { std::str::from_utf8_unchecked(&bytes[..err.valid_up_to()]) };
+                output.extend(text.chars().map(|c| c as u32));
+                Err(Utf8Error {
+                    valid_up_to: err.valid_up_to(),
+                    error_len: err.error_len(),
+                })
+            }
+        }
+    }
+}
+
 /// Validate `bytes` and return the corresponding `&str` on success.
 ///
 /// Single SIMD pass via `simdutf::validate_utf8_with_errors` — gives both
@@ -52,6 +106,14 @@ impl std::error::Error for Utf8Error {}
 #[cfg(not(target_arch = "wasm32"))]
 #[inline]
 pub fn validate(bytes: &[u8]) -> Result<&str, Utf8Error> {
+    // OSC fields and carried UTF-8 scalars are usually shorter than one
+    // SIMD block. Avoid the FFI dispatcher for these small validations.
+    if bytes.len() < 64 {
+        return std::str::from_utf8(bytes).map_err(|err| Utf8Error {
+            valid_up_to: err.valid_up_to(),
+            error_len: err.error_len(),
+        });
+    }
     let result = simdutf::validate_utf8_with_errors(bytes);
     if result.error == simdutf::ErrorCode::Success {
         // SAFETY: `simdutf` confirmed the entire byte slice is valid UTF-8.
@@ -121,6 +183,40 @@ pub fn from_utf8_lossy_fast(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoded_prefix_and_error_match_std_for_every_byte_pair() {
+        let mut decoded = Vec::new();
+        for first in 0..=255u8 {
+            for second in 0..=255u8 {
+                let bytes = [b'x', 0xc3, 0xa9, first, second, 0x80, b'z'];
+                for len in 0..=bytes.len() {
+                    let input = &bytes[..len];
+                    let expected = std::str::from_utf8(input);
+                    let actual = decode_to_utf32(input, &mut decoded);
+                    let valid = match expected {
+                        Ok(text) => {
+                            assert!(actual.is_ok());
+                            text
+                        }
+                        Err(expected) => {
+                            let actual = actual.unwrap_err();
+                            assert_eq!(
+                                (actual.valid_up_to(), actual.error_len()),
+                                (expected.valid_up_to(), expected.error_len()),
+                                "{input:02x?}"
+                            );
+                            std::str::from_utf8(&input[..expected.valid_up_to()]).unwrap()
+                        }
+                    };
+                    assert!(
+                        decoded.iter().copied().eq(valid.chars().map(|c| c as u32)),
+                        "{input:02x?}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn validation_errors_match_std_at_utf8_range_boundaries() {
