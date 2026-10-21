@@ -1105,6 +1105,11 @@ impl<U: Handler> Perform for Performer<'_, U> {
         let terminator = if bell_terminated { "\x07" } else { "\x1b\\" };
 
         fn unhandled(params: &[&[u8]]) {
+            // Formatting every byte allocates even when the warn event is
+            // disabled. Unknown OSCs are common in shell integration streams.
+            if !tracing::enabled!(tracing::Level::WARN) {
+                return;
+            }
             let mut buf = String::new();
             for items in params {
                 buf.push('[');

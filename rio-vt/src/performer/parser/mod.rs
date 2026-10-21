@@ -1060,7 +1060,11 @@ impl Parser {
     fn decode_codepoints_scalar(&mut self, src: &[u8]) {
         self.decode_buf.clear();
         self.decode_buf.reserve(src.len());
+        self.append_codepoints_scalar(src);
+    }
 
+    #[inline]
+    fn append_codepoints_scalar(&mut self, src: &[u8]) {
         let mut consumed = 0;
         while consumed < src.len() {
             match std::str::from_utf8(&src[consumed..]) {
@@ -1112,51 +1116,26 @@ impl Parser {
         // raw pointer writes simdutf does are always in-bounds.
         self.decode_buf.reserve(src.len());
 
-        let mut consumed = 0;
-        while consumed < src.len() {
-            // SAFETY:
-            //  - `src.as_ptr().add(consumed)` is a valid pointer into `src`
-            //    (consumed < src.len()).
-            //  - `decode_buf` has capacity `src.len()` and currently holds
-            //    `decode_buf.len()` items; remaining slots ≥ remaining
-            //    source bytes ≥ codepoints simdutf will produce.
-            let result = unsafe {
-                simdutf::convert_utf8_to_utf32_with_errors(
-                    src.as_ptr().add(consumed),
-                    src.len() - consumed,
-                    self.decode_buf.as_mut_ptr().add(self.decode_buf.len()),
-                )
-            };
-            if result.error == simdutf::ErrorCode::Success {
-                // SAFETY: simdutf wrote `result.count` u32 values.
-                unsafe {
-                    self.decode_buf
-                        .set_len(self.decode_buf.len() + result.count);
-                }
-                return;
-            }
-
-            // simdutf errored at offset `result.count` within the slice
-            // starting at `consumed`. It already wrote codepoints for the
-            // valid prefix; count them so the buffer length stays in sync.
-            let valid_prefix = &src[consumed..consumed + result.count];
+        // SAFETY: the output has at least one u32 slot per input byte.
+        let result = unsafe {
+            simdutf::convert_utf8_to_utf32_with_errors(
+                src.as_ptr(),
+                src.len(),
+                self.decode_buf.as_mut_ptr(),
+            )
+        };
+        if result.error == simdutf::ErrorCode::Success {
+            // SAFETY: simdutf wrote `result.count` u32 values.
+            unsafe { self.decode_buf.set_len(result.count) };
+        } else {
+            let valid_prefix = &src[..result.count];
             let written = simdutf::count_utf8(valid_prefix);
-            // SAFETY: simdutf wrote exactly `written` u32 values.
-            unsafe {
-                self.decode_buf.set_len(self.decode_buf.len() + written);
-            }
-
-            // Emit one U+FFFD for the maximal invalid subpart at the error
-            // position and advance past it. A standalone C1 byte keeps its
-            // execute semantics through decode.
-            let err_pos = consumed + result.count;
-            let subpart = maximal_subpart(&src[err_pos..]);
-            if subpart == 1 && (0x80..=0x9F).contains(&src[err_pos]) {
-                self.decode_buf.push(src[err_pos] as u32);
-            } else {
-                self.decode_buf.push(0xFFFD);
-            }
-            consumed = err_pos + subpart;
+            // SAFETY: simdutf wrote exactly `written` values before the error.
+            unsafe { self.decode_buf.set_len(written) };
+            // Dense malformed input otherwise re-enters the SIMD dispatcher
+            // once per invalid byte. Decode the rest of this bounded chunk
+            // scalarly, retaining maximal-subpart replacement and raw C1s.
+            self.append_codepoints_scalar(&src[result.count..]);
         }
     }
 
