@@ -101,6 +101,10 @@ impl<U: EventListener> Crosswords<U> {
         // The style currently in effect on the client. Starts as the default
         // (matching the `\x1b[0m` above); we emit an SGR only when it changes.
         let mut current = Style::default();
+        // The grid is immutable for this call, so a repeated ID has the
+        // same resolved value. Inline background cells have no style ID
+        // and must invalidate this key before another ordinary cell.
+        let mut current_id = Some(super::style::DEFAULT_STYLE_ID);
 
         // Find the last non-blank row so we can drop trailing blank rows.
         let last_row = if opts.trim {
@@ -145,18 +149,20 @@ impl<U: EventListener> Crosswords<U> {
                     col += 1;
                     continue;
                 }
-                let style = self.grid.style_of(square);
-                if style != current {
-                    let cached = square
-                        .style_id_checked()
-                        .map(|id| id as usize)
-                        .filter(|&id| id < cached_styles);
-                    if let Some(id) = cached {
-                        out.push_str(&sgr[offsets[id]..offsets[id + 1]]);
-                    } else {
-                        write_sgr(out, &style);
+                let id = square.style_id_checked();
+                if id.is_none() || id != current_id {
+                    let style = self.grid.style_of(square);
+                    if style != current {
+                        let cached =
+                            id.map(|id| id as usize).filter(|&id| id < cached_styles);
+                        if let Some(id) = cached {
+                            out.push_str(&sgr[offsets[id]..offsets[id + 1]]);
+                        } else {
+                            write_sgr(out, &style);
+                        }
+                        current = style;
                     }
-                    current = style;
+                    current_id = id;
                 }
                 let c = square.c();
                 out.push(if c == '\0' { ' ' } else { c });
@@ -468,6 +474,22 @@ mod tests {
                 b: 0
             }))
         );
+    }
+
+    #[test]
+    fn vt_style_runs_reset_after_inline_background_cells() {
+        let mut a = term(12, 2);
+        feed(&mut a, b"\x1b[31mAA\x1b[0m\x1b[3CBB\x1b[31mCC");
+        a.grid[Line(0)][Column(2)].set_bg_rgb(12, 34, 56);
+        a.grid[Line(0)][Column(3)].set_bg_palette(42);
+        let snapshot = a.contents_formatted();
+        let mut b = term(12, 2);
+        feed(&mut b, &snapshot);
+        for col in 0..9 {
+            let original = &a.grid[Line(0)][Column(col)];
+            let restored = &b.grid[Line(0)][Column(col)];
+            assert_eq!(a.grid.style_of(original), b.grid.style_of(restored));
+        }
     }
 
     #[test]
