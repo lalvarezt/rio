@@ -180,22 +180,26 @@ impl<T: Clone + Default> Row<T> {
             return None;
         }
 
-        // Split off cells for a new row.
-        let mut new_row = self.inner.split_off(columns);
-        let index = new_row
+        // Inspect the tail before allocating it. A mixed grid can need
+        // reflow overall while many individual rows only lose blank cells.
+        let index = self.inner[columns..]
             .iter()
             .rposition(|c| !c.is_empty())
             .map_or(0, |i| i + 1);
-        new_row.truncate(index);
+
+        let new_row = if index == 0 {
+            self.inner.truncate(columns);
+            None
+        } else {
+            let mut tail = self.inner.split_off(columns);
+            tail.truncate(index);
+            Some(tail)
+        };
 
         self.occ = min(self.occ, columns);
         self.dirty = true;
 
-        if new_row.is_empty() {
-            None
-        } else {
-            Some(new_row)
-        }
+        new_row
     }
 
     /// Reset the row using the template's background and default text attributes.

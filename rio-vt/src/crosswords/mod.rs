@@ -297,10 +297,9 @@ impl TermDamageState {
 
         self.lines.clear();
         self.dirty_lines = num_lines..0;
-        self.lines.reserve(num_lines);
-        for line in 0..num_lines {
-            self.lines.push(LineDamage::undamaged(line));
-        }
+        // The exact-size iterator lets Vec reserve once and initialize
+        // the whole range without a capacity check and length write per row.
+        self.lines.extend((0..num_lines).map(LineDamage::undamaged));
     }
 
     /// Damage a line
