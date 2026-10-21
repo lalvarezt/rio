@@ -1,0 +1,16 @@
+# Match Rio's configured 10000 history lines. Ghostty's stock byte budget
+# retains much less ASCII history, reversing stream comparisons under load.
+# This changes benchmark setup and is always disclosed as a patched baseline.
+diff --git a/src/benchmark/TerminalStream.zig b/src/benchmark/TerminalStream.zig
+index 46aaf8422..a2c281c9b 100644
+--- a/src/benchmark/TerminalStream.zig
++++ b/src/benchmark/TerminalStream.zig
+@@ -71,6 +71,8 @@ pub fn create(
+         .terminal = try .init(global.io(), alloc, .{
+             .rows = opts.@"terminal-rows",
+             .cols = opts.@"terminal-cols",
++            .max_scrollback_bytes = null,
++            .max_scrollback_lines = 10_000,
+         }),
+         .stream = undefined,
+     };

@@ -3,6 +3,12 @@ set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-ExecutionPoli
 default:
     @just --list
 
+# Compare committed upstream/river-raptor tips with freshly fetched Ghostty HEAD.
+# Runs are retained in bench-results; use --help for sampling and filtering.
+[unix]
+bench *args:
+    python3 misc/ghostty-bench/compare.py {{ args }}
+
 # Build and install Rio, including the platform's runtime and desktop files.
 # Reuse a build with --binary PATH on Unix or -Binary PATH on Windows.
 [windows]

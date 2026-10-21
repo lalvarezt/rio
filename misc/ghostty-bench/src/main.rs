@@ -259,6 +259,7 @@ struct Report<'a> {
     rustc_version: &'static str,
     options: &'a Options,
     input_bytes: usize,
+    setup_metrics: BTreeMap<&'static str, usize>,
     checksum: String,
     sample_ns: Vec<u128>,
     median_ns_per_operation: f64,
@@ -278,16 +279,33 @@ fn run() -> Result<()> {
     }
     let mut times = Vec::with_capacity(opts.samples);
     let mut checksum = None;
+    let mut setup_metrics = None;
     for sample in 0..opts.warmups + opts.samples {
         // A fresh workload per sample prevents warmups changing scrollback size,
         // reflow contents, or cache state for the first measured operation.
         let mut work = Workload::new(&opts, &data)?;
+        let metrics = work.setup_metrics();
+        if setup_metrics
+            .as_ref()
+            .is_some_and(|previous| previous != &metrics)
+        {
+            return Err("workload setup changed between samples".into());
+        }
+        setup_metrics = Some(metrics);
+        // Idle-frame timings are only useful if the fast return preserves the
+        // fully captured state. Hash outside the timer on both sides.
+        let idle_snapshot = (opts.action == "screen-clone"
+            && opts.mode == "render-clean")
+            .then(|| work.checksum(&opts));
         let mut buffer = vec![0; opts.chunk_size];
         let start = Instant::now();
         work.run(&opts, &mut input, &mut buffer)?;
         let elapsed = start.elapsed().as_nanos();
         work.verify(&opts)?;
         let current = work.checksum(&opts);
+        if idle_snapshot.is_some_and(|before| before != current) {
+            return Err("idle snapshot changed visible content".into());
+        }
         if checksum.is_some_and(|previous| previous != current) {
             return Err("workload output changed between samples".into());
         }
@@ -342,6 +360,7 @@ fn run() -> Result<()> {
             rustc_version: env!("GHOSTTY_BENCH_RUSTC_VERSION"),
             options: &opts,
             input_bytes: data.len(),
+            setup_metrics: setup_metrics.unwrap_or_default(),
             checksum: format!("{:016x}", checksum.unwrap()),
             sample_ns: times,
             median_ns_per_operation: median / opts.loops as f64,

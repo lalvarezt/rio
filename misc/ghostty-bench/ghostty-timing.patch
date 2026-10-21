@@ -1,0 +1,13 @@
+# Expose Benchmark.run's internal step duration after the timed region.
+# Process startup, setup, teardown, and this print are excluded for both engines.
+diff --git a/src/benchmark/cli.zig b/src/benchmark/cli.zig
+index f76dfc4b7..aaf93dfee 100644
+--- a/src/benchmark/cli.zig
++++ b/src/benchmark/cli.zig
+@@ -113,4 +113,5 @@ fn mainActionImpl(
+     // Initialize our benchmark
+     const b = impl.benchmark();
+-    _ = try b.run(.once);
++    const result = try b.run(.once);
++    std.debug.print("GHOSTTY_BENCH_RESULT {d} {d}\n", .{ result.iterations, result.duration });
+ }

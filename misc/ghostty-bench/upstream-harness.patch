@@ -1,0 +1,31 @@
+# Register the shared headless harness without changing upstream core code or
+# resolving newer dependencies. Context changes require a reviewed patch update.
+diff --git a/Cargo.lock b/Cargo.lock
+index dc1cef71bb..e9603bf40f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1806,3 +1806,14 @@ dependencies = [
++[[package]]
++name = "ghostty-bench"
++version = "0.5.28"
++dependencies = [
++ "rio-unicode",
++ "rio-vt",
++ "rustc-hash 2.1.3",
++ "serde",
++ "serde_json",
++]
++
+ [[package]]
+ name = "gif"
+ version = "0.14.2"
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -16,5 +16,6 @@ members = [
+     "librio",
+     "librio-wasm",
+     "libsugarloaf",
++    "misc/ghostty-bench",
+ ]
+ resolver = "2"

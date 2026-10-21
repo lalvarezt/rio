@@ -1,0 +1,24 @@
+# Resize reflow walks retained history. Match Rio's 10000 history lines,
+# rather than Ghostty's 50 MB budget, and expose actual setup sizes before
+# Benchmark.run starts its timer. The diagnostic is not timed.
+diff --git a/src/benchmark/TerminalResize.zig b/src/benchmark/TerminalResize.zig
+--- a/src/benchmark/TerminalResize.zig
++++ b/src/benchmark/TerminalResize.zig
+@@ -115,5 +115,6 @@ pub fn create(
+             .rows = opts.@"terminal-rows",
+             .cols = opts.@"terminal-cols",
+-            .max_scrollback_bytes = opts.@"scrollback-bytes",
++            .max_scrollback_bytes = null,
++            .max_scrollback_lines = 10_000,
+         }),
+     };
+@@ -193,4 +194,8 @@ fn setup(ptr: *anyopaque) Benchmark.Error!void {
+     self.fill();
+     try self.replayData();
+-
++    std.debug.print("GHOSTTY_BENCH_STATE {d} {d} {d}\n", .{
++        self.terminal.cols, self.terminal.rows,
++        self.terminal.screens.active.pages.total_rows - self.terminal.rows,
++    });
++
+     // Reflow only happens when wraparound mode is set (it is by

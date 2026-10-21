@@ -7,7 +7,7 @@ use rio_unicode::{
 };
 use rio_vt::ansi::CursorShape;
 use rio_vt::crosswords::formatter::FormatOptions;
-use rio_vt::crosswords::grid::{row::Row, ExtrasTable, Scroll};
+use rio_vt::crosswords::grid::{row::Row, Dimensions, ExtrasTable, Scroll};
 #[cfg(not(ghostty_bench_upstream_api))]
 use rio_vt::crosswords::snapshot::{RowStyles, SnapshotExtras};
 #[cfg(ghostty_bench_upstream_api)]
@@ -249,6 +249,18 @@ impl Workload {
                 })
             }
         }
+    }
+
+    // Captured before the timer: reflow cost depends on retained history, not
+    // just the requested viewport dimensions or the size of the input file.
+    pub fn setup_metrics(&self) -> std::collections::BTreeMap<&'static str, usize> {
+        let mut metrics = std::collections::BTreeMap::new();
+        if let Self::Screen { term, .. } = self {
+            metrics.insert("columns", term.columns());
+            metrics.insert("rows", term.screen_lines());
+            metrics.insert("history_lines", term.grid.history_size());
+        }
+        metrics
     }
 
     pub fn run(
