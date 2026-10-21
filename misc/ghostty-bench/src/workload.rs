@@ -14,10 +14,10 @@ use rio_vt::crosswords::snapshot::{RowStyles, SnapshotExtras};
 type RowStyles = Vec<rio_vt::crosswords::style::Style>;
 #[cfg(ghostty_bench_upstream_api)]
 type SnapshotExtras = rustc_hash::FxHashMap<u16, Extras>;
+use rio_vt::crosswords::pos::Line;
 use rio_vt::crosswords::square::{Extras, Hyperlink, Square};
 use rio_vt::crosswords::{Crosswords, CrosswordsSize};
 use rio_vt::event::{TerminalDamage, VoidListener, WindowId};
-use rio_vt::index::Line;
 use rio_vt::performer::handler::Processor;
 use rio_vt::performer::parser::{Params, Parser, Perform};
 use std::hint::black_box;
