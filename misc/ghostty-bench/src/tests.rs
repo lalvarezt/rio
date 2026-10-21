@@ -82,9 +82,29 @@ fn unicode_probes_keep_widths_and_graphemes_across_reads() {
         let expected = checksum(opts.clone(), data, data.len());
         for chunk in 1..=data.len() {
             assert_eq!(checksum(opts.clone(), data, chunk), expected);
+            assert_eq!(
+                checksum(options(action, &["--mode", "reference"]), data, chunk),
+                expected
+            );
         }
     }
     assert_eq!(checksum(options("grapheme-break", &[]), data, 1), 5);
+}
+
+#[test]
+fn production_and_reference_unicode_agree_on_malformed_and_initial_boundaries() {
+    for data in [
+        b"\r\na\xff\xed\xa0\x80\xf4\x90\x80\x80\xe2(\xa1".as_slice(),
+        "\u{301}\u{600}e\u{301}\u{110bd}\u{20000}".as_bytes(),
+    ] {
+        for action in ["codepoint-width", "grapheme-break"] {
+            let expected =
+                checksum(options(action, &["--mode", "reference"]), data, data.len());
+            for chunk in 1..=data.len() {
+                assert_eq!(checksum(options(action, &[]), data, chunk), expected);
+            }
+        }
+    }
 }
 
 #[test]

@@ -281,42 +281,88 @@ impl Workload {
                 Self::Unicode { decoder, value } => {
                     // Decode inside the timed region, as Ghostty does. Preserve a
                     // trailing UTF-8 prefix between reads; never decode chunks alone.
-                    let mut previous = None;
-                    let mut accept = |c: char| {
-                        if opts.action == "codepoint-width" {
-                            *value = value.wrapping_add(if opts.mode == "noop" {
-                                black_box(c) as u64
-                            } else {
-                                black_box(c.width().unwrap_or(0)) as u64
-                            });
-                        } else if opts.mode == "noop" {
+                    // Select the workload once per replay, not once per
+                    // decoded scalar. Otherwise option-string comparisons
+                    // obscure the cost of the Unicode operations themselves.
+                    if opts.mode == "noop" {
+                        let mut accept = |c: char| {
                             *value = value.wrapping_add(black_box(c) as u64);
-                        } else {
-                            let next = grapheme_class(c);
-                            let boundary = match &mut previous {
-                                Some((prev, state)) => {
-                                    let boundary = is_break(*prev, next, state);
-                                    *prev = next;
-                                    boundary
-                                }
-                                None => {
-                                    previous = Some((next, BreakState::start(next)));
-                                    true
-                                }
+                        };
+                        input.replay(buffer, |chunk| decoder.feed(chunk, &mut accept))?;
+                        decoder.finish(&mut accept);
+                    } else if opts.action == "codepoint-width"
+                        && (opts.mode == "reference"
+                            || !cfg!(ghostty_bench_unicode_tables))
+                    {
+                        let mut accept = |c: char| {
+                            *value = value
+                                .wrapping_add(black_box(c.width().unwrap_or(0)) as u64);
+                        };
+                        input.replay(buffer, |chunk| decoder.feed(chunk, &mut accept))?;
+                        decoder.finish(&mut accept);
+                    } else if opts.action == "codepoint-width" {
+                        #[cfg(ghostty_bench_unicode_tables)]
+                        {
+                            let table = rio_vt::codepoint_width::width_table();
+                            let mut accept = |c: char| {
+                                let width =
+                                    rio_vt::codepoint_width::width_in(table, c as u32);
+                                *value = value
+                                    .wrapping_add(black_box(width.unwrap_or(0)) as u64);
                             };
-                            *value = value.wrapping_add(black_box(boundary) as u64);
+                            input.replay(buffer, |chunk| {
+                                decoder.feed(chunk, &mut accept)
+                            })?;
+                            decoder.finish(&mut accept);
                         }
-                    };
-                    input.replay(buffer, |chunk| decoder.feed(chunk, &mut accept))?;
-                    decoder.finish(&mut accept);
+                    } else if opts.mode == "reference"
+                        || !cfg!(ghostty_bench_unicode_tables)
+                    {
+                        // A synthetic Control guarantees the initial boundary
+                        // without testing an Option on every later scalar.
+                        let mut previous = rio_unicode::grapheme::GraphemeClass::Control;
+                        let mut state = BreakState::start(previous);
+                        let mut accept = |c: char| {
+                            let next = grapheme_class(c);
+                            let boundary = is_break(previous, next, &mut state);
+                            previous = next;
+                            *value = value.wrapping_add(black_box(boundary) as u64);
+                        };
+                        input.replay(buffer, |chunk| decoder.feed(chunk, &mut accept))?;
+                        decoder.finish(&mut accept);
+                    } else {
+                        #[cfg(ghostty_bench_unicode_tables)]
+                        {
+                            // Measure the terminal's packed transition table.
+                            // Reference mode retains the scalar rule machine.
+                            let mut previous =
+                                rio_unicode::grapheme::GraphemeClass::Control as u8;
+                            let mut state = 0;
+                            let mut accept = |c: char| {
+                                use rio_vt::grapheme_lut::{class_of, is_break_lut};
+                                let next = class_of(c);
+                                let boundary = is_break_lut(previous, next, &mut state);
+                                previous = next;
+                                *value = value.wrapping_add(black_box(boundary) as u64);
+                            };
+                            input.replay(buffer, |chunk| {
+                                decoder.feed(chunk, &mut accept)
+                            })?;
+                            decoder.finish(&mut accept);
+                        }
+                    }
                 }
                 Self::Links { table, cells, link } => {
                     for cell in cells.iter_mut() {
                         if opts.mode == "churn" {
                             cell.set_extras_id(None);
-                            cell.set_extras_id(Some(
-                                table.alloc(black_box(link.clone())),
-                            ));
+                            // Borrow reusable payloads; ownership is copied
+                            // only for a genuinely new interned value.
+                            #[cfg(ghostty_bench_borrowed_extras)]
+                            let id = table.intern(black_box(link));
+                            #[cfg(not(ghostty_bench_borrowed_extras))]
+                            let id = table.alloc(black_box(link.clone()));
+                            cell.set_extras_id(Some(id));
                         } else {
                             black_box(table.get(cell.extras_id().unwrap()).unwrap());
                         }
@@ -395,11 +441,17 @@ impl Workload {
                             black_box(&output);
                             continue;
                         }
-                        *output = term.format(if opts.emit == "plain" {
+                        let options = if opts.emit == "plain" {
                             FormatOptions::plain()
                         } else {
                             FormatOptions::vt()
-                        });
+                        };
+                        #[cfg(ghostty_bench_reusable_format)]
+                        term.format_into(options, output);
+                        #[cfg(not(ghostty_bench_reusable_format))]
+                        {
+                            *output = term.format(options);
+                        }
                         black_box(&output);
                         if opts.mode == "roundtrip" {
                             let mut decoded = terminal(opts);
@@ -524,13 +576,38 @@ fn fill(term: &mut Terminal, processor: &mut Processor, opts: &Options) {
 }
 
 /// Incremental maximal-subpart UTF-8 decoding for the standalone Unicode probes.
-/// This measures Rust's decoder plus Rio's tables, not Ghostty's decoder/SIMD.
+/// Use the terminal's SIMD prefix decoder, with Unicode replacement semantics
+/// for malformed input. Raw C1 bytes are replacements here, not VT controls.
 #[derive(Default)]
 pub struct Decoder {
     pending: Vec<u8>,
+    #[cfg(ghostty_bench_unicode_simd)]
+    decoded: Vec<u32>,
 }
 
+// Header metadata keeps the malformed fallback from branching on every
+// possible lead-byte family. Zero length denotes an invalid leading byte.
+const UTF8_HEADERS: [(u8, u8, u8, u8); 256] = {
+    let mut headers = [(0, 0, 0, 0); 256];
+    let mut byte = 0;
+    while byte < headers.len() {
+        headers[byte] = match byte {
+            0xc2..=0xdf => (2, 0x1f, 0x80, 0xbf),
+            0xe0 => (3, 0x0f, 0xa0, 0xbf),
+            0xed => (3, 0x0f, 0x80, 0x9f),
+            0xe1..=0xef => (3, 0x0f, 0x80, 0xbf),
+            0xf0 => (4, 7, 0x90, 0xbf),
+            0xf4 => (4, 7, 0x80, 0x8f),
+            0xf1..=0xf3 => (4, 7, 0x80, 0xbf),
+            _ => (0, 0, 0, 0),
+        };
+        byte += 1;
+    }
+    headers
+};
+
 impl Decoder {
+    #[inline]
     pub fn feed(&mut self, bytes: &[u8], accept: &mut impl FnMut(char)) {
         let combined;
         let mut bytes = if self.pending.is_empty() {
@@ -540,30 +617,71 @@ impl Decoder {
             self.pending.clear();
             &combined
         };
+        if bytes.is_ascii() {
+            for &byte in bytes {
+                accept(byte as char);
+            }
+            return;
+        }
+        #[cfg(ghostty_bench_unicode_simd)]
+        {
+            let result = rio_vt::simd_utf8::decode_to_utf32(bytes, &mut self.decoded);
+            for &cp in &self.decoded {
+                // SAFETY: the shared decoder produces only validated scalars.
+                accept(unsafe { char::from_u32_unchecked(cp) });
+            }
+            match result {
+                Ok(()) => return,
+                Err(err) => bytes = &bytes[err.valid_up_to()..],
+            }
+        }
+        // Once an error is found, stay scalar for this read. Retrying the
+        // SIMD entry point per invalid byte overwhelms malformed workloads.
         while !bytes.is_empty() {
-            match std::str::from_utf8(bytes) {
-                Ok(text) => {
-                    text.chars().for_each(&mut *accept);
+            let first = bytes[0];
+            if first < 0x80 {
+                accept(first as char);
+                bytes = &bytes[1..];
+                continue;
+            }
+            let (needed, mask, min_second, max_second) = UTF8_HEADERS[first as usize];
+            if needed == 0 {
+                accept('\u{fffd}');
+                bytes = &bytes[1..];
+                continue;
+            }
+            let Some(&second) = bytes.get(1) else {
+                self.pending.extend_from_slice(bytes);
+                return;
+            };
+            if !(min_second..=max_second).contains(&second) {
+                accept('\u{fffd}');
+                bytes = &bytes[1..];
+                continue;
+            }
+            let mut cp = (u32::from(first & mask) << 6) | u32::from(second & 0x3f);
+            let needed = needed as usize;
+            let mut used = 2;
+            while used < needed {
+                let Some(&byte) = bytes.get(used) else {
+                    self.pending.extend_from_slice(bytes);
+                    return;
+                };
+                if !(0x80..=0xbf).contains(&byte) {
                     break;
                 }
-                Err(err) => {
-                    std::str::from_utf8(&bytes[..err.valid_up_to()])
-                        .unwrap()
-                        .chars()
-                        .for_each(&mut *accept);
-                    bytes = &bytes[err.valid_up_to()..];
-                    match err.error_len() {
-                        Some(len) => {
-                            accept('\u{fffd}');
-                            bytes = &bytes[len..];
-                        }
-                        None => {
-                            self.pending.extend_from_slice(bytes);
-                            break;
-                        }
-                    }
-                }
+                cp = (cp << 6) | u32::from(byte & 0x3f);
+                used += 1;
             }
+            if used == needed {
+                // SAFETY: lead and continuation bounds exclude overlong
+                // encodings, surrogates, and scalars above U+10FFFF.
+                accept(unsafe { char::from_u32_unchecked(cp) });
+            } else {
+                // Consume only the valid prefix of an invalid sequence.
+                accept('\u{fffd}');
+            }
+            bytes = &bytes[used..];
         }
     }
     pub fn finish(&mut self, accept: &mut impl FnMut(char)) {
@@ -577,6 +695,26 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_decoder_matches_lossy_utf8_across_chunk_boundaries() {
+        for first in 0..=255u8 {
+            for second in 0..=255u8 {
+                let input = [b'x', 0xc3, 0xa9, first, second, 0xf0, 0x9f, 0x92];
+                let expected = String::from_utf8_lossy(&input);
+                for size in [1, 3, input.len()] {
+                    let mut decoder = Decoder::default();
+                    let mut actual = String::new();
+                    let mut accept = |c| actual.push(c);
+                    for chunk in input.chunks(size) {
+                        decoder.feed(chunk, &mut accept);
+                    }
+                    decoder.finish(&mut accept);
+                    assert_eq!(actual, expected, "{input:02x?} chunk={size}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn stale_measured_snapshot_is_rejected_without_repairing_its_fingerprint() {

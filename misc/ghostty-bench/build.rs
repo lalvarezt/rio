@@ -49,6 +49,28 @@ fn main() {
         println!("cargo:rustc-cfg=ghostty_bench_upstream_api");
     }
     println!("cargo:rustc-check-cfg=cfg(ghostty_bench_deferred_styles)");
+    println!("cargo:rustc-check-cfg=cfg(ghostty_bench_unicode_simd)");
+    println!("cargo:rustc-check-cfg=cfg(ghostty_bench_reusable_format)");
+    println!("cargo:rustc-check-cfg=cfg(ghostty_bench_borrowed_extras)");
+    if std::fs::read_to_string(root.join("rio-vt/src/crosswords/grid/mod.rs"))
+        .is_ok_and(|source| source.contains("pub fn intern("))
+    {
+        println!("cargo:rustc-cfg=ghostty_bench_borrowed_extras");
+    }
+    if std::fs::read_to_string(root.join("rio-vt/src/crosswords/formatter.rs"))
+        .is_ok_and(|source| source.contains("pub fn format_into"))
+    {
+        println!("cargo:rustc-cfg=ghostty_bench_reusable_format");
+    }
+    if std::fs::read_to_string(root.join("rio-vt/src/simd_utf8.rs"))
+        .is_ok_and(|source| source.contains("pub fn decode_to_utf32"))
+    {
+        println!("cargo:rustc-cfg=ghostty_bench_unicode_simd");
+    }
+    println!("cargo:rustc-check-cfg=cfg(ghostty_bench_unicode_tables)");
+    if root.join("rio-vt/src/grapheme_lut.rs").exists() {
+        println!("cargo:rustc-cfg=ghostty_bench_unicode_tables");
+    }
     if std::fs::read_to_string(root.join("rio-vt/src/crosswords/mod.rs"))
         .is_ok_and(|source| source.contains("pub fn snapshot_visible_deferred"))
     {

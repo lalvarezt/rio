@@ -19,8 +19,8 @@ Actions and modes:
   terminal-stream                     VT parser + terminal mutation
   osc-parser                          length-prefixed OSC records, framed for Rio
   apc-parser                          APC framing and accumulation, no image decode
-  codepoint-width     --mode table|noop
-  grapheme-break      --mode table|noop
+  codepoint-width     --mode table|reference|noop
+  grapheme-break      --mode table|reference|noop
   terminal-resize     --mode cols|rows|both|noop
   screen-clone        --mode clone|render|render-clean|render-partial|render-scroll|render-scroll-page|render-output
   terminal-formatter  --mode format|roundtrip|noop --emit vt|plain
@@ -125,7 +125,7 @@ impl Options {
             "terminal-parser" | "terminal-stream" | "osc-parser" | "apc-parser" => {
                 &["default"]
             }
-            "codepoint-width" | "grapheme-break" => &["table", "noop"],
+            "codepoint-width" | "grapheme-break" => &["table", "reference", "noop"],
             "terminal-resize" => &["cols", "rows", "both", "noop"],
             "screen-clone" => &[
                 "clone",
@@ -251,6 +251,9 @@ struct Report<'a> {
     ghostty_revision: &'static str,
     optimized_build: bool,
     snapshot_api: &'static str,
+    unicode_api: &'static str,
+    formatter_api: &'static str,
+    extras_api: &'static str,
     rio_revision: &'static str,
     rio_dirty: Option<bool>,
     rustc_version: &'static str,
@@ -316,6 +319,21 @@ fn run() -> Result<()> {
                 "retained-rows"
             },
             rio_revision: env!("GHOSTTY_BENCH_RIO_REVISION"),
+            unicode_api: if cfg!(ghostty_bench_unicode_simd) {
+                "simd-prefix/production-width-and-grapheme-tables; reference mode uses rules"
+            } else {
+                "scalar-decoder; tables selected when available"
+            },
+            formatter_api: if cfg!(ghostty_bench_reusable_format) {
+                "reusable-output"
+            } else {
+                "owned-output"
+            },
+            extras_api: if cfg!(ghostty_bench_borrowed_extras) {
+                "borrowed-intern"
+            } else {
+                "owned-allocation"
+            },
             rio_dirty: match env!("GHOSTTY_BENCH_RIO_DIRTY") {
                 "true" => Some(true),
                 "false" => Some(false),
