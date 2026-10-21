@@ -1,0 +1,55 @@
+# Benchmark-only correction for Ghostty 48dde97e0413a27064e4c6182db3df6ee999db7d.
+# UTF8Decoder.next can emit U+FFFD without consuming the current byte.
+# ReleaseFast removes assert(consumed), so the stock probes skip that byte.
+# Retry it as the decoder contract requires before advancing the input.
+# Keep stock and corrected measurements separate; width policies still differ.
+diff --git a/src/benchmark/CodepointWidth.zig b/src/benchmark/CodepointWidth.zig
+index 95eb7edd3..1ed00c39f 100644
+--- a/src/benchmark/CodepointWidth.zig
++++ b/src/benchmark/CodepointWidth.zig
+@@ -155,15 +155,18 @@ fn stepTable(ptr: *anyopaque) Benchmark.Error!void {
+         if (n == 0) break; // EOF reached
+ 
+         for (buf[0..n]) |c| {
+-            const cp_, const consumed = d.next(c);
+-            assert(consumed);
+-            if (cp_) |cp| {
++            var consumed = false;
++            while (!consumed) {
++                const cp_, const did_consume = d.next(c);
++                consumed = did_consume;
++                if (cp_) |cp| {
+                 // This is the same trick we do in terminal.zig so we
+                 // keep it here.
+                 std.mem.doNotOptimizeAway(if (cp <= 0xFF)
+                     1
+                 else
+                     table.get(@intCast(cp)).width);
++                }
+             }
+         }
+     }
+diff --git a/src/benchmark/GraphemeBreak.zig b/src/benchmark/GraphemeBreak.zig
+index 8e5236fe1..d8160c033 100644
+--- a/src/benchmark/GraphemeBreak.zig
++++ b/src/benchmark/GraphemeBreak.zig
+@@ -131,11 +131,14 @@ fn stepTable(ptr: *anyopaque) Benchmark.Error!void {
+         if (n == 0) break; // EOF reached
+ 
+         for (buf[0..n]) |c| {
+-            const cp_, const consumed = d.next(c);
+-            assert(consumed);
+-            if (cp_) |cp2| {
+-                std.mem.doNotOptimizeAway(unicode.graphemeBreak(cp1, @intCast(cp2), &state));
+-                cp1 = cp2;
++            var consumed = false;
++            while (!consumed) {
++                const cp_, const did_consume = d.next(c);
++                consumed = did_consume;
++                if (cp_) |cp2| {
++                    std.mem.doNotOptimizeAway(unicode.graphemeBreak(cp1, @intCast(cp2), &state));
++                    cp1 = cp2;
++                }
+             }
+         }
+     }
