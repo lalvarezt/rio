@@ -237,20 +237,19 @@ impl RowStyles {
                 });
             }
             Some(prefix) => {
+                // A moving viewport often changes the leading style. It
+                // already proves the old run key cannot match, so rebuild
+                // directly instead of constructing another failed key.
+                if self.at(0) != style {
+                    self.resolve_mixed(src, prefix, style, styles);
+                    return;
+                }
                 self.pending.clear();
                 self.pending.push(StyleRun { end: prefix, style });
                 let mut start = prefix;
                 while start < src.inner.len() {
                     if self.pending.len() == MAX_STYLE_RUNS {
-                        self.set_mixed(
-                            prefix,
-                            style,
-                            src.inner[prefix..].iter().map(|sq| {
-                                sq.style_id_checked()
-                                    .and_then(|id| styles.get(id as usize).copied())
-                                    .unwrap_or_default()
-                            }),
-                        );
+                        self.resolve_mixed(src, prefix, style, styles);
                         return;
                     }
                     let id = src.inner[start].style_id_checked().unwrap_or(0);
@@ -280,6 +279,24 @@ impl RowStyles {
                 self.pending.clear();
             }
         }
+    }
+
+    fn resolve_mixed(
+        &mut self,
+        src: &Row<Square>,
+        prefix: usize,
+        style: Style,
+        styles: &[Style],
+    ) {
+        self.set_mixed(
+            prefix,
+            style,
+            src.inner[prefix..].iter().map(|sq| {
+                sq.style_id_checked()
+                    .and_then(|id| styles.get(id as usize).copied())
+                    .unwrap_or_default()
+            }),
+        );
     }
 
     // The caller compared source metadata with the previously captured cells.
