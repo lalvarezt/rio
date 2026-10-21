@@ -16,6 +16,7 @@ members = [
     "librio",
     "librio-wasm",
     "libsugarloaf",
+    "misc/ghostty-bench",
 ]
 resolver = "2"
 
