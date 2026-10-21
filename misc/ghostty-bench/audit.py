@@ -59,13 +59,15 @@ def main():
     parser.add_argument("--samples", type=int, default=7)
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--threshold", type=float, default=10)
+    parser.add_argument("--filter", help="Replay cases containing this text instead of selecting by ratio")
     parser.add_argument("--timeout", type=float, default=120)
     args = parser.parse_args()
     if (args.samples < 1 or args.warmups < 0 or not math.isfinite(args.threshold) or args.threshold <= 1
             or not math.isfinite(args.timeout) or args.timeout <= 0):
         parser.error("Samples must be positive, warmups nonnegative and threshold > 1")
     original = json.loads(args.report.read_text())
-    selected = outliers(original, args.threshold)
+    selected = ([c for c in original["results"] if args.filter in c["case"] and c.get("median_ns")]
+                if args.filter is not None else outliers(original, args.threshold))
     if not selected:
         parser.error("No cases meet the outlier threshold")
     validate_inputs(original)

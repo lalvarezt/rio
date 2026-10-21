@@ -17,6 +17,7 @@ type SnapshotExtras = rustc_hash::FxHashMap<u16, Extras>;
 use rio_vt::crosswords::square::{Extras, Hyperlink, Square};
 use rio_vt::crosswords::{Crosswords, CrosswordsSize};
 use rio_vt::event::{TerminalDamage, VoidListener, WindowId};
+use rio_vt::index::Line;
 use rio_vt::performer::handler::Processor;
 use rio_vt::performer::parser::{Params, Parser, Perform};
 use std::hint::black_box;
@@ -416,14 +417,10 @@ impl Workload {
                         "render" => snapshot.update(term, TerminalDamage::Full),
                         "render-clean" => snapshot.update(term, TerminalDamage::Noop),
                         "render-partial" => {
-                            processor.advance(
-                                term.as_mut(),
-                                if iteration % 2 == 0 {
-                                    b"\x1b[1;1HX"
-                                } else {
-                                    b"\x1b[1;1HY"
-                                },
-                            );
+                            // Match Ghostty's dirty-row probe: no parsing or
+                            // character changes are included in this timer.
+                            // render-output separately measures output + capture.
+                            term.grid[Line((opts.rows / 2) as i32)].dirty = true;
                             snapshot.update(term, TerminalDamage::Partial);
                         }
                         "render-scroll" | "render-scroll-page" => {

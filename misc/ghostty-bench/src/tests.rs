@@ -35,6 +35,22 @@ fn checksum(mut opts: Options, data: &[u8], chunk: usize) -> u64 {
 }
 
 #[test]
+fn partial_redraw_marks_a_row_without_changing_content() {
+    let opts = options(
+        "screen-clone",
+        &["--mode", "render-partial", "--loops", "3"],
+    );
+    let data =
+        b"\x1b[31mred\x1b[0m\r\n\x1b]8;;https://example.com\x1b\\linked\x1b]8;;\x1b\\";
+    let mut work = Workload::new(&opts, data).unwrap();
+    let before = work.checksum(&opts);
+    work.run(&opts, &mut Input::Memory(data.to_vec()), &mut vec![0; 4096])
+        .unwrap();
+    work.verify(&opts).unwrap();
+    assert_eq!(work.checksum(&opts), before);
+}
+
+#[test]
 fn terminal_and_parser_replays_are_independent_of_read_boundaries() {
     let data = b"a\xe6\xbc\xa2e\xcc\x81\x1b[31mred\x1b[0m\r\n\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\\x1b_Ga=q;AAAA\x1b\\\xe2\x28\xa1end";
     for action in ["terminal-parser", "terminal-stream", "apc-parser"] {

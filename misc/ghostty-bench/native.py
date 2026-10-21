@@ -31,9 +31,13 @@ def cases(short_data, long_data):
         if action == "screen-clone":
             operations = FRAMES[mode]
             native_flags += ["--loops", "1"]
-            note = "Ghostty clones a complete Screen object and retains all 1000 copies; Rio replaces visible-row snapshots. Different work, not an equivalent clone speedup."
+            note = "Native snapshot representations differ; capture and style/extras resolution are timed."
+            if mode == "clone":
+                note = "Ghostty clones a complete Screen object and retains all 1000 copies; Rio replaces visible-row snapshots. Different work, not an equivalent clone speedup."
             if mode == "render-clean":
                 note = "3000000 idle updates after a full initial snapshot; no terminal mutations. Rio checks before/after visible-state fingerprints outside the timer."
+            if mode == "render-partial":
+                note = "2000000 one-row dirty updates at the middle of the active viewport. Both mark the row without parsing or changing cell contents."
         elif action == "terminal-resize":
             operations = RESIZES[mode]
             native_flags += ["--loops", "1", "--fill-lines", "0",
