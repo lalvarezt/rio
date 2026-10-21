@@ -4,40 +4,22 @@
 //! not evaluate rule chains or binary-search property ranges per
 //! codepoint. Two tables replace both:
 //!
-//! - a flat class table over `U+0000..U+20000` (the same BMP+plane-1
-//!   window as [`codepoint_width`](crate::codepoint_width), covering
-//!   CJK and emoji), falling back to the range search above it;
+//! - rio-unicode's compact class tables covering every Unicode plane;
 //! - a transition table folding the whole break decision into one
 //!   index: `(prev_class, next_class, state) → (break?, next_state)`.
 //!
-//! Both are built at first use *by driving rio-unicode's reference
-//! implementation*, so they are correct by construction and can never
-//! drift from the conformance-tested rules.
+//! Classes are compiled from rio-unicode's property ranges. Transitions
+//! are built at first use by driving its conformance-tested rule machine.
 
 use rio_unicode::grapheme::{grapheme_class, is_break, BreakState, GraphemeClass};
 use std::sync::OnceLock;
 
-const TABLE_LEN: usize = 0x2_0000;
-
-static CLASS_TABLE: OnceLock<Box<[u8]>> = OnceLock::new();
 static TRANSITIONS: OnceLock<Box<[u8]>> = OnceLock::new();
 
 const CLASSES: usize = GraphemeClass::COUNT;
 const STATES: usize = BreakState::COUNT;
 /// Transition entry: bit 7 = break, bits 0..6 = packed next state.
 const BREAK_BIT: u8 = 0x80;
-
-fn class_table() -> &'static [u8] {
-    CLASS_TABLE.get_or_init(|| {
-        let mut table = vec![0u8; TABLE_LEN].into_boxed_slice();
-        for (cp, slot) in table.iter_mut().enumerate() {
-            if let Some(c) = char::from_u32(cp as u32) {
-                *slot = grapheme_class(c) as u8;
-            }
-        }
-        table
-    })
-}
 
 fn transitions() -> &'static [u8] {
     TRANSITIONS.get_or_init(|| {
@@ -58,16 +40,10 @@ fn transitions() -> &'static [u8] {
     })
 }
 
-/// The grapheme class of `c` as a table index, one lookup for the
-/// common window.
+/// The grapheme class of `c` as a transition-table index.
 #[inline]
 pub fn class_of(c: char) -> u8 {
-    let cp = c as usize;
-    if cp < TABLE_LEN {
-        class_table()[cp]
-    } else {
-        grapheme_class(c) as u8
-    }
+    grapheme_class(c) as u8
 }
 
 /// One-index break decision: whether a boundary falls between a
@@ -171,7 +147,7 @@ mod tests {
     /// it was built from, including the class table's fallback seam.
     #[test]
     fn tables_match_reference() {
-        for cp in (0..TABLE_LEN as u32 + 0x100).step_by(7) {
+        for cp in (0..0x11_0000).step_by(7) {
             if let Some(c) = char::from_u32(cp) {
                 assert_eq!(class_of(c), grapheme_class(c) as u8, "class of U+{cp:04X}");
             }

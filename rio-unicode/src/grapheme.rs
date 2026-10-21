@@ -81,21 +81,92 @@ impl GraphemeClass {
     }
 }
 
-/// Class lookup: binary search over the generated ranges.
+// Most Unicode pages contain only Other. Share one empty block for those
+// pages and materialize only pages intersecting a generated property range.
+// Everything is computed at compile time from the conformance-tested data.
+const CLASS_PAGES: [(u16, u16); 0x1100] = {
+    assert!(GRAPHEME_CLASS_RANGES.len() <= u16::MAX as usize);
+    let mut pages = [(0, 0); 0x1100];
+    let mut page = 0;
+    let mut start = 0;
+    while page < pages.len() {
+        let lo = (page as u32) << 8;
+        while start < GRAPHEME_CLASS_RANGES.len() && GRAPHEME_CLASS_RANGES[start].1 < lo {
+            start += 1;
+        }
+        let mut end = start;
+        while end < GRAPHEME_CLASS_RANGES.len()
+            && GRAPHEME_CLASS_RANGES[end].0 <= lo + 255
+        {
+            end += 1;
+        }
+        pages[page] = (start as u16, end as u16);
+        page += 1;
+    }
+    pages
+};
+
+const CLASS_BLOCK_COUNT: usize = {
+    let mut count = 1; // Block zero is the shared Other page.
+    let mut page = 0;
+    while page < CLASS_PAGES.len() {
+        if CLASS_PAGES[page].0 != CLASS_PAGES[page].1 {
+            count += 1;
+        }
+        page += 1;
+    }
+    count
+};
+
+struct ClassTable {
+    pages: [u16; 0x1100],
+    blocks: [[GraphemeClass; 256]; CLASS_BLOCK_COUNT],
+}
+
+static CLASS_TABLE: ClassTable = {
+    let mut table = ClassTable {
+        pages: [0; 0x1100],
+        blocks: [[GraphemeClass::Other; 256]; CLASS_BLOCK_COUNT],
+    };
+    let mut block = 0;
+    let mut page = 0;
+    while page < CLASS_PAGES.len() {
+        let (start, end) = CLASS_PAGES[page];
+        if start != end {
+            block += 1;
+            table.pages[page] = block as u16;
+            let base = (page as u32) << 8;
+            let mut range = start as usize;
+            while range < end as usize {
+                let (lo, hi, class) = GRAPHEME_CLASS_RANGES[range];
+                let mut cp = if lo > base { lo } else { base };
+                let limit = if hi < base + 255 { hi } else { base + 255 };
+                while cp <= limit {
+                    table.blocks[block][(cp - base) as usize] = class;
+                    cp += 1;
+                }
+                range += 1;
+            }
+        }
+        page += 1;
+    }
+    table
+};
+
+/// Class lookup through two compact tables covering every Unicode plane.
+#[inline]
 pub fn grapheme_class(c: char) -> GraphemeClass {
     let cp = c as u32;
-    match GRAPHEME_CLASS_RANGES.binary_search_by(|&(lo, hi, _)| {
-        if cp < lo {
-            core::cmp::Ordering::Greater
-        } else if cp > hi {
-            core::cmp::Ordering::Less
-        } else {
-            core::cmp::Ordering::Equal
-        }
-    }) {
-        Ok(i) => GRAPHEME_CLASS_RANGES[i].2,
-        Err(_) => GraphemeClass::Other,
+    if cp < 0x7f {
+        return match cp {
+            0x0a => GraphemeClass::LF,
+            0x0d => GraphemeClass::CR,
+            0..=0x1f => GraphemeClass::Control,
+            _ => GraphemeClass::Other,
+        };
     }
+    let block = CLASS_TABLE.pages[(cp >> 8) as usize] as usize;
+    CLASS_TABLE.blocks[block][(cp & 255) as usize]
 }
 
 /// Emoji ZWJ sequence progress (GB11): `\p{ExtPic} Extend* ZWJ × \p{ExtPic}`.
@@ -173,12 +244,14 @@ impl BreakState {
     }
 
     /// State after the first codepoint of a sequence.
+    #[inline]
     pub fn start(first: GraphemeClass) -> Self {
         let mut state = Self::default();
         state.advance(first);
         state
     }
 
+    #[inline]
     fn advance(&mut self, class: GraphemeClass) {
         use GraphemeClass as G;
         self.emoji = match (self.emoji, class) {
@@ -209,6 +282,7 @@ impl BreakState {
 // identical-bodied arms would make the machine harder to audit against
 // the standard for zero behavioral gain.
 #[allow(clippy::if_same_then_else)]
+#[inline]
 pub fn is_break(
     prev: GraphemeClass,
     next: GraphemeClass,
@@ -332,6 +406,26 @@ mod tests {
 
     fn clusters(s: &str) -> Vec<&str> {
         Graphemes::new(s).collect()
+    }
+
+    #[test]
+    fn page_index_matches_property_ranges_for_every_scalar() {
+        let mut range = 0;
+        for cp in 0..=0x10ffff {
+            let Some(c) = char::from_u32(cp) else {
+                continue;
+            };
+            while range < GRAPHEME_CLASS_RANGES.len()
+                && GRAPHEME_CLASS_RANGES[range].1 < cp
+            {
+                range += 1;
+            }
+            let expected = GRAPHEME_CLASS_RANGES
+                .get(range)
+                .filter(|&&(lo, _, _)| lo <= cp)
+                .map_or(GraphemeClass::Other, |&(_, _, class)| class);
+            assert_eq!(grapheme_class(c), expected, "U+{cp:04X}");
+        }
     }
 
     #[test]

@@ -3783,49 +3783,6 @@ impl<U: EventListener> Handler for Crosswords<U> {
             return;
         }
 
-        if clustering {
-            let mut remaining = codepoints;
-            while !remaining.is_empty() {
-                // Avoid repeated ASCII-run detection on Unicode-only input.
-                let scalar_len = remaining
-                    .iter()
-                    .position(|cp| (0x20..=0x7e).contains(cp))
-                    .unwrap_or(remaining.len());
-                for &cp in &remaining[..scalar_len] {
-                    self.input(char::from_u32(cp).unwrap_or('\u{FFFD}'));
-                }
-                remaining = &remaining[scalar_len..];
-                if remaining.is_empty() {
-                    break;
-                }
-                // Printable ASCII cannot extend a cluster, just as in
-                // input_ascii_str. Keep it on the bulk path even when the
-                // parser decoded it together with preceding Unicode text.
-                if remaining
-                    .get(1)
-                    .is_some_and(|cp| (0x20..=0x7e).contains(cp))
-                {
-                    let ascii = 2 + remaining[2..]
-                        .iter()
-                        .take_while(|&&cp| (0x20..=0x7e).contains(&cp))
-                        .count();
-                    self.grid.sync_template_style();
-                    let template = self.cell_template();
-                    let template_has_extras = template.extras_id().is_some();
-                    self.write_narrow_run(
-                        template,
-                        template_has_extras,
-                        &remaining[..ascii],
-                    );
-                    remaining = &remaining[ascii..];
-                } else {
-                    self.input(char::from_u32(remaining[0]).unwrap_or('\u{FFFD}'));
-                    remaining = &remaining[1..];
-                }
-            }
-            return;
-        }
-
         // Registered glyphs keep their system `wcwidth` here (see the
         // note in `input`); the declared width is a render-time hint
         // only, applied as pixel overflow in the renderer.
@@ -3875,6 +3832,47 @@ impl<U: EventListener> Handler for Crosswords<U> {
                 continue;
             }
 
+            // Other cannot extend a cluster except after Prepend. Resolve
+            // that boundary, then batch ordinary same-width characters.
+            // Combining marks, Hangul, emoji and Indic classes keep the full
+            // cluster path. Latin-1 retains input()'s existing break policy.
+            let ordinary = |cp| {
+                cp <= 0xff
+                    || char::from_u32(cp).is_some_and(|c| {
+                        crate::grapheme_lut::class_of(c)
+                            == rio_unicode::grapheme::GraphemeClass::Other as u8
+                    })
+            };
+            if clustering && !ordinary(cp) {
+                self.input(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                i += 1;
+                continue;
+            }
+            if clustering && cp > 0xff {
+                let after_prepend = self.prev_cell_col().is_some_and(|col| {
+                    let cell = self.grid[self.grid.cursor.pos.row][Column(col)];
+                    if !matches!(
+                        cell.content_tag(),
+                        crate::crosswords::square::ContentTag::Codepoint
+                    ) {
+                        return false;
+                    }
+                    let last = cell
+                        .extras_id()
+                        .and_then(|id| self.grid.extras_table.get(id))
+                        .and_then(|extras| extras.zerowidth.last().copied())
+                        .unwrap_or(cell.c());
+                    last > '\u{ff}'
+                        && crate::grapheme_lut::class_of(last)
+                            == rio_unicode::grapheme::GraphemeClass::Prepend as u8
+                });
+                if after_prepend {
+                    self.input(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                    i += 1;
+                    continue;
+                }
+            }
+
             if cp == crate::ansi::kitty_virtual::PLACEHOLDER as u32 {
                 let c = char::from_u32(cp).unwrap_or('\u{FFFD}');
                 self.write_codepoint_cell(cp, c, width);
@@ -3888,6 +3886,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
                 let next = codepoints[j];
                 if next == crate::ansi::kitty_virtual::PLACEHOLDER as u32
                     || crate::codepoint_width::width_in(table, next) != Some(width)
+                    || (clustering && !ordinary(next))
                 {
                     break;
                 }
@@ -9253,6 +9252,51 @@ mod tests {
         assert_eq!(extras_of(&cw, 0, 0), ['\u{200D}', '\u{1F33E}']);
         assert_eq!(cw.grid[Line(0)][Column(2)].c(), 'a');
         assert_eq!(cw.grid.cursor.pos.col, Column(3));
+    }
+
+    #[test]
+    fn clustered_bulk_runs_match_scalar_input_across_wraps_and_chunks() {
+        use crate::performer::handler::Handler;
+        let alphabet = [
+            0x61, 0xa9, 0xe9, 0x301, 0x600, 0xd4e, 0x110bd, 0x4e00, 0x20000, 0x10ffff,
+            0x200d, 0xfe0f, 0xfe0e, 0x1f469, 0x1f33e, 0x1f1e7, 0x1f1f7,
+        ];
+        let mut seed = 42u64;
+        let mut codepoints = vec![0xd4e, 0x20000, 0x20001, 0x61, 0x301, 0xe9, 0x62];
+        for _ in 0..400 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            codepoints.push(alphabet[(seed >> 32) as usize % alphabet.len()]);
+        }
+        for cols in [1, 2, 3, 20] {
+            for chunk in [1, 2, 7, 64] {
+                let mut scalar = term_2027(cols, 3);
+                let mut bulk = term_2027(cols, 3);
+                for &cp in &codepoints {
+                    scalar.input(char::from_u32(cp).unwrap());
+                }
+                for run in codepoints.chunks(chunk) {
+                    bulk.input_codepoints(run);
+                }
+                assert_eq!(bulk.grid.cursor.pos, scalar.grid.cursor.pos);
+                assert_eq!(bulk.grid.cursor.should_wrap, scalar.grid.cursor.should_wrap);
+                assert_eq!(bulk.grid.topmost_line(), scalar.grid.topmost_line());
+                for line in scalar.grid.topmost_line().0..3 {
+                    for col in 0..cols {
+                        let a = bulk.grid[Line(line)][Column(col)];
+                        let b = scalar.grid[Line(line)][Column(col)];
+                        assert_eq!(
+                            (a.c(), a.wide()),
+                            (b.c(), b.wide()),
+                            "cols={cols} chunk={chunk} cell={line},{col}"
+                        );
+                        assert_eq!(
+                            extras_of(&bulk, line, col),
+                            extras_of(&scalar, line, col)
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Reflow moves a cluster atomically: the wide pair and its
