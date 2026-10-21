@@ -10,6 +10,14 @@ fn git(args: &[&str]) -> Option<String> {
 }
 
 fn main() {
+    // Saved binaries must distinguish ordinary release code generation from
+    // host-specific builds; debug assertions alone do not describe optimization.
+    for name in ["PROFILE", "OPT_LEVEL", "CARGO_CFG_TARGET_FEATURE"] {
+        println!(
+            "cargo:rustc-env=GHOSTTY_BENCH_{name}={}",
+            std::env::var(name).unwrap_or_else(|_| "unknown".into())
+        );
+    }
     println!(
         "cargo:rustc-env=GHOSTTY_BENCH_RIO_REVISION={}",
         git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into())

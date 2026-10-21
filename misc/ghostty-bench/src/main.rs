@@ -250,6 +250,9 @@ struct Report<'a> {
     version: u32,
     ghostty_revision: &'static str,
     optimized_build: bool,
+    build_profile: &'static str,
+    optimization_level: &'static str,
+    target_features: &'static str,
     snapshot_api: &'static str,
     unicode_api: &'static str,
     formatter_api: &'static str,
@@ -328,7 +331,11 @@ fn run() -> Result<()> {
             suite: "ghostty-bench",
             version: 1,
             ghostty_revision: GHOSTTY_REVISION,
-            optimized_build: !cfg!(debug_assertions),
+            optimized_build: !cfg!(debug_assertions)
+                && env!("GHOSTTY_BENCH_OPT_LEVEL") != "0",
+            build_profile: env!("GHOSTTY_BENCH_PROFILE"),
+            optimization_level: env!("GHOSTTY_BENCH_OPT_LEVEL"),
+            target_features: env!("GHOSTTY_BENCH_CARGO_CFG_TARGET_FEATURE"),
             snapshot_api: if cfg!(ghostty_bench_upstream_api) {
                 "upstream-vec"
             } else if cfg!(ghostty_bench_deferred_styles) {

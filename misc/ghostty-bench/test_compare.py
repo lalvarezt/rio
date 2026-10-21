@@ -13,6 +13,19 @@ import report
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_native_codegen_preserves_flag_arguments_and_encoded_precedence(self):
+        plain = {"RUSTFLAGS": '-C "link-arg=path with spaces"'}
+        compare.enable_native_rust(plain)
+        self.assertEqual(plain["CARGO_ENCODED_RUSTFLAGS"].split("\x1f"),
+                         ["-C", "link-arg=path with spaces", "-C", "target-cpu=native"])
+        encoded = {"CARGO_ENCODED_RUSTFLAGS": "-C\x1fopt-level=2", "RUSTFLAGS": "ignored"}
+        compare.enable_native_rust(encoded)
+        self.assertEqual(encoded["CARGO_ENCODED_RUSTFLAGS"].split("\x1f"),
+                         ["-C", "opt-level=2", "-C", "target-cpu=native"])
+        empty = {"CARGO_ENCODED_RUSTFLAGS": "", "RUSTFLAGS": "ignored"}
+        compare.enable_native_rust(empty)
+        self.assertEqual(empty["CARGO_ENCODED_RUSTFLAGS"], "-C\x1ftarget-cpu=native")
+
     def test_committed_local_branches_ignore_dirty_checkout(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

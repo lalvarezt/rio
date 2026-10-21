@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import shlex
 import shutil
 import statistics
 import subprocess
@@ -216,6 +217,14 @@ def sample(engine, case, binary, directory, label, cpu, timeout):
             "stdout": str(stdout), "stderr": str(stderr)}
 
 
+def enable_native_rust(env):
+    # Encoded flags take precedence over RUSTFLAGS. Preserve their argument
+    # boundaries and any caller flags while selecting the host CPU explicitly.
+    encoded = env.get("CARGO_ENCODED_RUSTFLAGS")
+    flags = (encoded.split("\x1f") if encoded else []) if encoded is not None else shlex.split(env.get("RUSTFLAGS", ""))
+    env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join([*flags, "-C", "target-cpu=native"])
+
+
 def build_engines(args, directory, report, worktrees):
     cache = args.cache_dir.resolve()
     cache.mkdir(parents=True, exist_ok=True)
@@ -261,17 +270,21 @@ def build_engines(args, directory, report, worktrees):
         if engine == "ghostty":
             prefix = cache / "ghostty-install"
             command = ["zig", "build", "-Demit-bench", "-Doptimize=ReleaseFast",
-                       "-Dapp-runtime=none", "-Demit-exe=false", "-Dcpu=baseline",
+                       "-Dapp-runtime=none", "-Demit-exe=false",
+                       "-Dcpu=native" if args.native else "-Dcpu=baseline",
                        "--cache-dir", str(cache / "zig-local"), "--prefix", str(prefix)]
             source_binary = prefix / "bin/ghostty-bench"
             metadata["toolchain"] = subprocess.check_output(["zig", "version"], text=True).strip()
         else:
+            if args.native:
+                enable_native_rust(env)
             target = cache / "targets" / engine
             env["CARGO_TARGET_DIR"] = str(target)
             command = ["cargo", "build", "--release", "--locked", "-p", "ghostty-bench"]
             source_binary = target / "release/ghostty-bench"
             metadata["toolchain"] = subprocess.check_output(["rustc", "--version"], cwd=tree, text=True).strip()
         metadata["build_command"] = command
+        metadata["codegen_target"] = "native" if args.native else "baseline"
         # Capture only build-affecting variables, never credentials or all env.
         metadata["build_environment"] = {k: v for k, v in env.items() if k in (
             "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTUP_TOOLCHAIN", "CC", "CXX",
@@ -343,6 +356,11 @@ def main(argv=None):
     parser.add_argument("--cpu", type=int, help="Allowed logical CPU; default: first allowed CPU on Linux")
     parser.add_argument("--timeout", type=float, default=120, help="Seconds per sample process")
     parser.add_argument("--keep-worktrees", action="store_true")
+    parser.add_argument(
+        "--native", action="store_true",
+        help="Use host CPU features for both Rust release and Zig ReleaseFast builds; "
+             "omit for the portable baseline (inherited build flags are recorded)",
+    )
     args = parser.parse_args(argv)
     if (min(args.samples, args.bytes, args.stream_bytes) < 1 or args.warmups < 0
             or not math.isfinite(args.timeout) or args.timeout <= 0):
