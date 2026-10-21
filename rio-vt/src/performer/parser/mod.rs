@@ -1238,6 +1238,26 @@ fn find_string_c0(bytes: &[u8]) -> usize {
 
     let mut i = 0;
     let len = bytes.len();
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    {
+        use std::arch::x86_64::*;
+
+        // Unlike printable runs, these payloads accept non-ASCII bytes.
+        // Unsigned max detects C0 without treating the high bit as a stop.
+        // SAFETY: SSE2 is enabled and each unaligned load stays in the slice.
+        unsafe {
+            let boundary = _mm_set1_epi8(0x1f);
+            while i + 16 <= len {
+                let word = _mm_loadu_si128(bytes.as_ptr().add(i).cast());
+                let stop = _mm_cmpeq_epi8(_mm_max_epu8(word, boundary), boundary);
+                let mask = _mm_movemask_epi8(stop) as u32;
+                if mask != 0 {
+                    return i + mask.trailing_zeros() as usize;
+                }
+                i += 16;
+            }
+        }
+    }
     while i + 8 <= len {
         let w = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
         let lt20 = w.wrapping_sub(LO * 0x20) & !w & HI;
@@ -1588,11 +1608,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn printable_scanner_checks_every_byte_at_unaligned_boundaries() {
+    fn byte_scanners_check_every_byte_at_unaligned_boundaries() {
         for offset in 0..16 {
             for len in [0, 1, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65] {
                 let mut bytes = vec![b'x'; offset + len];
                 assert_eq!(find_non_printable(&bytes[offset..]), len);
+                assert_eq!(find_string_c0(&bytes[offset..]), len);
                 for position in 0..len {
                     for value in 0..=255u8 {
                         bytes[offset + position] = value;
@@ -1604,6 +1625,11 @@ mod tests {
                         assert_eq!(
                             find_non_printable(&bytes[offset..]), expected,
                             "offset {offset}, length {len}, position {position}, byte {value:02x}"
+                        );
+                        assert_eq!(
+                            find_string_c0(&bytes[offset..]),
+                            if value < 0x20 { position } else { len },
+                            "C0 offset {offset}, length {len}, position {position}, byte {value:02x}"
                         );
                     }
                     bytes[offset + position] = b'x';
