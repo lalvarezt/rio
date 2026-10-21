@@ -216,14 +216,15 @@ impl Parser {
                         self.ignoring = true;
                         i += 1;
                     } else {
-                        let mut param = self.param;
+                        let mut param = self.param as u32;
                         while i < bytes.len() && bytes[i].is_ascii_digit() {
-                            param = param
-                                .saturating_mul(10)
-                                .saturating_add((bytes[i] - b'0') as u16);
+                            // The u16-clamped input fits a multiply-add in u32,
+                            // so one final clamp replaces two saturating ops.
+                            param = (param * 10 + (bytes[i] - b'0') as u32)
+                                .min(u16::MAX as u32);
                             i += 1;
                         }
-                        self.param = param;
+                        self.param = param as u16;
                     }
                 }
                 0x3A => {
@@ -888,9 +889,7 @@ impl Parser {
 
         // If the next character is ESC, just process it and short-circuit.
         if plain_chars == 0 {
-            self.state = State::Escape;
-            self.reset_params();
-            return 1;
+            return self.start_ground_escape(bytes);
         }
 
         let has_trailing_esc = plain_chars < num_bytes;
@@ -919,11 +918,31 @@ impl Parser {
         }
 
         if has_trailing_esc {
-            self.state = State::Escape;
-            self.reset_params();
-            plain_chars + 1
+            plain_chars + self.start_ground_escape(&bytes[plain_chars..])
         } else {
             num_bytes
+        }
+    }
+
+    #[inline]
+    fn start_ground_escape(&mut self, bytes: &[u8]) -> usize {
+        self.reset_params();
+        // Ground runs stop at ESC. Consume common two-byte introducers
+        // together so SGR/OSC-heavy output avoids another state dispatch.
+        // A split introducer still takes the ordinary Escape path.
+        match bytes.get(1) {
+            Some(b'[') => {
+                self.state = State::CsiEntry;
+                2
+            }
+            Some(b']') => {
+                self.state = State::OscString;
+                2
+            }
+            _ => {
+                self.state = State::Escape;
+                1
+            }
         }
     }
 
@@ -2031,6 +2050,34 @@ mod tests {
         OpaquePut(OpaqueSequenceKind, u8),
         OpaqueEnd(OpaqueSequenceKind),
         DcsUnhook,
+    }
+
+    #[test]
+    fn adjacent_escape_introducers_match_split_state_transitions() {
+        let streams: &[&[u8]] = &[
+            b"text\x1b[1;38;2;120;80;40mcolor\x1b[0m\r\n",
+            b"\x1b[?2027h\x1b[4:3m\x1b[2 q\x1b[m",
+            b"\x1b[65534;65535;65536;999999999999999999999999m",
+            b"\x1b[38:2:65536:999999999999999999:0m",
+            b"\x1b[1;2\x18\x1b[3m\x1b[4\x1b[5m",
+            b"\x1b]8;id=link;https://example.org\x1b\\label\x1b]8;;\x07",
+            b"\x1b]0;title\x07\x1b[31m\x1b]9;4;1;20\x1b\\",
+            b"\x1b[1  q\x1b]0;\x18\x1b[?25h\x1b\x1b[0m",
+        ];
+        for stream in streams {
+            let mut reference = Dispatcher::default();
+            let mut parser = Parser::new();
+            for byte in *stream {
+                parser.advance(&mut reference, &[*byte]);
+            }
+            for split in 0..=stream.len() {
+                let mut actual = Dispatcher::default();
+                let mut parser = Parser::new();
+                parser.advance(&mut actual, &stream[..split]);
+                parser.advance(&mut actual, &stream[split..]);
+                assert_eq!(actual.dispatched, reference.dispatched, "split {split}");
+            }
+        }
     }
 
     impl Perform for Dispatcher {
