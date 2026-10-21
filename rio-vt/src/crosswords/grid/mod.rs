@@ -159,6 +159,10 @@ pub struct ExtrasTable {
     /// new hyperlinks silently drop. (Images no longer live here;
     /// placements own them with deterministic cleanup.)
     allocs_since_reclaim: usize,
+    // Repeated cluster/link payloads can reuse their last slot without
+    // hashing the same URI or combining sequence again. Validate the slot
+    // contents each time because sweeps may recycle its id.
+    last_alloc: u16,
 }
 
 /// One `reclaim_extras` mark-and-sweep per this many allocations. The
@@ -176,6 +180,7 @@ impl ExtrasTable {
             free: Vec::new(),
             lookup: rustc_hash::FxHashMap::default(),
             allocs_since_reclaim: 0,
+            last_alloc: 0,
         }
     }
 
@@ -201,18 +206,51 @@ impl ExtrasTable {
     /// Return the slot holding `extras`, interning by content: repeat
     /// content reuses its existing slot, new content allocates one.
     /// The returned id is always non-zero (0 on slot exhaustion).
+    #[inline]
     pub fn alloc(
         &mut self,
         extras: crate::crosswords::square::Extras,
     ) -> crate::crosswords::square::ExtrasId {
-        if let Some(&id) = self.lookup.get(&extras) {
+        if let Some(id) = self.find(&extras) {
             return id;
         }
+        self.insert(extras)
+    }
+
+    /// Intern a reusable payload, cloning only when its content is new.
+    /// Repeated assignments avoid cloning and dropping hyperlink Arcs or
+    /// combining-character vectors just to discover an existing slot.
+    #[inline]
+    pub fn intern(
+        &mut self,
+        extras: &crate::crosswords::square::Extras,
+    ) -> crate::crosswords::square::ExtrasId {
+        if let Some(id) = self.find(extras) {
+            return id;
+        }
+        self.insert(extras.clone())
+    }
+
+    #[inline]
+    fn find(&mut self, extras: &crate::crosswords::square::Extras) -> Option<u16> {
+        if self.slots[self.last_alloc as usize].as_deref() == Some(extras) {
+            return Some(self.last_alloc);
+        }
+        let id = *self.lookup.get(extras)?;
+        self.last_alloc = id;
+        Some(id)
+    }
+
+    fn insert(
+        &mut self,
+        extras: crate::crosswords::square::Extras,
+    ) -> crate::crosswords::square::ExtrasId {
         self.allocs_since_reclaim += 1;
         let extras = std::sync::Arc::new(extras);
         if let Some(id) = self.free.pop() {
             self.lookup.insert(extras.clone(), id);
             self.slots[id as usize] = Some(extras);
+            self.last_alloc = id;
             return id;
         }
         if self.slots.len() >= u16::MAX as usize {
@@ -222,6 +260,7 @@ impl ExtrasTable {
         let id = self.slots.len() as u16;
         self.lookup.insert(extras.clone(), id);
         self.slots.push(Some(extras));
+        self.last_alloc = id;
         id
     }
 

@@ -6,6 +6,28 @@ use super::*;
 
 use crate::crosswords::square::Square;
 
+#[test]
+fn extras_last_allocation_survives_sweep_and_slot_reuse() {
+    use crate::crosswords::square::Extras;
+    let mut table = ExtrasTable::new();
+    let first = Extras {
+        zerowidth: vec!['\u{301}'],
+        ..Extras::default()
+    };
+    let second = Extras {
+        zerowidth: vec!['\u{308}'],
+        ..Extras::default()
+    };
+    let id = table.alloc(first.clone());
+    assert_eq!(table.intern(&first), id);
+    table.sweep_unmarked(&vec![0; ID_BITSET_WORDS]);
+    assert_eq!(table.intern(&second), id);
+    let other = table.intern(&first);
+    assert_ne!(other, id);
+    assert_eq!(table.get(id), Some(&second));
+    assert_eq!(table.get(other), Some(&first));
+}
+
 impl GridSquare for usize {
     fn is_empty(&self) -> bool {
         *self == 0

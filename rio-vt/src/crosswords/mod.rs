@@ -261,6 +261,8 @@ struct TermDamageState {
 
     /// Information about damage on terminal lines.
     lines: Vec<LineDamage>,
+    /// Bounds of marked lines; len..0 is the empty sentinel.
+    dirty_lines: Range<usize>,
 
     /// Old terminal cursor point.
     last_cursor: Pos,
@@ -278,6 +280,7 @@ impl TermDamageState {
         Self {
             full: true,
             lines,
+            dirty_lines: num_lines..0,
             last_cursor: Default::default(),
             last_vi_cursor_point: Default::default(),
             last_selection: Default::default(),
@@ -293,6 +296,7 @@ impl TermDamageState {
         self.full = true;
 
         self.lines.clear();
+        self.dirty_lines = num_lines..0;
         self.lines.reserve(num_lines);
         for line in 0..num_lines {
             self.lines.push(LineDamage::undamaged(line));
@@ -303,6 +307,8 @@ impl TermDamageState {
     #[inline]
     fn damage_line(&mut self, line: usize) {
         self.lines[line].mark_damaged();
+        self.dirty_lines.start = self.dirty_lines.start.min(line);
+        self.dirty_lines.end = self.dirty_lines.end.max(line + 1);
     }
 
     fn damage_selection(&mut self, selection: SelectionRange, display_offset: usize) {
@@ -326,7 +332,12 @@ impl TermDamageState {
     /// Reset information about terminal damage.
     fn reset(&mut self) {
         self.full = false;
-        self.lines.iter_mut().for_each(|line| line.reset());
+        if !self.dirty_lines.is_empty() {
+            self.lines[self.dirty_lines.clone()]
+                .iter_mut()
+                .for_each(|line| line.reset());
+        }
+        self.dirty_lines = self.lines.len()..0;
     }
 }
 
@@ -627,7 +638,7 @@ impl<U: EventListener> Crosswords<U> {
     pub fn peek_damage_event(&self) -> Option<TerminalDamage> {
         if self.damage.full {
             Some(TerminalDamage::Full)
-        } else if self.damage.lines.iter().any(|line| line.is_damaged()) {
+        } else if !self.damage.dirty_lines.is_empty() {
             Some(TerminalDamage::Partial)
         } else if self.damage.last_cursor != self.grid.cursor.pos {
             Some(TerminalDamage::CursorOnly)
@@ -1197,7 +1208,7 @@ impl<U: EventListener> Crosswords<U> {
         }
 
         // Check if there's any partial damage
-        if self.damage.lines.iter().any(|line| line.is_damaged()) {
+        if !self.damage.dirty_lines.is_empty() {
             return true;
         }
 
@@ -2245,10 +2256,13 @@ impl<U: EventListener> Crosswords<U> {
         // A Noop/CursorOnly frame normally has nothing to copy, but rows
         // written after the damage event was consumed (e.g. a graphics
         // insert racing a redraw) still carry their dirty bit.
-        if !needs_full
-            && matches!(damage, TerminalDamage::Noop | TerminalDamage::CursorOnly)
-            && !(0..count as i32).any(|y| self.grid[Line(start + y)].dirty)
-        {
+        let dirty = if needs_full {
+            0..count
+        } else {
+            self.grid.raw.dirty_line_range(Line(start), count)
+        };
+        if !needs_full && dirty.is_empty() {
+            self.grid.raw.acknowledge_snapshot();
             return false;
         }
 
@@ -2256,8 +2270,9 @@ impl<U: EventListener> Crosswords<U> {
             let cells = if self.grid.styles().len() <= 1 {
                 0
             } else {
-                (start..end)
-                    .map(|line| &self.grid[Line(line)])
+                dirty
+                    .clone()
+                    .map(|y| &self.grid[Line(start + y as i32)])
                     .filter(|row| row.has_styles && (needs_full || row.dirty))
                     .map(|row| row.inner.len())
                     .sum()
@@ -2284,12 +2299,15 @@ impl<U: EventListener> Crosswords<U> {
                     extras.refresh(i, src, &self.grid.extras_table);
                 }
             }
-            return self.grid.raw.take_lines_dirty(Line(start), count);
+            let all_modified = self.grid.raw.take_lines_dirty(Line(start), count);
+            self.grid.raw.acknowledge_snapshot();
+            return all_modified;
         }
 
         extras.begin(count, false);
+        let mut modified = 0;
         #[allow(clippy::needless_range_loop)]
-        for y in 0..count {
+        for y in dirty {
             let row_idx = start + y as i32;
             if !self.grid[Line(row_idx)].dirty {
                 continue;
@@ -2303,8 +2321,11 @@ impl<U: EventListener> Crosswords<U> {
                 self.grid.resolve_row_styles(src, &mut row_styles[y]);
             }
             extras.refresh(y, src, &self.grid.extras_table);
+            self.grid[Line(row_idx)].dirty = false;
+            modified += 1;
         }
-        self.grid.raw.take_lines_dirty(Line(start), count)
+        self.grid.raw.acknowledge_snapshot();
+        modified == count
     }
 
     /// Half-open grid line range currently on screen, as `(start, end)`.
@@ -2543,6 +2564,12 @@ impl<U: EventListener> Crosswords<U> {
 
     pub fn bounds_to_string(&self, start: Pos, end: Pos) -> String {
         let mut text = String::new();
+        self.bounds_to_string_into(start, end, &mut text);
+        text
+    }
+
+    fn bounds_to_string_into(&self, start: Pos, end: Pos, text: &mut String) {
+        text.clear();
         let mut blank_rows: usize = 0;
         let mut blank_cells: usize = 0;
         let last_col = self.grid.last_column();
@@ -2564,9 +2591,9 @@ impl<U: EventListener> Crosswords<U> {
                 blank_cells = 0;
             }
 
-            let mut row_text = String::new();
+            let row_start = text.len();
             let had_content = self.append_cells(
-                &mut row_text,
+                text,
                 line,
                 start_col..end_col,
                 line == end.row,
@@ -2579,12 +2606,10 @@ impl<U: EventListener> Crosswords<U> {
                 continue;
             }
 
-            for _ in 0..blank_rows {
-                text.push('\n');
+            if blank_rows != 0 {
+                text.insert_str(row_start, &"\n".repeat(blank_rows));
             }
             blank_rows = 0;
-
-            text.push_str(&row_text);
 
             let cur_wraps = self.grid[line][last_col].wrapline();
             if end_col >= last_col && !cur_wraps {
@@ -2593,7 +2618,9 @@ impl<U: EventListener> Crosswords<U> {
             }
         }
 
-        text.strip_suffix('\n').map(str::to_owned).unwrap_or(text)
+        if text.ends_with('\n') {
+            text.pop();
+        }
     }
 
     /// Convert a single line in the grid to a String. Used by Block selection;
@@ -2644,8 +2671,50 @@ impl<U: EventListener> Crosswords<U> {
         }
 
         let mut tab_mode = false;
-        for column in (cols.start.0..line_length.0).map(Column::from) {
-            let cell = &grid_line[column];
+        let cells = grid_line
+            .inner
+            .get(cols.start.0..line_length.0)
+            .unwrap_or_default();
+        // Copy ordinary ASCII rows as one UTF-8 span. The general selection
+        // path below still owns tabs, wide spacers and combining characters.
+        // Preserve its deferred trailing spaces across soft-wrapped rows.
+        if !grid_line.has_extras && cells.len() <= 256 {
+            let mut ascii = [0u8; 256];
+            let mut end = 0;
+            let ordinary =
+                cells
+                    .iter()
+                    .zip(&mut ascii)
+                    .enumerate()
+                    .all(|(i, (cell, byte))| {
+                        let c = cell.c();
+                        if c > '\u{7f}' || c == '\t' || cell.wide() != Wide::Narrow {
+                            return false;
+                        }
+                        *byte = if c == '\0' { b' ' } else { c as u8 };
+                        if *byte != b' ' {
+                            end = i + 1;
+                        }
+                        true
+                    });
+            if ordinary {
+                if end != 0 {
+                    for _ in 0..*blank_cells {
+                        text.push(' ');
+                    }
+                    // SAFETY: every stored byte is ASCII.
+                    text.push_str(unsafe {
+                        std::str::from_utf8_unchecked(&ascii[..end])
+                    });
+                    *blank_cells = cells.len() - end;
+                    return true;
+                }
+                *blank_cells += cells.len();
+                return false;
+            }
+        }
+        for (offset, cell) in cells.iter().enumerate() {
+            let column = Column(cols.start.0 + offset);
 
             // Skip over cells until next tab-stop once a tab was found.
             if tab_mode {
@@ -3816,6 +3885,11 @@ impl<U: EventListener> Handler for Crosswords<U> {
             let width = match crate::codepoint_width::width_in(table, cp) {
                 Some(w) => w,
                 None => {
+                    // Preserve scalar replacement for non-scalars passed
+                    // through the public codepoint API in cluster mode.
+                    if clustering && char::from_u32(cp).is_none() {
+                        self.input('\u{fffd}');
+                    }
                     i += 1;
                     continue;
                 }
@@ -9259,7 +9333,7 @@ mod tests {
         use crate::performer::handler::Handler;
         let alphabet = [
             0x61, 0xa9, 0xe9, 0x301, 0x600, 0xd4e, 0x110bd, 0x4e00, 0x20000, 0x10ffff,
-            0x200d, 0xfe0f, 0xfe0e, 0x1f469, 0x1f33e, 0x1f1e7, 0x1f1f7,
+            0x200d, 0xfe0f, 0xfe0e, 0x1f469, 0x1f33e, 0x1f1e7, 0x1f1f7, 0xd800, 0x110000,
         ];
         let mut seed = 42u64;
         let mut codepoints = vec![0xd4e, 0x20000, 0x20001, 0x61, 0x301, 0xe9, 0x62];
@@ -9272,7 +9346,7 @@ mod tests {
                 let mut scalar = term_2027(cols, 3);
                 let mut bulk = term_2027(cols, 3);
                 for &cp in &codepoints {
-                    scalar.input(char::from_u32(cp).unwrap());
+                    scalar.input(char::from_u32(cp).unwrap_or('\u{fffd}'));
                 }
                 for run in codepoints.chunks(chunk) {
                     bulk.input_codepoints(run);
@@ -9289,6 +9363,7 @@ mod tests {
                             (b.c(), b.wide()),
                             "cols={cols} chunk={chunk} cell={line},{col}"
                         );
+                        assert_eq!(a.cell_flags(), b.cell_flags());
                         assert_eq!(
                             extras_of(&bulk, line, col),
                             extras_of(&scalar, line, col)

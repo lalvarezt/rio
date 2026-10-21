@@ -60,6 +60,10 @@ pub struct Storage<T> {
     /// neither path allocates rows. Bounded by `MAX_CACHE_SIZE` so it cannot
     /// grow without bound.
     free: Vec<Row<T>>,
+    /// Any row or ring mutation since the last completed viewport snapshot.
+    /// Conservative: history-only writes also set it. Every mutable row
+    /// access sets it before the reference escapes, including raw edits.
+    modified: bool,
 }
 
 impl<T: PartialEq> PartialEq for Storage<T> {
@@ -88,6 +92,7 @@ impl<T> Storage<T> {
             visible_lines,
             len: visible_lines,
             free: Vec::new(),
+            modified: true,
         }
     }
 
@@ -97,6 +102,7 @@ impl<T> Storage<T> {
     where
         T: Clone + Default,
     {
+        self.modified = true;
         // Number of lines the buffer needs to grow.
         let growage = next - self.visible_lines;
 
@@ -121,6 +127,7 @@ impl<T> Storage<T> {
     /// Decrease the number of lines in the buffer.
     #[inline]
     pub fn shrink_visible_lines(&mut self, next: usize) {
+        self.modified = true;
         // Shrink the size without removing any lines.
         let shrinkage = self.visible_lines - next;
         self.shrink_lines(shrinkage);
@@ -132,6 +139,7 @@ impl<T> Storage<T> {
     /// Shrink the number of lines in the buffer.
     #[inline]
     pub fn shrink_lines(&mut self, shrinkage: usize) {
+        self.modified = true;
         self.len -= shrinkage;
 
         // Free memory.
@@ -169,6 +177,7 @@ impl<T> Storage<T> {
     where
         T: Clone + Default,
     {
+        self.modified = true;
         if self.len + additional_rows > self.inner.len() {
             self.rezero();
 
@@ -225,6 +234,7 @@ impl<T> Storage<T> {
     /// instead of paying `compute_index` per line.
     #[inline]
     pub fn mark_lines_dirty(&mut self, start: Line, count: usize) {
+        self.modified = true;
         if count == 0 {
             return;
         }
@@ -234,6 +244,38 @@ impl<T> Storage<T> {
             self.inner[idx].dirty = true;
             idx = if idx == 0 { len - 1 } else { idx - 1 };
         }
+    }
+
+    /// Bound the dirty rows of a viewport while walking the ring once.
+    /// Resolving each logical row separately adds a modulo per clean row.
+    #[inline]
+    pub(crate) fn dirty_line_range(
+        &self,
+        start: Line,
+        count: usize,
+    ) -> std::ops::Range<usize> {
+        if count == 0 || !self.modified {
+            return 0..0;
+        }
+        let idx = self.compute_index(start);
+        let len = self.inner.len();
+        let head = count.min(idx + 1);
+        let rows = self.inner[idx + 1 - head..=idx]
+            .iter()
+            .rev()
+            .chain(self.inner[len - (count - head)..].iter().rev());
+        let Some(first) = rows.clone().position(|row| row.dirty) else {
+            return 0..0;
+        };
+        let trailing = rows.rev().position(|row| row.dirty).unwrap();
+        first..count - trailing
+    }
+
+    /// Only the snapshot consumer may acknowledge mutations. Row dirty bits
+    /// still decide what to copy after the next mutation, or a full redraw.
+    #[inline]
+    pub(crate) fn acknowledge_snapshot(&mut self) {
+        self.modified = false;
     }
 
     /// Clear a span's dirty bits and report whether every bit was set. Resolve
@@ -268,6 +310,7 @@ impl<T> Storage<T> {
     where
         T: Clone + Default,
     {
+        self.modified = true;
         for row in &mut self.inner {
             row.grow(columns);
         }
@@ -281,6 +324,7 @@ impl<T> Storage<T> {
     where
         T: Clone + Default,
     {
+        self.modified = true;
         for row in &mut self.inner {
             row.truncate_columns(columns);
         }
@@ -296,6 +340,7 @@ impl<T> Storage<T> {
     /// The hand-rolled qword loop has to copy that many slots — bumping
     /// the field count requires bumping the loop bound below.
     pub fn swap(&mut self, a: Line, b: Line) {
+        self.modified = true;
         debug_assert_eq!(mem::size_of::<Row<T>>(), mem::size_of::<usize>() * 5);
 
         let a = self.compute_index(a);
@@ -323,6 +368,7 @@ impl<T> Storage<T> {
     /// Rotate the grid, moving all lines up/down in history.
     #[inline]
     pub fn rotate(&mut self, count: isize) {
+        self.modified = true;
         debug_assert!(count.unsigned_abs() <= self.inner.len());
 
         let len = self.inner.len();
@@ -336,12 +382,14 @@ impl<T> Storage<T> {
     /// [`rotate_left`]: https://doc.rust-lang.org/std/vec/struct.Vec.html#method.rotate_left
     #[inline]
     pub fn rotate_down(&mut self, count: usize) {
+        self.modified = true;
         self.zero = (self.zero + count) % self.inner.len();
     }
 
     /// Update the raw storage buffer.
     #[inline]
     pub fn replace_inner(&mut self, vec: Vec<Row<T>>) {
+        self.modified = true;
         self.len = vec.len();
         self.inner = vec;
         self.zero = 0;
@@ -350,6 +398,7 @@ impl<T> Storage<T> {
     /// Remove all rows from storage.
     #[inline]
     pub fn take_all(&mut self) -> Vec<Row<T>> {
+        self.modified = true;
         self.truncate();
 
         let mut buffer = Vec::new();
@@ -407,6 +456,7 @@ impl<T> Index<Line> for Storage<T> {
 impl<T> IndexMut<Line> for Storage<T> {
     #[inline]
     fn index_mut(&mut self, index: Line) -> &mut Self::Output {
+        self.modified = true;
         let index = self.compute_index(index);
         &mut self.inner[index]
     }
@@ -442,6 +492,21 @@ mod tests {
             storage.mark_lines_dirty(Line(1), 2);
             assert!(storage.take_lines_dirty(Line(1), 2));
             assert!(storage.take_lines_dirty(Line(0), 0));
+        }
+    }
+
+    #[test]
+    fn raw_mutation_invalidates_clean_snapshot_across_ring_wraps() {
+        let mut storage = Storage::<char>::with_capacity(3, 1);
+        for _ in 0..3 {
+            storage.rotate(1);
+            storage.take_lines_dirty(Line(0), 3);
+            storage.acknowledge_snapshot();
+            assert!(storage.dirty_line_range(Line(0), 3).is_empty());
+            storage[Line(1)][Column(0)] = 'x';
+            assert_eq!(storage.dirty_line_range(Line(0), 3), 1..2);
+            storage.mark_lines_dirty(Line(0), 1);
+            assert_eq!(storage.dirty_line_range(Line(0), 3), 0..2);
         }
     }
 
@@ -501,6 +566,7 @@ mod tests {
             visible_lines: 3,
             len: 3,
             free: Vec::new(),
+            modified: true,
         };
 
         // Grow buffer.
@@ -513,6 +579,7 @@ mod tests {
             visible_lines: 4,
             len: 4,
             free: Vec::new(),
+            modified: true,
         };
         // Resize grows by exactly one line now (no scrollback over-alloc).
         expected.inner.push(filled_row('\0'));
@@ -545,6 +612,7 @@ mod tests {
             visible_lines: 3,
             len: 3,
             free: Vec::new(),
+            modified: true,
         };
 
         // Grow buffer.
@@ -557,6 +625,7 @@ mod tests {
             visible_lines: 4,
             len: 4,
             free: Vec::new(),
+            modified: true,
         };
         // Resize grows by exactly one line now (no scrollback over-alloc).
         expected.inner.push(filled_row('\0'));
@@ -586,6 +655,7 @@ mod tests {
             visible_lines: 3,
             len: 3,
             free: Vec::new(),
+            modified: true,
         };
 
         // Shrink buffer.
@@ -598,6 +668,7 @@ mod tests {
             visible_lines: 2,
             len: 2,
             free: Vec::new(),
+            modified: true,
         };
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -624,6 +695,7 @@ mod tests {
             visible_lines: 3,
             len: 3,
             free: Vec::new(),
+            modified: true,
         };
 
         // Shrink buffer.
@@ -636,6 +708,7 @@ mod tests {
             visible_lines: 2,
             len: 2,
             free: Vec::new(),
+            modified: true,
         };
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -675,6 +748,7 @@ mod tests {
             visible_lines: 6,
             len: 6,
             free: Vec::new(),
+            modified: true,
         };
 
         // Shrink buffer.
@@ -694,6 +768,7 @@ mod tests {
             visible_lines: 2,
             len: 2,
             free: Vec::new(),
+            modified: true,
         };
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -729,6 +804,7 @@ mod tests {
             visible_lines: 1,
             len: 2,
             free: Vec::new(),
+            modified: true,
         };
 
         // Truncate buffer.
@@ -741,6 +817,7 @@ mod tests {
             visible_lines: 1,
             len: 2,
             free: Vec::new(),
+            modified: true,
         };
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -766,6 +843,7 @@ mod tests {
             visible_lines: 1,
             len: 2,
             free: Vec::new(),
+            modified: true,
         };
 
         // Truncate buffer.
@@ -778,6 +856,7 @@ mod tests {
             visible_lines: 1,
             len: 2,
             free: Vec::new(),
+            modified: true,
         };
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -825,6 +904,7 @@ mod tests {
             visible_lines: 0,
             len: 6,
             free: Vec::new(),
+            modified: true,
         };
 
         // Shrink buffer.
@@ -844,6 +924,7 @@ mod tests {
             visible_lines: 0,
             len: 3,
             free: Vec::new(),
+            modified: true,
         };
         assert_eq!(storage.inner, shrinking_expected.inner);
         assert_eq!(storage.zero, shrinking_expected.zero);
@@ -866,6 +947,7 @@ mod tests {
             visible_lines: 0,
             len: 4,
             free: Vec::new(),
+            modified: true,
         };
 
         assert_eq!(storage.inner, growing_expected.inner);
@@ -889,6 +971,7 @@ mod tests {
             visible_lines: 0,
             len: 6,
             free: Vec::new(),
+            modified: true,
         };
 
         // Initialize additional lines.
@@ -912,6 +995,7 @@ mod tests {
             visible_lines: 0,
             len: 9,
             free: Vec::new(),
+            modified: true,
         };
 
         assert_eq!(storage.len, expected_storage.len);
@@ -937,6 +1021,7 @@ mod tests {
             visible_lines: 25,
             len: 6,
             free: Vec::new(),
+            modified: true,
         };
 
         // Initialize additional lines.
@@ -958,6 +1043,7 @@ mod tests {
             visible_lines: 25,
             len: 11,
             free: Vec::new(),
+            modified: true,
         };
 
         assert_eq!(storage.len, expected_storage.len);
@@ -973,6 +1059,7 @@ mod tests {
             visible_lines: 0,
             len: 3,
             free: Vec::new(),
+            modified: true,
         };
 
         storage.rotate(2);

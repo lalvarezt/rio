@@ -55,9 +55,18 @@ impl FormatOptions {
 impl<U: EventListener> Crosswords<U> {
     /// Serialize the visible screen using `opts`.
     pub fn format(&self, opts: FormatOptions) -> String {
+        let mut out = String::new();
+        self.format_into(opts, &mut out);
+        out
+    }
+
+    /// Serialize into a reusable buffer, replacing its previous contents.
+    /// Repeated snapshots keep their output allocation between calls.
+    pub fn format_into(&self, opts: FormatOptions, out: &mut String) {
+        out.clear();
         match opts.emit {
-            Emit::Plain => self.format_plain(),
-            Emit::Vt => self.format_vt(opts),
+            Emit::Plain => self.format_plain(out),
+            Emit::Vt => self.format_vt(opts, out),
         }
     }
 
@@ -67,26 +76,26 @@ impl<U: EventListener> Crosswords<U> {
         self.format(FormatOptions::vt()).into_bytes()
     }
 
-    fn format_plain(&self) -> String {
+    fn format_plain(&self, out: &mut String) {
         let rows = self.screen_lines();
         let cols = self.columns();
         if rows == 0 || cols == 0 {
-            return String::new();
+            return;
         }
         let start = crate::crosswords::pos::Pos::new(Line(0), Column(0));
         let end =
             crate::crosswords::pos::Pos::new(Line(rows as i32 - 1), Column(cols - 1));
-        self.bounds_to_string(start, end)
+        self.bounds_to_string_into(start, end, out)
     }
 
-    fn format_vt(&self, opts: FormatOptions) -> String {
+    fn format_vt(&self, opts: FormatOptions, out: &mut String) {
         let rows = self.screen_lines();
         let cols = self.columns();
         if rows == 0 || cols == 0 {
-            return String::new();
+            return;
         }
 
-        let mut out = String::new();
+        out.reserve(rows.saturating_mul(cols));
         // Reset, clear, home so the snapshot renders on a fresh client.
         out.push_str("\x1b[0m\x1b[2J\x1b[H");
         // The style currently in effect on the client. Starts as the default
@@ -104,9 +113,25 @@ impl<U: EventListener> Crosswords<U> {
         };
         let Some(last_row) = last_row else {
             // Blank screen; still restore the cursor.
-            self.push_cursor(&mut out);
-            return out;
+            self.push_cursor(out);
+            return;
         };
+
+        // A small palette repeats the same escape sequences across many
+        // rows. Encode it once per snapshot, without retaining recyclable
+        // style ids across calls. Large palettes keep the direct emitter.
+        let palette = self.grid.styles();
+        let mut sgr = String::new();
+        let mut offsets = [0; 33];
+        let mut cached_styles = 0;
+        if palette.len() > 1 && palette.len() <= 32 && rows.saturating_mul(cols) >= 256 {
+            sgr.reserve(palette.len() * 48);
+            for (i, style) in palette.iter().enumerate() {
+                write_sgr(&mut sgr, style);
+                offsets[i + 1] = sgr.len();
+            }
+            cached_styles = palette.len();
+        }
 
         for line in 0..=last_row {
             let last_col = self.row_last_content_col(line, cols, opts.trim);
@@ -122,7 +147,15 @@ impl<U: EventListener> Crosswords<U> {
                 }
                 let style = self.grid.style_of(square);
                 if style != current {
-                    write_sgr(&mut out, &style);
+                    let cached = square
+                        .style_id_checked()
+                        .map(|id| id as usize)
+                        .filter(|&id| id < cached_styles);
+                    if let Some(id) = cached {
+                        out.push_str(&sgr[offsets[id]..offsets[id + 1]]);
+                    } else {
+                        write_sgr(out, &style);
+                    }
                     current = style;
                 }
                 let c = square.c();
@@ -135,8 +168,7 @@ impl<U: EventListener> Crosswords<U> {
         }
 
         out.push_str("\x1b[0m");
-        self.push_cursor(&mut out);
-        out
+        self.push_cursor(out);
     }
 
     fn push_cursor(&self, out: &mut String) {
@@ -228,21 +260,49 @@ pub fn write_sgr(out: &mut String, style: &Style) {
     if let Some(underline) = style.underline_color {
         match underline {
             AnsiColor::Indexed(i) => {
-                let _ = write!(out, "\x1b[58;5;{i}m");
+                out.push_str("\x1b[58;5;");
+                push_byte(out, i);
+                out.push('m');
             }
             AnsiColor::Spec(rgb) => {
-                let _ = write!(out, "\x1b[58;2;{};{};{}m", rgb.r, rgb.g, rgb.b);
+                out.push_str("\x1b[58;2;");
+                push_rgb(out, rgb.r, rgb.g, rgb.b);
+                out.push('m');
             }
             AnsiColor::Named(n) => {
                 // Specials (Foreground = 256 and up) have no palette
                 // index; SGR 58 cannot express them, so leave the reset's
                 // unset underline color rather than emit an invalid index.
                 if let Ok(idx) = u8::try_from(n as u16) {
-                    let _ = write!(out, "\x1b[58;5;{idx}m");
+                    out.push_str("\x1b[58;5;");
+                    push_byte(out, idx);
+                    out.push('m');
                 }
             }
         }
     }
+}
+
+// SGR colors are bounded bytes. Avoid general-purpose formatting machinery
+// for each RGB component and palette index in a styled screen snapshot.
+#[inline]
+fn push_byte(out: &mut String, n: u8) {
+    if n >= 100 {
+        out.push((b'0' + n / 100) as char);
+        out.push((b'0' + (n / 10) % 10) as char);
+    } else if n >= 10 {
+        out.push((b'0' + n / 10) as char);
+    }
+    out.push((b'0' + n % 10) as char);
+}
+
+#[inline]
+fn push_rgb(out: &mut String, r: u8, g: u8, b: u8) {
+    push_byte(out, r);
+    out.push(';');
+    push_byte(out, g);
+    out.push(';');
+    push_byte(out, b);
 }
 
 fn push_color(params: &mut String, color: AnsiColor, fg: bool) {
@@ -251,21 +311,23 @@ fn push_color(params: &mut String, color: AnsiColor, fg: bool) {
             let n = named as u16;
             if n <= 7 {
                 let base = if fg { 30 } else { 40 };
-                let _ = write!(params, ";{}", base + n);
+                params.push(';');
+                push_byte(params, (base + n) as u8);
             } else if n <= 15 {
                 let base = if fg { 90 } else { 100 };
-                let _ = write!(params, ";{}", base + (n - 8));
+                params.push(';');
+                push_byte(params, (base + (n - 8)) as u8);
             }
             // Named default fg/bg (256/257) and specials: covered by the
             // leading `0` reset, so emit nothing.
         }
         AnsiColor::Indexed(i) => {
-            let intro = if fg { "38" } else { "48" };
-            let _ = write!(params, ";{intro};5;{i}");
+            params.push_str(if fg { ";38;5;" } else { ";48;5;" });
+            push_byte(params, i);
         }
         AnsiColor::Spec(rgb) => {
-            let intro = if fg { "38" } else { "48" };
-            let _ = write!(params, ";{intro};2;{};{};{}", rgb.r, rgb.g, rgb.b);
+            params.push_str(if fg { ";38;2;" } else { ";48;2;" });
+            push_rgb(params, rgb.r, rgb.g, rgb.b);
         }
     }
 }
@@ -296,8 +358,70 @@ mod tests {
     }
 
     #[test]
+    fn reusable_plain_output_keeps_wraps_and_blank_rows_and_replaces_old_contents() {
+        let mut t = term(6, 4);
+        let mut output = String::from("stale snapshot");
+        feed(&mut t, b"abcdefghi\r\n\r\nz");
+        t.format_into(FormatOptions::plain(), &mut output);
+        assert_eq!(output, "abcdefghi\n\nz");
+        feed(&mut t, b"\x1b[2J\x1b[Hx");
+        t.format_into(FormatOptions::plain(), &mut output);
+        assert_eq!(output, "x");
+        feed(&mut t, b"\x1b[2J\x1b[H");
+        t.format_into(FormatOptions::plain(), &mut output);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn ascii_selection_matches_general_path_across_wraps_and_partial_rows() {
+        for cols in [1, 3, 120, 256, 257] {
+            for text in ["ab  cd ef\r\n\r\nxyz ", "\tword\r\n漢e\u{301} x"] {
+                let mut fast = term(cols, 4);
+                let mut general = term(cols, 4);
+                feed(&mut fast, text.as_bytes());
+                feed(&mut general, text.as_bytes());
+                for line in 0..4 {
+                    // A conservative extras hint selects the general path
+                    // without changing any selected cells or their contents.
+                    general.grid[Line(line)].has_extras = true;
+                }
+                for start in [0, cols / 2, cols - 1] {
+                    for end in [start, cols - 1] {
+                        let a = crate::crosswords::pos::Pos::new(Line(0), Column(start));
+                        let b = crate::crosswords::pos::Pos::new(Line(3), Column(end));
+                        assert_eq!(
+                            fast.bounds_to_string(a, b),
+                            general.bounds_to_string(a, b)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sgr_byte_boundaries_roundtrip() {
+        use crate::config::colors::ColorRgb;
+        for n in [0, 9, 10, 99, 100, 199, 255] {
+            let style = Style {
+                fg: AnsiColor::Spec(ColorRgb { r: n, g: n, b: n }),
+                bg: AnsiColor::Indexed(n),
+                underline_color: Some(AnsiColor::Indexed(n)),
+                ..Style::default()
+            };
+            let mut out = String::new();
+            write_sgr(&mut out, &style);
+            out.push('x');
+            let mut t = term(6, 2);
+            feed(&mut t, out.as_bytes());
+            assert_eq!(t.grid.style_of(&t.grid[Line(0)][Column(0)]), style);
+        }
+    }
+
+    #[test]
     fn vt_roundtrip_preserves_text_and_style() {
-        let mut a = term(20, 4);
+        // Large enough to exercise the bounded per-snapshot SGR cache.
+        let mut a = term(80, 4);
         // rapid-blink red "hello", default space, bold-blink-blue "world",
         // then a red-undercurled "curl" on the next line.
         feed(
@@ -313,7 +437,7 @@ mod tests {
         assert!(text.contains("34"), "missing blue fg: {text:?}");
 
         // Re-parse into a fresh screen; the plain content must match.
-        let mut b = term(20, 4);
+        let mut b = term(80, 4);
         feed(&mut b, &snapshot);
         assert_eq!(
             a.format(FormatOptions::plain()),
