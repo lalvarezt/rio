@@ -82,46 +82,14 @@ pub fn validate(bytes: &[u8]) -> Result<&str, Utf8Error> {
 /// `None` for an unfinished sequence at end-of-input.
 #[cfg(not(target_arch = "wasm32"))]
 fn compute_error_len(bytes: &[u8], valid_up_to: usize) -> Option<usize> {
-    if valid_up_to >= bytes.len() {
-        return None;
-    }
-    let lead = bytes[valid_up_to];
-
-    // Determine the expected sequence length from the lead byte.
-    let expected_len = match lead {
-        0x00..=0x7F => return Some(1), // unreachable in practice
-        0x80..=0xBF => return Some(1), // unexpected continuation
-        0xC0..=0xC1 => return Some(1), // overlong 2-byte lead
-        0xC2..=0xDF => 2,
-        0xE0..=0xEF => 3,
-        0xF0..=0xF4 => 4,
-        0xF5..=0xFF => return Some(1), // out-of-range lead
-    };
-
-    let remaining = bytes.len() - valid_up_to;
-    if remaining < expected_len {
-        // Either truncated (None) or invalid continuation in the partial bytes.
-        let mut i = 1;
-        while i < remaining {
-            if bytes[valid_up_to + i] & 0xC0 != 0x80 {
-                return Some(i);
-            }
-            i += 1;
-        }
-        return None;
-    }
-
-    // Find the first non-continuation byte in the expected range.
-    let mut i = 1;
-    while i < expected_len {
-        if bytes[valid_up_to + i] & 0xC0 != 0x80 {
-            return Some(i);
-        }
-        i += 1;
-    }
-    // All continuation bytes look right but `simdutf` flagged the sequence —
-    // overlong, surrogate, or out-of-range codepoint.
-    Some(expected_len)
+    // SIMD identifies the first invalid sequence. Inspect at most one scalar
+    // to recover std's maximal-subpart error length, including E0/ED/F0/F4
+    // second-byte bounds. Merely counting continuation bytes can buffer an
+    // already-invalid prefix or swallow C1 controls across PTY read boundaries.
+    let suffix = bytes.get(valid_up_to..)?;
+    std::str::from_utf8(&suffix[..suffix.len().min(4)])
+        .err()
+        .and_then(|err| err.error_len())
 }
 
 /// Compatibility shim — same as [`validate`].
@@ -153,6 +121,34 @@ pub fn from_utf8_lossy_fast(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validation_errors_match_std_at_utf8_range_boundaries() {
+        // Invalid second-byte ranges must be rejected even before a complete
+        // sequence arrives. They are not valid prefixes to buffer for later.
+        for lead in 0_u8..=255 {
+            for second in 0_u8..=255 {
+                let bytes = [lead, second, 0x80, 0x80];
+                for len in 1..=bytes.len() {
+                    let input = &bytes[..len];
+                    let expected = std::str::from_utf8(input);
+                    let actual = validate(input);
+                    assert_eq!(
+                        actual.as_ref().ok(),
+                        expected.as_ref().ok(),
+                        "{input:02x?}"
+                    );
+                    if let (Err(actual), Err(expected)) = (actual, expected) {
+                        assert_eq!(
+                            (actual.valid_up_to(), actual.error_len()),
+                            (expected.valid_up_to(), expected.error_len()),
+                            "{input:02x?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_valid_utf8() {
@@ -207,11 +203,11 @@ mod tests {
 
     #[test]
     fn complete_invalid_sequence_returns_some_len() {
-        // Surrogate codepoint encoded in UTF-8 (3 bytes) — valid bytes,
-        // invalid Unicode value.
+        // The surrogate range is invalid at its second byte, so the lead
+        // alone is the maximal subpart, matching std's error contract.
         let bytes = b"\xED\xA0\x80"; // U+D800, surrogate
         let err = validate(bytes).unwrap_err();
         assert_eq!(err.valid_up_to(), 0);
-        assert_eq!(err.error_len(), Some(3));
+        assert_eq!(err.error_len(), Some(1));
     }
 }

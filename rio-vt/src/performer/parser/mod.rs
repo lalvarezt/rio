@@ -1657,6 +1657,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn malformed_utf8_dispatch_does_not_depend_on_read_boundaries() {
+        for invalid in [
+            b"\xed\xa0\x80".as_slice(),
+            b"\xe0\x80\x80",
+            b"\xf0\x80\x80\x80",
+            b"\xf4\x90\x80\x80",
+            b"\xe2(\xa1",
+            b"\xc0\xaf",
+        ] {
+            let input =
+                [b"prefix ".as_slice(), invalid, b" suffix\x1b[31mred\x1b[0m"].concat();
+            let mut expected = Dispatcher::default();
+            Parser::default().advance(&mut expected, &input);
+            for chunk_size in 1..=input.len() {
+                let mut actual = Dispatcher::default();
+                let mut parser = Parser::default();
+                for chunk in input.chunks(chunk_size) {
+                    parser.advance(&mut actual, chunk);
+                }
+                assert_eq!(
+                    actual.dispatched, expected.dispatched,
+                    "{invalid:02x?}, chunk {chunk_size}"
+                );
+            }
+        }
+    }
+
     const OSC_BYTES: &[u8] = &[
         0x1B, 0x5D, // Begin OSC
         b'2', b';', b'j', b'w', b'i', b'l', b'm', b'@', b'j', b'w', b'i', b'l', b'm',
