@@ -298,8 +298,13 @@ impl<T> Row<T> {
         self.inner.extend_from_slice(&src.inner[..count]);
         self.occ += count;
         self.dirty = true;
-        self.has_extras = true;
-        self.has_styles |= src.inner[..count].iter().any(GridSquare::carries_style);
+        // Reflow moves cells between rows, so their conservative hints must
+        // follow them too. A false source hint also avoids scanning plain rows.
+        self.has_extras |= src.has_extras;
+        self.kitty_virtual_placeholder |= src.kitty_virtual_placeholder;
+        if !self.has_styles && src.has_styles {
+            self.has_styles = src.inner[..count].iter().any(GridSquare::carries_style);
+        }
 
         src.inner.drain(..count);
         src.occ = src.occ.saturating_sub(count);

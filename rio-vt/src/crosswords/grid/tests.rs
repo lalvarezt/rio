@@ -529,6 +529,19 @@ fn extras_reclaim_keeps_ids_of_hidden_cached_rows() {
 }
 
 #[test]
+fn reflow_append_preserves_placeholder_hint() {
+    let mut destination: Row<Square> = Row::new(2);
+    let mut source: Row<Square> = Row::new(2);
+    source.inner[0] = Square::from_char('\u{10eeee}');
+    source.kitty_virtual_placeholder = true;
+
+    destination.append_front_of(&mut source, 1);
+
+    assert_eq!(destination.inner[2].c(), '\u{10eeee}');
+    assert!(destination.kitty_virtual_placeholder);
+}
+
+#[test]
 fn row_hint_follows_erased_background() {
     use crate::config::colors::{AnsiColor, NamedColor};
     use crate::crosswords::style::Style;
