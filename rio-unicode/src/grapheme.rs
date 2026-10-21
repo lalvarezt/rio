@@ -153,17 +153,33 @@ static CLASS_TABLE: ClassTable = {
     table
 };
 
+// One load classifies ASCII controls and Latin-1 alike. Keep this derived
+// from the same ranges as the paged table, rather than branching per class
+// or making a dependent page lookup for these common codepoints.
+static LATIN1_CLASSES: [GraphemeClass; 256] = {
+    let mut classes = [GraphemeClass::Other; 256];
+    let mut range = 0;
+    while range < GRAPHEME_CLASS_RANGES.len() {
+        let (lo, hi, class) = GRAPHEME_CLASS_RANGES[range];
+        if lo > 255 {
+            break;
+        }
+        let mut cp = lo;
+        while cp <= hi && cp <= 255 {
+            classes[cp as usize] = class;
+            cp += 1;
+        }
+        range += 1;
+    }
+    classes
+};
+
 /// Class lookup through two compact tables covering every Unicode plane.
 #[inline]
 pub fn grapheme_class(c: char) -> GraphemeClass {
     let cp = c as u32;
-    if cp < 0x7f {
-        return match cp {
-            0x0a => GraphemeClass::LF,
-            0x0d => GraphemeClass::CR,
-            0..=0x1f => GraphemeClass::Control,
-            _ => GraphemeClass::Other,
-        };
+    if cp < 256 {
+        return LATIN1_CLASSES[cp as usize];
     }
     let block = CLASS_TABLE.pages[(cp >> 8) as usize] as usize;
     CLASS_TABLE.blocks[block][(cp & 255) as usize]
