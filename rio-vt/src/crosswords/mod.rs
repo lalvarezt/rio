@@ -1891,9 +1891,7 @@ impl<U: EventListener> Crosswords<U> {
                 let line = self.grid.cursor.pos.row;
                 let row = &mut self.grid[line];
                 let cells = &mut row[Column(cursor_col)..Column(cursor_col + take)];
-                let needs_cleanup = cells
-                    .iter()
-                    .fold(false, |acc, c| acc | c.needs_wide_cleanup());
+                let needs_cleanup = Square::any_needs_wide_cleanup(cells);
                 if !needs_cleanup {
                     for (cell, &cp) in cells.iter_mut().zip(&cps[idx..idx + take]) {
                         let c = char::from_u32(cp).unwrap_or('\u{FFFD}');
@@ -1967,9 +1965,7 @@ impl<U: EventListener> Crosswords<U> {
                 let line = self.grid.cursor.pos.row;
                 let row = &mut self.grid[line];
                 let cells = &mut row[Column(cursor_col)..Column(cursor_col + take * 2)];
-                let needs_cleanup = cells
-                    .iter()
-                    .fold(false, |acc, c| acc | c.needs_wide_cleanup());
+                let needs_cleanup = Square::any_needs_wide_cleanup(cells);
                 if !needs_cleanup {
                     for (pair, &cp) in
                         cells.chunks_exact_mut(2).zip(&cps[idx..idx + take])
@@ -4077,10 +4073,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
                 let line = self.grid.cursor.pos.row;
                 let row = &mut self.grid[line];
                 let cells = &mut row[Column(cursor_col)..Column(cursor_col + take)];
-                // Branchless fold; an early-exit any() does not vectorize.
-                let needs_cleanup = cells
-                    .iter()
-                    .fold(false, |acc, c| acc | c.needs_wide_cleanup());
+                let needs_cleanup = Square::any_needs_wide_cleanup(cells);
                 if !needs_cleanup {
                     let src = &bytes[idx..idx + take];
                     for (cell, &b) in cells.iter_mut().zip(src) {

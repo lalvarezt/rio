@@ -294,6 +294,18 @@ impl Square {
         matches!(self.wide(), Wide::Wide | Wide::Spacer)
     }
 
+    /// Whether any cell in a print span needs wide-character neighbour cleanup.
+    #[inline]
+    pub(crate) fn any_needs_wide_cleanup(cells: &[Self]) -> bool {
+        // Wide (01) and Spacer (10) have unequal wide bits; Narrow (00)
+        // and LeadingSpacer (11) do not. Reduce those bits before converting
+        // to bool, avoiding per-cell comparisons and lane shuffles in SIMD.
+        let bits = cells
+            .iter()
+            .fold(0, |bits, cell| bits | (cell.0 ^ (cell.0 >> 1)));
+        bits & (1 << WIDE_SHIFT) != 0
+    }
+
     #[inline]
     pub fn wide(self) -> Wide {
         Wide::from_bits(self.0)
@@ -650,6 +662,38 @@ mod tests {
 
     use crate::crosswords::grid::row::Row;
     use crate::crosswords::pos::Column;
+
+    #[test]
+    fn bulk_wide_cleanup_matches_individual_cells() {
+        assert!(!Square::any_needs_wide_cleanup(&[]));
+        for payload in [0, !WIDE_MASK, 0x1234_5678_9abc_def0 & !WIDE_MASK] {
+            for pattern in 0..256u64 {
+                let cells: Vec<_> = (0..4)
+                    .map(|i| Square(payload | (((pattern >> (i * 2)) & 3) << WIDE_SHIFT)))
+                    .collect();
+                assert_eq!(
+                    Square::any_needs_wide_cleanup(&cells),
+                    cells.iter().any(|cell| cell.needs_wide_cleanup()),
+                    "payload {payload:x}, pattern {pattern:x}"
+                );
+            }
+        }
+        for len in 1..=65 {
+            let mut cells = vec![Square::default(); len];
+            for position in 0..len {
+                for wide in [Wide::Narrow, Wide::Wide, Wide::Spacer, Wide::LeadingSpacer]
+                {
+                    cells[position].set_wide(wide);
+                    assert_eq!(
+                        Square::any_needs_wide_cleanup(&cells),
+                        cells.iter().any(|cell| cell.needs_wide_cleanup()),
+                        "length {len}, position {position}, wide {wide:?}"
+                    );
+                }
+                cells[position] = Square::default();
+            }
+        }
+    }
 
     #[test]
     fn line_length_ignores_bg_only_cells_regardless_of_color() {
