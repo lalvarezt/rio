@@ -361,10 +361,7 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
     pub fn scroll_down(&mut self, region: &Range<Line>, positions: usize) {
         // When rotating the entire region, just reset everything.
         if region.end - region.start <= positions {
-            for i in (region.start.0..region.end.0).map(Line::from) {
-                self.raw[i].reset(&self.cursor.template, &mut self.style_set);
-            }
-
+            self.reset_rows(region.clone());
             return;
         }
 
@@ -390,9 +387,7 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
             self.raw.rotate_down(positions);
 
             // Ensure all new lines are fully cleared.
-            for i in (0..positions).map(Line::from) {
-                self.raw[i].reset(&self.cursor.template, &mut self.style_set);
-            }
+            self.reset_rows(Line(0)..Line(positions as i32));
 
             // Swap the fixed lines at the top back into position.
             for i in (0..region.start.0).map(Line::from) {
@@ -405,10 +400,7 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
                 self.raw.swap(line, line - positions);
             }
 
-            let range = region.start.0..(region.start + positions).0;
-            for line in range.rev().map(Line::from) {
-                self.raw[line].reset(&self.cursor.template, &mut self.style_set);
-            }
+            self.reset_rows(region.start..region.start + positions);
         }
 
         // See `scroll_up` for the rationale — `raw.swap` / `raw.rotate`
@@ -436,10 +428,7 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
         // the post-scroll layout. Same fix for `scroll_down` below.
         // When rotating the entire region with fixed lines at the top, just reset everything.
         if region.end - region.start <= positions && region.start != 0 {
-            for i in (region.start.0..region.end.0).map(Line::from) {
-                self.raw[i].reset(&self.cursor.template, &mut self.style_set);
-            }
-
+            self.reset_rows(region.clone());
             return;
         }
 
@@ -490,9 +479,7 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
         }
 
         // Ensure all new lines are fully cleared.
-        for i in (region.end.0 - positions as i32..region.end.0).map(Line::from) {
-            self.raw[i].reset(&self.cursor.template, &mut self.style_set);
-        }
+        self.reset_rows(region.end - positions..region.end);
 
         // Mark every row in the region dirty. Reset rows above already
         // got `dirty = true` from `Row::reset`; the swap/rotate'd ones
@@ -564,8 +551,20 @@ impl<T> Grid<T> {
         debug_assert!(start < self.screen_lines() as i32);
         debug_assert!(end <= self.screen_lines() as i32);
 
-        for line in (start.0..end.0).map(Line::from) {
-            self.raw[line].reset(&self.cursor.template, &mut self.style_set);
+        self.reset_rows(start..end);
+    }
+
+    fn reset_rows(&mut self, range: Range<Line>)
+    where
+        T: GridSquare + Clone + Default + PartialEq,
+    {
+        if range.is_empty() {
+            return;
+        }
+        let mut fill = T::default();
+        fill.reset(&self.cursor.template, &mut self.style_set);
+        for line in (range.start.0..range.end.0).map(Line::from) {
+            self.raw[line].reset_to(fill.clone());
         }
     }
 

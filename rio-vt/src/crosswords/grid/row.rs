@@ -204,14 +204,24 @@ impl<T: Clone + Default> Row<T> {
     where
         T: GridSquare + PartialEq,
     {
+        let mut proto = T::default();
+        proto.reset(template, styles);
+        self.reset_to(proto);
+    }
+
+    /// Reset to a cell whose text attributes and extras are already erased.
+    /// Region clears share this value instead of resolving the same template
+    /// background through the style table separately for every row.
+    pub(super) fn reset_to(&mut self, proto: T)
+    where
+        T: GridSquare + PartialEq,
+    {
         debug_assert!(!self.inner.is_empty());
 
         // The tail beyond `occ` holds at most two fill values: the last
         // reset's fill, then defaults appended by `grow`. If both tail
         // ends match what this reset writes, only the prefix needs work.
         let len = self.inner.len();
-        let mut proto = T::default();
-        proto.reset(template, styles);
         let mut occ = self.occ;
         if occ < len && (proto != self.inner[occ] || proto != self.inner[len - 1]) {
             occ = len;
