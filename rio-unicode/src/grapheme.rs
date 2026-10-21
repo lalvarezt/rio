@@ -55,7 +55,7 @@ impl GraphemeClass {
     pub const COUNT: usize = 18;
 
     /// Inverse of `as u8`, for table builders enumerating classes.
-    pub fn from_u8(value: u8) -> Option<Self> {
+    pub const fn from_u8(value: u8) -> Option<Self> {
         use GraphemeClass as G;
         Some(match value {
             0 => G::Other,
@@ -209,7 +209,7 @@ impl BreakState {
     pub const COUNT: usize = 18;
 
     /// Pack into `0..COUNT` for table indexing.
-    pub fn pack(self) -> u8 {
+    pub const fn pack(self) -> u8 {
         let emoji = match self.emoji {
             EmojiSeq::None => 0u8,
             EmojiSeq::Emoji => 1,
@@ -224,7 +224,7 @@ impl BreakState {
     }
 
     /// Inverse of [`pack`](Self::pack).
-    pub fn unpack(value: u8) -> Option<Self> {
+    pub const fn unpack(value: u8) -> Option<Self> {
         if value as usize >= Self::COUNT {
             return None;
         }
@@ -252,7 +252,7 @@ impl BreakState {
     }
 
     #[inline]
-    fn advance(&mut self, class: GraphemeClass) {
+    const fn advance(&mut self, class: GraphemeClass) {
         use GraphemeClass as G;
         self.emoji = match (self.emoji, class) {
             (_, G::ExtPic) => EmojiSeq::Emoji,
@@ -283,7 +283,7 @@ impl BreakState {
 // the standard for zero behavioral gain.
 #[allow(clippy::if_same_then_else)]
 #[inline]
-pub fn is_break(
+pub const fn is_break(
     prev: GraphemeClass,
     next: GraphemeClass,
     state: &mut BreakState,
@@ -291,7 +291,7 @@ pub fn is_break(
     use GraphemeClass as G;
     let decision = {
         // GB3: CR × LF.
-        if prev == G::CR && next == G::LF {
+        if matches!(prev, G::CR) && matches!(next, G::LF) {
             false
         // GB4 / GB5: controls break on both sides.
         } else if matches!(prev, G::Control | G::CR | G::LF)
@@ -299,29 +299,31 @@ pub fn is_break(
         {
             true
         // GB6-8: Hangul jamo.
-        } else if prev == G::L && matches!(next, G::L | G::V | G::LV | G::LVT) {
+        } else if matches!(prev, G::L) && matches!(next, G::L | G::V | G::LV | G::LVT) {
             false
         } else if matches!(prev, G::LV | G::V) && matches!(next, G::V | G::T) {
             false
-        } else if matches!(prev, G::LVT | G::T) && next == G::T {
+        } else if matches!(prev, G::LVT | G::T) && matches!(next, G::T) {
             false
         // GB9 / GB9a / GB9b: extenders, spacing marks, prepends.
         } else if matches!(next, G::Extend | G::ExtendIncb | G::Linker | G::Zwj) {
             false
-        } else if next == G::SpacingMark {
+        } else if matches!(next, G::SpacingMark) {
             false
-        } else if prev == G::Prepend {
+        } else if matches!(prev, G::Prepend) {
             false
         // GB9c: Indic conjuncts join across a linker chain.
-        } else if next == G::Consonant && state.incb == Incb::LinkerSeen {
+        } else if matches!(next, G::Consonant) && matches!(state.incb, Incb::LinkerSeen) {
             false
         // GB11: emoji ZWJ sequences.
-        } else if prev == G::Zwj && next == G::ExtPic && state.emoji == EmojiSeq::EmojiZwj
+        } else if matches!(prev, G::Zwj)
+            && matches!(next, G::ExtPic)
+            && matches!(state.emoji, EmojiSeq::EmojiZwj)
         {
             false
         // GB12/GB13: regional indicators pair up.
-        } else if prev == G::RegionalIndicator
-            && next == G::RegionalIndicator
+        } else if matches!(prev, G::RegionalIndicator)
+            && matches!(next, G::RegionalIndicator)
             && state.ri_odd
         {
             false
