@@ -2291,7 +2291,9 @@ impl<U: EventListener> Crosswords<U> {
                 let src = &self.grid[Line(row_idx)];
                 dst[i].dirty = true;
                 if !src.has_styles
-                    || !deferred.as_mut().is_some_and(|styles| styles.capture(i))
+                    || !deferred
+                        .as_mut()
+                        .is_some_and(|styles| styles.capture(i, false))
                 {
                     self.grid.resolve_row_styles(src, &mut row_styles[i]);
                 }
@@ -2313,14 +2315,37 @@ impl<U: EventListener> Crosswords<U> {
                 continue;
             }
             let src = &self.grid[Line(row_idx)];
+            // Glyphs/flags can change while style and extras IDs stay put.
+            // The branchless reduction vectorizes over compact cell words;
+            // managed values are still checked against their live tables.
+            let unchanged = (src.has_styles || src.has_extras)
+                && src.inner.len() == dst[y].inner.len()
+                && src
+                    .inner
+                    .iter()
+                    .zip(&dst[y].inner)
+                    .fold(0, |changed, (a, b)| {
+                        changed | (a.snapshot_metadata() ^ b.snapshot_metadata())
+                    })
+                    == 0;
             dst[y].copy_from(src);
             dst[y].dirty = true;
             if !src.has_styles
-                || !deferred.as_mut().is_some_and(|styles| styles.capture(y))
+                || !deferred
+                    .as_mut()
+                    .is_some_and(|styles| styles.capture(y, unchanged))
             {
-                self.grid.resolve_row_styles(src, &mut row_styles[y]);
+                if unchanged {
+                    row_styles[y].resolve_unchanged(src, self.grid.styles());
+                } else {
+                    self.grid.resolve_row_styles(src, &mut row_styles[y]);
+                }
             }
-            extras.refresh(y, src, &self.grid.extras_table);
+            if unchanged {
+                extras.refresh_unchanged(y, &self.grid.extras_table);
+            } else {
+                extras.refresh(y, src, &self.grid.extras_table);
+            }
             self.grid[Line(row_idx)].dirty = false;
             modified += 1;
         }

@@ -45,6 +45,8 @@ def cases(short_data, long_data):
                              "--scrollback-bytes", "50000000"]
             rio += ["--fill-lines", "0", "--resize-cols", "60", "--resize-rows", "40"]
             note = "One shrink-and-restore cycle per operation (two resizes). Same corpus and 10000-line history limits; actual setup dimensions and history are checked across engines."
+            if mode == "noop":
+                note = "50000000 same-size resize requests, one call per operation. Measures the early return and harness overhead, with matching initial viewport/history sizes."
         elif action == "terminal-formatter":
             operations = 1 if mode == "roundtrip" else 1000
             native_flags += ["--loops", str(operations), "--formatter", "screen",

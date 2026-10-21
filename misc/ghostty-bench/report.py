@@ -168,7 +168,9 @@ def render(report, directory=None):
             cls = "good" if ratio is not None and ratio >= 1 else "slow"
             label = "faster" if ratio is not None and ratio >= 1 else "slower"
             factor = ratio if ratio is not None and ratio >= 1 else (1 / ratio if ratio else 0)
-            if baseline == "ghostty" and result["action"] == "screen-clone" and result["mode"] == "clone" and ratio:
+            if result["control"] and ratio:
+                ratios.append(f'<td><b>Control only</b><br><small>{ratio:.2f}× native cost ratio</small></td>')
+            elif baseline == "ghostty" and result["action"] == "screen-clone" and result["mode"] == "clone" and ratio:
                 ratios.append(f'<td><b>Different work</b><br><small>{ratio:.2f}× native cost ratio</small></td>')
             else:
                 ratios.append(f'<td class="{cls}"><b>{factor:.2f}×</b><br><small>{label}</small></td>'

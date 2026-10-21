@@ -108,26 +108,52 @@ impl SnapshotCells {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StyleRun {
+    end: usize,
+    style: Style,
+}
+
+// Most rows have a few text/padding runs. Keep caching bounded when an
+// application deliberately alternates styles at every cell.
+const MAX_STYLE_RUNS: usize = 16;
+
 /// Resolved styles owned by a row snapshot. Uniform rows store one value;
 /// mixed rows keep an index-parallel vector. Values remain valid when the
 /// terminal reuses style IDs after the snapshot lock is released.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct RowStyles {
     uniform: Style,
     mixed: Vec<Style>,
+    applied: Vec<StyleRun>,
+    pending: Vec<StyleRun>,
 }
+
+impl PartialEq for RowStyles {
+    fn eq(&self, other: &Self) -> bool {
+        self.uniform == other.uniform && self.mixed == other.mixed
+    }
+}
+
+impl Eq for RowStyles {}
 
 impl Clone for RowStyles {
     fn clone(&self) -> Self {
         Self {
             uniform: self.uniform,
             mixed: self.mixed.clone(),
+            // Copies may be paired with different cells by a caller. Only
+            // resolution against that row may establish reusable metadata.
+            applied: Vec::new(),
+            pending: Vec::new(),
         }
     }
 
     fn clone_from(&mut self, source: &Self) {
         self.uniform = source.uniform;
         self.mixed.clone_from(&source.mixed);
+        self.applied.clear();
+        self.pending.clear();
     }
 }
 
@@ -135,6 +161,8 @@ impl RowStyles {
     pub const DEFAULT: Self = Self {
         uniform: Style::DEFAULT,
         mixed: Vec::new(),
+        applied: Vec::new(),
+        pending: Vec::new(),
     };
 
     #[inline]
@@ -157,6 +185,8 @@ impl RowStyles {
 
     /// Expand only when an overlay needs to edit individual cell styles.
     pub fn make_mut(&mut self, columns: usize) -> &mut [Style] {
+        // Overlays change the resolved values without changing source cells.
+        self.applied.clear();
         self.mixed.resize(columns, self.uniform);
         &mut self.mixed
     }
@@ -164,6 +194,8 @@ impl RowStyles {
     pub(super) fn set_uniform(&mut self, style: Style) {
         self.uniform = style;
         self.mixed.clear();
+        self.applied.clear();
+        self.pending.clear();
     }
 
     pub(super) fn set_mixed(
@@ -172,6 +204,8 @@ impl RowStyles {
         style: Style,
         remainder: impl ExactSizeIterator<Item = Style>,
     ) {
+        self.applied.clear();
+        self.pending.clear();
         self.uniform = Style::DEFAULT;
         self.mixed.clear();
         self.mixed.reserve(prefix + remainder.len());
@@ -195,16 +229,85 @@ impl RowStyles {
             .iter()
             .position(|sq| sq.style_id_checked().unwrap_or(0) != first)
         {
-            None => self.set_uniform(style),
-            Some(prefix) => self.set_mixed(
-                prefix,
-                style,
-                src.inner[prefix..].iter().map(|sq| {
-                    sq.style_id_checked()
-                        .and_then(|id| styles.get(id as usize).copied())
-                        .unwrap_or_default()
-                }),
-            ),
+            None => {
+                self.set_uniform(style);
+                self.applied.push(StyleRun {
+                    end: src.inner.len(),
+                    style,
+                });
+            }
+            Some(prefix) => {
+                self.pending.clear();
+                self.pending.push(StyleRun { end: prefix, style });
+                let mut start = prefix;
+                while start < src.inner.len() {
+                    if self.pending.len() == MAX_STYLE_RUNS {
+                        self.set_mixed(
+                            prefix,
+                            style,
+                            src.inner[prefix..].iter().map(|sq| {
+                                sq.style_id_checked()
+                                    .and_then(|id| styles.get(id as usize).copied())
+                                    .unwrap_or_default()
+                            }),
+                        );
+                        return;
+                    }
+                    let id = src.inner[start].style_id_checked().unwrap_or(0);
+                    let end = src.inner[start..]
+                        .iter()
+                        .position(|sq| sq.style_id_checked().unwrap_or(0) != id)
+                        .map_or(src.inner.len(), |offset| start + offset);
+                    self.pending.push(StyleRun {
+                        end,
+                        style: styles.get(id as usize).copied().unwrap_or_default(),
+                    });
+                    start = end;
+                }
+                // Like Ghostty's applied style runs, compare compact resolved
+                // values before rewriting a whole row. Store values, not IDs:
+                // sweeps/grid replacement may recycle IDs between snapshots.
+                if self.pending == self.applied {
+                    return;
+                }
+                self.uniform = Style::DEFAULT;
+                self.mixed.clear();
+                self.mixed.reserve(src.inner.len());
+                for run in &self.pending {
+                    self.mixed.resize(run.end, run.style);
+                }
+                std::mem::swap(&mut self.applied, &mut self.pending);
+                self.pending.clear();
+            }
+        }
+    }
+
+    // The caller compared source metadata with the previously captured cells.
+    // Validate palette values at the retained run boundaries: IDs alone are
+    // insufficient because terminal sweeps may reuse them.
+    pub(super) fn resolve_unchanged(&mut self, src: &Row<Square>, styles: &[Style]) {
+        if !src.has_styles {
+            self.set_uniform(Style::DEFAULT);
+            return;
+        }
+        if src.inner.is_empty()
+            || self.applied.last().map(|run| run.end) != Some(src.inner.len())
+        {
+            self.resolve(src, styles);
+            return;
+        }
+        let mut start = 0;
+        for run in &self.applied {
+            let current = src.inner[start]
+                .style_id_checked()
+                .and_then(|id| styles.get(id as usize))
+                .copied()
+                .unwrap_or_default();
+            if current != run.style {
+                self.resolve(src, styles);
+                return;
+            }
+            start = run.end;
         }
     }
 }
@@ -214,7 +317,7 @@ impl RowStyles {
 #[derive(Debug, Default)]
 pub struct DeferredStyles {
     palette: Vec<Style>,
-    rows: Vec<usize>,
+    rows: Vec<(usize, bool)>,
 }
 
 /// Captured rows remain borrowed until their styles have been resolved. This
@@ -253,17 +356,21 @@ impl DeferredStyles {
         }
     }
 
-    pub(super) fn capture(&mut self, row: usize) -> bool {
+    pub(super) fn capture(&mut self, row: usize, unchanged: bool) -> bool {
         if self.palette.is_empty() {
             return false;
         }
-        self.rows.push(row);
+        self.rows.push((row, unchanged));
         true
     }
 
     fn resolve(&mut self, rows: &[Row<Square>], styles: &mut [RowStyles]) {
-        for row in self.rows.drain(..) {
-            styles[row].resolve(&rows[row], &self.palette);
+        for (row, unchanged) in self.rows.drain(..) {
+            if unchanged {
+                styles[row].resolve_unchanged(&rows[row], &self.palette);
+            } else {
+                styles[row].resolve(&rows[row], &self.palette);
+            }
         }
     }
 }
@@ -324,6 +431,120 @@ mod tests {
     }
 
     #[test]
+    fn repeated_style_runs_refresh_recycled_values_and_remove_overlays() {
+        let bold = Style {
+            flags: StyleFlags::BOLD,
+            ..Style::DEFAULT
+        };
+        let italic = Style {
+            flags: StyleFlags::ITALIC,
+            ..Style::DEFAULT
+        };
+        let mut row = Row::<Square>::new(8);
+        row.has_styles = true;
+        for cell in &mut row.inner[..4] {
+            cell.set_style_id(1);
+        }
+        let mut styles = RowStyles::default();
+        let mut palette = vec![Style::DEFAULT, bold];
+        styles.resolve(&row, &palette);
+        let frozen = styles.clone();
+        row.inner[0].set_c('x');
+        styles.resolve_unchanged(&row, &palette);
+        assert_eq!(styles.at(0), bold);
+        assert_eq!(styles.at(7), Style::DEFAULT);
+        styles.make_mut(8)[0] = italic;
+        styles.resolve_unchanged(&row, &palette);
+        assert_eq!(styles.at(0), bold);
+        palette[1] = italic;
+        styles.resolve_unchanged(&row, &palette);
+        assert_eq!(styles.at(0), italic);
+        assert_eq!(styles.at(3), italic);
+        assert_eq!(styles.at(7), Style::DEFAULT);
+        assert_eq!(frozen.at(0), bold);
+    }
+
+    #[test]
+    fn fragmented_style_rows_follow_palette_and_geometry_changes() {
+        let mut row = Row::<Square>::new(64);
+        row.has_styles = true;
+        for (i, cell) in row.inner.iter_mut().enumerate() {
+            cell.set_style_id((i % 2) as u16);
+        }
+        let mut palette = vec![
+            Style::DEFAULT,
+            Style {
+                flags: StyleFlags::BOLD,
+                ..Style::DEFAULT
+            },
+        ];
+        let mut styles = RowStyles::default();
+        for columns in [64, 32, 8] {
+            row.inner.truncate(columns);
+            palette[1].flags = StyleFlags::ITALIC;
+            styles.resolve(&row, &palette);
+            for (i, cell) in row.inner.iter().enumerate() {
+                assert_eq!(
+                    styles.at(i),
+                    palette[cell.style_id_checked().unwrap_or(0) as usize]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn extras_refresh_preserves_shared_rows_and_releases_removed_memberships() {
+        use crate::crosswords::square::Hyperlink;
+        let mut table = ExtrasTable::new();
+        let a = table.alloc(Extras {
+            hyperlink: Some(Hyperlink::new(None::<&str>, "https://a.invalid")),
+            ..Extras::default()
+        });
+        let b = table.alloc(Extras {
+            hyperlink: Some(Hyperlink::new(None::<&str>, "https://b.invalid")),
+            ..Extras::default()
+        });
+        let mut row = Row::<Square>::new(8);
+        row.has_extras = true;
+        for cell in &mut row.inner {
+            cell.set_extras_id(Some(a));
+        }
+        let mut extras = SnapshotExtras::default();
+        let table_references = Arc::strong_count(table.shared(a).unwrap());
+        extras.begin(2, true);
+        extras.refresh(0, &row, &table);
+        extras.refresh(1, &row, &table);
+        for _ in 0..3 {
+            extras.begin(2, false);
+            extras.refresh(0, &row, &table);
+            assert_eq!(
+                Arc::strong_count(table.shared(a).unwrap()),
+                table_references + 1
+            );
+        }
+        row.inner[0].set_extras_id(Some(b));
+        extras.begin(2, false);
+        extras.refresh(1, &row, &table);
+        assert!(extras.get(&a).is_some());
+        assert!(extras.get(&b).is_some());
+        row.inner.fill(Square::default());
+        row.has_extras = false;
+        extras.begin(2, false);
+        extras.refresh(0, &row, &table);
+        assert!(extras.get(&a).is_some());
+        extras.refresh(1, &row, &table);
+        assert!(extras.is_empty());
+        assert_eq!(
+            Arc::strong_count(table.shared(a).unwrap()),
+            table_references
+        );
+        assert_eq!(
+            Arc::strong_count(table.shared(b).unwrap()),
+            table_references
+        );
+    }
+
+    #[test]
     fn overlays_expand_uniform_styles_and_reuse_mixed_storage() {
         let bold = Style {
             flags: StyleFlags::BOLD,
@@ -359,6 +580,25 @@ struct SnapshotExtra {
     value: Option<Arc<Extras>>,
     rows: usize,
     refreshed: u64,
+}
+
+impl SnapshotExtra {
+    #[inline]
+    fn refresh(&mut self, id: u16, table: &ExtrasTable, generation: u64) {
+        if self.refreshed == generation {
+            return;
+        }
+        let current = table.shared(id);
+        let same = match (self.value.as_ref(), current) {
+            (Some(saved), Some(current)) => Arc::ptr_eq(saved, current),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            self.value = current.cloned();
+        }
+        self.refreshed = generation;
+    }
 }
 
 /// Immutable extras referenced by the snapshot, with dependencies per row.
@@ -414,6 +654,15 @@ impl SnapshotExtras {
     }
 
     #[inline]
+    pub(super) fn refresh_unchanged(&mut self, y: usize, table: &ExtrasTable) {
+        for id in &self.rows[y] {
+            if let Some(entry) = self.entries.get_mut(id) {
+                entry.refresh(*id, table, self.generation);
+            }
+        }
+    }
+
+    #[inline]
     pub(super) fn refresh(&mut self, y: usize, row: &Row<Square>, table: &ExtrasTable) {
         let ids = &mut self.rows[y];
         if !row.has_extras && ids.is_empty() {
@@ -451,10 +700,7 @@ impl SnapshotExtras {
                 Entry::Occupied(mut entry) => {
                     let entry = entry.get_mut();
                     entry.rows += 1;
-                    if entry.refreshed != self.generation {
-                        entry.value = table.shared(id).cloned();
-                        entry.refreshed = self.generation;
-                    }
+                    entry.refresh(id, table, self.generation);
                 }
                 Entry::Vacant(entry) => {
                     entry.insert(SnapshotExtra {

@@ -224,6 +224,14 @@ impl Default for Square {
 }
 
 impl Square {
+    /// Packed tag/style/extras bits, excluding glyph and presentation flags.
+    /// Equal metadata permits reusing row dependencies, but their table values
+    /// must still be refreshed because IDs can be recycled.
+    #[inline]
+    pub(crate) fn snapshot_metadata(self) -> u64 {
+        self.0 >> CONTENT_TAG_SHIFT
+    }
+
     /// Create a cell with the given codepoint and the default style/extras.
     #[inline]
     pub fn from_char(c: char) -> Self {
