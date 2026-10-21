@@ -178,6 +178,94 @@ impl RowStyles {
         self.mixed.resize(prefix, style);
         self.mixed.extend(remainder);
     }
+
+    pub(super) fn resolve(&mut self, src: &Row<Square>, styles: &[Style]) {
+        if !src.has_styles {
+            self.set_uniform(Style::DEFAULT);
+            return;
+        }
+        let first = src
+            .inner
+            .first()
+            .and_then(|sq| sq.style_id_checked())
+            .unwrap_or(0);
+        let style = styles.get(first as usize).copied().unwrap_or_default();
+        match src
+            .inner
+            .iter()
+            .position(|sq| sq.style_id_checked().unwrap_or(0) != first)
+        {
+            None => self.set_uniform(style),
+            Some(prefix) => self.set_mixed(
+                prefix,
+                style,
+                src.inner[prefix..].iter().map(|sq| {
+                    sq.style_id_checked()
+                        .and_then(|id| styles.get(id as usize).copied())
+                        .unwrap_or_default()
+                }),
+            ),
+        }
+    }
+}
+
+/// Scratch storage for moving style expansion outside the terminal lock.
+/// Owns the captured palette: terminal sweeps may reuse IDs before resolution.
+#[derive(Debug, Default)]
+pub struct DeferredStyles {
+    palette: Vec<Style>,
+    rows: Vec<usize>,
+}
+
+/// Captured rows remain borrowed until their styles have been resolved. This
+/// token does not borrow the terminal, so it can outlive the terminal lock.
+#[must_use = "resolve the captured snapshot after releasing the terminal lock"]
+pub struct CapturedStyles<'a> {
+    pub(super) rows: &'a [Row<Square>],
+    pub(super) styles: &'a mut [RowStyles],
+    pub(super) deferred: &'a mut DeferredStyles,
+    pub(super) all_rows_modified: bool,
+}
+
+impl CapturedStyles<'_> {
+    /// Finish style expansion and report whether every source row was modified.
+    pub fn resolve(self) -> bool {
+        // Drop completes expansion before the caller can read the rows/styles.
+        self.all_rows_modified
+    }
+}
+
+impl Drop for CapturedStyles<'_> {
+    fn drop(&mut self) {
+        self.deferred.resolve(self.rows, self.styles);
+    }
+}
+
+impl DeferredStyles {
+    pub(super) fn begin(&mut self, styles: &[Style], cells: usize) {
+        self.rows.clear();
+        self.palette.clear();
+        // Bound palette copying to half the potential per-cell style output.
+        // A long-lived session can retain far more styles than its dirty rows
+        // need; resolve eagerly instead of copying that whole table.
+        if styles.len() <= cells / 2 {
+            self.palette.extend_from_slice(styles);
+        }
+    }
+
+    pub(super) fn capture(&mut self, row: usize) -> bool {
+        if self.palette.is_empty() {
+            return false;
+        }
+        self.rows.push(row);
+        true
+    }
+
+    fn resolve(&mut self, rows: &[Row<Square>], styles: &mut [RowStyles]) {
+        for row in self.rows.drain(..) {
+            styles[row].resolve(&rows[row], &self.palette);
+        }
+    }
 }
 
 #[cfg(test)]

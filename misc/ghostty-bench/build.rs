@@ -48,6 +48,12 @@ fn main() {
     if !root.join("rio-vt/src/crosswords/snapshot.rs").exists() {
         println!("cargo:rustc-cfg=ghostty_bench_upstream_api");
     }
+    println!("cargo:rustc-check-cfg=cfg(ghostty_bench_deferred_styles)");
+    if std::fs::read_to_string(root.join("rio-vt/src/crosswords/mod.rs"))
+        .is_ok_and(|source| source.contains("pub fn snapshot_visible_deferred"))
+    {
+        println!("cargo:rustc-cfg=ghostty_bench_deferred_styles");
+    }
     for path in [
         "misc/ghostty-bench",
         "rio-vt/src",

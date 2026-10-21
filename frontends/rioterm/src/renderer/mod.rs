@@ -496,7 +496,7 @@ impl Renderer {
                 .take_terminal_damage();
             context.renderable_content.pending_update.reset();
 
-            {
+            let captured_styles = {
                 let mut terminal = context.terminal.lock();
 
                 // Clear in-flight flag so PTY thread can notify again
@@ -525,11 +525,12 @@ impl Renderer {
 
                 terminal.reset_damage();
 
-                context.renderable_content.all_rows_modified = terminal.snapshot_visible(
+                let captured_styles = terminal.snapshot_visible_deferred(
                     &damage,
                     &mut context.renderable_content.visible_rows,
                     &mut context.renderable_content.row_styles,
                     &mut context.renderable_content.extras,
+                    &mut context.renderable_content.deferred_styles,
                 );
                 context.renderable_content.term_colors = terminal.colors;
                 context.renderable_content.display_offset = terminal.display_offset();
@@ -570,7 +571,13 @@ impl Renderer {
                 }
                 context.renderable_content.frame_damage = damage;
                 drop(terminal);
-            }
+                captured_styles
+            };
+
+            // Only owned cells and palette values cross the lock boundary:
+            // expanding mixed rows here lets PTY parsing resume sooner, without
+            // exposing the snapshot to style-ID reuse on the terminal thread.
+            context.renderable_content.all_rows_modified = captured_styles.resolve();
 
             // Recalculate image overlay positions every frame when placements
             // exist. Positions depend on display_offset and history_size which

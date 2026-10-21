@@ -102,16 +102,32 @@ pub struct Snapshot {
     rows: Vec<Row<Square>>,
     styles: Vec<RowStyles>,
     extras: SnapshotExtras,
+    #[cfg(ghostty_bench_deferred_styles)]
+    deferred: rio_vt::crosswords::snapshot::DeferredStyles,
 }
 
 impl Snapshot {
     fn update(&mut self, term: &mut Terminal, damage: TerminalDamage) {
+        #[cfg(not(ghostty_bench_deferred_styles))]
         term.snapshot_visible(
             &damage,
             &mut self.rows,
             &mut self.styles,
             &mut self.extras,
         );
+        #[cfg(ghostty_bench_deferred_styles)]
+        {
+            // Include both phases in elapsed time. The separate lock-time
+            // measurement lives in snapshot_style_capture_timings in rio-vt.
+            term.snapshot_visible_deferred(
+                &damage,
+                &mut self.rows,
+                &mut self.styles,
+                &mut self.extras,
+                &mut self.deferred,
+            )
+            .resolve();
+        }
         black_box((&self.rows, &self.styles, &self.extras));
         term.reset_damage();
     }
@@ -147,6 +163,10 @@ impl Snapshot {
     }
 }
 
+// The two large variants both contain parser state and differ only modestly
+// in size. Keep that state inline rather than changing timed pointer access
+// when a snapshot API adds scratch storage.
+#[allow(clippy::large_enum_variant)]
 pub enum Workload {
     Parser {
         parser: Parser,

@@ -949,7 +949,9 @@ impl Parser {
                 // is the validated UTF-8 view of those bytes, so it has at least
                 // one character.
                 let c = unsafe { parsed.chars().next().unwrap_unchecked() };
-                performer.print(c);
+                // A completed character has the same control semantics as one
+                // decoded in a bulk run, including UTF-8-encoded C1 controls.
+                Self::dispatch_codepoints(performer, &[c as u32]);
 
                 self.partial_utf8_len = 0;
                 c.len_utf8() - old_bytes
@@ -970,7 +972,7 @@ impl Parser {
                         parsed.chars().next().unwrap_unchecked()
                     };
 
-                    performer.print(c);
+                    Self::dispatch_codepoints(performer, &[c as u32]);
 
                     self.partial_utf8_len = 0;
                     return valid_bytes - old_bytes;
@@ -1681,6 +1683,87 @@ mod tests {
                     actual.dispatched, expected.dispatched,
                     "{invalid:02x?}, chunk {chunk_size}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn all_byte_pairs_dispatch_identically_across_read_boundaries() {
+        // Exercise both the bulk decoder and the carried UTF-8 path. A valid
+        // suffix completes truncated input and verifies parser recovery, so
+        // matching an empty output cannot hide a stuck sequence.
+        for first in 0..=255u8 {
+            for second in 0..=255u8 {
+                let mut input = vec![b'x'; SIMD_DECODE_MIN + 4];
+                input.extend_from_slice(&[first, second]);
+                input.extend_from_slice(b"\x18\x1b[0mend");
+                let mut expected = Dispatcher::default();
+                Parser::new().advance(&mut expected, &input);
+                for split in SIMD_DECODE_MIN + 4..=SIMD_DECODE_MIN + 6 {
+                    let mut actual = Dispatcher::default();
+                    let mut parser = Parser::new();
+                    parser.advance(&mut actual, &input[..split]);
+                    parser.advance(&mut actual, &input[split..]);
+                    assert_eq!(
+                        actual.dispatched, expected.dispatched,
+                        "bytes {first:02x} {second:02x}, split {split}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_c1_controls_execute_when_split_between_reads() {
+        for control in 0x80..=0x9f {
+            // Test both the valid-buffer and valid-prefix branches in the
+            // carried decoder, using an invalid byte after the completed C1.
+            for suffix in [b"".as_slice(), b"\xff"] {
+                let mut parser = Parser::new();
+                let mut dispatcher = Dispatcher::default();
+                parser.advance(&mut dispatcher, &[0xc2]);
+                parser.advance(&mut dispatcher, &[&[control], suffix].concat());
+                assert_eq!(dispatcher.dispatched[0], Sequence::Execute(control));
+            }
+        }
+    }
+
+    #[test]
+    fn protocol_dispatch_does_not_depend_on_read_boundaries() {
+        let fragments: &[&[u8]] = &[
+            b"plain text\r\n",
+            "é👩\u{200d}💻".as_bytes(),
+            b"\xc2\x80\xc2\x9f",
+            b"\xf0\x9f\x92",
+            b"\xed\xa0\x80\xe0\x80\xbf",
+            b"\x1b[38:2::255:128:0mcolor\x1b[0m",
+            b"\x1b]8;id=test;https://example.test\x1b\\link\x1b]8;;\x07",
+            b"\x1b]7501;state=running\x07",
+            b"\x1bP1;2$qpayload\x1b\\",
+            b"\x1b_Ga=T,f=32;YWJj\x1b\\",
+            b"\x1bXignored\x1b\\\x1b^private\x1b\\",
+            b"\x1b]2;cancelled\x18",
+            b"\x1b[1;2\x1a",
+            b"\x1b]2;unfinished\x1b",
+        ];
+        // Compose fragments so an incomplete sequence also encounters every
+        // other kind of sequence. Compare semantic callbacks, not batching:
+        // Dispatcher expands print_str/print_codepoints through Perform defaults.
+        for (a, first) in fragments.iter().enumerate() {
+            for (b, second) in fragments.iter().enumerate() {
+                let input = [*first, *second, b"\x18\x1b[0mend"].concat();
+                let mut expected = Dispatcher::default();
+                Parser::new().advance(&mut expected, &input);
+                for split in 0..=input.len() {
+                    let mut actual = Dispatcher::default();
+                    let mut parser = Parser::new();
+                    parser.advance(&mut actual, &input[..split]);
+                    parser.advance(&mut actual, &input[split..]);
+                    assert_eq!(
+                        actual.dispatched, expected.dispatched,
+                        "fragments {a}, {b}, split {split}"
+                    );
+                }
             }
         }
     }

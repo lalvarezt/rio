@@ -2201,6 +2201,38 @@ impl<U: EventListener> Crosswords<U> {
         row_styles: &mut Vec<snapshot::RowStyles>,
         extras: &mut snapshot::SnapshotExtras,
     ) -> bool {
+        self.snapshot_visible_impl(damage, dst, row_styles, extras, None)
+    }
+
+    /// Capture rows and the style values they need under the terminal lock.
+    /// Resolve the returned token after unlocking. Its borrow prevents reading
+    /// partially resolved styles; dropping it also completes the snapshot.
+    pub fn snapshot_visible_deferred<'a>(
+        &mut self,
+        damage: &crate::event::TerminalDamage,
+        dst: &'a mut Vec<Row<Square>>,
+        row_styles: &'a mut Vec<snapshot::RowStyles>,
+        extras: &mut snapshot::SnapshotExtras,
+        deferred: &'a mut snapshot::DeferredStyles,
+    ) -> snapshot::CapturedStyles<'a> {
+        let all_rows_modified =
+            self.snapshot_visible_impl(damage, dst, row_styles, extras, Some(deferred));
+        snapshot::CapturedStyles {
+            rows: dst,
+            styles: row_styles,
+            deferred,
+            all_rows_modified,
+        }
+    }
+
+    fn snapshot_visible_impl(
+        &mut self,
+        damage: &crate::event::TerminalDamage,
+        dst: &mut Vec<Row<Square>>,
+        row_styles: &mut Vec<snapshot::RowStyles>,
+        extras: &mut snapshot::SnapshotExtras,
+        mut deferred: Option<&mut snapshot::DeferredStyles>,
+    ) -> bool {
         use crate::event::TerminalDamage;
         let (start, end) = self.visible_line_bounds();
         let count = (end - start) as usize;
@@ -2209,6 +2241,29 @@ impl<U: EventListener> Crosswords<U> {
             || dst.len() != count
             || row_styles.len() != count
             || extras.row_count() != count;
+
+        // A Noop/CursorOnly frame normally has nothing to copy, but rows
+        // written after the damage event was consumed (e.g. a graphics
+        // insert racing a redraw) still carry their dirty bit.
+        if !needs_full
+            && matches!(damage, TerminalDamage::Noop | TerminalDamage::CursorOnly)
+            && !(0..count as i32).any(|y| self.grid[Line(start + y)].dirty)
+        {
+            return false;
+        }
+
+        if let Some(deferred) = deferred.as_mut() {
+            let cells = if self.grid.styles().len() <= 1 {
+                0
+            } else {
+                (start..end)
+                    .map(|line| &self.grid[Line(line)])
+                    .filter(|row| row.has_styles && (needs_full || row.dirty))
+                    .map(|row| row.inner.len())
+                    .sum()
+            };
+            deferred.begin(self.grid.styles(), cells);
+        }
 
         // Styles are resolved to values per copied row, so the snapshot
         // holds no style ids at all: sweeps reusing ids, table growth,
@@ -2220,23 +2275,16 @@ impl<U: EventListener> Crosswords<U> {
             for (i, row_idx) in (start..end).enumerate() {
                 let src = &self.grid[Line(row_idx)];
                 dst[i].dirty = true;
-                self.grid.resolve_row_styles(src, &mut row_styles[i]);
+                if !src.has_styles
+                    || !deferred.as_mut().is_some_and(|styles| styles.capture(i))
+                {
+                    self.grid.resolve_row_styles(src, &mut row_styles[i]);
+                }
                 if src.has_extras {
                     extras.refresh(i, src, &self.grid.extras_table);
                 }
             }
             return self.grid.raw.take_lines_dirty(Line(start), count);
-        }
-
-        // A Noop/CursorOnly frame normally has nothing to copy, but rows
-        // written after the damage event was consumed (e.g. a graphics
-        // insert racing a redraw) still carry their dirty bit. Fall
-        // through when any row is dirty so the snapshot can't go stale.
-        if matches!(damage, TerminalDamage::Noop | TerminalDamage::CursorOnly) {
-            let any_dirty = (0..count as i32).any(|y| self.grid[Line(start + y)].dirty);
-            if !any_dirty {
-                return false;
-            }
         }
 
         extras.begin(count, false);
@@ -2249,7 +2297,11 @@ impl<U: EventListener> Crosswords<U> {
             let src = &self.grid[Line(row_idx)];
             dst[y].copy_from(src);
             dst[y].dirty = true;
-            self.grid.resolve_row_styles(src, &mut row_styles[y]);
+            if !src.has_styles
+                || !deferred.as_mut().is_some_and(|styles| styles.capture(y))
+            {
+                self.grid.resolve_row_styles(src, &mut row_styles[y]);
+            }
             extras.refresh(y, src, &self.grid.extras_table);
         }
         self.grid.raw.take_lines_dirty(Line(start), count)
@@ -6125,6 +6177,201 @@ mod tests {
         assert_eq!(extras.get(&id).unwrap().zerowidth, ['\u{308}']);
         assert_eq!(older.get(&id).unwrap().zerowidth, ['\u{301}']);
         assert_eq!(extras.len(), 1);
+    }
+
+    #[test]
+    fn deferred_snapshots_match_eager_updates() {
+        use crate::performer::handler::Processor;
+        let mut eager = new_term(120, 80);
+        let mut deferred = new_term(120, 80);
+        let mut eager_parser = Processor::default();
+        let mut deferred_parser = Processor::default();
+        let (mut rows, mut styles, mut extras) = Default::default();
+        let (mut reference_rows, mut reference_styles, mut reference_extras) =
+            Default::default();
+        let mut scratch = snapshot::DeferredStyles::default();
+        let mut initial = String::new();
+        for n in 0..1000 {
+            use std::fmt::Write;
+            write!(initial, "\x1b[38;5;{}mline {n} e\u{301}界\r\n", n % 64).unwrap();
+        }
+        let inputs: &[&[u8]] = &[
+            initial.as_bytes(),
+            b"",                         // Clean frame.
+            b"\x1b[1;1H\x1b[31mchanged", // Partial, palette larger than one row.
+            b"\x1b[42m\x1b[2K",          // Inline erased background.
+            b"",                         // Scroll history in the next three steps.
+            b"",
+            b"",
+            b"\x1b[?1049h\x1b[34malternate",
+            b"\x1b[?1049l",
+            b"\x1b]8;;https://example.test\x07linked\x1b]8;;\x07",
+            b"", // Resize with reflow, then grow again.
+            b"",
+        ];
+        for (step, input) in inputs.iter().enumerate() {
+            eager_parser.advance(&mut eager, input);
+            deferred_parser.advance(&mut deferred, input);
+            for terminal in [&mut eager, &mut deferred] {
+                match step {
+                    4 => terminal.scroll_display(Scroll::Top),
+                    5 => terminal.scroll_display(Scroll::Delta(-1)),
+                    6 => terminal.scroll_display(Scroll::Bottom),
+                    10 => terminal.resize(CrosswordsSize::new(61, 25)),
+                    11 => terminal.resize(CrosswordsSize::new(120, 80)),
+                    _ => (),
+                }
+            }
+            let damage = eager.peek_damage_event().unwrap_or(TerminalDamage::Noop);
+            let expected = eager.snapshot_visible(
+                &damage,
+                &mut reference_rows,
+                &mut reference_styles,
+                &mut reference_extras,
+            );
+            let actual = deferred
+                .snapshot_visible_deferred(
+                    &damage,
+                    &mut rows,
+                    &mut styles,
+                    &mut extras,
+                    &mut scratch,
+                )
+                .resolve();
+            assert_eq!(actual, expected, "source damage at step {step}");
+            assert_eq!(rows, reference_rows, "cells at step {step}");
+            assert_eq!(styles, reference_styles, "styles at step {step}");
+            eager.reset_damage();
+            deferred.reset_damage();
+        }
+    }
+
+    #[test]
+    fn deferred_snapshot_owns_styles_across_grid_replacement() {
+        use crate::performer::handler::Processor;
+        let mut terminal = new_term(120, 80);
+        let mut processor = Processor::default();
+        processor.advance(&mut terminal, b"\x1b[31mred\x1b[0m default");
+        let old_id = terminal.grid[Line(0)][Column(0)].style_id();
+        let expected = terminal.grid.styles()[old_id as usize];
+        let (mut rows, mut styles, mut extras) = Default::default();
+        let mut deferred = snapshot::DeferredStyles::default();
+        let captured = terminal.snapshot_visible_deferred(
+            &TerminalDamage::Full,
+            &mut rows,
+            &mut styles,
+            &mut extras,
+            &mut deferred,
+        );
+
+        // Mimic a grid swap or style-ID reclamation while the renderer works
+        // unlocked. The same ID now means blue in the live terminal.
+        terminal = new_term(120, 80);
+        processor.advance(&mut terminal, b"\x1b[34mblue\x1b[0m default");
+        assert_eq!(terminal.grid[Line(0)][Column(0)].style_id(), old_id);
+        assert_ne!(terminal.grid.styles()[old_id as usize], expected);
+        captured.resolve();
+        assert_eq!(styles[0].at(0), expected);
+        assert_eq!(styles[0].at(4), style::Style::DEFAULT);
+
+        drop(terminal.snapshot_visible_deferred(
+            &TerminalDamage::Full,
+            &mut rows,
+            &mut styles,
+            &mut extras,
+            &mut deferred,
+        ));
+        let previous = styles.clone();
+        terminal.reset_damage();
+        processor.advance(&mut terminal, b"\x1b[2;1H\x1b[32mgreen");
+        terminal
+            .snapshot_visible_deferred(
+                &TerminalDamage::Partial,
+                &mut rows,
+                &mut styles,
+                &mut extras,
+                &mut deferred,
+            )
+            .resolve();
+        assert_eq!(styles[0], previous[0]);
+        assert_ne!(styles[1], previous[1]);
+        let mut reference_rows = Vec::new();
+        let mut reference_styles = Vec::new();
+        let mut reference_extras = snapshot::SnapshotExtras::default();
+        terminal.snapshot_visible(
+            &TerminalDamage::Full,
+            &mut reference_rows,
+            &mut reference_styles,
+            &mut reference_extras,
+        );
+        assert_eq!(rows, reference_rows);
+        assert_eq!(styles, reference_styles);
+    }
+
+    #[test]
+    #[ignore = "manual snapshot lock-time measurement; run in release mode"]
+    fn snapshot_style_capture_timings() {
+        use crate::config::colors::{AnsiColor, ColorRgb};
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+        for colors in [0, 2, 64, 4096, 9600] {
+            let mut cw = new_term(120, 80);
+            for y in 0..80 {
+                cw.goto(Line(y), Column(0));
+                for x in 0..120 {
+                    if colors == 0 {
+                        cw.input('x');
+                        continue;
+                    }
+                    let n = (y as usize * 120 + x) % colors;
+                    cw.terminal_attribute(Attr::Foreground(AnsiColor::Spec(ColorRgb {
+                        r: n as u8,
+                        g: (n >> 8) as u8,
+                        b: 100,
+                    })));
+                    cw.input('x');
+                }
+            }
+            let mut rows = Vec::new();
+            let mut styles = Vec::new();
+            let mut extras = snapshot::SnapshotExtras::default();
+            let mut deferred = snapshot::DeferredStyles::default();
+            for round in 0..4 {
+                let mut eager = Duration::ZERO;
+                let mut capture = Duration::ZERO;
+                let mut finish = Duration::ZERO;
+                for _ in 0..2000 {
+                    let start = Instant::now();
+                    cw.snapshot_visible(
+                        &TerminalDamage::Full,
+                        &mut rows,
+                        &mut styles,
+                        &mut extras,
+                    );
+                    eager += start.elapsed();
+                    black_box((&rows, &styles));
+                    let start = Instant::now();
+                    let captured = cw.snapshot_visible_deferred(
+                        &TerminalDamage::Full,
+                        &mut rows,
+                        &mut styles,
+                        &mut extras,
+                        &mut deferred,
+                    );
+                    capture += start.elapsed();
+                    let start = Instant::now();
+                    captured.resolve();
+                    finish += start.elapsed();
+                    black_box((&rows, &styles));
+                }
+                eprintln!(
+                    "colors={colors} round={round} eager={:?} capture={:?} finish={:?}",
+                    eager / 2000,
+                    capture / 2000,
+                    finish / 2000
+                );
+            }
+        }
     }
 
     #[test]

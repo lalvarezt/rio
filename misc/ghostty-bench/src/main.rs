@@ -310,6 +310,8 @@ fn run() -> Result<()> {
             optimized_build: !cfg!(debug_assertions),
             snapshot_api: if cfg!(ghostty_bench_upstream_api) {
                 "upstream-vec"
+            } else if cfg!(ghostty_bench_deferred_styles) {
+                "retained-rows-deferred"
             } else {
                 "retained-rows"
             },

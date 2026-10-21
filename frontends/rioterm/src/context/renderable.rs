@@ -84,6 +84,7 @@ pub struct RenderableContent {
     /// retinted by later style-table mutations.
     /// Uniform rows keep one value; mixed rows keep per-cell values.
     pub row_styles: Vec<rio_backend::crosswords::snapshot::RowStyles>,
+    pub deferred_styles: rio_backend::crosswords::snapshot::DeferredStyles,
     /// Per-frame snapshot of extras (zero-width chars, hyperlinks,
     /// sixel/iterm graphics) actually referenced by visible cells —
     /// keyed by the cell's `extras_id`. Refreshed per-dirty-row by
@@ -136,6 +137,7 @@ impl RenderableContent {
             all_rows_modified: true,
             visible_rows: Vec::new(),
             row_styles: Vec::new(),
+            deferred_styles: Default::default(),
             extras: Default::default(),
             term_colors: TermColors::default(),
             display_offset: 0,
