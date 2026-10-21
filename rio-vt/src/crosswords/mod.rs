@@ -2279,20 +2279,42 @@ impl<U: EventListener> Crosswords<U> {
         // holds no style ids at all: sweeps reusing ids, table growth,
         // and grid swaps can't affect rows copied on earlier frames.
         if needs_full {
-            self.fill_visible_rows(dst);
-            row_styles.resize_with(count, snapshot::RowStyles::default);
-            extras.begin(count, true);
+            let retained = dst.len() == count
+                && row_styles.len() == count
+                && extras.row_count() == count;
+            if !retained {
+                self.fill_visible_rows(dst);
+                row_styles.resize_with(count, snapshot::RowStyles::default);
+            }
+            extras.begin(count, !retained);
+            let top = self
+                .lines_evicted()
+                .saturating_add((self.history_size() - self.display_offset()) as u64);
+            extras.align(dst, row_styles, top, self.columns());
             for (i, row_idx) in (start..end).enumerate() {
                 let src = &self.grid[Line(row_idx)];
+                // Full redraws include scrolling and UI damage. Reuse the
+                // moved row's dependencies when only glyphs/flags changed;
+                // IDs alone never establish that their values are unchanged.
+                let unchanged = retained && snapshot::metadata_matches(src, &dst[i]);
+                if retained {
+                    dst[i].copy_from(src);
+                }
                 dst[i].dirty = true;
                 if !src.has_styles
                     || !deferred
                         .as_mut()
-                        .is_some_and(|styles| styles.capture(i, false))
+                        .is_some_and(|styles| styles.capture(i, unchanged))
                 {
-                    self.grid.resolve_row_styles(src, &mut row_styles[i]);
+                    if unchanged {
+                        row_styles[i].resolve_unchanged(src, self.grid.styles());
+                    } else {
+                        self.grid.resolve_row_styles(src, &mut row_styles[i]);
+                    }
                 }
-                if src.has_extras {
+                if unchanged {
+                    extras.refresh_unchanged(i, &self.grid.extras_table);
+                } else {
                     extras.refresh(i, src, &self.grid.extras_table);
                 }
             }
@@ -2313,16 +2335,7 @@ impl<U: EventListener> Crosswords<U> {
             // Glyphs/flags can change while style and extras IDs stay put.
             // The branchless reduction vectorizes over compact cell words;
             // managed values are still checked against their live tables.
-            let unchanged = (src.has_styles || src.has_extras)
-                && src.inner.len() == dst[y].inner.len()
-                && src
-                    .inner
-                    .iter()
-                    .zip(&dst[y].inner)
-                    .fold(0, |changed, (a, b)| {
-                        changed | (a.snapshot_metadata() ^ b.snapshot_metadata())
-                    })
-                    == 0;
+            let unchanged = snapshot::metadata_matches(src, &dst[y]);
             dst[y].copy_from(src);
             dst[y].dirty = true;
             if !src.has_styles
@@ -6206,6 +6219,172 @@ mod tests {
         // And the cleared alt cells were stamped with a local id too.
         let sq = cw.grid[Line(0)][Column(0)];
         assert_eq!(cw.grid.style_of(&sq).bg, red);
+    }
+
+    #[test]
+    fn scrolling_snapshots_move_retained_row_allocations() {
+        use std::fmt::Write;
+        let mut cw = new_term(120, 80);
+        let mut processor = crate::performer::handler::Processor::default();
+        let mut input = String::new();
+        for n in 0..200 {
+            write!(input, "\x1b[31m{n}\x1b[0m e\u{301}\r\n").unwrap();
+        }
+        processor.advance(&mut cw, input.as_bytes());
+        cw.scroll_display(Scroll::Top);
+        let (mut rows, mut styles, mut extras) = Default::default();
+        cw.snapshot_visible(&TerminalDamage::Full, &mut rows, &mut styles, &mut extras);
+        let allocation = rows[1].inner.as_ptr();
+        let expected = rows[1].clone();
+        let expected_style = styles[1].clone();
+        cw.scroll_display(Scroll::Delta(-1));
+        cw.snapshot_visible(&TerminalDamage::Full, &mut rows, &mut styles, &mut extras);
+        assert_eq!(rows[0], expected);
+        assert_eq!(styles[0], expected_style);
+        assert_eq!(rows[0].inner.as_ptr(), allocation);
+        assert!(rows.iter().all(|row| row.dirty));
+    }
+
+    #[test]
+    fn moving_snapshot_caches_match_fresh_captures() {
+        use std::collections::HashSet;
+        use std::fmt::Write;
+        for deferred in [false, true] {
+            let mut cw = new_term(32, 8);
+            cw.grid.update_history(32);
+            let mut processor = crate::performer::handler::Processor::default();
+            let mut input = String::new();
+            for n in 0..100 {
+                write!(input, "\x1b[38;5;{}m{n} \x1b[0m\x1b]8;id={n};https://example.test/{n}\x07e\u{301}界\x1b]8;;\x07\r\n", n % 16).unwrap();
+            }
+            processor.advance(&mut cw, input.as_bytes());
+            let (mut rows, mut styles, mut extras): (
+                Vec<Row<Square>>,
+                Vec<snapshot::RowStyles>,
+                snapshot::SnapshotExtras,
+            ) = Default::default();
+            let mut scratch = snapshot::DeferredStyles::default();
+            for step in 0..160 {
+                let mut damage = TerminalDamage::Full;
+                match step % 16 {
+                    0 => cw.scroll_display(Scroll::Top),
+                    1 | 2 => cw.scroll_display(Scroll::Delta(-1)),
+                    3 => cw.scroll_display(Scroll::Delta(1)),
+                    4 => cw.scroll_display(Scroll::Delta(-4)),
+                    5 => cw.scroll_display(Scroll::Bottom),
+                    6 => processor.advance(&mut cw, input.as_bytes()),
+                    7 => {
+                        processor.advance(&mut cw, b"\x1b[1;1H\x1b[44m\x1b[2K");
+                        damage = TerminalDamage::Partial;
+                    }
+                    8 => processor.advance(&mut cw, b"\x1b[?1049h\x1b[34malt"),
+                    9 => processor.advance(&mut cw, b"\x1b[?1049l"),
+                    10 => cw.resize(CrosswordsSize::new(19, 5)),
+                    11 => cw.resize(CrosswordsSize::new(32, 8)),
+                    12 => {
+                        // Overlays edit resolved values, not the source IDs.
+                        for row in &mut styles {
+                            row.make_mut(cw.columns())[0].flags |=
+                                style::StyleFlags::INVERSE;
+                        }
+                    }
+                    13 => {
+                        cw = new_term(32, 8);
+                        cw.grid.update_history(32);
+                        processor = crate::performer::handler::Processor::default();
+                        processor.advance(&mut cw, input.as_bytes());
+                    }
+                    14 => damage = TerminalDamage::Noop,
+                    _ => processor.advance(&mut cw, b"\x1b[3J\x1b[0m\x1b[2J"),
+                }
+                let (start, end) = cw.visible_line_bounds();
+                let all_modified = (start..end).all(|y| cw.grid[Line(y)].dirty);
+                let actual = if deferred {
+                    cw.snapshot_visible_deferred(
+                        &damage,
+                        &mut rows,
+                        &mut styles,
+                        &mut extras,
+                        &mut scratch,
+                    )
+                    .resolve()
+                } else {
+                    cw.snapshot_visible(&damage, &mut rows, &mut styles, &mut extras)
+                };
+                assert_eq!(actual, all_modified, "source damage at {step}");
+                let (mut fresh_rows, mut fresh_styles, mut fresh_extras) =
+                    Default::default();
+                cw.snapshot_visible(
+                    &TerminalDamage::Full,
+                    &mut fresh_rows,
+                    &mut fresh_styles,
+                    &mut fresh_extras,
+                );
+                assert_eq!(rows, fresh_rows, "cells at {step}, deferred={deferred}");
+                assert_eq!(
+                    styles, fresh_styles,
+                    "styles at {step}, deferred={deferred}"
+                );
+                let mut ids = HashSet::new();
+                for row in &rows {
+                    if matches!(damage, TerminalDamage::Full) {
+                        assert!(row.dirty, "redraw at {step}");
+                    }
+                    for cell in &row.inner {
+                        if let Some(id) = cell.extras_id_checked() {
+                            ids.insert(id);
+                            assert_eq!(
+                                extras.get(&id),
+                                fresh_extras.get(&id),
+                                "extras {id} at {step}"
+                            );
+                        }
+                    }
+                }
+                assert_eq!(extras.len(), ids.len(), "offscreen extras at {step}");
+                for row in &mut rows {
+                    row.dirty = false;
+                }
+                cw.reset_damage();
+            }
+        }
+    }
+
+    #[test]
+    fn full_snapshots_refresh_reused_ids_and_preserve_frozen_values() {
+        let mut cw = new_term(120, 80);
+        let mut processor = crate::performer::handler::Processor::default();
+        processor.advance(&mut cw, "\x1b[31me\u{301}\x1b[0m default".as_bytes());
+        let (mut rows, mut styles, mut extras) = Default::default();
+        cw.snapshot_visible(&TerminalDamage::Full, &mut rows, &mut styles, &mut extras);
+        let frozen_styles = styles.clone();
+        let frozen_extras = extras.clone();
+        let id = rows[0][Column(0)].extras_id().unwrap();
+        let raw = rows[0][Column(0)];
+
+        // Both intern tables restart, with the same raw cell bits but new
+        // meanings. Coordinate alignment must never bypass value validation.
+        cw = new_term(120, 80);
+        processor.advance(&mut cw, "\x1b[34me\u{308}\x1b[0m default".as_bytes());
+        assert_eq!(cw.grid[Line(0)][Column(0)], raw);
+        let mut scratch = snapshot::DeferredStyles::default();
+        let captured = cw.snapshot_visible_deferred(
+            &TerminalDamage::Full,
+            &mut rows,
+            &mut styles,
+            &mut extras,
+            &mut scratch,
+        );
+        // Palette ownership must still hold if the terminal changes again
+        // between capture and deferred style resolution.
+        let expected_style = cw.grid.style_of(&raw);
+        cw = new_term(120, 80);
+        processor.advance(&mut cw, b"\x1b[32mgreen");
+        captured.resolve();
+        assert_eq!(styles[0].at(0), expected_style);
+        assert_ne!(styles[0], frozen_styles[0]);
+        assert_eq!(extras.get(&id).unwrap().zerowidth, ['\u{308}']);
+        assert_eq!(frozen_extras.get(&id).unwrap().zerowidth, ['\u{301}']);
     }
 
     #[test]

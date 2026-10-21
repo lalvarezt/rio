@@ -7,6 +7,19 @@ use std::hash::Hasher;
 use std::ops::Range;
 use std::sync::Arc;
 
+pub(super) fn metadata_matches(src: &Row<Square>, saved: &Row<Square>) -> bool {
+    (src.has_styles || src.has_extras)
+        && src.inner.len() == saved.inner.len()
+        && src
+            .inner
+            .iter()
+            .zip(&saved.inner)
+            .fold(0, |changed, (a, b)| {
+                changed | (a.snapshot_metadata() ^ b.snapshot_metadata())
+            })
+            == 0
+}
+
 #[derive(Clone, Debug)]
 enum ClusterData {
     Empty,
@@ -628,6 +641,7 @@ pub struct SnapshotExtras {
     rows: Vec<Vec<u16>>,
     seen: Vec<u64>,
     generation: u64,
+    viewport: Option<(u64, usize)>,
 }
 
 impl SnapshotExtras {
@@ -652,8 +666,45 @@ impl SnapshotExtras {
         self.rows.len()
     }
 
+    // Move all index-parallel caches together. The absolute history position
+    // includes evictions, so output can move the viewport even at offset zero.
+    // This is only an alignment hint: grid replacement/reflow can invalidate
+    // those coordinates. The caller must compare each row's metadata and
+    // validate retained style/extras values against the current tables.
+    pub(super) fn align(
+        &mut self,
+        rows: &mut [Row<Square>],
+        styles: &mut [RowStyles],
+        top: u64,
+        columns: usize,
+    ) {
+        if let Some((previous, width)) = self.viewport {
+            let distance = top.abs_diff(previous);
+            if width == columns
+                && distance > 0
+                && distance < rows.len() as u64
+                // Plain output has no dependencies worth moving; copying its
+                // cell words is cheaper than rotating three cache vectors.
+                && (!self.entries.is_empty() || rows.iter().any(|row| row.has_styles))
+            {
+                let distance = distance as usize;
+                if top > previous {
+                    rows.rotate_left(distance);
+                    styles.rotate_left(distance);
+                    self.rows.rotate_left(distance);
+                } else {
+                    rows.rotate_right(distance);
+                    styles.rotate_right(distance);
+                    self.rows.rotate_right(distance);
+                }
+            }
+        }
+        self.viewport = Some((top, columns));
+    }
+
     pub(super) fn begin(&mut self, count: usize, full: bool) {
         if full {
+            self.viewport = None;
             if !self.entries.is_empty() {
                 self.entries.clear();
                 for row in &mut self.rows {
