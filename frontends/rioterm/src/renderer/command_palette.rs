@@ -40,6 +40,7 @@ const INPUT_RADIUS: f32 = 10.0;
 const RESULT_RADIUS: f32 = 8.0;
 const HINT_GAP: f32 = 20.0;
 const SCROLLBAR_OPACITY: f32 = 0.65;
+const RESULT_SCROLLBAR_GAP: f32 = 8.0;
 const RESULT_ITEM_HEIGHT: f32 = 34.0;
 const RESULT_FONT_SIZE: f32 = 14.0;
 const SHORTCUT_FONT_SIZE: f32 = 12.0;
@@ -1020,6 +1021,14 @@ impl CommandPalette {
                 ORDER + 2,
             );
         }
+        let show_scrollbar = self.matches.len() > layout.count && layout.count > 0;
+        let scrollbar_x =
+            x + width - (PALETTE_PADDING + scrollbar::SCROLLBAR_WIDTH) / 2.0;
+        let result_width = if show_scrollbar {
+            (scrollbar_x - RESULT_SCROLLBAR_GAP - input_x).max(0.0)
+        } else {
+            input_width
+        };
         let result_opts = opts(RESULT_FONT_SIZE, theme.foreground);
         let selected_opts = opts(RESULT_FONT_SIZE, theme.on_accent);
         let shortcut_opts = opts(SHORTCUT_FONT_SIZE, theme.muted);
@@ -1059,7 +1068,7 @@ impl CommandPalette {
                     None,
                     input_x,
                     top,
-                    input_width,
+                    result_width,
                     RESULT_ITEM_HEIGHT,
                     theme.accent,
                     0.2,
@@ -1085,7 +1094,7 @@ impl CommandPalette {
                 0.0
             };
             let budget =
-                (input_width - INPUT_PADDING_X * 2.0 - hint_width - copy_width).max(0.0);
+                (result_width - INPUT_PADDING_X * 2.0 - hint_width - copy_width).max(0.0);
             let title =
                 super::window_chrome::fit_text(sugarloaf, row.title(), budget, text_opts);
             sugarloaf.text_mut().draw(
@@ -1096,9 +1105,9 @@ impl CommandPalette {
             );
             if !shortcut.is_empty() {
                 let width = sugarloaf.text_mut().measure(shortcut, hint_opts);
-                if width < input_width - INPUT_PADDING_X * 2.0 {
+                if width < result_width - INPUT_PADDING_X * 2.0 {
                     sugarloaf.text_mut().draw(
-                        input_x + input_width - INPUT_PADDING_X - width,
+                        input_x + result_width - INPUT_PADDING_X - width,
                         cy + shortcut_y,
                         shortcut,
                         hint_opts,
@@ -1108,7 +1117,7 @@ impl CommandPalette {
             if matches!(row, PaletteRow::Font { .. }) {
                 draw_copy_icon(
                     sugarloaf,
-                    input_x + input_width - INPUT_PADDING_X - ICON_SIZE,
+                    input_x + result_width - INPUT_PADDING_X - ICON_SIZE,
                     cy - ICON_SIZE / 2.0,
                     if selected {
                         theme.on_accent
@@ -1118,7 +1127,7 @@ impl CommandPalette {
                 );
             }
         }
-        if self.matches.len() > layout.count && layout.count > 0 {
+        if show_scrollbar {
             let top = layout.rows[0].1;
             let track = y + height - PALETTE_PADDING - top;
             let normalized =
@@ -1132,7 +1141,7 @@ impl CommandPalette {
             ) {
                 scrollbar::draw_thumb(
                     sugarloaf,
-                    x + width - (PALETTE_PADDING + scrollbar::SCROLLBAR_WIDTH) / 2.0,
+                    scrollbar_x,
                     thumb_y,
                     thumb_height,
                     SCROLLBAR_OPACITY,
