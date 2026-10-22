@@ -1027,14 +1027,17 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 self.toggle_quake_window(event_loop);
             }
             #[cfg(target_os = "macos")]
-            RioEventType::Rio(RioEvent::CreateNativeTab(working_dir_overwrite)) => {
+            RioEventType::Rio(RioEvent::CreateNativeTab(
+                working_dir_overwrite,
+                command,
+            )) => {
                 if let Some(route) = self.router.routes.get(&window_id) {
                     // This case happens only for native tabs
                     // every time that a new tab is created through context
                     // it also reaches for the foreground process path if
                     // config.use_current_path is true
                     // For these case we need to make a workaround
-                    let config = if working_dir_overwrite.is_some() {
+                    let mut config = if working_dir_overwrite.is_some() {
                         rio_backend::config::Config {
                             working_dir: working_dir_overwrite,
                             ..self.config.clone()
@@ -1042,6 +1045,12 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     } else {
                         self.config.clone()
                     };
+                    if let Some((program, args)) = command {
+                        config.shell = rio_backend::config::Shell {
+                            program: Some(program),
+                            args,
+                        };
+                    }
 
                     self.router.create_native_tab(
                         event_loop,

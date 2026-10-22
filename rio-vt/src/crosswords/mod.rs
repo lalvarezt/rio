@@ -471,6 +471,7 @@ where
     pub route_id: usize,
     title_stack: Vec<String>,
     pub current_directory: Option<std::path::PathBuf>,
+    pub remote_directory: Option<(String, std::path::PathBuf)>,
     /// Shell state from `OSC 1337 ; SetUserVar` (iTerm2 style).
     pub user_vars: rustc_hash::FxHashMap<String, String>,
 
@@ -544,6 +545,7 @@ impl<U: EventListener> Crosswords<U> {
             route_id,
             title_stack: Default::default(),
             current_directory: None,
+            remote_directory: None,
             user_vars: rustc_hash::FxHashMap::default(),
             damage_event_in_flight: false,
             modify_other_keys: 0,
@@ -3696,10 +3698,22 @@ impl<U: EventListener> Handler for Crosswords<U> {
 
     fn set_current_directory(&mut self, path: std::path::PathBuf) {
         trace!("Setting working directory {:?}", path);
+        self.remote_directory = None;
         if self.current_directory.as_deref() == Some(path.as_path()) {
             return;
         }
         self.current_directory = Some(path);
+        self.event_proxy.send_event(
+            RioEvent::CurrentDirectoryChanged(self.route_id),
+            self.window_id,
+        );
+    }
+
+    fn set_remote_directory(&mut self, host: String, path: std::path::PathBuf) {
+        if self.remote_directory.as_ref() == Some(&(host.clone(), path.clone())) {
+            return;
+        }
+        self.remote_directory = Some((host, path));
         self.event_proxy.send_event(
             RioEvent::CurrentDirectoryChanged(self.route_id),
             self.window_id,

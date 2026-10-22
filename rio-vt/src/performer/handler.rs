@@ -108,6 +108,9 @@ pub trait Handler {
     /// OSC to set current directory.
     fn set_current_directory(&mut self, _: std::path::PathBuf) {}
 
+    /// Remote OSC 7 paths stay separate from the local filesystem context.
+    fn set_remote_directory(&mut self, _host: String, _path: std::path::PathBuf) {}
+
     /// OSC 133: mark the cursor row as a semantic prompt row.
     fn set_semantic_prompt(&mut self, _: crate::crosswords::grid::row::SemanticPrompt) {}
 
@@ -1160,6 +1163,10 @@ impl<U: Handler> Perform for Performer<'_, U> {
                 if let Some(payload) = osc::join_params(params, 1) {
                     if let Some(path) = osc::parse_current_directory(payload.as_bytes()) {
                         self.handler.set_current_directory(path.into());
+                    } else if let Some((host, path)) =
+                        osc::parse_remote_directory(payload.as_bytes())
+                    {
+                        self.handler.set_remote_directory(host, path.into());
                     }
                 }
             }

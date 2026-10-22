@@ -75,6 +75,8 @@ pub struct Context<T: EventListener> {
     /// `{{ program }}` and the empty-title strip fallback without ever
     /// inspecting the foreground process.
     pub spawned_program: String,
+    /// Present for panes launched directly through Rio's SSH connector.
+    pub ssh: Option<crate::ssh::Connection>,
     _io_thread: Option<JoinHandle<(Machine<teletypewriter::Pty, T>, performer::State)>>,
 }
 
@@ -221,6 +223,7 @@ pub fn create_dead_context<T: rio_backend::event::EventListener>(
         title: ContextTitle::default(),
         title_dirty: false,
         spawned_program: String::new(),
+        ssh: None,
         _io_thread: None,
     }
 }
@@ -418,6 +421,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             rich_text_id,
             renderable_content: RenderableContent::new(cursor_state.0.clone()),
             dimension,
+            ssh: crate::ssh::Connection::from_shell(&config.shell),
             title: ContextTitle::default(),
             title_dirty: false,
             spawned_program: spawned_program_name(config),
@@ -1299,39 +1303,110 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         self.set_current(target);
     }
 
+    pub fn current_ssh(&self) -> Option<crate::ssh::Connection> {
+        if let Some(connection) = &self.current().ssh {
+            return Some(connection.clone());
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let current = self.current();
+            let mut argv = teletypewriter::foreground_process_args(
+                *current.main_fd,
+                current.shell_pid,
+            )
+            .ok()?
+            .into_iter();
+            let shell = Shell {
+                program: argv.next(),
+                args: argv.collect(),
+            };
+            crate::ssh::Connection::from_shell(&shell)
+        }
+        #[cfg(target_os = "windows")]
+        None
+    }
+
+    pub fn report_ssh_error(&self, message: String) {
+        self.event_proxy.send_event(
+            RioEvent::ReportToAssistant(RioError {
+                report: RioErrorType::InitializationError(message),
+                level: RioErrorLevel::Warning,
+            }),
+            self.window_id,
+        );
+    }
+
+    /// Tabs and splits share the same host, directory, and authentication rules.
+    fn config_here(&self, inherit_ssh: bool) -> Result<ContextManagerConfig, String> {
+        let mut config = self.config.clone();
+        if let Some(connection) = inherit_ssh.then(|| self.current_ssh()).flatten() {
+            let (directory, reported_host) = {
+                let terminal = self.current().terminal.lock();
+                let directory = terminal
+                    .remote_directory
+                    .as_ref()
+                    .map(|(_, path)| path.clone())
+                    .or_else(|| {
+                        let reported_remote =
+                            terminal.user_vars.get("RIO_SSH").is_some_and(|v| v == "1");
+                        (self.current().ssh.is_some() || reported_remote)
+                            .then_some(terminal.current_directory.clone())
+                            .flatten()
+                    });
+                (
+                    directory,
+                    terminal
+                        .remote_directory
+                        .as_ref()
+                        .map(|(host, _)| host.clone()),
+                )
+            };
+            let directory = config.cwd.then_some(directory).flatten();
+            config.shell = connection
+                .duplicate_shell(directory.as_deref(), reported_host.as_deref())?;
+            // Remote paths are arguments to the remote shell, never a local cwd.
+            config.shell_integration = false;
+            return Ok(config);
+        }
+        if !inherit_ssh && crate::ssh::Connection::from_shell(&config.shell).is_some() {
+            config.shell = Shell::default();
+        }
+        if config.cwd {
+            #[cfg(not(target_os = "windows"))]
+            if let Ok(path) = teletypewriter::foreground_process_path(
+                *self.current().main_fd,
+                self.current().shell_pid,
+            ) {
+                config.working_dir = Some(path.to_string_lossy().into_owned());
+            }
+            #[cfg(target_os = "windows")]
+            if let Some(path) = self
+                .current()
+                .terminal
+                .lock()
+                .current_directory
+                .as_ref()
+                .filter(|p| p.is_dir())
+            {
+                config.working_dir = Some(path.to_string_lossy().into_owned());
+            }
+        }
+        Ok(config)
+    }
+
     pub fn split(
         &mut self,
         rich_text_id: usize,
         split_down: bool,
         sugarloaf: &mut Sugarloaf,
     ) {
-        let mut working_dir = self.config.working_dir.clone();
-        if self.config.cwd {
-            #[cfg(not(target_os = "windows"))]
-            {
-                let current_context = self.current();
-                if let Ok(path) = teletypewriter::foreground_process_path(
-                    *current_context.main_fd,
-                    current_context.shell_pid,
-                ) {
-                    working_dir = Some(path.to_string_lossy().to_string());
-                }
+        let cloned_config = match self.config_here(true) {
+            Ok(config) => config,
+            Err(message) => {
+                self.report_ssh_error(message);
+                return;
             }
-
-            #[cfg(target_os = "windows")]
-            {
-                // if let Ok(path) = teletypewriter::foreground_process_path() {
-                //     working_dir =
-                //         Some(path.to_string_lossy().to_string());
-                // }
-                working_dir = None;
-            }
-        }
-
-        let mut cloned_config = self.config.clone();
-        if working_dir.is_some() {
-            cloned_config.working_dir = working_dir;
-        }
+        };
 
         let current = self.current();
         let cursor = current.cursor_from_ref();
@@ -1426,43 +1501,62 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[inline]
     pub fn add_context(&mut self, redirect: bool, rich_text_id: usize) {
-        let mut working_dir = self.config.working_dir.clone();
-        if self.config.cwd {
-            #[cfg(not(target_os = "windows"))]
-            {
-                let current_context = self.current();
-                if let Ok(path) = teletypewriter::foreground_process_path(
-                    *current_context.main_fd,
-                    current_context.shell_pid,
-                ) {
-                    working_dir = Some(path.to_string_lossy().to_string());
+        self.add_context_here(redirect, rich_text_id, true);
+    }
+
+    pub fn add_context_here(
+        &mut self,
+        redirect: bool,
+        rich_text_id: usize,
+        inherit_ssh: bool,
+    ) {
+        match self.config_here(inherit_ssh) {
+            Ok(config) => self.add_context_with_config(redirect, rich_text_id, config),
+            Err(message) => self.report_ssh_error(message),
+        }
+    }
+
+    pub fn connect_ssh(
+        &mut self,
+        rich_text_id: usize,
+        connection: crate::ssh::Connection,
+    ) {
+        match connection.connect_shell() {
+            Ok(shell) => {
+                let mut config = self.config.clone();
+                config.shell = shell;
+                config.shell_integration = false;
+                self.add_context_with_config(true, rich_text_id, config);
+                if let Err(message) = crate::ssh::remember(&connection) {
+                    tracing::warn!("Could not save SSH connection: {message}");
                 }
             }
-
-            #[cfg(target_os = "windows")]
-            {
-                // if let Ok(path) = teletypewriter::foreground_process_path() {
-                //     working_dir =
-                //         Some(path.to_string_lossy().to_string());
-                // }
-                working_dir = None;
-            }
+            Err(message) => self.report_ssh_error(message),
         }
+    }
 
+    fn add_context_with_config(
+        &mut self,
+        redirect: bool,
+        rich_text_id: usize,
+        cloned_config: ContextManagerConfig,
+    ) {
         if self.config.is_native {
-            self.event_proxy
-                .send_event(RioEvent::CreateNativeTab(working_dir), self.window_id);
+            let command = cloned_config
+                .shell
+                .program
+                .clone()
+                .map(|program| (program, cloned_config.shell.args.clone()));
+            self.event_proxy.send_event(
+                RioEvent::CreateNativeTab(cloned_config.working_dir, command),
+                self.window_id,
+            );
             return;
         }
 
         let size = self.contexts.len();
         if size < self.capacity {
             let last_index = self.contexts.len();
-
-            let mut cloned_config = self.config.clone();
-            if working_dir.is_some() {
-                cloned_config.working_dir = working_dir;
-            }
 
             let current = self.current();
             let cursor = current.cursor_from_ref();
@@ -1564,6 +1658,173 @@ pub fn process_open_url(
 pub mod test {
     use super::*;
     use crate::event::VoidListener;
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires RIO_TEST_SSH_TARGET and an already authenticated Windows SSH master"]
+    fn live_ssh_tabs_and_split_launches_reuse_connection_and_directory() {
+        use std::time::Duration;
+        #[derive(Clone, Default)]
+        struct SshEvents(Arc<std::sync::Mutex<Vec<(usize, String)>>>);
+        impl EventListener for SshEvents {
+            fn send_event(&self, event: RioEvent, _: WindowId) {
+                if let RioEvent::PtyWrite(route, text) = event {
+                    self.0.lock().unwrap().push((route, text));
+                }
+            }
+        }
+        let events = SshEvents::default();
+        let target =
+            std::env::var("RIO_TEST_SSH_TARGET").expect("set RIO_TEST_SSH_TARGET");
+        let connection = crate::ssh::Connection::new(&target, true).unwrap();
+        let shell = connection
+            .duplicate_shell(None, None)
+            .expect("authenticate the SSH master first");
+        let dimension = ContextDimension::build(
+            800.0,
+            600.0,
+            rio_backend::sugarloaf::layout::TextDimensions::default(),
+            rio_backend::sugarloaf::layout::CellMetrics {
+                cell_width: 8,
+                cell_height: 16,
+                cell_baseline: 12,
+                face_width: 8.0,
+                face_height: 16.0,
+                face_y: 0.0,
+            },
+            1.0,
+            14.0,
+            Margin::default(),
+        );
+        let mut manager = ContextManager::start(
+            (&Cursor::default(), false),
+            events.clone(),
+            WindowId::from(0),
+            0,
+            0,
+            ContextManagerConfig {
+                dead_pty: true,
+                ..Default::default()
+            },
+            dimension,
+            Margin::default(),
+            None,
+        )
+        .unwrap();
+        manager.config.dead_pty = false;
+        manager.config.spawn_performer = true;
+        manager.config.cwd = true;
+        let mut config = manager.config.clone();
+        config.shell = shell;
+        manager.add_context_with_config(true, 1, config);
+
+        let wait_for = |context: &Context<SshEvents>, variable: &str| -> String {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                // Native terminals send cursor/device queries before drawing.
+                // Mirror the window event loop's replies in this headless test.
+                {
+                    let mut replies = events.0.lock().unwrap();
+                    let mut index = 0;
+                    while index < replies.len() {
+                        if replies[index].0 == context.route_id {
+                            let (_, text) = replies.remove(index);
+                            context.messenger.send_write(text.into_bytes());
+                        } else {
+                            index += 1;
+                        }
+                    }
+                }
+                if let Some(value) =
+                    context.terminal.lock().user_vars.get(variable).cloned()
+                {
+                    return value;
+                }
+                if context
+                    ._io_thread
+                    .as_ref()
+                    .is_some_and(|thread| thread.is_finished())
+                    || Instant::now() >= deadline
+                {
+                    panic!("SSH pane {} did not report {variable} before exiting or timing out", context.route_id);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let report = |context: &Context<SshEvents>, variable: &str, expression: &str| {
+            context.messenger.send_write(format!(
+                "[Console]::Write(\"$([char]27)]1337;SetUserVar={variable}=$([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]({expression}))))$([char]7)\")\r"
+            ).into_bytes());
+        };
+        // Wait for integration, then move the original shell without modifying
+        // any remote files. The connection's server-side port proves reuse.
+        wait_for(manager.current(), "RIO_SSH");
+        manager.current().messenger.send_write(b"$global:RioReuseProbe = 'parent'; Set-Location -LiteralPath 'C:\\Windows'\r".to_vec());
+        report(manager.current(), "RIO_TEST_READY", "$PWD.Path");
+        assert_eq!(wait_for(manager.current(), "RIO_TEST_READY"), "C:\\Windows");
+        report(
+            manager.current(),
+            "RIO_TEST_TRANSPORT",
+            "$env:SSH_CONNECTION",
+        );
+        let transport = wait_for(manager.current(), "RIO_TEST_TRANSPORT");
+
+        // Also cover SSH launched inside a shell: identify the live foreground
+        // argv when Rio did not retain a connection recipe at creation time.
+        manager.current_mut().ssh = None;
+        assert_eq!(manager.current_ssh().unwrap().destination, target);
+
+        manager.add_context(true, 2);
+        assert_eq!(manager.len(), 3);
+        wait_for(manager.current(), "RIO_SSH");
+        report(manager.current(), "RIO_TEST_DIRECTORY", "$PWD.Path");
+        assert_eq!(
+            wait_for(manager.current(), "RIO_TEST_DIRECTORY"),
+            "C:\\Windows"
+        );
+        report(
+            manager.current(),
+            "RIO_TEST_TRANSPORT",
+            "$env:SSH_CONNECTION",
+        );
+        assert_eq!(wait_for(manager.current(), "RIO_TEST_TRANSPORT"), transport);
+        report(manager.current(), "RIO_TEST_INDEPENDENT", "$null -eq (Get-Variable RioReuseProbe -Scope Global -ErrorAction SilentlyContinue)");
+        assert_eq!(wait_for(manager.current(), "RIO_TEST_INDEPENDENT"), "True");
+
+        // Both split directions call config_here and create_context. Exercise
+        // that exact launch path without requiring a graphical window or GPU.
+        for split in ["right", "down"] {
+            let config = manager.config_here(true).unwrap();
+            let pane = ContextManager::create_context(
+                (&Cursor::default(), false),
+                events.clone(),
+                WindowId::from(0),
+                3,
+                manager.current().dimension,
+                &config,
+            )
+            .unwrap();
+            wait_for(&pane, "RIO_SSH");
+            report(&pane, "RIO_TEST_DIRECTORY", "$PWD.Path");
+            assert_eq!(
+                wait_for(&pane, "RIO_TEST_DIRECTORY"),
+                "C:\\Windows",
+                "{split} split"
+            );
+            report(&pane, "RIO_TEST_TRANSPORT", "$env:SSH_CONNECTION");
+            assert_eq!(
+                wait_for(&pane, "RIO_TEST_TRANSPORT"),
+                transport,
+                "{split} split"
+            );
+        }
+
+        // Closing the original pane must not close its sibling shell.
+        manager.contexts.remove(1);
+        manager.current_index -= 1;
+        report(manager.current(), "RIO_TEST_SURVIVED", "'alive'");
+        assert_eq!(wait_for(manager.current(), "RIO_TEST_SURVIVED"), "alive");
+    }
 
     #[test]
     fn test_capacity() {

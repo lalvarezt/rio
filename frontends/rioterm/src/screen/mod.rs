@@ -1725,6 +1725,15 @@ impl Screen<'_> {
     }
 
     pub fn create_tab(&mut self, clipboard: &mut Clipboard) {
+        self.create_tab_with(clipboard, None, true);
+    }
+
+    fn create_tab_with(
+        &mut self,
+        clipboard: &mut Clipboard,
+        connection: Option<crate::ssh::Connection>,
+        inherit_ssh: bool,
+    ) {
         let redirect = true;
 
         // We resize the current tab ahead to prepare the
@@ -1742,7 +1751,18 @@ impl Screen<'_> {
         // Allocate panel id; the layout pass handles positioning via
         // `ContextDimension` once the new tab's grid is built.
         let rich_text_id = next_rich_text_id();
-        self.context_manager.add_context(redirect, rich_text_id);
+        if let Some(connection) = connection {
+            self.context_manager.connect_ssh(rich_text_id, connection);
+        } else if inherit_ssh {
+            self.context_manager.add_context(redirect, rich_text_id);
+        } else {
+            self.context_manager
+                .add_context_here(redirect, rich_text_id, false);
+        }
+        // A failed connection check creates no tab. Restore the old tab strip.
+        if self.ctx().len() == num_tabs {
+            self.resize_top_or_bottom_line(num_tabs);
+        }
         let new_index = self.context_manager.current_index();
         self.context_manager.switch_context_visibility(
             &mut self.sugarloaf,
@@ -2963,10 +2983,7 @@ impl Screen<'_> {
         let pointer = (self.renderer.navigation.island_visible(num_tabs)
             && mouse_y >= 0.0
             && mouse_y <= (self.chrome_height() * scale_factor) as f64)
-            .then_some([
-                mouse_x as f32 / scale_factor,
-                mouse_y as f32 / scale_factor,
-            ]);
+            .then_some([mouse_x as f32 / scale_factor, mouse_y as f32 / scale_factor]);
         let changed = self
             .renderer
             .island
@@ -3838,10 +3855,7 @@ impl Screen<'_> {
             self.clear_selection();
 
             let payload = rio_backend::clipboard::encode_paste(text, true);
-            self.ctx_mut()
-                .current_mut()
-                .messenger
-                .send_write(payload);
+            self.ctx_mut().current_mut().messenger.send_write(payload);
         } else {
             let payload = if bracketed {
                 // The application did not enable bracketed paste, so normalize
@@ -3873,13 +3887,25 @@ impl Screen<'_> {
     /// dismissal behavior.
     pub fn activate_palette_selection(&mut self, clipboard: &mut Clipboard) {
         use crate::renderer::command_palette::PaletteAction;
+        if let Some(connection) = self.renderer.command_palette.get_selected_ssh() {
+            self.renderer.command_palette.set_enabled(false);
+            self.create_tab_with(clipboard, Some(connection), false);
+            return;
+        }
         if let Some(font) = self.renderer.command_palette.get_selected_font() {
             clipboard.set(ClipboardType::Clipboard, font);
             self.renderer.command_palette.set_enabled(false);
             return;
         }
         let action = self.renderer.command_palette.get_selected_action();
-        if action != Some(PaletteAction::ListFonts) {
+        if !matches!(
+            action,
+            Some(
+                PaletteAction::ListFonts
+                    | PaletteAction::SshConnect
+                    | PaletteAction::SshConnectPowerShell
+            )
+        ) {
             self.renderer.command_palette.set_enabled(false);
         }
         if let Some(action) = action {
@@ -3895,6 +3921,25 @@ impl Screen<'_> {
         use crate::renderer::command_palette::PaletteAction;
         match action {
             PaletteAction::TabCreate => self.create_tab(clipboard),
+            PaletteAction::TabCreateLocal => self.create_tab_with(clipboard, None, false),
+            PaletteAction::SshConnect => {
+                self.renderer.command_palette.enter_ssh_mode(false)
+            }
+            PaletteAction::SshConnectPowerShell => {
+                self.renderer.command_palette.enter_ssh_mode(true)
+            }
+            PaletteAction::SshSaveConnection => {
+                match self.context_manager.current_ssh() {
+                    Some(connection) => {
+                        if let Err(message) = crate::ssh::remember(&connection) {
+                            self.context_manager.report_ssh_error(message);
+                        }
+                    }
+                    None => self.context_manager.report_ssh_error(
+                        "The focused pane is not an SSH connection.".into(),
+                    ),
+                }
+            }
             PaletteAction::TabClose => self.close_tab(clipboard),
             PaletteAction::TabCloseUnfocused => {
                 if self.ctx().len() > 1 {

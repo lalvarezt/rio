@@ -219,6 +219,16 @@ fn strip_scheme<'a>(s: &'a str, scheme: &str) -> Option<&'a str> {
 /// far side of an ssh session, so a directory that belongs to another machine is
 /// refused rather than reported as ours.
 pub(super) fn parse_current_directory(param: &[u8]) -> Option<String> {
+    let (host, path) = parse_directory(param)?;
+    host_is_local(&host).then_some(path)
+}
+
+pub(super) fn parse_remote_directory(param: &[u8]) -> Option<(String, String)> {
+    let (host, path) = parse_directory(param)?;
+    (!host_is_local(&host)).then_some((host, path))
+}
+
+fn parse_directory(param: &[u8]) -> Option<(String, String)> {
     let s = simd_utf8::from_utf8_fast(param).ok()?;
 
     let (after_scheme, percent_encoded) = match strip_scheme(s, FILE_SCHEME) {
@@ -232,26 +242,25 @@ pub(super) fn parse_current_directory(param: &[u8]) -> Option<String> {
     let host = &after_scheme[..path_start];
     let path = &after_scheme[path_start..];
 
-    if !host_is_local(host) {
-        tracing::warn!("ignoring OSC 7 for non-local host {host:?}");
-        return None;
-    }
-
     // Windows paths arrive as `/C:/...` in both flavors; drop the
     // leading slash.
     #[cfg(windows)]
-    let path = path.strip_prefix('/').unwrap_or(path);
+    let path = if host_is_local(host) {
+        path.strip_prefix('/').unwrap_or(path)
+    } else {
+        path
+    };
 
     if !percent_encoded {
         // The kitty flavor is the path verbatim: `?`, `#` and `%` are
         // path bytes, not URL syntax.
-        return Some(path.to_string());
+        return Some((host.to_string(), path.to_string()));
     }
 
     // A query or fragment is not part of the path.
     let path = &path[..path.find(['?', '#']).unwrap_or(path.len())];
 
-    percent_decode(path)
+    Some((host.to_string(), percent_decode(path)?))
 }
 
 /// Whether an OSC 7 host names this machine.
@@ -767,5 +776,11 @@ mod tests {
             term.current_directory.as_deref(),
             Some(std::path::Path::new("/home/My Files"))
         );
+        assert_eq!(
+            term.remote_directory,
+            Some(("not-this-machine.invalid".into(), "/tmp".into()))
+        );
+        processor.advance(&mut term, b"\x1b]7;file:///home/back\x1b\\");
+        assert!(term.remote_directory.is_none());
     }
 }

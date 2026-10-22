@@ -178,7 +178,7 @@ pub enum RioEvent {
     CreateWindow,
     ToggleQuake,
     CloseWindow,
-    CreateNativeTab(Option<String>),
+    CreateNativeTab(Option<String>, Option<(String, Vec<String>)>),
     CreateConfigEditor,
     SelectNativeTabByIndex(usize),
     SelectNativeTabLast,
@@ -374,7 +374,7 @@ impl Debug for RioEvent {
             RioEvent::CreateWindow => write!(f, "CreateWindow"),
             RioEvent::ToggleQuake => write!(f, "ToggleQuake"),
             RioEvent::CloseWindow => write!(f, "CloseWindow"),
-            RioEvent::CreateNativeTab(_) => write!(f, "CreateNativeTab"),
+            RioEvent::CreateNativeTab(..) => write!(f, "CreateNativeTab"),
             RioEvent::SelectNativeTabByIndex(tab_index) => {
                 write!(f, "SelectNativeTabByIndex({tab_index})")
             }

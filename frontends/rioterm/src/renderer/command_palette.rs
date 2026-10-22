@@ -51,6 +51,10 @@ const ORDER: u8 = 20;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaletteAction {
     TabCreate,
+    TabCreateLocal,
+    SshConnect,
+    SshConnectPowerShell,
+    SshSaveConnection,
     TabClose,
     TabCloseUnfocused,
     SelectNextTab,
@@ -94,9 +98,29 @@ const fn platform_shortcut(macos: &'static str, desktop: &'static str) -> &'stat
 
 const COMMANDS: &[Command] = &[
     Command {
-        title: "New Tab",
+        title: "New Tab Here",
         shortcut: platform_shortcut("⌘T", "Ctrl+Shift+T"),
         action: PaletteAction::TabCreate,
+    },
+    Command {
+        title: "New Local Tab",
+        shortcut: "",
+        action: PaletteAction::TabCreateLocal,
+    },
+    Command {
+        title: "Connect via SSH…",
+        shortcut: "",
+        action: PaletteAction::SshConnect,
+    },
+    Command {
+        title: "Connect via SSH with PowerShell…",
+        shortcut: "",
+        action: PaletteAction::SshConnectPowerShell,
+    },
+    Command {
+        title: "Save SSH Connection",
+        shortcut: "",
+        action: PaletteAction::SshSaveConnection,
     },
     Command {
         title: "Close Tab",
@@ -233,6 +257,10 @@ const COMMANDS: &[Command] = &[
 enum PaletteMode {
     Commands,
     Fonts(Vec<String>),
+    Ssh {
+        connections: Vec<crate::ssh::Connection>,
+        powershell: bool,
+    },
 }
 
 /// One row in the filtered result list. Variants carry exactly the
@@ -248,6 +276,10 @@ enum PaletteRow<'a> {
     Font {
         family: &'a str,
     },
+    Ssh {
+        destination: &'a str,
+        powershell: bool,
+    },
 }
 
 impl<'a> PaletteRow<'a> {
@@ -255,6 +287,7 @@ impl<'a> PaletteRow<'a> {
         match *self {
             PaletteRow::Command { title, .. } => title,
             PaletteRow::Font { family } => family,
+            PaletteRow::Ssh { destination, .. } => destination,
         }
     }
 
@@ -262,6 +295,10 @@ impl<'a> PaletteRow<'a> {
         match *self {
             PaletteRow::Command { shortcut, .. } => shortcut,
             PaletteRow::Font { .. } => "",
+            PaletteRow::Ssh {
+                powershell: true, ..
+            } => "PowerShell",
+            PaletteRow::Ssh { .. } => "SSH",
         }
     }
 
@@ -269,6 +306,7 @@ impl<'a> PaletteRow<'a> {
         match *self {
             PaletteRow::Command { action, .. } => Some(action),
             PaletteRow::Font { .. } => None,
+            PaletteRow::Ssh { .. } => None,
         }
     }
 }
@@ -453,6 +491,30 @@ impl CommandPalette {
         self.set_query(String::new());
     }
 
+    pub fn enter_ssh_mode(&mut self, powershell: bool) {
+        self.enabled = true;
+        self.mode = PaletteMode::Ssh {
+            connections: crate::ssh::connections(powershell),
+            powershell,
+        };
+        self.set_query(String::new());
+    }
+
+    pub fn get_selected_ssh(&self) -> Option<crate::ssh::Connection> {
+        let PaletteMode::Ssh {
+            connections,
+            powershell,
+        } = &self.mode
+        else {
+            return None;
+        };
+        let source = self.matches.get(self.selected_index)?.source;
+        connections
+            .get(source)
+            .cloned()
+            .or_else(|| crate::ssh::Connection::new(&self.query, *powershell).ok())
+    }
+
     pub fn append_query(&mut self, text: &str) -> bool {
         if !crate::renderer::is_printable_text(text) {
             return false;
@@ -556,6 +618,17 @@ impl CommandPalette {
             PaletteMode::Fonts(fonts) => PaletteRow::Font {
                 family: &fonts[source],
             },
+            PaletteMode::Ssh {
+                connections,
+                powershell,
+            } => {
+                let connection = connections.get(source);
+                PaletteRow::Ssh {
+                    destination: connection
+                        .map_or(self.query.trim(), |c| c.destination.as_str()),
+                    powershell: connection.map_or(*powershell, |c| c.powershell),
+                }
+            }
         }
     }
 
@@ -572,7 +645,18 @@ impl CommandPalette {
                     {
                         continue;
                     }
-                    if let Some(score) = score(&query, command.title) {
+                    let keywords = match command.action {
+                        PaletteAction::TabCreate => {
+                            "smart tab duplicate ssh same host current directory"
+                        }
+                        PaletteAction::SplitRight | PaletteAction::SplitDown => {
+                            "ssh pane same host current directory"
+                        }
+                        _ => "",
+                    };
+                    if let Some(score) = score(&query, command.title).or_else(|| {
+                        (!query.is_empty() && keywords.contains(&query)).then_some(0)
+                    }) {
                         self.matches.push(Match { score, source });
                     }
                 }
@@ -582,6 +666,26 @@ impl CommandPalette {
                     if let Some(score) = score(&query, family) {
                         self.matches.push(Match { score, source });
                     }
+                }
+            }
+            PaletteMode::Ssh {
+                connections,
+                powershell,
+            } => {
+                for (source, connection) in connections.iter().enumerate() {
+                    if let Some(score) = score(&query, &connection.destination) {
+                        self.matches.push(Match { score, source });
+                    }
+                }
+                if crate::ssh::Connection::new(&self.query, *powershell).is_ok()
+                    && !connections.iter().any(|c| {
+                        c.destination == self.query.trim() && c.powershell == *powershell
+                    })
+                {
+                    self.matches.push(Match {
+                        score: -1,
+                        source: connections.len(),
+                    });
                 }
             }
         }
@@ -871,10 +975,10 @@ impl CommandPalette {
                 theme.foreground
             },
         );
-        let placeholder = if matches!(self.mode, PaletteMode::Fonts(_)) {
-            "Search fonts…"
-        } else {
-            "Search commands…"
+        let placeholder = match self.mode {
+            PaletteMode::Fonts(_) => "Search fonts…",
+            PaletteMode::Ssh { .. } => "Host alias, user@host, or ssh:// address…",
+            PaletteMode::Commands => "Search commands…",
         };
         let input_budget = (input_width - INPUT_TEXT_INSET - INPUT_PADDING_X).max(0.0);
         let text_width = if self.query.is_empty() {
@@ -1044,6 +1148,27 @@ impl CommandPalette {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_picker_accepts_a_destination_without_running_it() {
+        let mut palette = super::CommandPalette::new();
+        palette.mode = super::PaletteMode::Ssh {
+            connections: Vec::new(),
+            powershell: true,
+        };
+        palette.set_query("alice@windows.example".into());
+        let connection = palette.get_selected_ssh().unwrap();
+        assert_eq!(connection.destination, "alice@windows.example");
+        assert!(connection.powershell);
+        palette.set_query("host\ncommand".into());
+        assert!(palette.get_selected_ssh().is_none());
+        palette.set_enabled(true);
+        palette.set_query("smart tab".into());
+        assert_eq!(
+            palette.get_selected_action(),
+            Some(super::PaletteAction::TabCreate)
+        );
+    }
 
     #[test]
     fn test_set_enabled_resets_state() {

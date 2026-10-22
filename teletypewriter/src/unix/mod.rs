@@ -1026,6 +1026,85 @@ pub fn foreground_process_name(main_fd: RawFd, shell_pid: u32) -> String {
     name
 }
 
+/// Read the foreground command's argv without interpreting a shell command
+/// string. Used when opening another shell beside an interactive SSH client.
+pub fn foreground_process_args(
+    main_fd: RawFd,
+    shell_pid: u32,
+) -> io::Result<Vec<String>> {
+    let foreground = unsafe { libc::tcgetpgrp(main_fd) };
+    let pid = if foreground > 0 {
+        foreground
+    } else {
+        shell_pid as libc::pid_t
+    };
+    #[cfg(target_os = "macos")]
+    {
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        let mut bytes = vec![0u8; 1024 * 1024];
+        let mut size = bytes.len();
+        let result = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as u32,
+                bytes.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        bytes.truncate(size);
+        if bytes.len() < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing argv count",
+            ));
+        }
+        let argc = i32::from_ne_bytes(bytes[..4].try_into().unwrap());
+        if argc <= 0 {
+            return Ok(Vec::new());
+        }
+        let executable_end = bytes[4..]
+            .iter()
+            .position(|b| *b == 0)
+            .map(|i| i + 4)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing executable path")
+            })?;
+        let start = bytes[executable_end..]
+            .iter()
+            .position(|b| *b != 0)
+            .map(|i| i + executable_end)
+            .unwrap_or(bytes.len());
+        return bytes[start..]
+            .split(|b| *b == 0)
+            .take(argc as usize)
+            .map(|arg| {
+                String::from_utf8(arg.to_vec())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            })
+            .collect();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        #[cfg(target_os = "freebsd")]
+        let path = format!("/compat/linux/proc/{pid}/cmdline");
+        #[cfg(not(target_os = "freebsd"))]
+        let path = format!("/proc/{pid}/cmdline");
+        std::fs::read(path)?
+            .split(|byte| *byte == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| {
+                String::from_utf8(arg.to_vec())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            })
+            .collect()
+    }
+}
+
 pub fn foreground_process_path(
     main_fd: RawFd,
     shell_pid: u32,

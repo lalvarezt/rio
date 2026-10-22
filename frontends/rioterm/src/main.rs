@@ -19,6 +19,7 @@ mod router;
 mod scheduler;
 mod screen;
 mod shell_integration;
+mod ssh;
 mod watcher;
 
 #[cfg(test)]
