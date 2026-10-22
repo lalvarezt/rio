@@ -79,7 +79,6 @@ struct ShapedGlyph {
 }
 
 #[derive(Clone, Debug)]
-#[allow(unused)]
 struct ShapedRun {
     font_id: u32,
     size_u16: u16,

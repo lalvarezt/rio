@@ -97,11 +97,6 @@ pub fn default_cursor() -> CursorShape {
 }
 
 #[inline]
-pub fn default_theme() -> String {
-    String::from("")
-}
-
-#[inline]
 pub fn default_editor() -> Shell {
     #[cfg(not(target_os = "windows"))]
     {

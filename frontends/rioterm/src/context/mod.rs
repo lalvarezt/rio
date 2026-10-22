@@ -597,7 +597,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             self.current_index = new_index;
         }
 
-        self.keep_only_active_context_visible(sugarloaf);
+        self.clear_inactive_image_overlays(sugarloaf);
         false
     }
 
@@ -1192,7 +1192,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             self.set_current(0);
         }
 
-        self.keep_only_active_context_visible(sugarloaf);
+        self.clear_inactive_image_overlays(sugarloaf);
     }
 
     pub fn close_unfocused_tab(&mut self, index: usize, sugarloaf: &mut Sugarloaf) {
@@ -1204,7 +1204,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         if index < self.current_index {
             self.current_index -= 1;
         }
-        self.keep_only_active_context_visible(sugarloaf);
+        self.clear_inactive_image_overlays(sugarloaf);
     }
 
     #[inline]
@@ -1593,33 +1593,28 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         }
     }
 
-    /// Hide all rich text components except for the current tab
+    /// Clear image overlays for inactive tabs.
     #[inline]
-    pub fn keep_only_active_context_visible(&self, sugarloaf: &mut Sugarloaf) {
+    pub fn clear_inactive_image_overlays(&self, sugarloaf: &mut Sugarloaf) {
         for (idx, context) in self.contexts.iter().enumerate() {
             // Skip the current tab
             if idx == self.current_index {
-                context.set_all_rich_text_visibility(sugarloaf, true);
                 continue;
             }
 
-            context.set_all_rich_text_visibility(sugarloaf, false);
+            context.clear_image_overlays(sugarloaf);
         }
     }
 
-    /// Switch visibility between two contexts (hide old, show new)
+    /// Clear image overlays for a tab being hidden.
     #[inline]
-    pub fn switch_context_visibility(
+    pub fn clear_context_image_overlays(
         &self,
         sugarloaf: &mut Sugarloaf,
         old_index: usize,
-        new_index: usize,
     ) {
         if let Some(old_context) = self.contexts.get(old_index) {
-            old_context.set_all_rich_text_visibility(sugarloaf, false);
-        }
-        if let Some(new_context) = self.contexts.get(new_index) {
-            new_context.set_all_rich_text_visibility(sugarloaf, true);
+            old_context.clear_image_overlays(sugarloaf);
         }
     }
 }

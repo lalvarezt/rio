@@ -9,19 +9,7 @@
 // Eventually the file had updates to support other features like background-color,
 // text color, underline color and etc.
 
-use crate::UnderlineShape;
 use bytemuck::{Pod, Zeroable};
-
-#[allow(dead_code)]
-#[derive(Default, Clone, Copy)]
-pub struct RunUnderline {
-    pub enabled: bool,
-    pub offset: f32,
-    pub size: f32,
-    pub color: [f32; 4],
-    pub is_doubled: bool,
-    pub shape: UnderlineShape,
-}
 
 /// Per-quad instance for instanced rendering (96 bytes).
 /// One per quad — vertex shader generates 4 corners from vertex_id.
@@ -81,8 +69,6 @@ impl From<[f32; 4]> for Rect {
 
 #[derive(Default, Debug)]
 struct Batch {
-    image: Option<i32>,
-    mask: Option<i32>,
     instances: Vec<QuadInstance>,
     vertices: Vec<Vertex>,
     subpix: bool,
@@ -91,8 +77,6 @@ struct Batch {
 
 impl Batch {
     fn clear(&mut self) {
-        self.image = None;
-        self.mask = None;
         self.instances.clear();
         self.vertices.clear();
         self.subpix = false;
@@ -115,23 +99,13 @@ impl Batch {
         width: f32,
         depth: f32,
         color: [f32; 4],
-        image: Option<i32>,
-        mask: Option<i32>,
         subpix: bool,
     ) -> bool {
         if !self.is_empty() && subpix != self.subpix {
             return false;
         }
-        if !self.is_empty() && self.image != image {
-            return false;
-        }
-        if !self.is_empty() && self.mask != mask {
-            return false;
-        }
         self.subpix = subpix;
-        self.image = image;
-        self.mask = mask;
-        let layers = [self.image.unwrap_or(0), self.mask.unwrap_or(0)];
+        let layers = [0, 0];
 
         // Calculate the direction vector of the line
         let dx = x2 - x1;
@@ -231,24 +205,14 @@ impl Batch {
         y3: f32,
         color: [f32; 4],
         depth: f32,
-        image: Option<i32>,
-        mask: Option<i32>,
         subpix: bool,
     ) -> bool {
         if !self.is_empty() && subpix != self.subpix {
             return false;
         }
-        if !self.is_empty() && self.image != image {
-            return false;
-        }
-        if !self.is_empty() && self.mask != mask {
-            return false;
-        }
 
         self.subpix = subpix;
-        self.image = image;
-        self.mask = mask;
-        let layers = [self.image.unwrap_or(0), self.mask.unwrap_or(0)];
+        let layers = [0, 0];
 
         // Create vertices for the triangle and add them directly in drawing order
         self.vertices.push(Vertex {
@@ -297,23 +261,13 @@ impl Batch {
         stroke_width: f32,
         depth: f32,
         color: &[f32; 4],
-        image: Option<i32>,
-        mask: Option<i32>,
         subpix: bool,
     ) -> bool {
         if !self.is_empty() && subpix != self.subpix {
             return false;
         }
-        if !self.is_empty() && self.image != image {
-            return false;
-        }
-        if !self.is_empty() && self.mask != mask {
-            return false;
-        }
         self.subpix = subpix;
-        self.image = image;
-        self.mask = mask;
-        let layers = [self.image.unwrap_or(0), self.mask.unwrap_or(0)];
+        let layers = [0, 0];
 
         // Convert angles from degrees to radians
         let start_angle = start_angle_deg.to_radians();
@@ -417,26 +371,15 @@ impl Batch {
         rect: &Rect,
         depth: f32,
         color: &[f32; 4],
-        coords: Option<&[f32; 4]>,
-        image: Option<i32>,
-        mask: Option<i32>,
         subpix: bool,
         clip_rect: [f32; 4],
     ) -> bool {
         if !self.is_empty() && subpix != self.subpix {
             return false;
         }
-        if !self.is_empty() && self.image != image {
-            return false;
-        }
-        if !self.is_empty() && self.mask != mask {
-            return false;
-        }
         self.subpix = subpix;
-        self.image = image;
-        self.mask = mask;
-        let layers = [self.image.unwrap_or(0), self.mask.unwrap_or(0)];
-        self.push_rect(rect, depth, color, coords, layers, [0.0; 4], 0, clip_rect);
+        let layers = [0, 0];
+        self.push_rect(rect, depth, color, layers, [0.0; 4], 0, clip_rect);
         true
     }
 
@@ -447,9 +390,6 @@ impl Batch {
         rect: &Rect,
         depth: f32,
         color: &[f32; 4],
-        coords: Option<&[f32; 4]>,
-        image: Option<i32>,
-        mask: Option<i32>,
         subpix: bool,
         corner_radii: [f32; 4],
         clip_rect: [f32; 4],
@@ -457,67 +397,9 @@ impl Batch {
         if !self.is_empty() && subpix != self.subpix {
             return false;
         }
-        if !self.is_empty() && self.image != image {
-            return false;
-        }
-        if !self.is_empty() && self.mask != mask {
-            return false;
-        }
         self.subpix = subpix;
-        self.image = image;
-        self.mask = mask;
-        let layers = [self.image.unwrap_or(0), self.mask.unwrap_or(0)];
-        self.push_rect(
-            rect,
-            depth,
-            color,
-            coords,
-            layers,
-            corner_radii,
-            0,
-            clip_rect,
-        );
-        true
-    }
-
-    /// Add an underline quad with GPU pattern rendering
-    /// underline_style: 1 = regular, 2 = dashed, 3 = dotted, 4 = curly
-    /// thickness: The actual line thickness (passed in corner_radii.x)
-    #[inline]
-    #[allow(dead_code)]
-    fn underline(
-        &mut self,
-        rect: &Rect,
-        depth: f32,
-        color: &[f32; 4],
-        underline_style: i32,
-        thickness: f32,
-        clip_rect: [f32; 4],
-    ) -> bool {
-        if !self.is_empty() && self.subpix {
-            return false;
-        }
-        if !self.is_empty() && self.image.is_some() {
-            return false;
-        }
-        if !self.is_empty() && self.mask.is_some() {
-            return false;
-        }
-        self.subpix = false;
-        self.image = None;
-        self.mask = None;
         let layers = [0, 0];
-        let corner_radii = [thickness, 0.0, 0.0, 0.0];
-        self.push_rect(
-            rect,
-            depth,
-            color,
-            None,
-            layers,
-            corner_radii,
-            underline_style,
-            clip_rect,
-        );
+        self.push_rect(rect, depth, color, layers, corner_radii, 0, clip_rect);
         true
     }
 
@@ -528,19 +410,15 @@ impl Batch {
         rect: &Rect,
         depth: f32,
         color: &[f32; 4],
-        coords: Option<&[f32; 4]>,
         layers: [i32; 2],
         corner_radii: [f32; 4],
         underline_style: i32,
         clip_rect: [f32; 4],
     ) {
-        const DEFAULT_COORDS: [f32; 4] = [0., 0., 1., 1.];
-        let coords = coords.unwrap_or(&DEFAULT_COORDS);
-
         self.instances.push(QuadInstance {
             pos: [rect.x, rect.y, depth],
             color: *color,
-            uv_rect: *coords,
+            uv_rect: [0., 0., 1., 1.],
             layers,
             size: [rect.width, rect.height],
             corner_radii,
@@ -556,17 +434,12 @@ impl Batch {
         vert_list: &mut Vec<Vertex>,
         cmds: &mut Vec<DrawCmd>,
     ) {
-        let color_layer = self.image.unwrap_or(0);
-        let mask_layer = self.mask.unwrap_or(0);
-
         if !self.instances.is_empty() {
             let offset = inst_list.len() as u32;
             inst_list.extend_from_slice(&self.instances);
             cmds.push(DrawCmd::Instanced {
                 offset,
                 count: self.instances.len() as u32,
-                color_layer,
-                mask_layer,
             });
         }
 
@@ -576,34 +449,19 @@ impl Batch {
             cmds.push(DrawCmd::Vertices {
                 offset,
                 count: self.vertices.len() as u32,
-                color_layer,
-                mask_layer,
             });
         }
     }
 }
 
 /// Draw command emitted by the batch system.
-// Fields are read by the wgpu/metal recorders; on Linux+no-wgpu only
-// the Vulkan recorder runs and it reads them via `Debug` formatting in
-// trace logs but not via field access — silence dead_code there.
-#[allow(dead_code)]
+#[cfg_attr(not(any(feature = "wgpu", target_os = "macos")), allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
 pub enum DrawCmd {
     /// Instanced quad draw (one instance per quad, 4 verts from vertex_id).
-    Instanced {
-        offset: u32,
-        count: u32,
-        color_layer: i32,
-        mask_layer: i32,
-    },
+    Instanced { offset: u32, count: u32 },
     /// Triangle-list draw for non-quad geometry (lines, triangles, arcs).
-    Vertices {
-        offset: u32,
-        count: u32,
-        color_layer: i32,
-        mask_layer: i32,
-    },
+    Vertices { offset: u32, count: u32 },
 }
 
 pub struct BatchManager {
@@ -634,38 +492,6 @@ impl BatchManager {
     }
 
     #[inline]
-    #[allow(unused)]
-    pub fn add_polygon(
-        &mut self,
-        points: &[(f32, f32)], // Array of (x,y) points defining the polygon
-        depth: f32,
-        color: [f32; 4],
-    ) {
-        // Need at least 3 points to form a polygon
-        if points.len() < 3 {
-            return;
-        }
-
-        // Use triangulation by fan method
-        // This works well for convex shapes and some concave shapes,
-        // but more complex triangulation would be needed for highly concave polygons
-        let first_point = points[0];
-
-        for i in 1..points.len() - 1 {
-            self.add_triangle(
-                first_point.0,
-                first_point.1, // First vertex
-                points[i].0,
-                points[i].1, // Second vertex
-                points[i + 1].0,
-                points[i + 1].1, // Third vertex
-                depth,
-                color,
-            );
-        }
-    }
-
-    #[inline]
     #[allow(clippy::too_many_arguments)]
     pub fn add_triangle(
         &mut self,
@@ -681,15 +507,13 @@ impl BatchManager {
         let subpix = true;
         for batch in self.active.iter_mut() {
             if batch.order == 0
-                && batch.add_triangle(
-                    x1, y1, x2, y2, x3, y3, color, depth, None, None, subpix,
-                )
+                && batch.add_triangle(x1, y1, x2, y2, x3, y3, color, depth, subpix)
             {
                 return;
             }
         }
         self.alloc_batch(0)
-            .add_triangle(x1, y1, x2, y2, x3, y3, color, depth, None, None, subpix);
+            .add_triangle(x1, y1, x2, y2, x3, y3, color, depth, subpix);
     }
 
     #[inline]
@@ -707,13 +531,13 @@ impl BatchManager {
     ) {
         for batch in self.active.iter_mut() {
             if batch.order == order
-                && batch.add_line(x1, y1, x2, y2, width, depth, color, None, None, false)
+                && batch.add_line(x1, y1, x2, y2, width, depth, color, false)
             {
                 return;
             }
         }
         self.alloc_batch(order)
-            .add_line(x1, y1, x2, y2, width, depth, color, None, None, false);
+            .add_line(x1, y1, x2, y2, width, depth, color, false);
     }
 
     #[inline]
@@ -740,8 +564,6 @@ impl BatchManager {
                     stroke_width,
                     depth,
                     color,
-                    None,
-                    None,
                     false,
                 )
             {
@@ -757,8 +579,6 @@ impl BatchManager {
             stroke_width,
             depth,
             color,
-            None,
-            None,
             false,
         );
     }
@@ -840,85 +660,14 @@ impl BatchManager {
     }
 
     #[inline]
-    pub fn add_image_rect(
-        &mut self,
-        rect: &Rect,
-        depth: f32,
-        color: &[f32; 4],
-        coords: &[f32; 4],
-        atlas_layer: i32,
-    ) {
-        let cr = self.clip_rect;
-        for batch in self.active.iter_mut() {
-            if batch.order == 0
-                && batch.rect(
-                    rect,
-                    depth,
-                    color,
-                    Some(coords),
-                    Some(atlas_layer),
-                    None,
-                    false,
-                    cr,
-                )
-            {
-                return;
-            }
-        }
-        self.alloc_batch(0).rect(
-            rect,
-            depth,
-            color,
-            Some(coords),
-            Some(atlas_layer),
-            None,
-            false,
-            cr,
-        );
-    }
-
-    #[inline]
     pub fn rect(&mut self, rect: &Rect, depth: f32, color: &[f32; 4], order: u8) {
         let cr = self.clip_rect;
         for batch in self.active.iter_mut() {
-            if batch.order == order
-                && batch.rect(rect, depth, color, None, None, None, false, cr)
-            {
+            if batch.order == order && batch.rect(rect, depth, color, false, cr) {
                 return;
             }
         }
-        self.alloc_batch(order)
-            .rect(rect, depth, color, None, None, None, false, cr);
-    }
-
-    /// Add an underline quad with GPU pattern rendering
-    #[allow(dead_code)]
-    #[inline]
-    pub fn underline(
-        &mut self,
-        rect: &Rect,
-        depth: f32,
-        color: &[f32; 4],
-        underline_style: i32,
-        thickness: f32,
-        order: u8,
-    ) {
-        let cr = self.clip_rect;
-        for batch in self.active.iter_mut() {
-            if batch.order == order
-                && batch.underline(rect, depth, color, underline_style, thickness, cr)
-            {
-                return;
-            }
-        }
-        self.alloc_batch(order).underline(
-            rect,
-            depth,
-            color,
-            underline_style,
-            thickness,
-            cr,
-        );
+        self.alloc_batch(order).rect(rect, depth, color, false, cr);
     }
 
     /// Add a rounded rectangle with uniform corner radius (no border)
@@ -935,32 +684,13 @@ impl BatchManager {
         let corner_radii = [corner_radius; 4];
         for batch in self.active.iter_mut() {
             if batch.order == order
-                && batch.rounded_rect(
-                    rect,
-                    depth,
-                    color,
-                    None,
-                    None,
-                    None,
-                    false,
-                    corner_radii,
-                    cr,
-                )
+                && batch.rounded_rect(rect, depth, color, false, corner_radii, cr)
             {
                 return;
             }
         }
-        self.alloc_batch(order).rounded_rect(
-            rect,
-            depth,
-            color,
-            None,
-            None,
-            None,
-            false,
-            corner_radii,
-            cr,
-        );
+        self.alloc_batch(order)
+            .rounded_rect(rect, depth, color, false, corner_radii, cr);
     }
 
     /// Add a quad with per-corner radii
@@ -981,9 +711,6 @@ impl BatchManager {
                     rect,
                     depth,
                     background_color,
-                    None,
-                    None,
-                    None,
                     false,
                     corner_radii,
                     cr,
@@ -996,9 +723,6 @@ impl BatchManager {
             rect,
             depth,
             background_color,
-            None,
-            None,
-            None,
             false,
             corner_radii,
             cr,
@@ -1013,89 +737,13 @@ impl BatchManager {
         cmds: &mut Vec<DrawCmd>,
     ) {
         // Sort batches by draw order (painter's algorithm)
-        // Secondary sort: unmasked batches (backgrounds) before masked batches (text)
-        // This ensures backgrounds render before text at the same draw order level
-        self.active.sort_by_key(|b| (b.order, b.mask.is_some()));
+        self.active.sort_by_key(|b| b.order);
 
         for batch in &self.active {
             if batch.instances.is_empty() && batch.vertices.is_empty() {
                 continue;
             }
             batch.build_display_list(instances, vertices, cmds);
-        }
-    }
-
-    #[allow(dead_code)]
-    #[inline]
-    pub fn draw_underline(
-        &mut self,
-        underline: &RunUnderline,
-        x: f32,
-        advance: f32,
-        baseline: f32,
-        depth: f32,
-        line_height: f32,
-    ) {
-        if underline.enabled {
-            let ux = x;
-            let end = x + advance;
-            if ux >= end {
-                return;
-            }
-
-            let width = end - ux;
-
-            // Map UnderlineShape to underline_style:
-            // 1 = regular, 2 = dashed, 3 = dotted, 4 = curly
-            let (underline_style, rect_height, rect_y, thickness) = match underline.shape
-            {
-                UnderlineShape::Regular => {
-                    let uy = baseline + underline.offset;
-                    (1, underline.size, uy, underline.size)
-                }
-                UnderlineShape::Dashed => {
-                    let uy = baseline + underline.offset;
-                    (2, underline.size, uy, underline.size)
-                }
-                UnderlineShape::Dotted => {
-                    let uy = baseline + underline.offset;
-                    (3, underline.size, uy, underline.size)
-                }
-                UnderlineShape::Curly => {
-                    // Curly underline needs extra height for the wave amplitude
-                    // thickness is the actual line width, rect_height includes wave amplitude
-                    let stroke = (line_height / 16.).clamp(1.0, 2.0);
-                    let wave_amplitude = stroke * 0.8; // WAVE_HEIGHT_RATIO
-                    let total_height = stroke + wave_amplitude * 2.0;
-                    let uy = baseline + underline.offset - wave_amplitude;
-                    (4, total_height, uy, stroke)
-                }
-            };
-
-            self.underline(
-                &Rect::new(ux, rect_y, width, rect_height),
-                depth,
-                &underline.color,
-                underline_style,
-                thickness,
-                0,
-            );
-
-            // Handle doubled underlines (only for regular style)
-            // Second line is placed with a small gap (1px) below the first
-            if underline.is_doubled && matches!(underline.shape, UnderlineShape::Regular)
-            {
-                let gap = 1.0;
-                let second_y = rect_y + underline.size + gap;
-                self.underline(
-                    &Rect::new(ux, second_y, width, underline.size),
-                    depth,
-                    &underline.color,
-                    1,
-                    underline.size,
-                    0,
-                );
-            }
         }
     }
 

@@ -74,7 +74,7 @@ pub(super) fn parse_semantic_prompt(
 pub(super) fn parse_set_user_var(params: &[&[u8]]) -> Option<(String, String)> {
     let payload = params.get(1)?.strip_prefix(b"SetUserVar=")?;
     let mut parts = payload.splitn(2, |byte| *byte == b'=');
-    let name = simd_utf8::from_utf8_fast(parts.next()?).ok()?;
+    let name = simd_utf8::validate(parts.next()?).ok()?;
     if name.is_empty() {
         return None;
     }
@@ -97,7 +97,7 @@ pub(super) fn xparse_color(color: &[u8]) -> Option<ColorRgb> {
 
 /// Parse colors in `rgb:r(rrr)/g(ggg)/b(bbb)` format.
 fn parse_rgb_color(color: &[u8]) -> Option<ColorRgb> {
-    let colors = simd_utf8::from_utf8_fast(color)
+    let colors = simd_utf8::validate(color)
         .ok()?
         .split('/')
         .collect::<Vec<_>>();
@@ -130,8 +130,7 @@ fn parse_legacy_color(color: &[u8]) -> Option<ColorRgb> {
 
     // Truncate/Fill to two byte precision.
     let color_from_slice = |slice: &[u8]| {
-        let col =
-            usize::from_str_radix(simd_utf8::from_utf8_fast(slice).ok()?, 16).ok()? << 4;
+        let col = usize::from_str_radix(simd_utf8::validate(slice).ok()?, 16).ok()? << 4;
         Some((col >> (4 * slice.len().saturating_sub(1))) as u8)
     };
 
@@ -168,7 +167,7 @@ pub(super) fn parse_title(params: &[&[u8]]) -> Option<String> {
     Some(
         params[1..]
             .iter()
-            .flat_map(|x| simd_utf8::from_utf8_fast(x))
+            .flat_map(|x| simd_utf8::validate(x))
             .collect::<Vec<&str>>()
             .join(";")
             .trim()
@@ -229,7 +228,7 @@ pub(super) fn parse_remote_directory(param: &[u8]) -> Option<(String, String)> {
 }
 
 fn parse_directory(param: &[u8]) -> Option<(String, String)> {
-    let s = simd_utf8::from_utf8_fast(param).ok()?;
+    let s = simd_utf8::validate(param).ok()?;
 
     let (after_scheme, percent_encoded) = match strip_scheme(s, FILE_SCHEME) {
         Some(rest) => (rest, true),
@@ -359,13 +358,13 @@ pub(super) fn parse_hyperlink_id(link_params: &[u8]) -> Option<&str> {
     link_params
         .split(|&b| b == b':')
         .find_map(|kv| kv.strip_prefix(b"id="))
-        .and_then(|kv| simd_utf8::from_utf8_fast(kv).ok())
+        .and_then(|kv| simd_utf8::validate(kv).ok())
 }
 
 /// Construct a [`Hyperlink`] from the link params + URI bytes. Returns
 /// `None` for an empty URI (caller should clear the active hyperlink).
 pub(super) fn parse_hyperlink(link_params: &[u8], uri_param: &[u8]) -> Option<Hyperlink> {
-    let uri = simd_utf8::from_utf8_fast(uri_param).unwrap_or_default();
+    let uri = simd_utf8::validate(uri_param).unwrap_or_default();
     if uri.is_empty() {
         return None;
     }
@@ -401,7 +400,7 @@ pub(super) fn join_params(params: &[&[u8]], from: usize) -> Option<String> {
         params
             .get(from..)?
             .iter()
-            .map(|param| simd_utf8::from_utf8_fast(param).ok())
+            .map(|param| simd_utf8::validate(param).ok())
             .collect::<Option<Vec<_>>>()?
             .join(";"),
     )

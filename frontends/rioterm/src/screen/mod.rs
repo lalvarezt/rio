@@ -219,7 +219,6 @@ impl Screen<'_> {
 
         let sugarloaf_renderer = SugarloafRenderer {
             backend,
-            font_features: config.fonts.features.clone(),
             colorspace: config.window.colorspace.to_sugarloaf_colorspace(),
             // The exact predicate the rest of the frontend uses: glass
             // blur forces the window bg alpha to 0 regardless of opacity,
@@ -438,7 +437,7 @@ impl Screen<'_> {
     /// restore visibility after a mid-composition scroll.
     ///
     /// Selection follows what the equivalent plain typing does: plain
-    /// input drops it (`send_bytes`), search typing drops it only
+    /// input drops it (`send_write`), search typing drops it only
     /// outside vi mode (`search_input` keeps a vi visual selection).
     pub fn set_ime_preedit(&mut self, preedit: Option<crate::ime::Preedit>) -> bool {
         let composing = preedit.is_some();
@@ -1518,10 +1517,9 @@ impl Screen<'_> {
                         let old_index = self.context_manager.current_index();
                         self.context_manager.switch_to_next_split_or_tab();
                         let new_index = self.context_manager.current_index();
-                        self.context_manager.switch_context_visibility(
+                        self.context_manager.clear_context_image_overlays(
                             &mut self.sugarloaf,
                             old_index,
-                            new_index,
                         );
                         if let Some(island) = &mut self.renderer.island {
                             island.animate_tab_navigation(old_index, new_index, 1);
@@ -1534,10 +1532,9 @@ impl Screen<'_> {
                         let old_index = self.context_manager.current_index();
                         self.context_manager.switch_to_prev_split_or_tab();
                         let new_index = self.context_manager.current_index();
-                        self.context_manager.switch_context_visibility(
+                        self.context_manager.clear_context_image_overlays(
                             &mut self.sugarloaf,
                             old_index,
-                            new_index,
                         );
                         if let Some(island) = &mut self.renderer.island {
                             island.animate_tab_navigation(old_index, new_index, -1);
@@ -1547,11 +1544,9 @@ impl Screen<'_> {
                     Act::SelectTab(tab_index) => {
                         let old_index = self.context_manager.current_index();
                         self.context_manager.select_tab(*tab_index);
-                        let new_index = self.context_manager.current_index();
-                        self.context_manager.switch_context_visibility(
+                        self.context_manager.clear_context_image_overlays(
                             &mut self.sugarloaf,
                             old_index,
-                            new_index,
                         );
                         self.cancel_search(clipboard);
                         self.mark_dirty();
@@ -1560,11 +1555,9 @@ impl Screen<'_> {
                         self.cancel_search(clipboard);
                         let old_index = self.context_manager.current_index();
                         self.context_manager.select_last_tab();
-                        let new_index = self.context_manager.current_index();
-                        self.context_manager.switch_context_visibility(
+                        self.context_manager.clear_context_image_overlays(
                             &mut self.sugarloaf,
                             old_index,
-                            new_index,
                         );
                         self.mark_dirty();
                     }
@@ -1574,10 +1567,9 @@ impl Screen<'_> {
                         let old_index = self.context_manager.current_index();
                         self.context_manager.switch_to_next();
                         let new_index = self.context_manager.current_index();
-                        self.context_manager.switch_context_visibility(
+                        self.context_manager.clear_context_image_overlays(
                             &mut self.sugarloaf,
                             old_index,
-                            new_index,
                         );
                         if let Some(island) = &mut self.renderer.island {
                             island.animate_tab_navigation(old_index, new_index, 1);
@@ -1590,10 +1582,9 @@ impl Screen<'_> {
                         let old_index = self.context_manager.current_index();
                         self.context_manager.move_current_to_prev();
                         let new_index = self.context_manager.current_index();
-                        self.context_manager.switch_context_visibility(
+                        self.context_manager.clear_context_image_overlays(
                             &mut self.sugarloaf,
                             old_index,
-                            new_index,
                         );
                         if let Some(island) = &mut self.renderer.island {
                             island.remap_tab_swap(old_index, new_index);
@@ -1607,10 +1598,9 @@ impl Screen<'_> {
                         let old_index = self.context_manager.current_index();
                         self.context_manager.move_current_to_next();
                         let new_index = self.context_manager.current_index();
-                        self.context_manager.switch_context_visibility(
+                        self.context_manager.clear_context_image_overlays(
                             &mut self.sugarloaf,
                             old_index,
-                            new_index,
                         );
                         if let Some(island) = &mut self.renderer.island {
                             island.remap_tab_swap(old_index, new_index);
@@ -1624,10 +1614,9 @@ impl Screen<'_> {
                         let old_index = self.context_manager.current_index();
                         self.context_manager.switch_to_prev();
                         let new_index = self.context_manager.current_index();
-                        self.context_manager.switch_context_visibility(
+                        self.context_manager.clear_context_image_overlays(
                             &mut self.sugarloaf,
                             old_index,
-                            new_index,
                         );
                         if let Some(island) = &mut self.renderer.island {
                             island.animate_tab_navigation(old_index, new_index, -1);
@@ -1763,11 +1752,9 @@ impl Screen<'_> {
         if self.ctx().len() == num_tabs {
             self.resize_top_or_bottom_line(num_tabs);
         }
-        let new_index = self.context_manager.current_index();
-        self.context_manager.switch_context_visibility(
+        self.context_manager.clear_context_image_overlays(
             &mut self.sugarloaf,
             old_index,
-            new_index,
         );
 
         self.cancel_search(clipboard);
@@ -3192,11 +3179,9 @@ impl Screen<'_> {
             self.clear_selection();
             let old_index = self.context_manager.current_index();
             self.context_manager.set_current(clicked_tab);
-            let new_index = self.context_manager.current_index();
-            self.context_manager.switch_context_visibility(
+            self.context_manager.clear_context_image_overlays(
                 &mut self.sugarloaf,
                 old_index,
-                new_index,
             );
 
             self.mark_dirty();
@@ -3283,10 +3268,9 @@ impl Screen<'_> {
         if target != old_index {
             self.context_manager.move_current_tab_to(target);
             let new_index = self.context_manager.current_index();
-            self.context_manager.switch_context_visibility(
+            self.context_manager.clear_context_image_overlays(
                 &mut self.sugarloaf,
                 old_index,
-                new_index,
             );
             if let Some(ref mut island) = self.renderer.island {
                 island.remap_tab_move(old_index, new_index);
@@ -3955,22 +3939,18 @@ impl Screen<'_> {
                 self.clear_selection();
                 let old = self.context_manager.current_index();
                 self.context_manager.switch_to_next();
-                let new = self.context_manager.current_index();
-                self.context_manager.switch_context_visibility(
+                self.context_manager.clear_context_image_overlays(
                     &mut self.sugarloaf,
                     old,
-                    new,
                 );
             }
             PaletteAction::SelectPrevTab => {
                 self.clear_selection();
                 let old = self.context_manager.current_index();
                 self.context_manager.switch_to_prev();
-                let new = self.context_manager.current_index();
-                self.context_manager.switch_context_visibility(
+                self.context_manager.clear_context_image_overlays(
                     &mut self.sugarloaf,
                     old,
-                    new,
                 );
             }
             PaletteAction::SplitRight => self.split_right(),
@@ -4992,23 +4972,6 @@ impl Screen<'_> {
             self.hint_state.stop();
             self.update_hint_state();
         }
-    }
-
-    /// Process a new character for keyboard hints
-    #[allow(dead_code)]
-    pub fn hint_input(&mut self, c: char, clipboard: &mut Clipboard) {
-        let terminal = self.context_manager.current().terminal.lock();
-        if let Some(hint_match) = self.hint_state.keyboard_input(&*terminal, c) {
-            drop(terminal);
-            self.execute_hint_action(&hint_match, clipboard);
-            // Stop hint mode and update state with proper damage tracking
-            self.hint_state.stop();
-            self.update_hint_state();
-        } else {
-            drop(terminal);
-            self.update_hint_state();
-        }
-        self.mark_dirty();
     }
 
     /// Start hint mode with the given hint configuration

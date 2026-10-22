@@ -340,7 +340,6 @@ impl Header {
             let close_hover = hovered && *action == HeaderAction::Close;
             if hovered {
                 sugarloaf.rect(
-                    None,
                     x,
                     0.0,
                     BUTTON_WIDTH,

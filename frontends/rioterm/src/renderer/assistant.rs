@@ -249,7 +249,6 @@ impl AssistantOverlay {
 
         // Backdrop
         sugarloaf.rect(
-            None,
             0.0,
             0.0,
             window_width / scale_factor,
@@ -261,7 +260,6 @@ impl AssistantOverlay {
 
         // Background
         sugarloaf.rounded_rect(
-            None,
             ox,
             oy,
             ow,
@@ -331,7 +329,6 @@ impl AssistantOverlay {
 
         if docs_hovered {
             sugarloaf.rounded_rect(
-                None,
                 dbx,
                 dby,
                 dbw,
@@ -349,7 +346,6 @@ impl AssistantOverlay {
 
         if is_hovered {
             sugarloaf.rounded_rect(
-                None,
                 bx,
                 by,
                 bw,

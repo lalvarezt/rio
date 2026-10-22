@@ -3776,9 +3776,9 @@ impl<U: EventListener> Handler for Crosswords<U> {
         };
 
         if let Some(bytes) = crate::simd_base64::decode(base64) {
-            if let Ok(text) = simd_utf8::from_utf8_to_string(&bytes) {
+            if let Ok(text) = simd_utf8::validate(&bytes) {
                 self.event_proxy.send_event(
-                    RioEvent::ClipboardStore(clipboard_type, text),
+                    RioEvent::ClipboardStore(clipboard_type, text.to_owned()),
                     self.window_id,
                 );
             }

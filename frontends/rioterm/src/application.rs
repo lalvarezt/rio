@@ -733,7 +733,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         .current_grid_mut()
                         .get_by_route_id(route_id)
                     {
-                        item.context_mut().messenger.send_bytes(resp.into_bytes());
+                        item.context_mut().messenger.send_write(resp.into_bytes());
                     }
                 }
             }
@@ -935,7 +935,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                             .context_manager
                             .get_by_route_id(route_id)
                         {
-                            item.val.messenger.send_bytes(text.into_bytes());
+                            item.val.messenger.send_write(text.into_bytes());
                         }
                     }
                 }
@@ -961,7 +961,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         .context_manager
                         .get_by_route_id(route_id)
                     {
-                        item.val.messenger.send_bytes(text.into_bytes());
+                        item.val.messenger.send_write(text.into_bytes());
                     }
                 }
             }
@@ -977,7 +977,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         let text = format(crate::renderer::utils::terminal_dimensions(
                             &dimension,
                         ));
-                        item.val.messenger.send_bytes(text.into_bytes());
+                        item.val.messenger.send_write(text.into_bytes());
                     }
                 }
             }
@@ -1011,7 +1011,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     };
                     drop(terminal);
 
-                    item.val.messenger.send_bytes(format(color).into_bytes());
+                    item.val.messenger.send_write(format(color).into_bytes());
                 }
             }
             RioEventType::Rio(RioEvent::CreateWindow) => {
@@ -2195,9 +2195,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                             route.request_redraw();
                         }
                     }
-                    Ime::Enabled => {
-                        route.window.screen.ime.set_enabled(true);
-                    }
+                    Ime::Enabled => (),
                     Ime::Disabled => {
                         // Disabling wipes any live preedit (input
                         // source switched mid-composition): mark dirty
@@ -2205,7 +2203,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         // block ghosts on screen until unrelated
                         // damage.
                         let had_preedit = route.window.screen.ime.preedit().is_some();
-                        route.window.screen.ime.set_enabled(false);
+                        route.window.screen.ime.set_preedit(None);
                         if had_preedit {
                             route.window.screen.mark_dirty();
                             route.request_redraw();

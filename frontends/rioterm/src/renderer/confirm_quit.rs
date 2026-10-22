@@ -47,7 +47,6 @@ impl ConfirmQuit {
         let box_y = (win_h - box_h) / 2.0;
 
         sugarloaf.rect(
-            None,
             box_x,
             box_y,
             box_w,

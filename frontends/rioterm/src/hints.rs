@@ -169,12 +169,6 @@ impl HintState {
         &self.matches
     }
 
-    /// Get keys pressed so far
-    #[allow(dead_code)]
-    pub fn keys_pressed(&self) -> &[char] {
-        &self.keys
-    }
-
     /// Get visible labels (filtered by current input)
     pub fn visible_labels(&self) -> Vec<(usize, Vec<char>)> {
         let keys_len = self.keys.len();
@@ -191,17 +185,6 @@ impl HintState {
             })
             .collect()
     }
-
-    /// Update the alphabet used for hint labels
-    #[allow(dead_code)]
-    pub fn update_alphabet(&mut self, alphabet: &str) {
-        if self.alphabet != alphabet {
-            self.alphabet = alphabet.to_string();
-            self.keys.clear();
-        }
-    }
-
-    // Private helper methods
 
     fn find_regex_matches<T: EventListener>(
         &mut self,

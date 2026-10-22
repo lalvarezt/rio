@@ -154,23 +154,6 @@ fn compute_error_len(bytes: &[u8], valid_up_to: usize) -> Option<usize> {
         .and_then(|err| err.error_len())
 }
 
-/// Compatibility shim — same as [`validate`].
-#[inline]
-pub fn from_utf8_fast(bytes: &[u8]) -> Result<&str, Utf8Error> {
-    validate(bytes)
-}
-
-/// Compatibility shim — same as [`validate`].
-#[inline]
-pub fn from_utf8_compat(bytes: &[u8]) -> Result<&str, Utf8Error> {
-    validate(bytes)
-}
-
-#[inline]
-pub fn from_utf8_to_string(bytes: &[u8]) -> Result<String, Utf8Error> {
-    validate(bytes).map(|s| s.to_string())
-}
-
 /// Validate; on failure fall back to `String::from_utf8_lossy`.
 #[inline]
 pub fn from_utf8_lossy_fast(bytes: &[u8]) -> String {
@@ -249,14 +232,14 @@ mod tests {
     #[test]
     fn test_valid_utf8() {
         let bytes = b"Hello, \xE2\x9D\xA4\xEF\xB8\x8F UTF-8!";
-        let result = from_utf8_fast(bytes).unwrap();
+        let result = validate(bytes).unwrap();
         assert_eq!(result, "Hello, ❤️ UTF-8!");
     }
 
     #[test]
     fn test_invalid_utf8() {
         let bytes = b"Hello, \xFF invalid UTF-8!";
-        assert!(from_utf8_fast(bytes).is_err());
+        assert!(validate(bytes).is_err());
 
         let result = from_utf8_lossy_fast(bytes);
         assert!(result.contains("Hello"));
@@ -266,14 +249,14 @@ mod tests {
     #[test]
     fn test_ascii_fast_path() {
         let bytes = b"Pure ASCII text";
-        let result = from_utf8_fast(bytes).unwrap();
+        let result = validate(bytes).unwrap();
         assert_eq!(result, "Pure ASCII text");
     }
 
     #[test]
     fn test_compat_error_info() {
         let bytes = b"Valid\xFF\xFEInvalid";
-        let err = from_utf8_compat(bytes).unwrap_err();
+        let err = validate(bytes).unwrap_err();
         assert!(err.to_string().contains("invalid utf-8"));
         assert_eq!(err.valid_up_to(), 5);
         assert_eq!(err.error_len(), Some(1));

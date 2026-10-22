@@ -1,6 +1,3 @@
-// `grow_to` is reserved for atlas-resize on the rich-text path.
-#![allow(dead_code)]
-
 /// Improved shelf-based atlas allocator for better space utilization
 #[derive(Clone)]
 pub struct AtlasAllocator {
@@ -131,19 +128,11 @@ impl AtlasAllocator {
     }
 
     /// Clear all allocations and reset the atlas
-    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.shelves.clear();
     }
 
-    /// Check if the atlas is empty
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.shelves.is_empty()
-    }
-
     /// Get the atlas dimensions
-    #[allow(dead_code)]
     pub fn dimensions(&self) -> (u16, u16) {
         (self.width, self.height)
     }
@@ -158,45 +147,6 @@ impl AtlasAllocator {
         self.width = new_width;
         self.height = new_height;
     }
-
-    /// Deallocates a rectangle (simplified - in practice this is complex)
-    pub fn deallocate(&mut self, _x: u16, _y: u16, _width: u16) {
-        // For now, we don't implement deallocation as it's complex
-        // In a full implementation, you'd need to track allocated rectangles
-        // and merge adjacent free spaces when deallocating
-
-        // This is acceptable for a terminal where glyphs are rarely deallocated
-        // and the atlas is cleared periodically
-    }
-
-    /// Get atlas utilization statistics
-    #[allow(dead_code)]
-    pub fn utilization(&self) -> AtlasStats {
-        let total_area = (self.width as u32) * (self.height as u32);
-        let used_area = self.calculate_used_area();
-
-        AtlasStats {
-            total_area,
-            used_area,
-            utilization_ratio: used_area as f32 / total_area as f32,
-            num_shelves: self.shelves.len(),
-        }
-    }
-
-    #[allow(dead_code)]
-    fn calculate_used_area(&self) -> u32 {
-        let next_y = self.find_next_y_position();
-        (self.width as u32) * (next_y as u32)
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Debug)]
-pub struct AtlasStats {
-    pub total_area: u32,
-    pub used_area: u32,
-    pub utilization_ratio: f32,
-    pub num_shelves: usize,
 }
 
 #[cfg(test)]
@@ -280,30 +230,13 @@ mod tests {
         let mut atlas = AtlasAllocator::new(100, 100);
 
         atlas.allocate(10, 10);
-        assert!(!atlas.is_empty());
+        assert!(!atlas.shelves.is_empty());
 
         atlas.clear();
-        assert!(atlas.is_empty());
+        assert!(atlas.shelves.is_empty());
 
         // Should be able to allocate again after clear
         let pos = atlas.allocate(10, 10);
         assert_eq!(pos, Some((0, 0)));
-    }
-
-    #[test]
-    fn test_utilization_stats() {
-        let mut atlas = AtlasAllocator::new(100, 100);
-
-        let stats = atlas.utilization();
-        assert_eq!(stats.total_area, 10000);
-        assert_eq!(stats.used_area, 0);
-        assert_eq!(stats.utilization_ratio, 0.0);
-        assert_eq!(stats.num_shelves, 0);
-
-        atlas.allocate(50, 20);
-        let stats = atlas.utilization();
-        assert_eq!(stats.used_area, 2100); // 100 * 21 (20 + 1 padding)
-        assert_eq!(stats.utilization_ratio, 0.21);
-        assert_eq!(stats.num_shelves, 1);
     }
 }

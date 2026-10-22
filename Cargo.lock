@@ -4135,7 +4135,6 @@ dependencies = [
  "global-hotkey",
  "image",
  "libc",
- "lru",
  "notify",
  "objc-rs 0.3.2",
  "onig",

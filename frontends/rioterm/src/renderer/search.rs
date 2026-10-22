@@ -222,7 +222,6 @@ impl SearchOverlay {
 
         // Background
         sugarloaf.rounded_rect(
-            None,
             ox,
             oy,
             ow,
@@ -240,7 +239,6 @@ impl SearchOverlay {
         let input_height = oh - 12.0;
 
         sugarloaf.rounded_rect(
-            None,
             input_x,
             input_y,
             input_width,
@@ -314,7 +312,6 @@ impl SearchOverlay {
             let caret_y = input_y + (input_height - INPUT_FONT_SIZE) / 2.0 + 1.0;
 
             sugarloaf.rect(
-                None,
                 caret_x,
                 caret_y,
                 CARET_WIDTH,
@@ -345,7 +342,6 @@ impl SearchOverlay {
 
             if is_hovered {
                 sugarloaf.rounded_rect(
-                    None,
                     *bx,
                     *by,
                     *bw,

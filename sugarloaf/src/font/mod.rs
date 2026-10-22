@@ -2602,29 +2602,6 @@ mod alias_tests {
     }
 }
 
-#[allow(dead_code)]
-fn find_font_path(
-    db: &crate::font::loader::Database,
-    font_family: String,
-) -> Option<PathBuf> {
-    info!("Font path search: family '{font_family}'");
-
-    let query = crate::font::loader::Query {
-        families: &[crate::font::loader::Family::Name(&font_family)],
-        ..crate::font::loader::Query::default()
-    };
-
-    if let Some(id) = db.query(&query) {
-        if let Some((crate::font::loader::Source::File(ref path), _index)) =
-            db.face_source(id)
-        {
-            return Some(path.to_path_buf());
-        }
-    }
-
-    None
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 fn load_from_font_source(path: &PathBuf) -> Option<SharedData> {
     let cache = get_font_data_cache();

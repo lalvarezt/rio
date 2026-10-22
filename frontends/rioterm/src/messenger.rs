@@ -12,11 +12,6 @@ impl Messenger {
     }
 
     #[inline]
-    pub fn send_bytes(&mut self, string: Vec<u8>) {
-        self.send_write(string);
-    }
-
-    #[inline]
     pub fn send_write<B: Into<Cow<'static, [u8]>>>(&self, bytes: B) {
         let bytes = bytes.into();
         // terminal hangs if we send 0 bytes through.

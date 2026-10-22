@@ -121,7 +121,6 @@ fn draw_rim<const HAS_STATUS: bool>(
                 [1.0, 1.0, 1.0, alpha * shine]
             };
             sugarloaf.rect(
-                None,
                 x + column * pixel,
                 y + row * pixel,
                 length * pixel,

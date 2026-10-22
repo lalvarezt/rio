@@ -139,13 +139,13 @@ impl ApplicationHandler for Application {
 
                 // These rectangles overlap
                 // Red: large background rect (order=0, renders first/bottom)
-                sugarloaf.rect(None, 50., 50., 200., 150., red, 0.0, 0);
+                sugarloaf.rect(50., 50., 200., 150., red, 0.0, 0);
 
                 // Green: medium rect offset (order=1, renders second/middle)
-                sugarloaf.rect(None, 100., 80., 200., 150., green, 0.0, 1);
+                sugarloaf.rect(100., 80., 200., 150., green, 0.0, 1);
 
                 // Blue: small rect offset more (order=2, renders last/top)
-                sugarloaf.rect(None, 150., 110., 200., 150., blue, 0.0, 2);
+                sugarloaf.rect(150., 110., 200., 150., blue, 0.0, 2);
 
                 // Demonstration of order independence from call order:
                 // Even though yellow is drawn AFTER white, yellow has lower order
@@ -154,9 +154,9 @@ impl ApplicationHandler for Application {
                 let white = [1.0, 1.0, 1.0, 1.0];
 
                 // Yellow drawn first but with order=10
-                sugarloaf.rect(None, 20., 200., 80., 60., yellow, 0.0, 10);
+                sugarloaf.rect(20., 200., 80., 60., yellow, 0.0, 10);
                 // White drawn second but with order=20, so white is on top
-                sugarloaf.rect(None, 60., 220., 80., 60., white, 0.0, 20);
+                sugarloaf.rect(60., 220., 80., 60., white, 0.0, 20);
 
                 sugarloaf.render();
                 event_loop.set_control_flow(ControlFlow::Wait);

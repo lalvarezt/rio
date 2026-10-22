@@ -2,9 +2,6 @@ pub use rio_grid::preedit::PreeditCursor;
 
 #[derive(Debug, Default)]
 pub struct Ime {
-    /// Whether the IME is enabled.
-    enabled: bool,
-
     /// Current IME preedit.
     preedit: Option<Preedit>,
 }
@@ -12,22 +9,6 @@ pub struct Ime {
 impl Ime {
     pub fn new() -> Self {
         Default::default()
-    }
-
-    #[inline]
-    pub fn set_enabled(&mut self, is_enabled: bool) {
-        if is_enabled {
-            self.enabled = is_enabled
-        } else {
-            // Clear state when disabling IME.
-            *self = Default::default();
-        }
-    }
-
-    #[inline]
-    #[allow(unused)]
-    pub fn is_enabled(&self) -> bool {
-        self.enabled
     }
 
     #[inline]

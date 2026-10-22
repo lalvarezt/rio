@@ -435,10 +435,6 @@ pub trait EventListener {
     fn send_event(&self, _event: RioEvent, _id: WindowId) {}
 
     fn send_event_with_high_priority(&self, _event: RioEvent, _id: WindowId) {}
-
-    fn send_redraw(&self, _id: WindowId) {}
-
-    fn send_global_event(&self, _event: RioEvent) {}
 }
 
 #[derive(Clone)]

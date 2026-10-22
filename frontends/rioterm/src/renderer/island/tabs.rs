@@ -746,7 +746,6 @@ impl Island {
         );
         let fill = if floating.is_some() {
             sugarloaf.rounded_rect(
-                None,
                 x - 2.0,
                 y - 1.0,
                 w + 4.0,
@@ -811,7 +810,6 @@ impl Island {
                 })
             {
                 sugarloaf.rounded_rect(
-                    None,
                     text_x,
                     title_y + appearance.geometry.font_size * (2.0 / 3.0)
                         - BELL_DOT_SIZE / 2.0,
@@ -859,7 +857,6 @@ impl Island {
                     });
                 if hot {
                     sugarloaf.rounded_rect(
-                        None,
                         cx - close_half,
                         appearance.center_y() - close_half,
                         close_half * 2.0,

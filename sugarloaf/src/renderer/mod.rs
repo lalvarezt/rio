@@ -11,8 +11,6 @@ use crate::context::webgpu::WgpuContext;
 use crate::context::{Context, ContextType};
 use crate::font::FontLibrary;
 use crate::layout::TextDimensions;
-use crate::renderer::image_cache::ImageCache;
-use crate::Graphics;
 use compositor::{Compositor, Rect, Vertex};
 use rustc_hash::FxHashMap;
 // Only the macOS Metal path and the wgpu path use bare `mem::` (they
@@ -78,7 +76,6 @@ pub struct WgpuRenderer {
     instance_buffer: wgpu::Buffer,
     constant_bind_group: wgpu::BindGroup,
     layout_bind_group: wgpu::BindGroup,
-    layout_bind_group_layout: wgpu::BindGroupLayout,
     transform: wgpu::Buffer,
     pipeline: wgpu::RenderPipeline,
     instanced_pipeline: wgpu::RenderPipeline,
@@ -566,7 +563,6 @@ impl MetalRenderer {
         instances: &[batch::QuadInstance],
         vertices: &[Vertex],
         draw_cmds: &[batch::DrawCmd],
-        images: &ImageCache,
         render_encoder: &RenderCommandEncoderRef,
         context: &MetalContext,
         instance_buffer: &InstanceBuffer,
@@ -619,9 +615,6 @@ impl MetalRenderer {
 
         render_encoder.set_fragment_sampler_state(0, Some(&self.sampler));
 
-        let color_textures = images.get_metal_textures();
-        let mask_texture = images.get_mask_texture();
-
         let mut current_pipeline_instanced = false;
         let mut pipeline_set = false;
 
@@ -629,40 +622,8 @@ impl MetalRenderer {
         let globals_size = mem::size_of::<Globals>() as u64;
 
         for cmd in draw_cmds {
-            let (color_layer, mask_layer) = match cmd {
-                batch::DrawCmd::Instanced {
-                    color_layer,
-                    mask_layer,
-                    ..
-                } => (*color_layer, *mask_layer),
-                batch::DrawCmd::Vertices {
-                    color_layer,
-                    mask_layer,
-                    ..
-                } => (*color_layer, *mask_layer),
-            };
-
-            // Bind textures
-            if color_layer > 0 {
-                let idx = (color_layer - 1) as usize;
-                if idx < color_textures.len() {
-                    render_encoder.set_fragment_texture(0, Some(color_textures[idx]));
-                } else {
-                    render_encoder.set_fragment_texture(0, None);
-                }
-            } else {
-                render_encoder.set_fragment_texture(0, None);
-            }
-
-            if mask_layer > 0 {
-                if let Some(mask_tex) = mask_texture {
-                    render_encoder.set_fragment_texture(1, Some(mask_tex));
-                } else {
-                    render_encoder.set_fragment_texture(1, None);
-                }
-            } else {
-                render_encoder.set_fragment_texture(1, None);
-            }
+            render_encoder.set_fragment_texture(0, None);
+            render_encoder.set_fragment_texture(1, None);
 
             match cmd {
                 batch::DrawCmd::Instanced { offset, count, .. } => {
@@ -858,7 +819,6 @@ pub struct Renderer {
     instances: Vec<batch::QuadInstance>,
     vertices: Vec<Vertex>,
     draw_cmds: Vec<batch::DrawCmd>,
-    images: ImageCache,
     /// Per-image GPU textures (one map, any backend).
     image_textures: FxHashMap<u64, ImageTextureEntry>,
     /// Sum of `bytes` across `image_textures`; compared against
@@ -1041,7 +1001,6 @@ impl Renderer {
             instances: vec![],
             vertices: vec![],
             draw_cmds: vec![],
-            images: ImageCache::new(context),
             image_textures: FxHashMap::default(),
             image_texture_bytes: 0,
             image_frame_counter: 0,
@@ -1057,7 +1016,7 @@ impl Renderer {
 
     /// Drain per-frame batch state that was populated via
     /// `rect` / `quad` / etc. Normally `comp.batches` is drained
-    /// inside `compute_updates` → `comp.finish()` during a render;
+    /// inside `prepare` → `comp.finish()` during a render;
     /// when the caller skips the GPU submit entirely (see
     /// `Sugarloaf::discard_frame`), those recorded primitives would
     /// otherwise pile into the next presented frame.
@@ -1082,8 +1041,6 @@ impl Renderer {
     pub fn prepare(
         &mut self,
         context: &mut crate::context::Context,
-        _state: &crate::sugarloaf::state::SugarState,
-        _graphics: &mut Graphics,
         image_data: &mut rustc_hash::FxHashMap<
             u64,
             crate::sugarloaf::graphics::GraphicDataEntry,
@@ -1096,14 +1053,6 @@ impl Renderer {
         self.instances.clear();
         self.vertices.clear();
         self.draw_cmds.clear();
-
-        // The per-id `Content.states` walk is gone — non-Text content
-        // arms (Rect/RoundedRect/Line/Triangle/Polygon/Arc/Image) had
-        // no rio caller passing `Some(id)`, so the Content registry
-        // never accumulated them. Immediate-mode primitives flow
-        // through `Renderer::rect/quad/...` straight into
-        // `comp.batches`; rich-text emission is handled by the grid
-        // pass and `sugarloaf::text`.
 
         // Image overlays: rio is responsible for not leaving stale
         // overlays for hidden panels (callers `clear_image_overlays_for`
@@ -1146,7 +1095,6 @@ impl Renderer {
         self.instances.clear();
         self.vertices.clear();
         self.draw_cmds.clear();
-        self.images.process_atlases(context);
         self.comp
             .finish(&mut self.instances, &mut self.vertices, &mut self.draw_cmds);
 
@@ -1688,15 +1636,6 @@ impl Renderer {
     }
 
     #[inline]
-    pub fn clear_atlas(&mut self) {
-        self.images.clear_atlas();
-        self.image_textures.clear();
-        self.image_texture_bytes = 0;
-        self.image_draws.clear();
-        tracing::info!("Renderer atlas cleared");
-    }
-
-    #[inline]
     #[allow(clippy::too_many_arguments)]
     pub fn rect(
         &mut self,
@@ -1783,33 +1722,6 @@ impl Renderer {
     }
 
     #[inline]
-    #[allow(clippy::too_many_arguments)]
-    pub fn add_image_rect(
-        &mut self,
-        x: f32,
-        y: f32,
-        width: f32,
-        height: f32,
-        color: [f32; 4],
-        coords: [f32; 4],
-        depth: f32,
-        atlas_layer: i32,
-    ) {
-        self.comp.batches.add_image_rect(
-            &Rect {
-                x,
-                y,
-                width,
-                height,
-            },
-            depth,
-            &color,
-            &coords,
-            atlas_layer,
-        );
-    }
-
-    #[inline]
     pub fn polygon(&mut self, points: &[(f32, f32)], depth: f32, color: [f32; 4]) {
         self.comp
             .batches
@@ -1887,7 +1799,6 @@ impl Renderer {
         // Destructure to get independent borrows of different fields
         let Self {
             brush_type,
-            images,
             instances,
             vertices,
             draw_cmds,
@@ -1898,12 +1809,9 @@ impl Renderer {
         } = self;
 
         if let RendererType::Wgpu(brush) = brush_type {
-            let color_views = images.get_texture_views();
-            let mask_texture_view = images.get_mask_texture_view();
-
             let has_images = !image_draws.is_empty();
             let has_background = background_image_texture.is_some();
-            if (color_views.is_empty() || (instances.is_empty() && vertices.is_empty()))
+            if (instances.is_empty() && vertices.is_empty())
                 && !has_images
                 && !has_background
             {
@@ -2061,33 +1969,6 @@ impl Renderer {
             let mut pipeline_set = false;
 
             for cmd in draw_cmds {
-                let (color_layer, mask_layer) = match cmd {
-                    batch::DrawCmd::Instanced {
-                        color_layer,
-                        mask_layer,
-                        ..
-                    } => (*color_layer, *mask_layer),
-                    batch::DrawCmd::Vertices {
-                        color_layer,
-                        mask_layer,
-                        ..
-                    } => (*color_layer, *mask_layer),
-                };
-
-                // Bind textures for this batch
-                let color_view = if color_layer > 0 {
-                    let idx = (color_layer - 1) as usize;
-                    color_views.get(idx).unwrap_or(&color_views[0])
-                } else {
-                    &color_views[0]
-                };
-                let final_mask_view = if mask_layer > 0 {
-                    mask_texture_view.unwrap_or(color_views[0])
-                } else {
-                    color_views[0]
-                };
-                brush.update_bind_group(ctx, color_view, final_mask_view);
-
                 match cmd {
                     batch::DrawCmd::Instanced { offset, count, .. } => {
                         if !pipeline_set || !current_pipeline_instanced {
@@ -2367,7 +2248,6 @@ impl Renderer {
                         &self.instances,
                         &self.vertices,
                         &self.draw_cmds,
-                        &self.images,
                         render_encoder,
                         context,
                         &instance_buffer,
@@ -2577,11 +2457,6 @@ impl Renderer {
     /// upload them to a per-instance vertex buffer; we just iterate.
     pub(crate) fn instances(&self) -> &[crate::renderer::batch::QuadInstance] {
         &self.instances
-    }
-
-    /// Image cache for CPU rasterizer atlas sampling.
-    pub(crate) fn image_cache(&self) -> &ImageCache {
-        &self.images
     }
 
     pub fn resize(&mut self, context: &mut Context) {
@@ -3072,7 +2947,6 @@ impl WgpuRenderer {
 
         WgpuRenderer {
             layout_bind_group,
-            layout_bind_group_layout,
             constant_bind_group,
             transform,
             pipeline,
@@ -3143,72 +3017,6 @@ impl WgpuRenderer {
 
         let vertex_count = vertices.len() as u32;
         rpass.draw(0..vertex_count, 0..1);
-    }
-
-    #[inline]
-    pub fn render_range(
-        &mut self,
-        ctx: &mut WgpuContext,
-        vertices: &[Vertex],
-        rpass: &mut wgpu::RenderPass,
-        range: std::ops::Range<usize>,
-    ) {
-        if range.is_empty() {
-            return;
-        }
-
-        let queue = &mut ctx.queue;
-
-        // Ensure buffer is large enough
-        if vertices.len() > self.supported_vertex_buffer {
-            self.vertex_buffer.destroy();
-            self.supported_vertex_buffer = (vertices.len() as f32 * 1.25) as usize;
-            self.vertex_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("sugarloaf::rich_text::Pipeline vertices"),
-                size: mem::size_of::<Vertex>() as u64
-                    * self.supported_vertex_buffer as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        }
-
-        // Write all vertices to buffer (we need the full buffer for correct indexing)
-        let vertices_bytes: &[u8] = bytemuck::cast_slice(vertices);
-        if !vertices_bytes.is_empty() {
-            queue.write_buffer(&self.vertex_buffer, 0, vertices_bytes);
-        }
-
-        rpass.set_pipeline(&self.pipeline);
-        rpass.set_bind_group(0, &self.constant_bind_group, &[]);
-        rpass.set_bind_group(1, &self.layout_bind_group, &[]);
-        rpass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-
-        // Draw only the specified range
-        rpass.draw(range.start as u32..range.end as u32, 0..1);
-    }
-
-    pub fn update_bind_group(
-        &mut self,
-        ctx: &WgpuContext,
-        color_view: &wgpu::TextureView,
-        mask_view: &wgpu::TextureView,
-    ) {
-        // Always update bind group since different batches need different textures
-        self.layout_bind_group =
-            ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &self.layout_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(color_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(mask_view),
-                    },
-                ],
-                label: Some("rich_text::Pipeline uniforms"),
-            });
     }
 }
 

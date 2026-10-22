@@ -895,7 +895,6 @@ impl CommandPalette {
             ..DrawOpts::default()
         };
         sugarloaf.rounded_rect(
-            None,
             x,
             y,
             width,
@@ -907,7 +906,6 @@ impl CommandPalette {
         );
         let pixel = 1.0 / scale;
         sugarloaf.rounded_rect(
-            None,
             x + pixel,
             y + pixel,
             width - 2.0 * pixel,
@@ -921,7 +919,6 @@ impl CommandPalette {
         let input_y = y + PALETTE_PADDING;
         let input_width = width - PALETTE_PADDING * 2.0;
         sugarloaf.rounded_rect(
-            None,
             input_x,
             input_y,
             input_width,
@@ -936,7 +933,6 @@ impl CommandPalette {
         let lens_radius = (ICON_SIZE - ICON_STROKE) / 2.0 - ICON_STROKE;
         let lens_x = input_x + INPUT_PADDING_X;
         sugarloaf.rounded_rect(
-            None,
             lens_x,
             cy - ICON_SIZE / 2.0,
             lens_radius * 2.0,
@@ -947,7 +943,6 @@ impl CommandPalette {
             ORDER + 2,
         );
         sugarloaf.rounded_rect(
-            None,
             lens_x + ICON_STROKE,
             cy - ICON_SIZE / 2.0 + ICON_STROKE,
             (lens_radius - ICON_STROKE) * 2.0,
@@ -1011,7 +1006,6 @@ impl CommandPalette {
                 .is_multiple_of(2)
         }) {
             sugarloaf.rect(
-                None,
                 snap(text_x + text_width.min(input_budget), scale),
                 snap(cy - INPUT_FONT_SIZE / 2.0, scale),
                 pixel,
@@ -1065,7 +1059,6 @@ impl CommandPalette {
             let selected = index == self.selected_index;
             if selected {
                 sugarloaf.rounded_rect(
-                    None,
                     input_x,
                     top,
                     result_width,

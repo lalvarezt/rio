@@ -115,7 +115,6 @@ fn draw_hint_tooltip(
     let y = (logical_height - height - TOOLTIP_MARGIN).max(0.0);
 
     sugarloaf.rounded_rect(
-        None,
         x,
         y,
         width,
@@ -810,7 +809,6 @@ impl Renderer {
                 }
                 let [left, top, width, height] = grid_context.geometry.frame;
                 sugarloaf.rounded_rect(
-                    None,
                     left / scale_factor,
                     top / scale_factor,
                     width / scale_factor,
@@ -921,7 +919,6 @@ impl Renderer {
         }
         grid.for_each_divider(|[x, y, width, height]| {
             sugarloaf.rect(
-                None,
                 x / scale_factor,
                 y / scale_factor,
                 width / scale_factor,

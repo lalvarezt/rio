@@ -285,7 +285,7 @@ fn draw_island(
         (left, top, snap(x + w) - left, snap(y + h) - top)
     };
     if fill[3] > 0.0 {
-        sugarloaf.rounded_rect(None, x, y, w, h, fill, 0.05, radius, order);
+        sugarloaf.rounded_rect(x, y, w, h, fill, 0.05, radius, order);
     }
     super::tab_glass::draw(
         sugarloaf,
@@ -1056,7 +1056,6 @@ impl Island {
 
                 if bar_width > 0.0 {
                     sugarloaf.rect(
-                        None,
                         0.0,
                         y_position,
                         bar_width,
@@ -1086,7 +1085,6 @@ impl Island {
                 let x_pos = position * (width - bar_width);
 
                 sugarloaf.rect(
-                    None,
                     x_pos,
                     y_position,
                     bar_width,
@@ -1340,7 +1338,6 @@ impl Island {
 
         // Background
         sugarloaf.rounded_rect(
-            None,
             bg_x,
             bg_y,
             bg_width,
@@ -1361,7 +1358,6 @@ impl Island {
             if is_selected {
                 let border = 2.0;
                 sugarloaf.rounded_rect(
-                    None,
                     sx - border,
                     swatch_y - border,
                     PICKER_SWATCH_SIZE + border * 2.0,
@@ -1374,7 +1370,6 @@ impl Island {
             }
 
             sugarloaf.rounded_rect(
-                None,
                 sx,
                 swatch_y,
                 PICKER_SWATCH_SIZE,
@@ -1393,7 +1388,6 @@ impl Island {
         if reset_selected {
             let border = 2.0;
             sugarloaf.rounded_rect(
-                None,
                 reset_x - border,
                 swatch_y - border,
                 PICKER_SWATCH_SIZE + border * 2.0,
@@ -1405,7 +1399,6 @@ impl Island {
             );
         }
         sugarloaf.rounded_rect(
-            None,
             reset_x,
             swatch_y,
             PICKER_SWATCH_SIZE,
@@ -1434,7 +1427,6 @@ impl Island {
 
         // Input background
         sugarloaf.rounded_rect(
-            None,
             input_x,
             input_y,
             input_width,
@@ -1505,7 +1497,6 @@ impl Island {
             let caret_x = text_x + rendered_width;
             if caret_x <= input_x + input_width {
                 sugarloaf.rect(
-                    None,
                     caret_x,
                     input_y + 4.0,
                     1.5,

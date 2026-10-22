@@ -293,12 +293,6 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         grid
     }
 
-    #[inline]
-    #[allow(dead_code)]
-    pub fn get_mut(&mut self, key: NodeId) -> Option<&mut ContextGridItem<T>> {
-        self.inner.get_mut(&key)
-    }
-
     /// Get item by route_id (used for event routing)
     #[inline]
     pub fn get_by_route_id(
@@ -805,11 +799,6 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         &mut self.inner
     }
 
-    /// Immutable view into the panel map. Kept even though the
-    /// emission loop uses `contexts_mut` (it needs `&mut
-    /// renderable_content` to take damage) — this one is handy for
-    /// read-only cross-panel queries like the damage audit.
-    #[allow(dead_code)]
     #[inline]
     pub fn contexts(&self) -> &FxHashMap<NodeId, ContextGridItem<T>> {
         &self.inner
@@ -1270,28 +1259,17 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         self.move_divider(BorderDirection::Vertical, amount, sugarloaf)
     }
 
-    /// Hide the panel set by clearing per-panel image overlays. The
-    /// `visible=true` case is a no-op — the next `Renderer::run` will
-    /// repopulate overlays naturally for whichever tab/group is
-    /// active. (Naming preserved for callers; the function used to
-    /// drive sugarloaf's content visibility flag, which is gone.)
+    /// Clear image overlays for every panel in this grid.
     #[inline]
-    pub fn set_all_rich_text_visibility(&self, sugarloaf: &mut Sugarloaf, visible: bool) {
-        if visible {
-            return;
-        }
+    pub fn clear_image_overlays(&self, sugarloaf: &mut Sugarloaf) {
         for item in self.inner.values() {
             sugarloaf.clear_image_overlays_for(item.val.rich_text_id);
         }
     }
 
-    /// Drop image overlays for every panel in the grid. Used on tab
-    /// teardown — the panels themselves go away with the
-    /// `ContextManager`; only the kitty graphics state needs an
-    /// explicit cleanup signal.
-    #[inline]
     /// Release everything this grid's panels hold in sugarloaf: image
     /// overlays and the images they drew.
+    #[inline]
     pub fn remove_from_sugarloaf(&self, sugarloaf: &mut Sugarloaf) {
         for item in self.inner.values() {
             sugarloaf.clear_image_overlays_for(item.val.rich_text_id);

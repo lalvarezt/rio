@@ -5,14 +5,12 @@
 // Writes directly into softbuffer's `&mut [u32]` (0x00RRGGBB) — no
 // intermediate pixmap, no pixel format conversion at present time.
 //
-// v1 limitations: monochrome glyphs only (color-atlas glyphs not
-// implemented), no per-corner radii / borders / advanced underlines.
-// Kitty image overlays composite via `draw_image_overlay`.
+// Grid and UI text renderers own their glyph atlases. Kitty image
+// overlays composite via `draw_image_overlay`.
 
 use crate::context::cpu::CpuContext;
 use crate::premul::{pack_opaque, pack_premul};
 use crate::renderer::compositor::Vertex;
-use crate::renderer::image_cache::ImageCache;
 use crate::renderer::Renderer;
 use crate::sugarloaf::graphics::{GraphicDataEntry, GraphicOverlay};
 use rustc_hash::FxHashMap;
@@ -27,7 +25,6 @@ pub struct ImageLayers<'a> {
 
 #[derive(Default)]
 pub struct CpuCache {
-    glyphs: FxHashMap<GlyphKey, CachedGlyph>,
     last_frame_hash: u64,
     has_last: bool,
 }
@@ -38,25 +35,8 @@ impl CpuCache {
     }
 
     pub fn clear(&mut self) {
-        self.glyphs.clear();
         self.has_last = false;
     }
-}
-
-#[derive(Hash, Eq, PartialEq, Clone, Copy)]
-struct GlyphKey {
-    atlas_x: u16,
-    atlas_y: u16,
-    w: u16,
-    h: u16,
-    color: u32,
-}
-
-struct CachedGlyph {
-    /// Length = w * h. Premultiplied (a<<24)|(r<<16)|(g<<8)|b.
-    pixels: Vec<u32>,
-    w: u16,
-    h: u16,
 }
 
 /// Scalar SWAR premultiplied source-over for all four channels (RGBA).
@@ -128,40 +108,13 @@ fn blend_over_simd_const_src_x8(src_v: u32x8, inv_v: u32x8, dst: u32x8) -> u32x8
     src_v + drb + (dag << 8)
 }
 
-/// SWAR source-over with **per-lane** src and inv_a — used by glyph blit
-/// where each cached glyph pixel has its own premultiplied (a,r,g,b).
-/// Branchless: produces correct result for sa==0 (returns dst) and sa==255
-/// (returns src) without any conditional, so the loop fully vectorizes.
-#[inline(always)]
-fn blend_over_simd_var_src_x4(src: u32x4, dst: u32x4) -> u32x4 {
-    let mask_byte = u32x4::splat(0xff);
-    let mask_rb = u32x4::splat(0x00ff_00ff);
-    let half_rb = u32x4::splat(0x0080_0080);
-
-    let sa = (src >> 24) & mask_byte;
-    let inv_v = u32x4::splat(255) - sa;
-
-    let drb = (dst & mask_rb) * inv_v;
-    let drb = ((drb + half_rb + ((drb >> 8) & mask_rb)) >> 8) & mask_rb;
-
-    // A and G pair as 00AA00GG, mirroring the R+B pair.
-    let dag = ((dst >> 8) & mask_rb) * inv_v;
-    let dag = ((dag + half_rb + ((dag >> 8) & mask_rb)) >> 8) & mask_rb;
-
-    src + drb + (dag << 8)
-}
-
 #[derive(Clone, Copy)]
 struct ParsedQuad {
     min_x: f32,
     min_y: f32,
     max_x: f32,
     max_y: f32,
-    min_u: f32,
-    min_v: f32,
     color: [f32; 4],
-    color_layer: i32,
-    mask_layer: i32,
     clip: [f32; 4],
 }
 
@@ -171,8 +124,6 @@ fn parse_quad(chunk: &[Vertex]) -> ParsedQuad {
     let mut min_y = f32::INFINITY;
     let mut max_x = f32::NEG_INFINITY;
     let mut max_y = f32::NEG_INFINITY;
-    let mut min_u = f32::INFINITY;
-    let mut min_v = f32::INFINITY;
     for v in chunk {
         if v.pos[0] < min_x {
             min_x = v.pos[0];
@@ -186,12 +137,6 @@ fn parse_quad(chunk: &[Vertex]) -> ParsedQuad {
         if v.pos[1] > max_y {
             max_y = v.pos[1];
         }
-        if v.uv[0] < min_u {
-            min_u = v.uv[0];
-        }
-        if v.uv[1] < min_v {
-            min_v = v.uv[1];
-        }
     }
     let v0 = chunk[0];
     ParsedQuad {
@@ -199,11 +144,7 @@ fn parse_quad(chunk: &[Vertex]) -> ParsedQuad {
         min_y,
         max_x,
         max_y,
-        min_u,
-        min_v,
         color: v0.color,
-        color_layer: v0.layers[0],
-        mask_layer: v0.layers[1],
         clip: v0.clip_rect,
     }
 }
@@ -535,8 +476,6 @@ pub fn render_cpu(
     }
 
     if !vertices.is_empty() {
-        let images = renderer.image_cache();
-        let atlas_size = images.cpu_max_texture_size();
         let buf_slice: &mut [u32] = &mut buffer;
 
         let mut pending: Option<PendingFill> = None;
@@ -551,9 +490,7 @@ pub fn render_cpu(
                 continue;
             }
 
-            let diagonal_line = q.mask_layer == 0
-                && q.color_layer == 0
-                && chunk[0].pos[0] != chunk[1].pos[0]
+            let diagonal_line = chunk[0].pos[0] != chunk[1].pos[0]
                 && chunk[0].pos[1] != chunk[1].pos[1]
                 && chunk[0].pos == chunk[5].pos
                 && chunk[2].pos == chunk[3].pos;
@@ -573,26 +510,6 @@ pub fn render_cpu(
                 None => continue,
             };
             let (x0, y0, x1, y1) = snapped;
-
-            // Glyph?
-            if q.mask_layer > 0 {
-                if let Some(p) = pending.take() {
-                    flush_fill(buf_slice, buf_w, &p);
-                }
-                draw_glyph(
-                    buf_slice, buf_w, x0, y0, x1, y1, q.min_x, q.min_y, q.min_u, q.min_v,
-                    q.color, images, atlas_size, cache,
-                );
-                continue;
-            }
-
-            // Color-atlas (image / color glyph): not implemented.
-            if q.color_layer > 0 {
-                if let Some(p) = pending.take() {
-                    flush_fill(buf_slice, buf_w, &p);
-                }
-                continue;
-            }
 
             // Solid quad.
             let r = (q.color[0].clamp(0.0, 1.0) * 255.0) as u8;
@@ -809,125 +726,6 @@ fn fill_translucent_simd(
         // Scalar tail.
         for px in chunks4.into_remainder() {
             *px = blend_over_swar(src_premul, *px);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-#[inline]
-fn draw_glyph(
-    buf: &mut [u32],
-    buf_w: i32,
-    x0: i32,
-    y0: i32,
-    x1: i32,
-    y1: i32,
-    quad_min_x: f32,
-    quad_min_y: f32,
-    min_u: f32,
-    min_v: f32,
-    color: [f32; 4],
-    images: &ImageCache,
-    atlas_size: u16,
-    cache: &mut CpuCache,
-) {
-    if atlas_size == 0 {
-        return;
-    }
-    let atlas_size_f = atlas_size as f32;
-    let u0_px = (min_u * atlas_size_f) as i32;
-    let v0_px = (min_v * atlas_size_f) as i32;
-    let q_x0 = quad_min_x.round() as i32;
-    let q_y0 = quad_min_y.round() as i32;
-
-    let g_w = (x1 - x0).max(0) as u16;
-    let g_h = (y1 - y0).max(0) as u16;
-    if g_w == 0 || g_h == 0 {
-        return;
-    }
-
-    let r = (color[0].clamp(0.0, 1.0) * 255.0) as u8;
-    let g = (color[1].clamp(0.0, 1.0) * 255.0) as u8;
-    let b = (color[2].clamp(0.0, 1.0) * 255.0) as u8;
-    let a = (color[3].clamp(0.0, 1.0) * 255.0) as u8;
-    let color_packed = u32::from_le_bytes([r, g, b, a]);
-
-    let atlas_x = (u0_px + (x0 - q_x0)).max(0) as u16;
-    let atlas_y = (v0_px + (y0 - q_y0)).max(0) as u16;
-
-    let key = GlyphKey {
-        atlas_x,
-        atlas_y,
-        w: g_w,
-        h: g_h,
-        color: color_packed,
-    };
-
-    if let std::collections::hash_map::Entry::Vacant(e) = cache.glyphs.entry(key) {
-        let mask = images.cpu_mask_atlas_buffer();
-        if mask.is_empty() {
-            return;
-        }
-        let atlas_w_us = atlas_size as usize;
-        let r_u = r as u32;
-        let g_u = g as u32;
-        let b_u = b as u32;
-        let a_u = a as u32;
-
-        let mut pixels = vec![0u32; (g_w as usize) * (g_h as usize)];
-        for yy in 0..g_h as usize {
-            let src_y = (atlas_y as usize + yy).min(atlas_w_us - 1);
-            let src_row = src_y * atlas_w_us;
-            let dst_row = yy * (g_w as usize);
-            for xx in 0..g_w as usize {
-                let src_x = (atlas_x as usize + xx).min(atlas_w_us - 1);
-                let m = mask[src_row + src_x] as u32;
-                let pa = (m * a_u + 127) / 255;
-                if pa == 0 {
-                    continue;
-                }
-                let pr = (r_u * pa + 127) / 255;
-                let pg = (g_u * pa + 127) / 255;
-                let pb = (b_u * pa + 127) / 255;
-                pixels[dst_row + xx] =
-                    pack_premul(pr as u8, pg as u8, pb as u8, pa as u8);
-            }
-        }
-
-        e.insert(CachedGlyph {
-            pixels,
-            w: g_w,
-            h: g_h,
-        });
-    }
-
-    let glyph = cache.glyphs.get(&key).unwrap();
-    let buf_w_us = buf_w as usize;
-    let g_w_us = glyph.w as usize;
-
-    for yy in 0..glyph.h as usize {
-        let dst_y = y0 as usize + yy;
-        let dst_row_off = dst_y * buf_w_us + x0 as usize;
-        let src_row_off = yy * g_w_us;
-        let dst_row = &mut buf[dst_row_off..dst_row_off + g_w_us];
-        let src_row = &glyph.pixels[src_row_off..src_row_off + g_w_us];
-
-        // SIMD: 4 pixels at a time, branchless blend (handles sa==0/255
-        // correctly as a side effect of the formula).
-        let mut dst_chunks = dst_row.chunks_exact_mut(4);
-        let mut src_chunks = src_row.chunks_exact(4);
-        for (dchunk, schunk) in (&mut dst_chunks).zip(&mut src_chunks) {
-            let dst = u32x4::new([dchunk[0], dchunk[1], dchunk[2], dchunk[3]]);
-            let src = u32x4::new([schunk[0], schunk[1], schunk[2], schunk[3]]);
-            let out = blend_over_simd_var_src_x4(src, dst);
-            let arr = out.to_array();
-            dchunk.copy_from_slice(&arr);
-        }
-        // Scalar tail keeps the early-out branches.
-        let dst_tail = dst_chunks.into_remainder();
-        let src_tail = src_chunks.remainder();
-        for (d, &s) in dst_tail.iter_mut().zip(src_tail) {
-            *d = blend_over_swar(s, *d);
         }
     }
 }
@@ -1152,7 +950,7 @@ mod blend_alpha_tests {
         assert!(oa >= sa.max(da));
     }
 
-    /// The three SIMD kernels must agree with the scalar SWAR blend bit
+    /// The SIMD kernels must agree with the scalar SWAR blend bit
     /// for bit, per lane: the A+G pairing may not change any rounding.
     #[test]
     fn simd_kernels_match_scalar_exactly() {
@@ -1161,20 +959,6 @@ mod blend_alpha_tests {
             let src = valid_premul(lcg(&mut seed));
             let dst: Vec<u32> = (0..8).map(|_| lcg(&mut seed)).collect();
             let scalar: Vec<u32> = dst.iter().map(|&d| blend_over_swar(src, d)).collect();
-
-            // The var-src kernel is documented branchless-correct for the
-            // extreme alphas too, so it is checked before the early-out
-            // skip the const-src kernels rely on their fill paths for.
-            let var = blend_over_simd_var_src_x4(
-                u32x4::splat(src),
-                u32x4::new(dst[..4].try_into().unwrap()),
-            )
-            .to_array();
-            assert_eq!(
-                &var[..],
-                &scalar[..4],
-                "var_src disagrees for src={src:08x}"
-            );
 
             let sa = (src >> 24) & 0xff;
             // The const-src kernels skip the scalar early-outs; those
