@@ -105,7 +105,7 @@ fn main() {
                 }
                 "uniform_change" => uniforms.cursor_pos[0] = sequence % 160,
                 "cursor_blink" => grid.set_cursor(
-                    if sequence % 2 == 0 {
+                    if sequence.is_multiple_of(2) {
                         &foreground[..1]
                     } else {
                         &[]

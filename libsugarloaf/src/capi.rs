@@ -1344,6 +1344,9 @@ pub unsafe extern "C" fn sl_render_surface(
             flags: 0,
             padding_extend: sl.padding_extend,
             input_colorspace,
+            panel_rect: [0.0; 4],
+            panel_radius: 0.0,
+            _pad_panel: [0.0; 3],
         };
 
         // IME preedit: draw the composition string in an inverted box at the

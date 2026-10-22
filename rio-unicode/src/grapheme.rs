@@ -84,7 +84,7 @@ impl GraphemeClass {
 // Most Unicode pages contain only Other. Share one empty block for those
 // pages and materialize only pages intersecting a generated property range.
 // Everything is computed at compile time from the conformance-tested data.
-const CLASS_PAGES: [(u16, u16); 0x1100] = {
+static CLASS_PAGES: [(u16, u16); 0x1100] = {
     assert!(GRAPHEME_CLASS_RANGES.len() <= u16::MAX as usize);
     let mut pages = [(0, 0); 0x1100];
     let mut page = 0;

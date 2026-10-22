@@ -3025,7 +3025,10 @@ impl<U: EventListener> Handler for Crosswords<U> {
             }
             NamedPrivateMode::AlternateScroll => self.mode.insert(Mode::ALTERNATE_SCROLL),
             NamedPrivateMode::LineWrap => self.mode.insert(Mode::LINE_WRAP),
-            NamedPrivateMode::Origin => self.mode.insert(Mode::ORIGIN),
+            NamedPrivateMode::Origin => {
+                self.mode.insert(Mode::ORIGIN);
+                self.goto(Line(0), Column(0));
+            }
             NamedPrivateMode::ColumnMode => self.deccolm(),
             NamedPrivateMode::BlinkingCursor => {
                 self.blinking_cursor = true;
@@ -3094,7 +3097,10 @@ impl<U: EventListener> Handler for Crosswords<U> {
             NamedPrivateMode::Utf8Mouse => self.mode.remove(Mode::UTF8_MOUSE),
             NamedPrivateMode::AlternateScroll => self.mode.remove(Mode::ALTERNATE_SCROLL),
             NamedPrivateMode::LineWrap => self.mode.remove(Mode::LINE_WRAP),
-            NamedPrivateMode::Origin => self.mode.remove(Mode::ORIGIN),
+            NamedPrivateMode::Origin => {
+                self.mode.remove(Mode::ORIGIN);
+                self.goto(Line(0), Column(0));
+            }
             NamedPrivateMode::ColumnMode => self.deccolm(),
             NamedPrivateMode::BlinkingCursor => {
                 self.blinking_cursor = false;
@@ -3246,20 +3252,22 @@ impl<U: EventListener> Handler for Crosswords<U> {
         trace!("Moving backward {} tabs", count);
 
         for _ in 0..count {
-            let mut col = self.grid.cursor.pos.col;
+            let col = self.grid.cursor.pos.col;
 
             if col == 0 {
                 break;
             }
 
+            let mut destination = Column(0);
             for i in (0..(col.0)).rev() {
                 if self.tabs[Column(i)] {
-                    col = Column(i);
+                    destination = Column(i);
                     break;
                 }
             }
-            self.grid.cursor.pos.col = col;
+            self.grid.cursor.pos.col = destination;
         }
+        self.grid.cursor.should_wrap = false;
 
         let line = self.grid.cursor.pos.row.0 as usize;
         self.damage.damage_line(line);
@@ -3272,7 +3280,10 @@ impl<U: EventListener> Handler for Crosswords<U> {
 
     #[inline]
     fn goto_col(&mut self, col: Column) {
-        self.goto(self.grid.cursor.pos.row, col)
+        self.damage_cursor();
+        self.grid.cursor.pos.col = std::cmp::min(col, self.grid.last_column());
+        self.grid.cursor.should_wrap = false;
+        self.damage_cursor();
     }
 
     #[inline]
@@ -3290,22 +3301,44 @@ impl<U: EventListener> Handler for Crosswords<U> {
 
     #[inline]
     fn move_up(&mut self, rows: usize) {
-        self.goto(self.grid.cursor.pos.row - rows, self.grid.cursor.pos.col)
+        let row = self.grid.cursor.pos.row;
+        let top = if row >= self.scroll_region.start {
+            self.scroll_region.start
+        } else {
+            Line(0)
+        };
+        self.damage_cursor();
+        self.grid.cursor.pos.row =
+            std::cmp::max(row - rows.min(self.grid.screen_lines()), top);
+        self.grid.cursor.should_wrap = false;
+        self.damage_cursor();
     }
 
     #[inline]
     fn move_down(&mut self, rows: usize) {
-        self.goto(self.grid.cursor.pos.row + rows, self.grid.cursor.pos.col)
+        let row = self.grid.cursor.pos.row;
+        let bottom = if row < self.scroll_region.end {
+            self.scroll_region.end - 1
+        } else {
+            self.grid.bottommost_line()
+        };
+        self.damage_cursor();
+        self.grid.cursor.pos.row =
+            std::cmp::min(row + rows.min(self.grid.screen_lines()), bottom);
+        self.grid.cursor.should_wrap = false;
+        self.damage_cursor();
     }
 
     #[inline]
     fn move_down_and_cr(&mut self, rows: usize) {
-        self.goto(self.grid.cursor.pos.row + rows, Column(0))
+        self.move_down(rows);
+        self.carriage_return();
     }
 
     #[inline]
     fn move_up_and_cr(&mut self, lines: usize) {
-        self.goto(self.grid.cursor.pos.row - lines, Column(0))
+        self.move_up(lines);
+        self.carriage_return();
     }
 
     #[inline]
@@ -3321,6 +3354,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
 
         if lines > 0 && self.scroll_region.contains(&origin) {
             self.scroll_up_relative(origin, lines);
+            self.carriage_return();
         }
     }
 
@@ -3351,6 +3385,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
 
     #[inline]
     fn erase_chars(&mut self, count: Column) {
+        self.grid.cursor.should_wrap = false;
         let start = self.grid.cursor.pos.col;
         let end = std::cmp::min(start + count, Column(self.grid.columns()));
 
@@ -3379,10 +3414,13 @@ impl<U: EventListener> Handler for Crosswords<U> {
         let blank = self.grid.blank_with_bg(bg);
 
         // Ensure deleting within terminal bounds.
-        let count = std::cmp::min(count, columns);
-
         let start = self.grid.cursor.pos.col.0;
-        let end = std::cmp::min(start + count, columns - 1);
+        let count = std::cmp::min(count, columns - start);
+        self.grid.cursor.should_wrap = false;
+        if count == 0 {
+            return;
+        }
+        let end = start + count;
         let num_cells = columns - end;
 
         let line = self.grid.cursor.pos.row;
@@ -3418,13 +3456,18 @@ impl<U: EventListener> Handler for Crosswords<U> {
     #[inline]
     fn insert_blank_lines(&mut self, lines: usize) {
         let origin = self.grid.cursor.pos.row;
-        if self.scroll_region.contains(&origin) {
+        if lines > 0 && self.scroll_region.contains(&origin) {
             self.scroll_down_relative(origin, lines);
+            self.carriage_return();
         }
     }
 
     #[inline]
     fn insert_blank(&mut self, count: usize) {
+        self.grid.cursor.should_wrap = false;
+        if count == 0 {
+            return;
+        }
         let bg = self.grid.template_style().bg;
         let blank = self.grid.blank_with_bg(bg);
 
@@ -4285,8 +4328,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
             ClearMode::Above => {
                 let cursor = self.grid.cursor.pos;
 
-                // If clearing more than one line.
-                if cursor.row > 1 {
+                if cursor.row > 0 {
                     // Fully clear all lines before the current line.
                     self.grid.reset_region(..cursor.row);
                 }
@@ -4416,6 +4458,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
 
     #[inline]
     fn linefeed(&mut self) {
+        self.grid.cursor.should_wrap = false;
         let next = self.grid.cursor.pos.row + 1;
         if next == self.scroll_region.end {
             self.scroll_up_relative(self.scroll_region.start, 1);
@@ -4543,9 +4586,9 @@ impl<U: EventListener> Handler for Crosswords<U> {
 
     #[inline]
     fn put_tab(&mut self, mut count: u16) {
-        // A tab after the last column is the same as a linebreak.
+        // HT moves within the current row. A pending wrap is consumed only
+        // by printing, not by a tab at the right edge.
         if self.grid.cursor.should_wrap {
-            self.wrapline();
             return;
         }
 
@@ -4625,10 +4668,9 @@ impl<U: EventListener> Handler for Crosswords<U> {
         let bg = self.grid.template_style().bg;
         let blank = self.grid.blank_with_bg(bg);
         let point = self.grid.cursor.pos;
-        let should_wrap = self.grid.cursor.should_wrap;
+        self.grid.cursor.should_wrap = false;
 
         let (left, right) = match mode {
-            LineClearMode::Right if should_wrap => return,
             LineClearMode::Right => (point.col, Column(self.grid.columns())),
             LineClearMode::Left => (Column(0), point.col + 1),
             LineClearMode::All => (Column(0), Column(self.grid.columns())),
@@ -6036,6 +6078,9 @@ impl<U: EventListener> Crosswords<U> {
         self.graphics.kitty_graphics_dirty = true;
     }
 }
+
+#[cfg(test)]
+mod conformance_tests;
 
 #[cfg(test)]
 mod tests {
@@ -10529,11 +10574,8 @@ mod tests {
             assert_eq!(zw, &[DIACRITICS[row], DIACRITICS[0]]);
         }
 
-        // The renderer's geometry for each row's run: with the grid
-        // implied from a 2×2 px image on 1×2 px cells (2 cols × 1 row),
-        // row 0 is visible and drawn 1:1. Before the fix the placement
-        // box collapsed to one cell and row 1 of a taller image drew
-        // nothing while row 0 squeezed the whole image.
+        // A 2x2 px image on 1x2 px cells occupies two columns and one row, so
+        // the first placeholder run uses the image's full vertical extent.
         let run = crate::ansi::kitty_virtual::PlaceholderRun {
             image_id,
             placement_id: 0,

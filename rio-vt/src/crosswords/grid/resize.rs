@@ -121,6 +121,10 @@ impl Grid<Square> {
                 self.cursor.should_wrap = false;
                 self.cursor.pos.col += 1;
             }
+            if self.saved_cursor.should_wrap && reflow {
+                self.saved_cursor.should_wrap = false;
+                self.saved_cursor.pos.col += 1;
+            }
             self.raw.grow_all_rows(columns);
             return;
         }
@@ -129,6 +133,10 @@ impl Grid<Square> {
 
         let mut reversed: Vec<Row<Square>> = Vec::with_capacity(self.raw.len());
         let mut cursor_line_delta = 0;
+        let saved_buffer_line = self.lines - self.saved_cursor.pos.row.0 as usize - 1;
+        let saved_column = self.saved_cursor.pos.col.0
+            + usize::from(self.saved_cursor.should_wrap && reflow);
+        let mut saved_location = None;
 
         // Remove the linewrap special case, by moving the cursor outside of the grid.
         if self.cursor.should_wrap && reflow {
@@ -156,6 +164,9 @@ impl Grid<Square> {
                 Some(last_row) if should_reflow(last_row) => last_row,
                 _ => {
                     reversed.push(row);
+                    if reflow && i == saved_buffer_line {
+                        saved_location = Some((reversed.len() - 1, saved_column));
+                    }
                     if let Some(r) = remap.as_mut() {
                         r.new_pos[old_len - 1 - i] = (reversed.len() - 1) as i64;
                     }
@@ -212,16 +223,34 @@ impl Grid<Square> {
                 }
             }
 
+            if reflow && i == saved_buffer_line {
+                saved_location = Some(if saved_column < num_wrapped || row.is_clear() {
+                    (merge_target, last_len + saved_column)
+                } else {
+                    (merge_target + 1, saved_column - num_wrapped)
+                });
+            }
+
             let cursor_buffer_line = self.lines - self.cursor.pos.row.0 as usize - 1;
 
             if i == cursor_buffer_line && reflow {
                 // Resize cursor's line and reflow the cursor if necessary.
-                let mut target = self.cursor.pos.sub(self, Boundary::Cursor, num_wrapped);
+                // A merge can move the top visible cursor into history. Do
+                // not clamp this intermediate row: doing so hides the row
+                // change and keeps an empty continuation in the output.
+                let mut target = self.cursor.pos;
+                if target.col.0 >= num_wrapped {
+                    target.col -= num_wrapped;
+                } else {
+                    target.row -= 1;
+                    target.col = Column(columns + target.col.0 - num_wrapped);
+                }
 
                 // Clamp to the last column, if no content was reflown with the cursor.
                 if target.col.0 == 0 && row.is_clear() {
                     self.cursor.should_wrap = true;
-                    target = target.sub(self, Boundary::Cursor, 1);
+                    target.row -= 1;
+                    target.col = Column(columns - 1);
                 }
                 self.cursor.pos.col = target.col;
 
@@ -291,6 +320,10 @@ impl Grid<Square> {
 
         self.raw.replace_inner(reversed);
 
+        if let Some((row, column)) = saved_location {
+            self.set_saved_cursor_after_reflow(row, column, self.raw.len());
+        }
+
         // Clamp display offset in case lines above it got merged.
         self.display_offset = min(self.display_offset, self.history_size());
 
@@ -302,14 +335,16 @@ impl Grid<Square> {
         // Fast path: if no row has occupied content beyond `columns` there is
         // nothing to wrap down, so shrinking is a per-row truncation of
         // trailing blank cells. Wrapped rows are full width, so `occ <=
-        // columns` also rules them out. Requires the cursor to fit (otherwise
-        // the full path wraps it onto a new line, which is not a plain
-        // truncation) and no image-placement tracking (whose remap the full
-        // path builds).
+        // columns` also rules them out. Both cursor positions must fit,
+        // including pending wrap; otherwise the full path moves one onto a
+        // new line. Image-placement tracking also requires the full path.
         let effective_cursor_col =
             self.cursor.pos.col.0 + usize::from(self.cursor.should_wrap && reflow);
+        let effective_saved_col = self.saved_cursor.pos.col.0
+            + usize::from(self.saved_cursor.should_wrap && reflow);
         if !self.track_reflow_remap
             && (!reflow || effective_cursor_col <= columns)
+            && (!reflow || effective_saved_col <= columns)
             && self.raw.rows().all(|row| row.occ <= columns)
         {
             self.columns = columns;
@@ -330,8 +365,16 @@ impl Grid<Square> {
             } else {
                 self.cursor.pos = self.cursor.pos.grid_clamp(self, Boundary::Cursor);
             }
-            self.saved_cursor.pos.col =
-                min(self.saved_cursor.pos.col, Column(columns - 1));
+            if reflow {
+                self.set_saved_cursor_after_reflow(
+                    self.history_size() + self.saved_cursor.pos.row.0 as usize,
+                    effective_saved_col,
+                    self.raw.len(),
+                );
+            } else {
+                self.saved_cursor.pos.col =
+                    min(self.saved_cursor.pos.col, Column(columns - 1));
+            }
             return;
         }
 
@@ -345,6 +388,9 @@ impl Grid<Square> {
 
         let mut new_raw = Vec::with_capacity(self.raw.len());
         let mut buffered: Option<Vec<Square>> = None;
+        let saved_buffer_line = self.lines - self.saved_cursor.pos.row.0 as usize - 1;
+        let mut saved_offset = None;
+        let mut saved_location = None;
 
         let mut rows = self.raw.take_all();
         let old_len = rows.len();
@@ -364,6 +410,10 @@ impl Grid<Square> {
         let mut trackers: Vec<(usize, i64)> = Vec::new();
 
         for (i, mut row) in rows.drain(..).enumerate().rev() {
+            if reflow && i == saved_buffer_line {
+                saved_offset =
+                    Some(buffered.as_ref().map_or(0, |b| b.len()) + effective_saved_col);
+            }
             if remap.is_some() {
                 let own_first = buffered.as_ref().map_or(0, |b| b.len()) as i64;
                 trackers.push((old_len - 1 - i, own_first));
@@ -389,15 +439,19 @@ impl Grid<Square> {
                         let cursor_buffer_line =
                             self.lines - self.cursor.pos.row.0 as usize - 1;
                         if reflow
-                            && i == cursor_buffer_line
-                            && self.cursor.pos.col > columns
+                            && ((i == cursor_buffer_line
+                                && self.cursor.pos.col > columns)
+                                || saved_offset.is_some_and(|offset| offset > columns))
                         {
-                            // If there are empty cells before the cursor, we assume it is explicit
-                            // whitespace and need to wrap it like normal content.
+                            // Empty cells before either cursor are explicit
+                            // whitespace and must wrap like normal content.
                             Vec::new()
                         } else {
                             // Since it fits, just push the existing line without any reflow.
                             new_raw.push(row);
+                            if let Some(offset) = saved_offset.take() {
+                                saved_location = Some((new_raw.len() - 1, offset));
+                            }
                             if let Some(r) = remap.as_mut() {
                                 for (p, _) in trackers.drain(..) {
                                     r.new_pos[p] = (new_raw.len() - 1) as i64;
@@ -445,6 +499,9 @@ impl Grid<Square> {
                     if len == 1 {
                         row[Column(columns - 1)].set_wrapline(true);
                         new_raw.push(row);
+                        if let Some(offset) = saved_offset.take() {
+                            saved_location = Some((new_raw.len() - 1, offset));
+                        }
                         if let Some(r) = remap.as_mut() {
                             for (p, _) in trackers.drain(..) {
                                 r.new_pos[p] = (new_raw.len() - 1) as i64;
@@ -459,6 +516,15 @@ impl Grid<Square> {
                 }
 
                 new_raw.push(row);
+                if let Some(offset) = saved_offset {
+                    let consumed = columns - displaced as usize;
+                    if offset < consumed {
+                        saved_location = Some((new_raw.len() - 1, offset));
+                        saved_offset = None;
+                    } else {
+                        saved_offset = Some(offset - consumed);
+                    }
+                }
                 if let Some(r) = remap.as_mut() {
                     // This push consumed `columns` cells of the
                     // stream, minus a wide char the spacer displaced
@@ -532,6 +598,7 @@ impl Grid<Square> {
         // grid storage, avoiding a second full row-buffer allocation.
         new_raw.reverse();
         let mut reversed = new_raw;
+        let output_rows = reversed.len();
         // Reflow can overflow the scrollback cap; the oldest lines
         // fall off the ring and must advance the absolute row base.
         let cap = self.max_scroll_limit + self.lines;
@@ -556,9 +623,39 @@ impl Grid<Square> {
             self.cursor.pos = self.cursor.pos.grid_clamp(self, Boundary::Cursor);
         }
 
-        // Clamp the saved cursor to the grid.
-        self.saved_cursor.pos.col = min(self.saved_cursor.pos.col, Column(columns - 1));
+        if let Some((row, column)) = saved_location {
+            self.set_saved_cursor_after_reflow(row, column, output_rows);
+        } else {
+            self.saved_cursor.pos.col =
+                min(self.saved_cursor.pos.col, Column(columns - 1));
+        }
 
         self.reflow_remap = remap;
+    }
+
+    /// Convert an oldest-first output location into a visible saved cursor.
+    /// The output index is captured during the same cell moves as reflow,
+    /// including wide-character displacement and tails buffered across rows.
+    fn set_saved_cursor_after_reflow(
+        &mut self,
+        row: usize,
+        mut column: usize,
+        output_rows: usize,
+    ) {
+        let top = output_rows.saturating_sub(self.lines);
+        let mut row = row.saturating_sub(top).min(self.lines - 1);
+        while column > self.columns {
+            column -= self.columns;
+            row = (row + 1).min(self.lines - 1);
+        }
+        let pending_wrap = column == self.columns
+            && !self[Line(row as i32)][Column(self.columns - 1)].wrapline();
+        if column == self.columns && !pending_wrap {
+            column = 0;
+            row = (row + 1).min(self.lines - 1);
+        }
+        self.saved_cursor.pos.row = Line(row as i32);
+        self.saved_cursor.pos.col = Column(column.min(self.columns - 1));
+        self.saved_cursor.should_wrap = pending_wrap;
     }
 }

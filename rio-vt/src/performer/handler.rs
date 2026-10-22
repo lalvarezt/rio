@@ -217,8 +217,10 @@ pub trait Handler {
     /// Substitute char under cursor.
     fn substitute(&mut self) {}
 
-    /// Newline.
-    fn newline(&mut self) {}
+    /// Handle LF, VT, or FF. Implementations may also apply newline mode.
+    fn newline(&mut self) {
+        self.linefeed();
+    }
 
     /// Set current position as a tabstop.
     fn set_horizontal_tabstop(&mut self) {}
@@ -1014,7 +1016,7 @@ impl<U: Handler> Perform for Performer<'_, U> {
             C0::HT => self.handler.put_tab(1),
             C0::BS => self.handler.backspace(),
             C0::CR => self.handler.carriage_return(),
-            C0::LF | C0::VT | C0::FF => self.handler.linefeed(),
+            C0::LF | C0::VT | C0::FF => self.handler.newline(),
             C0::BEL => self.handler.bell(),
             C0::SUB => self.handler.substitute(),
             C0::SI => self.handler.set_active_charset(CharsetIndex::G0),

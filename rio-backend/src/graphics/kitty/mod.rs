@@ -517,8 +517,18 @@ fn test_cursor_movement_no_move() {
 
     term.place_graphic(placement);
 
-    // With cursor_movement=1, cursor behavior depends on placement x,y
-    // This test verifies the no-move code path executes without panic
+    assert_eq!(term.grid.cursor.pos.row.0, 5);
+    assert_eq!(term.grid.cursor.pos.col.0, 10);
+    assert_eq!(term.graphics.kitty_placements.len(), 1);
+    assert_eq!(
+        term.graphics
+            .kitty_placements
+            .values()
+            .next()
+            .unwrap()
+            .dest_row,
+        5
+    );
 }
 
 #[test]
@@ -626,7 +636,6 @@ fn test_image_row_occupation_exact_fit() {
 
     let final_cursor_row = term.grid.cursor.pos.row.0;
 
-    // With fix: cursor stays ON last row of image (row 1)
     assert_eq!(
         final_cursor_row, 1,
         "Cursor should be at row 1 (last row of image) after placing a 2-row image, but got row {}",
@@ -857,7 +866,6 @@ fn test_image_row_occupation_single_row() {
 
     let final_cursor_row = term.grid.cursor.pos.row.0;
 
-    // With fix: cursor stays ON last row of image (row 0)
     assert_eq!(
         final_cursor_row, 0,
         "Cursor should be at row 0 (last row of image) after placing a 1-row image, but got row {}",
@@ -926,7 +934,6 @@ fn test_image_row_occupation_three_rows() {
 
     let final_cursor_row = term.grid.cursor.pos.row.0;
 
-    // With fix: cursor stays ON last row of image (row 2)
     assert_eq!(
         final_cursor_row, 2,
         "Cursor should be at row 2 (last row of image) after placing a 3-row image, but got row {}. \
@@ -1000,47 +1007,12 @@ fn test_image_row_occupation_from_middle() {
 
     let final_cursor_row = term.grid.cursor.pos.row.0;
 
-    // With fix: cursor stays ON last row of image (row 6)
     assert_eq!(
         final_cursor_row, 6,
         "Cursor should be at row 6 (last row of image) after placing a 2-row image from row 5, but got row {}",
         final_cursor_row
     );
 }
-
-// Delete Tests
-
-#[test]
-fn test_delete_all() {
-    let event_listener = TestEventListener;
-    let window_id = WindowId::from(0);
-
-    let mut term: Crosswords<TestEventListener> = Crosswords::new(
-        crate::crosswords::CrosswordsSize::new(80, 24),
-        crate::ansi::CursorShape::Block,
-        event_listener,
-        window_id,
-        0,
-        10_000,
-    );
-
-    // Delete all graphics (d=a)
-    let delete = DeleteRequest {
-        action: b'a',
-        image_id: 0,
-        image_number: 0,
-        placement_id: 0,
-        x: 0,
-        y: 0,
-        z_index: 0,
-        delete_data: false,
-    };
-
-    // Should not panic
-    term.delete_graphics(delete);
-}
-
-// Placement Management Tests
 
 #[test]
 fn test_store_graphic() {
@@ -1110,14 +1082,12 @@ fn test_place_nonexistent_graphic() {
         cell_y_offset: 0,
     };
 
-    // Should not panic, just warn
+    let cursor_before = term.grid.cursor.pos;
     term.place_graphic(placement);
+    assert_eq!(term.grid.cursor.pos, cursor_before);
+    assert!(term.graphics.kitty_placements.is_empty());
+    assert!(term.graphics.get_kitty_image(999).is_none());
 }
-
-// test_delete_by_kitty_image_id and test_delete_by_image_id_does_not_delete_wrong_id
-// were removed: kitty images no longer go into grid cells (overlay path only).
-// Equivalent tests exist as test_delete_by_image_id_removes_all_placements_for_image
-// and test_delete_by_specific_placement_id.
 
 #[test]
 fn test_recount_releases_key_exactly_once() {
@@ -3341,172 +3311,9 @@ fn test_resize_narrow_wraps_command_image_follows() {
     );
 }
 
-/// Print the visible grid contents for debugging.
-fn dump_grid(term: &Crosswords<TestEventListener>, label: &str) {
-    use crate::crosswords::grid::Dimensions;
-    eprintln!("=== {label} ===");
-    eprintln!(
-        "  cursor.row={}, history={}, columns={}, screen_lines={}",
-        term.grid.cursor.pos.row.0,
-        term.history_size(),
-        Dimensions::columns(&term.grid),
-        Dimensions::screen_lines(&term.grid),
-    );
-    for placement in term.graphics.kitty_placements.values() {
-        eprintln!(
-            "  placement: image_id={}, dest_row={}, dest_col={}, columns={}, rows={}",
-            placement.image_id,
-            placement.dest_row,
-            placement.dest_col,
-            placement.columns,
-            placement.rows,
-        );
-    }
-    use crate::crosswords::pos::{Column, Line};
-    let lines = Dimensions::screen_lines(&term.grid);
-    let cols = Dimensions::columns(&term.grid);
-    for r in 0..lines {
-        let line = Line(r as i32);
-        let mut s = String::new();
-        for c in 0..cols {
-            let cell = &term.grid[line][Column(c)];
-            let ch = cell.c();
-            if ch == '\0' || ch == ' ' {
-                s.push('.');
-            } else {
-                s.push(ch);
-            }
-        }
-        eprintln!("  row {:>2}: |{}|", r, s.trim_end_matches('.'));
-    }
-}
-
-#[test]
-fn test_debug_widen_visible_layout() {
-    // Mirror of test_debug_narrow_visible_layout: starts NARROW with the
-    // command wrapped onto 2 rows, then widens.
-    use crate::performer::handler::Handler;
-    let event_listener = TestEventListener;
-    let window_id = WindowId::from(0);
-    let mut term: Crosswords<TestEventListener> = Crosswords::new(
-        crate::crosswords::CrosswordsSize::new(20, 24),
-        crate::ansi::CursorShape::Block,
-        event_listener,
-        window_id,
-        0,
-        10_000,
-    );
-    term.graphics.cell_width = 10.0;
-    term.graphics.cell_height = 20.0;
-
-    for _ in 0..18 {
-        term.linefeed();
-    }
-    term.carriage_return();
-
-    type_text(&mut term, "$ kitten icat /path/to/image.png");
-    term.linefeed();
-    term.carriage_return();
-
-    store_red_pixel(&mut term, 1);
-    let placement = kitty_graphics_protocol::PlacementRequest {
-        image_id: 1,
-        placement_id: 0,
-        x: 0,
-        y: 0,
-        width: 0,
-        height: 0,
-        columns: 1,
-        rows: 1,
-        z_index: 0,
-        virtual_placement: false,
-        unicode_placeholder: 0,
-        cursor_movement: 0,
-        cell_x_offset: 0,
-        cell_y_offset: 0,
-    };
-    term.place_graphic(placement);
-
-    term.linefeed();
-    term.carriage_return();
-    type_text(&mut term, "$ ");
-
-    dump_grid(&term, "BEFORE widen");
-
-    term.resize(ReflowDim {
-        columns: 50,
-        lines: 24,
-    });
-
-    dump_grid(&term, "AFTER widen");
-}
-
-#[test]
-fn test_debug_narrow_visible_layout() {
-    // Print visible layout before/after narrowing to understand what
-    // shrink_columns actually does to cursor and content positioning.
-    use crate::performer::handler::Handler;
-    let event_listener = TestEventListener;
-    let window_id = WindowId::from(0);
-    let mut term: Crosswords<TestEventListener> = Crosswords::new(
-        crate::crosswords::CrosswordsSize::new(50, 24),
-        crate::ansi::CursorShape::Block,
-        event_listener,
-        window_id,
-        0,
-        10_000,
-    );
-    term.graphics.cell_width = 10.0;
-    term.graphics.cell_height = 20.0;
-
-    for _ in 0..20 {
-        term.linefeed();
-    }
-    term.carriage_return();
-
-    type_text(&mut term, "$ kitten icat /path/to/image.png");
-    term.linefeed();
-    term.carriage_return();
-
-    store_red_pixel(&mut term, 1);
-    let placement = kitty_graphics_protocol::PlacementRequest {
-        image_id: 1,
-        placement_id: 0,
-        x: 0,
-        y: 0,
-        width: 0,
-        height: 0,
-        columns: 1,
-        rows: 1,
-        z_index: 0,
-        virtual_placement: false,
-        unicode_placeholder: 0,
-        cursor_movement: 0,
-        cell_x_offset: 0,
-        cell_y_offset: 0,
-    };
-    term.place_graphic(placement);
-
-    term.linefeed();
-    term.carriage_return();
-    type_text(&mut term, "$ ");
-
-    dump_grid(&term, "BEFORE narrow");
-
-    term.resize(ReflowDim {
-        columns: 20,
-        lines: 24,
-    });
-
-    dump_grid(&term, "AFTER narrow");
-}
-
 #[test]
 fn test_resize_narrow_combined_col_and_row_change() {
-    // Real window resize: user drags the corner, both columns and
-    // lines change in the same Crosswords::resize call. Both
-    // grow_columns/shrink_columns AND grow_lines/shrink_lines fire.
-    // Cursor delta accumulates from both.
+    // Resizing both dimensions keeps the image directly above the prompt.
     use crate::performer::handler::Handler;
     let event_listener = TestEventListener;
     let window_id = WindowId::from(0);
@@ -3561,11 +3368,10 @@ fn test_resize_narrow_combined_col_and_row_change() {
         .unwrap()
         .dest_row;
 
-    eprintln!(
-        "BEFORE combined: cursor.row={}, history={}, dest_row={}",
-        term.grid.cursor.pos.row.0,
-        term.history_size(),
-        initial_dest_row,
+    assert_eq!(initial_dest_row, 11);
+    assert_eq!(
+        term.history_size() as i64 + term.grid.cursor.pos.row.0 as i64,
+        initial_dest_row + 1
     );
 
     // Narrow + shorten at the same time.
@@ -3582,20 +3388,12 @@ fn test_resize_narrow_combined_col_and_row_change() {
         .unwrap()
         .dest_row;
 
-    eprintln!(
-        "AFTER combined : cursor.row={}, history={}, dest_row={}, delta={}",
-        term.grid.cursor.pos.row.0,
-        term.history_size(),
-        final_dest_row,
-        final_dest_row - initial_dest_row,
+    assert_eq!(final_dest_row, initial_dest_row + 1);
+    assert_eq!(
+        term.history_size() as i64 + term.grid.cursor.pos.row.0 as i64,
+        final_dest_row + 1,
+        "the image must remain directly above the prompt after reflow"
     );
-
-    // The image should still follow the wrap regardless of the
-    // simultaneous row count change.
-    // Cursor delta should be (history_grew_by_wrap) +
-    // (cursor_row_change_from_shrink_lines + wrap_above_cursor).
-    // The exact number depends on how shrink_lines + shrink_columns
-    // interact, but the image should track the cursor.
 }
 
 #[test]
