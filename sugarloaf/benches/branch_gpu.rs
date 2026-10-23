@@ -142,8 +142,9 @@ mod native {
                     )
                     .unwrap()[0];
                 let frame = ctx.acquire_frame().expect("acquire benchmark image");
-                let bg = vec![CellBg::TRANSPARENT; 160];
+                let mut bg = vec![CellBg::TRANSPARENT; 160];
                 for buckets in [1, 2] {
+                    bg.fill(CellBg::TRANSPARENT);
                     let mut cells: Vec<_> = (0..160)
                         .map(|x| CellText {
                             grid_pos: [x, 0],
@@ -162,13 +163,28 @@ mod native {
                         "row_length",
                         "atlas_change",
                         "atlas_then_edit",
+                        "bg_one_row",
+                        "bg_distant_rows",
+                        "bg_full",
                     ] {
                         let name = format!("gpu/record/{buckets}_atlas/{mode}");
                         let mut sequence = 0usize;
                         support::measure(&name, 160 * 48, || {
                             sequence += 1;
                             let slot = sequence % FRAMES_IN_FLIGHT;
-                            if mode != "unchanged"
+                            if mode.starts_with("bg_") {
+                                bg[0].rgba[3] ^= 255;
+                                if mode == "bg_full" {
+                                    for row in 0..48 {
+                                        grid.write_row(row, &bg, &cells);
+                                    }
+                                } else {
+                                    grid.write_row(0, &bg, &cells);
+                                    if mode == "bg_distant_rows" {
+                                        grid.write_row(47, &bg, &cells);
+                                    }
+                                }
+                            } else if mode != "unchanged"
                                 && (mode != "rotating_slots" || slot == 0)
                             {
                                 cells[0].color[0] ^= 1;

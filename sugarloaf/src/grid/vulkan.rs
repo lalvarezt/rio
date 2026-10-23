@@ -164,8 +164,23 @@ mod row_patch_tests {
                         cell.color[0] = step as u8;
                     }
                 }
-                grid.write_row(row as u32, &[CellBg::TRANSPARENT; 5], cells);
+                let mut bg = [CellBg::TRANSPARENT; 5];
+                bg[4].rgba = [step as u8, 0, 0, 255];
+                let len = (step + row) % 6;
+                grid.write_row(row as u32, &bg[..len], cells);
+                if step % 4 == 0 {
+                    grid.clear_row(row as u32);
+                    grid.clear_row(row as u32);
+                    grid.write_row(row as u32, &[], cells);
+                }
             }
+            let visible: Vec<_> = grid
+                .bg_cpu
+                .chunks(5)
+                .map(|row| row.iter().any(|cell| *cell != CellBg::TRANSPARENT))
+                .collect();
+            assert_eq!(grid.bg_row_visible, visible, "visibility step={step}");
+            assert_eq!(grid.bg_visible_rows, visible.iter().filter(|&&v| v).count());
             let frame = ctx.acquire_frame().expect("test frame");
             let device = ctx.device();
             let cmd = frame.cmd_buffer;
@@ -199,6 +214,13 @@ mod row_patch_tests {
                 );
             }
             grid.render_bg(&ctx, cmd, frame.slot, &u);
+            let uploaded_bg = unsafe {
+                std::slice::from_raw_parts(
+                    grid.bg_buffers[frame.slot].as_mut_ptr() as *const CellBg,
+                    grid.bg_cpu.len(),
+                )
+            };
+            assert_eq!(uploaded_bg, grid.bg_cpu, "background upload step={step}");
             grid.render_text(&ctx, cmd, frame.slot, &u);
             if matches!(step, 0 | 5 | 9 | 12 | 16 | 20) {
                 assert!(
@@ -241,6 +263,9 @@ mod row_patch_tests {
         unsafe {
             ctx.device().device_wait_idle().unwrap();
         }
+        grid.resize(2, 2);
+        assert_eq!(grid.bg_visible_rows, 0);
+        assert_eq!(grid.bg_row_visible, [false, false]);
     }
 
     #[test]
@@ -937,8 +962,10 @@ pub struct VulkanGridRenderer {
     rows: u32,
 
     bg_buffers: [VulkanBuffer; FRAMES_IN_FLIGHT],
-    bg_dirty: [bool; FRAMES_IN_FLIGHT],
+    /// Cell spans accumulate independently until each frame slot is uploaded.
+    bg_dirty: [Option<Range<usize>>; FRAMES_IN_FLIGHT],
     bg_cpu: Vec<CellBg>,
+    bg_row_visible: Vec<bool>,
     bg_visible_rows: usize,
 
     uniform_buffers: [VulkanBuffer; FRAMES_IN_FLIGHT],
@@ -1048,8 +1075,9 @@ impl VulkanGridRenderer {
             cols,
             rows,
             bg_buffers,
-            bg_dirty: [true; FRAMES_IN_FLIGHT],
+            bg_dirty: std::array::from_fn(|_| Some(0..bg_len)),
             bg_cpu: vec![CellBg::TRANSPARENT; bg_len],
+            bg_row_visible: vec![false; rows as usize],
             bg_visible_rows: 0,
             uniform_buffers,
             bg_descriptor_pool,
@@ -1101,6 +1129,7 @@ impl VulkanGridRenderer {
         self.rows = rows;
         let bg_len = (cols as usize) * (rows as usize);
         self.bg_cpu = vec![CellBg::TRANSPARENT; bg_len];
+        self.bg_row_visible = vec![false; rows as usize];
         self.bg_visible_rows = 0;
 
         // Reallocate bg buffers via the cached `Arc<VkShared>` and
@@ -1122,7 +1151,7 @@ impl VulkanGridRenderer {
                 &self.bg_buffers[slot],
             );
         }
-        self.bg_dirty = [true; FRAMES_IN_FLIGHT];
+        self.bg_dirty = std::array::from_fn(|_| Some(0..bg_len));
 
         // Reset fg state — emit loop will re-populate after resize.
         self.fg_rows = init_fg_rows(rows);
@@ -1137,53 +1166,49 @@ impl VulkanGridRenderer {
         }
         // Identical row writes must not invalidate every frame-slot upload.
         let idx = (row as usize) + 1;
-        if !self.fg_staging_dirty
-            && !self.fg_mixed_row_offsets_valid
-            && self.fg_row_offsets.is_empty()
-            && self.fg_rows[idx].as_slice() != fg
-            && same_atlas_layout(&self.fg_rows[idx], fg)
+        if bytemuck::cast_slice::<_, u8>(self.fg_rows[idx].as_slice())
+            != bytemuck::cast_slice(fg)
         {
-            self.cache_mixed_row_offsets();
-        }
-        if let Some(slot) = self.fg_rows.get_mut(idx) {
-            if bytemuck::cast_slice::<_, u8>(slot.as_slice()) != bytemuck::cast_slice(fg)
+            if !self.fg_staging_dirty
+                && !self.fg_mixed_row_offsets_valid
+                && self.fg_row_offsets.is_empty()
+                && same_atlas_layout(&self.fg_rows[idx], fg)
             {
-                let range = if !self.fg_staging_dirty
-                    && slot.len() == fg.len()
-                    && self.fg_row_offsets.len() == self.rows as usize + 1
-                    && self.fg_buckets.first().is_some_and(|bucket| {
-                        fg.iter().all(|cell| {
-                            (cell.atlas, cell.page) == (bucket.kind, bucket.page)
-                        })
-                    }) {
-                    let range = self.fg_row_offsets[row as usize]
-                        ..self.fg_row_offsets[row as usize + 1];
-                    self.fg_staging[range.clone()].copy_from_slice(fg);
-                    Some(range)
-                } else if !self.fg_staging_dirty && self.fg_mixed_row_offsets_valid {
-                    self.fg_mixed_row_offsets
-                        .get(row as usize)
-                        .and_then(|offsets| {
-                            patch_mixed_row(&mut self.fg_staging, offsets, slot, fg)
-                        })
-                } else {
-                    None
-                };
-                if let Some(range) = range {
-                    for dirty in &mut self.fg_dirty {
-                        *dirty = Some(match dirty.take() {
-                            Some(old) => {
-                                old.start.min(range.start)..old.end.max(range.end)
-                            }
-                            None => range.clone(),
-                        });
-                    }
-                } else {
-                    self.fg_staging_dirty = true;
-                }
-                slot.clear();
-                slot.extend_from_slice(fg);
+                self.cache_mixed_row_offsets();
             }
+            let slot = &mut self.fg_rows[idx];
+            let range = if !self.fg_staging_dirty
+                && slot.len() == fg.len()
+                && self.fg_row_offsets.len() == self.rows as usize + 1
+                && self.fg_buckets.first().is_some_and(|bucket| {
+                    fg.iter()
+                        .all(|cell| (cell.atlas, cell.page) == (bucket.kind, bucket.page))
+                }) {
+                let range = self.fg_row_offsets[row as usize]
+                    ..self.fg_row_offsets[row as usize + 1];
+                self.fg_staging[range.clone()].copy_from_slice(fg);
+                Some(range)
+            } else if !self.fg_staging_dirty && self.fg_mixed_row_offsets_valid {
+                self.fg_mixed_row_offsets
+                    .get(row as usize)
+                    .and_then(|offsets| {
+                        patch_mixed_row(&mut self.fg_staging, offsets, slot, fg)
+                    })
+            } else {
+                None
+            };
+            if let Some(range) = range {
+                for dirty in &mut self.fg_dirty {
+                    *dirty = Some(match dirty.take() {
+                        Some(old) => old.start.min(range.start)..old.end.max(range.end),
+                        None => range.clone(),
+                    });
+                }
+            } else {
+                self.fg_staging_dirty = true;
+            }
+            slot.clear();
+            slot.extend_from_slice(fg);
         }
 
         let row_start = (row as usize) * (self.cols as usize);
@@ -1195,13 +1220,14 @@ impl VulkanGridRenderer {
                 .iter()
                 .any(|cell| *cell != CellBg::TRANSPARENT)
         {
-            let was_visible = cpu.iter().any(|cell| *cell != CellBg::TRANSPARENT);
+            let was_visible = self.bg_row_visible[row as usize];
             cpu[..row_len].copy_from_slice(&bg[..row_len]);
             cpu[row_len..].fill(CellBg::TRANSPARENT);
             let is_visible = cpu.iter().any(|cell| *cell != CellBg::TRANSPARENT);
+            self.bg_row_visible[row as usize] = is_visible;
             self.bg_visible_rows =
                 self.bg_visible_rows + is_visible as usize - was_visible as usize;
-            self.bg_dirty = [true; FRAMES_IN_FLIGHT];
+            self.mark_bg_dirty(row_start..row_start + self.cols as usize);
         }
     }
 
@@ -1246,10 +1272,20 @@ impl VulkanGridRenderer {
         }
         let row_start = (row as usize) * (self.cols as usize);
         let cpu = &mut self.bg_cpu[row_start..row_start + self.cols as usize];
-        if cpu.iter().any(|cell| *cell != CellBg::TRANSPARENT) {
+        if self.bg_row_visible[row as usize] {
             cpu.fill(CellBg::TRANSPARENT);
+            self.bg_row_visible[row as usize] = false;
             self.bg_visible_rows -= 1;
-            self.bg_dirty = [true; FRAMES_IN_FLIGHT];
+            self.mark_bg_dirty(row_start..row_start + self.cols as usize);
+        }
+    }
+
+    fn mark_bg_dirty(&mut self, range: Range<usize>) {
+        for dirty in &mut self.bg_dirty {
+            *dirty = Some(match dirty.take() {
+                Some(old) => old.start.min(range.start)..old.end.max(range.end),
+                None => range.clone(),
+            });
         }
     }
 
@@ -1296,7 +1332,7 @@ impl VulkanGridRenderer {
         self.needs_full_rebuild = true;
         self.fg_staging_dirty = true;
         self.cursor_dirty = [true; FRAMES_IN_FLIGHT];
-        self.bg_dirty = [true; FRAMES_IN_FLIGHT];
+        self.mark_bg_dirty(0..self.bg_cpu.len());
     }
 
     /// The atlas's own `insert` walks existing pages and appends a
@@ -1363,16 +1399,15 @@ impl VulkanGridRenderer {
         debug_assert!(frame_slot < FRAMES_IN_FLIGHT);
         let slot = frame_slot;
 
-        if self.bg_dirty[slot] {
+        if let Some(range) = self.bg_dirty[slot].take() {
             unsafe {
                 let dst = self.bg_buffers[slot].as_mut_ptr() as *mut CellBg;
                 std::ptr::copy_nonoverlapping(
-                    self.bg_cpu.as_ptr(),
-                    dst,
-                    self.bg_cpu.len(),
+                    self.bg_cpu.as_ptr().add(range.start),
+                    dst.add(range.start),
+                    range.len(),
                 );
             }
-            self.bg_dirty[slot] = false;
         }
         // The text pass shares these uniforms even when backgrounds are skipped.
         unsafe {

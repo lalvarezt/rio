@@ -3,6 +3,9 @@
 #[path = "../../misc/benchmarks/support.rs"]
 mod support;
 
+#[path = "../../misc/benchmarks/cpu_state.rs"]
+mod state;
+
 use std::hint::black_box;
 use sugarloaf::{
     font::FontLibrary,
@@ -17,6 +20,8 @@ fn main() {
     backgrounds();
     glyphs();
     text();
+    state::hashes();
+    state::atlases();
 }
 
 fn uniforms() -> GridUniforms {

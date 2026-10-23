@@ -312,14 +312,10 @@ pub fn render_cpu(
 
     // Frame skip.
     //
-    // Hash includes the bg color, the overlay vertex stream, and each
-    // grid's uniforms + bg cells. Per-glyph fg state is hashed by
-    // length only — full fg-row hashing is too expensive on large
-    // panels (and a column of glyphs that swap colors will still
-    // change `cell_size` / `cursor_pos` / something downstream that's
-    // covered here). If you see stale text on the CPU backend after a
-    // pure-fg-color edit, expand this to hash bytemuck::cast_slice of
-    // each row.
+    // Hash includes background, overlay geometry, and grid uniforms.
+    // Grid identity and revision cover row and atlas mutations without
+    // scanning every cell on unchanged frames. Uniforms cover geometry
+    // and cursor changes independently of the stored cells.
     let frame_hash = {
         let mut h = rustc_hash::FxHasher::default();
         if let Some(c) = background {

@@ -103,6 +103,39 @@ pub fn check(name: &str, value: u64) {
     println!("RIO_CHECK {{\"case\":\"{name}\",\"value\":\"{value:016x}\"}}");
 }
 
+/// Time a state transition once per fresh fixture. Setup and destruction are
+/// outside the timer, so atlas growth cannot become a warmed insertion loop.
+pub fn measure_cold<T>(
+    name: &str,
+    units: usize,
+    mut setup: impl FnMut() -> T,
+    mut operation: impl FnMut(&mut T) -> u64,
+) {
+    if !selected(name) {
+        return;
+    }
+    let samples = setting("RIO_BENCH_SAMPLES", 11);
+    assert!(samples >= 3);
+    for sample in 0..samples {
+        let mut fixture = setup();
+        let start = Instant::now();
+        black_box(operation(&mut fixture));
+        let ns = start.elapsed().as_nanos();
+        println!("RIO_BENCH {{\"case\":\"{name}\",\"sample\":{sample},\"iterations\":1,\"units\":{units},\"ns\":{ns},\"cold_transition\":true}}");
+    }
+    let mut fixture = setup();
+    ALLOCATIONS.store(0, Relaxed);
+    BYTES.store(0, Relaxed);
+    COUNT.store(true, Relaxed);
+    black_box(operation(&mut fixture));
+    COUNT.store(false, Relaxed);
+    println!(
+        "RIO_ALLOC {{\"case\":\"{name}\",\"allocations\":{},\"bytes\":{}}}",
+        ALLOCATIONS.load(Relaxed),
+        BYTES.load(Relaxed)
+    );
+}
+
 pub fn hash(bytes: impl IntoIterator<Item = u8>) -> u64 {
     bytes.into_iter().fold(0xcbf29ce484222325, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)

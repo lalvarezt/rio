@@ -68,8 +68,10 @@ def main():
     binary_hashes = {name: hashlib.sha256(Path(binary).read_bytes()).hexdigest()
                      for name, binary in binaries.items()}
     source_hashes = {name: hashlib.sha256((source / name).read_bytes()).hexdigest() for name in (
-        "sugarloaf/src/grid/cpu.rs", "sugarloaf/src/grid/vulkan.rs", "sugarloaf/src/premul.rs", "sugarloaf/src/text.rs",
-        "sugarloaf/benches/rendering.rs", "sugarloaf/benches/branch_gpu.rs")}
+        "sugarloaf/src/grid/cpu.rs", "sugarloaf/src/grid/vulkan.rs", "sugarloaf/src/renderer/cpu.rs",
+        "sugarloaf/src/premul.rs", "sugarloaf/src/text.rs",
+        "sugarloaf/benches/rendering.rs", "sugarloaf/benches/branch_gpu.rs",
+        "misc/benchmarks/cpu_state.rs", "misc/benchmarks/support.rs")}
     if args.reference:
         reference_hashes = {name: hashlib.sha256((out.parent / args.reference / name).read_bytes()).hexdigest()
                             for name in binaries}
@@ -129,15 +131,22 @@ def main():
                      ("rendering", "cpu/background/translucent"),
                      ("rendering", "cpu/glyphs/mask"),
                      ("rendering", "cpu/glyphs/color"),
+                     ("rendering", "cpu/state_hash/160x48/unchanged"),
+                     ("rendering", "cpu/atlas/color/grow_2048"),
                      ("branch_performance", "title_churn")]
             if args.gpu:
+                cases.append(("branch_gpu", "gpu/row_storage/tail_change"))
                 cases.extend(("branch_gpu", f"gpu/record/2_atlas/{mode}") for mode in ("full", "one_row", "unchanged"))
             for suite, case in cases:
                 if args.filter and args.filter not in case:
                     continue
                 stem = case.replace("/", "-")
                 print("Profiling " + case, flush=True)
-                profile_env = dict(env, RIO_BENCH_FILTER=case, RIO_BENCH_SAMPLES="5", RIO_BENCH_MS="400")
+                # Cold growth runs once per fixture rather than for a timed
+                # iteration loop. Collect enough transitions for sampled stacks.
+                profile_samples = "401" if "/grow_" in case else "5"
+                profile_env = dict(env, RIO_BENCH_FILTER=case,
+                                   RIO_BENCH_SAMPLES=profile_samples, RIO_BENCH_MS="400")
                 with (out / (stem + ".log")).open("w") as log:
                     subprocess.run(["perf", "record", "-F", "499", "--call-graph", "dwarf,16384", "-o",
                                     str(out / (stem + ".perf.data")), "--", "taskset", "-c", str(args.cpu), binaries[suite]],

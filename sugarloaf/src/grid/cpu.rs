@@ -23,6 +23,7 @@
 //   - glyph origin = cell_origin + (bearing_x, cell_h - bearing_y)
 
 use rustc_hash::FxHashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::atlas::{AtlasSlot, GlyphKey, RasterizedGlyph};
 use super::cell::{CellBg, CellText, GridUniforms};
@@ -37,6 +38,7 @@ const ATLAS_MAX_SIZE: u16 = 4096;
 /// Slot 0 = block-cursor cells, slot `rows + 1` = non-block-cursor
 /// cells. Matches the Metal layout in `metal::init_fg_rows`.
 const CURSOR_ROW_SLOTS: usize = 2;
+static NEXT_GRID_ID: AtomicU64 = AtomicU64::new(1);
 
 /// CPU-side glyph atlas. R8 for grayscale masks, RGBA8 premultiplied
 /// for color emoji. Uses the same shelf allocator as the GPU atlases
@@ -183,6 +185,8 @@ impl CpuGridAtlas {
 }
 
 pub struct CpuGridRenderer {
+    id: u64,
+    paint_revision: u64,
     cols: u32,
     rows: u32,
     /// `cols * rows` flat. Indexed `row * cols + col`.
@@ -199,6 +203,8 @@ pub struct CpuGridRenderer {
 impl CpuGridRenderer {
     pub fn new(cols: u32, rows: u32) -> Self {
         Self {
+            id: NEXT_GRID_ID.fetch_add(1, Ordering::Relaxed),
+            paint_revision: 0,
             cols,
             rows,
             bg_cells: vec![CellBg::TRANSPARENT; bg_capacity(cols, rows)],
@@ -217,6 +223,7 @@ impl CpuGridRenderer {
         self.rows = rows;
         self.bg_cells = vec![CellBg::TRANSPARENT; bg_capacity(cols, rows)];
         self.fg_rows = init_fg_rows(rows);
+        self.paint_revision = self.paint_revision.wrapping_add(1);
         // Fresh buffers = zero contents; emission path must rewrite
         // every row on the next frame even if no damage came in.
         self.needs_full_rebuild = true;
@@ -224,50 +231,66 @@ impl CpuGridRenderer {
 
     pub fn write_row(&mut self, row: u32, bg: &[CellBg], fg: &[CellText]) {
         let idx = (row as usize) + 1;
+        let mut changed = false;
         if let Some(slot) = self.fg_rows.get_mut(idx) {
-            slot.clear();
-            slot.extend_from_slice(fg);
+            changed |= replace_text_row(slot, fg);
         }
 
-        if row >= self.rows {
-            return;
+        if row < self.rows {
+            let cols = self.cols as usize;
+            let row_start = (row as usize) * cols;
+            let row_len = cols.min(bg.len());
+            let dst = &mut self.bg_cells[row_start..row_start + cols];
+            if bytemuck::cast_slice::<_, u8>(&dst[..row_len])
+                != bytemuck::cast_slice(&bg[..row_len])
+                || dst[row_len..]
+                    .iter()
+                    .any(|cell| *cell != CellBg::TRANSPARENT)
+            {
+                dst[..row_len].copy_from_slice(&bg[..row_len]);
+                dst[row_len..].fill(CellBg::TRANSPARENT);
+                changed = true;
+            }
         }
-        let cols = self.cols as usize;
-        let row_start = (row as usize) * cols;
-        let row_len = cols.min(bg.len());
-        let dst = &mut self.bg_cells[row_start..row_start + cols];
-        dst[..row_len].copy_from_slice(&bg[..row_len]);
-        for slot in &mut dst[row_len..] {
-            *slot = CellBg::TRANSPARENT;
+        if changed {
+            self.paint_revision = self.paint_revision.wrapping_add(1);
         }
     }
 
     pub fn clear_row(&mut self, row: u32) {
         let idx = (row as usize) + 1;
+        let mut changed = false;
         if let Some(slot) = self.fg_rows.get_mut(idx) {
+            changed |= !slot.is_empty();
             slot.clear();
         }
-        if row >= self.rows {
-            return;
+        if row < self.rows {
+            let cols = self.cols as usize;
+            let row_start = (row as usize) * cols;
+            let dst = &mut self.bg_cells[row_start..row_start + cols];
+            if dst.iter().any(|cell| *cell != CellBg::TRANSPARENT) {
+                dst.fill(CellBg::TRANSPARENT);
+                changed = true;
+            }
         }
-        let cols = self.cols as usize;
-        let row_start = (row as usize) * cols;
-        for slot in &mut self.bg_cells[row_start..row_start + cols] {
-            *slot = CellBg::TRANSPARENT;
+        if changed {
+            self.paint_revision = self.paint_revision.wrapping_add(1);
         }
     }
 
     pub fn set_cursor(&mut self, block: &[CellText], non_block: &[CellText]) {
+        let mut changed = false;
         if let Some(slot) = self.fg_rows.first_mut() {
-            slot.clear();
-            slot.extend_from_slice(block);
+            changed |= replace_text_row(slot, block);
         }
         let last = self.fg_rows.len().saturating_sub(1);
         if last > 0 {
             if let Some(slot) = self.fg_rows.get_mut(last) {
-                slot.clear();
-                slot.extend_from_slice(non_block);
+                changed |= replace_text_row(slot, non_block);
             }
+        }
+        if changed {
+            self.paint_revision = self.paint_revision.wrapping_add(1);
         }
     }
 
@@ -282,6 +305,7 @@ impl CpuGridRenderer {
         self.atlas_grayscale.clear();
         self.atlas_color.clear();
         self.needs_full_rebuild = true;
+        self.paint_revision = self.paint_revision.wrapping_add(1);
     }
 
     pub fn insert_glyph(
@@ -292,6 +316,7 @@ impl CpuGridRenderer {
         let mut cleared = false;
         loop {
             if let Some(slot) = self.atlas_grayscale.insert(key, glyph) {
+                self.paint_revision = self.paint_revision.wrapping_add(1);
                 return Some(slot);
             }
             if self.atlas_grayscale.grow() {
@@ -319,6 +344,7 @@ impl CpuGridRenderer {
         let mut cleared = false;
         loop {
             if let Some(slot) = self.atlas_color.insert(key, glyph) {
+                self.paint_revision = self.paint_revision.wrapping_add(1);
                 return Some(slot);
             }
             if self.atlas_color.grow() {
@@ -349,20 +375,15 @@ impl CpuGridRenderer {
     #[inline]
     pub fn request_full_rebuild(&mut self) {
         self.needs_full_rebuild = true;
+        self.paint_revision = self.paint_revision.wrapping_add(1);
     }
 
-    /// Hash all state that affects what `render` will paint. The CPU
-    /// rasterizer's frame-skip path uses this to short-circuit when
-    /// the previous frame's output is still valid.
+    /// Hash the grid's identity and paint revision for the CPU frame gate.
+    /// Exact comparisons at mutation sites preserve the key for identical
+    /// writes. Identity distinguishes grids with equal mutation counts.
     pub fn hash_state<H: std::hash::Hasher>(&self, h: &mut H) {
-        // bg_cells is a flat `Vec<CellBg>` — hash as raw bytes.
-        h.write(bytemuck::cast_slice(self.bg_cells.as_slice()));
-        // Per-row CellText bytes. Length-prefix so two adjacent rows
-        // can't be confused with one wider row.
-        for row in &self.fg_rows {
-            h.write_usize(row.len());
-            h.write(bytemuck::cast_slice(row.as_slice()));
-        }
+        h.write_u64(self.id);
+        h.write_u64(self.paint_revision);
     }
 
     /// Paint the grid (bg cells + cursor + fg glyphs) into the
@@ -584,6 +605,15 @@ fn bg_capacity(cols: u32, rows: u32) -> usize {
 }
 
 #[inline]
+fn replace_text_row(slot: &mut Vec<CellText>, cells: &[CellText]) -> bool {
+    if bytemuck::cast_slice::<_, u8>(slot.as_slice()) == bytemuck::cast_slice(cells) {
+        return false;
+    }
+    slot.clear();
+    slot.extend_from_slice(cells);
+    true
+}
+
 fn init_fg_rows(rows: u32) -> Vec<Vec<CellText>> {
     (0..(rows as usize + CURSOR_ROW_SLOTS))
         .map(|_| Vec::new())
@@ -699,6 +729,179 @@ fn fill_rect(buf: &mut [u32], buf_w: i32, buf_h: i32, bounds: [i32; 4], rgba: [u
 mod panel_tests {
     use super::*;
     use bytemuck::Zeroable;
+
+    #[test]
+    fn atlas_growth_preserves_pixels_slots_and_zero_padding() {
+        for bpp in [1, 4] {
+            let mut atlas = CpuGridAtlas::new(bpp);
+            let bytes: Vec<_> = (0..13 * 17 * bpp as usize)
+                .map(|i| (i * 73) as u8)
+                .collect();
+            let key = GlyphKey {
+                font_id: 0,
+                glyph_id: 1,
+                size_bucket: 64,
+            };
+            let slot = atlas
+                .insert(
+                    key,
+                    RasterizedGlyph {
+                        width: 13,
+                        height: 17,
+                        bearing_x: 0,
+                        bearing_y: 17,
+                        bytes: &bytes,
+                    },
+                )
+                .unwrap();
+            for _ in 0..2 {
+                let side = atlas.side() as usize;
+                let pixels = atlas.pixels().to_vec();
+                assert!(atlas.grow());
+                let found = atlas.lookup(key).unwrap();
+                assert_eq!(
+                    (
+                        found.x,
+                        found.y,
+                        found.w,
+                        found.h,
+                        found.bearing_x,
+                        found.bearing_y,
+                        found.page
+                    ),
+                    (
+                        slot.x,
+                        slot.y,
+                        slot.w,
+                        slot.h,
+                        slot.bearing_x,
+                        slot.bearing_y,
+                        slot.page
+                    )
+                );
+                let new_stride = atlas.side() as usize * bpp as usize;
+                let old_stride = side * bpp as usize;
+                for row in 0..side {
+                    assert_eq!(
+                        &atlas.pixels()[row * new_stride..row * new_stride + old_stride],
+                        &pixels[row * old_stride..(row + 1) * old_stride]
+                    );
+                    assert!(atlas.pixels()
+                        [row * new_stride + old_stride..(row + 1) * new_stride]
+                        .iter()
+                        .all(|&b| b == 0));
+                }
+                assert!(atlas.pixels()[side * new_stride..].iter().all(|&b| b == 0));
+            }
+        }
+    }
+
+    #[test]
+    fn frame_hash_tracks_mutations_and_ignores_identical_writes() {
+        use std::hash::Hasher;
+        let hash = |grid: &CpuGridRenderer| {
+            let mut h = rustc_hash::FxHasher::default();
+            grid.hash_state(&mut h);
+            h.finish()
+        };
+        let mut grid = CpuGridRenderer::new(2, 2);
+        let bg = [CellBg {
+            rgba: [10, 20, 30, 255],
+        }; 2];
+        let mut fg = [CellText {
+            color: [100, 120, 140, 255],
+            ..Default::default()
+        }];
+        let empty = hash(&grid);
+        grid.write_row(0, &bg, &fg);
+        let first = hash(&grid);
+        assert_ne!(empty, first);
+        grid.write_row(0, &bg, &fg);
+        assert_eq!(first, hash(&grid));
+        fg[0].color[0] ^= 1;
+        grid.write_row(0, &bg, &fg);
+        assert_ne!(first, hash(&grid));
+        let before_cursor = hash(&grid);
+        grid.set_cursor(&fg, &fg);
+        let cursor = hash(&grid);
+        assert_ne!(before_cursor, cursor);
+        grid.set_cursor(&fg, &fg);
+        assert_eq!(cursor, hash(&grid));
+        grid.clear_row(0);
+        let cleared = hash(&grid);
+        assert_ne!(cursor, cleared);
+        grid.clear_row(0);
+        assert_eq!(cleared, hash(&grid));
+        grid.resize(3, 2);
+        let resized = hash(&grid);
+        assert_ne!(cleared, resized);
+        grid.resize(3, 2);
+        assert_eq!(resized, hash(&grid));
+        let mut other = CpuGridRenderer::new(2, 2);
+        other.write_row(0, &bg, &[]);
+        assert_ne!(
+            first,
+            hash(&other),
+            "different grids must not alias at the same mutation count"
+        );
+    }
+
+    #[test]
+    fn frame_hash_tracks_background_truncation_and_atlas_replacement() {
+        use std::hash::Hasher;
+        let hash = |grid: &CpuGridRenderer| {
+            let mut h = rustc_hash::FxHasher::default();
+            grid.hash_state(&mut h);
+            h.finish()
+        };
+        let mut grid = CpuGridRenderer::new(2, 1);
+        let bg = [CellBg {
+            rgba: [30, 40, 50, 255],
+        }; 2];
+        let empty = hash(&grid);
+        grid.write_row(0, &bg, &[]);
+        let filled = hash(&grid);
+        assert_ne!(empty, filled);
+        grid.write_row(0, &bg[..1], &[]);
+        let truncated = hash(&grid);
+        assert_ne!(filled, truncated);
+        assert_eq!(grid.bg_cells[1], CellBg::TRANSPARENT);
+        grid.write_row(0, &bg[..1], &[]);
+        assert_eq!(truncated, hash(&grid));
+        for color in [false, true] {
+            let key = GlyphKey {
+                font_id: 0,
+                glyph_id: 1,
+                size_bucket: 64,
+            };
+            for value in [100, 200] {
+                let bytes = [value; 4];
+                let glyph = RasterizedGlyph {
+                    width: 1,
+                    height: 1,
+                    bearing_x: 0,
+                    bearing_y: 1,
+                    bytes: &bytes,
+                };
+                let before = hash(&grid);
+                if color {
+                    grid.insert_glyph_color(key, glyph).unwrap();
+                } else {
+                    grid.insert_glyph(key, glyph).unwrap();
+                }
+                assert_ne!(before, hash(&grid), "atlas replacement affects painting");
+            }
+        }
+        let before = hash(&grid);
+        grid.clear_atlas();
+        assert_ne!(before, hash(&grid));
+        let before = hash(&grid);
+        grid.request_full_rebuild();
+        assert_ne!(before, hash(&grid));
+        let before = hash(&grid);
+        grid.mark_full_rebuild_done();
+        assert_eq!(before, hash(&grid));
+    }
 
     #[test]
     fn color_blit_matches_pixel_reference_when_clipped() {
