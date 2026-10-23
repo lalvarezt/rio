@@ -31,25 +31,60 @@ pub(crate) fn blend_premul_over(src: [u8; 4], dst: u32) -> u32 {
         return pack_opaque(src[0], src[1], src[2]);
     }
     let inv = 255 - sa;
-    let dr = (dst >> 16) & 0xff;
-    let dg = (dst >> 8) & 0xff;
-    let db = dst & 0xff;
-    let da = (dst >> 24) & 0xff;
-    let or = src[0] as u32 + (dr * inv + 127) / 255;
-    let og = src[1] as u32 + (dg * inv + 127) / 255;
-    let ob = src[2] as u32 + (db * inv + 127) / 255;
-    let oa = sa + (da * inv + 127) / 255;
-    pack_premul(
-        or.min(255) as u8,
-        og.min(255) as u8,
-        ob.min(255) as u8,
-        oa.min(255) as u8,
-    )
+    let source = pack_premul(src[0], src[1], src[2], src[3]);
+    // Two independent 16-bit lanes hold R+B or A+G. Each product fits
+    // in its lane, including the bias for exact rounded division by 255.
+    let pair = |source: u32, destination: u32| {
+        let product = destination * inv + 0x0080_0080;
+        let scaled = ((product + ((product >> 8) & 0x00ff_00ff)) >> 8) & 0x00ff_00ff;
+        let sum = source + scaled;
+        // Keep the scalar helper's saturation even for non-premultiplied input.
+        let overflow = sum & 0x0100_0100;
+        (sum | (overflow - (overflow >> 8))) & 0x00ff_00ff
+    };
+    pair(source & 0x00ff_00ff, dst & 0x00ff_00ff)
+        | (pair((source >> 8) & 0x00ff_00ff, (dst >> 8) & 0x00ff_00ff) << 8)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blend_matches_scalar_rounding_and_saturation() {
+        for alpha in 0..=255u32 {
+            for channel in 0..=255u32 {
+                let dst = pack_premul(
+                    channel as u8,
+                    (255 - channel) as u8,
+                    channel as u8,
+                    channel as u8,
+                );
+                for value in [0, alpha / 2, alpha, 255] {
+                    let src = [value as u8, (value / 2) as u8, value as u8, alpha as u8];
+                    let expected = if alpha == 0 {
+                        dst
+                    } else {
+                        let blend = |src: u8, dst: u32| {
+                            (src as u32 + (dst * (255 - alpha) + 127) / 255).min(255)
+                                as u8
+                        };
+                        pack_premul(
+                            blend(src[0], channel),
+                            blend(src[1], 255 - channel),
+                            blend(src[2], channel),
+                            blend(src[3], channel),
+                        )
+                    };
+                    assert_eq!(
+                        blend_premul_over(src, dst),
+                        expected,
+                        "src={src:?} dst={dst:08x}"
+                    );
+                }
+            }
+        }
+    }
 
     /// Opaque destinations stay opaque and transparent sources are
     /// identity, alpha byte included: the invariants `window.opacity`

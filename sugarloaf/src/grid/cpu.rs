@@ -408,17 +408,32 @@ impl CpuGridRenderer {
         let col_count = (cols as usize).min(self.cols as usize);
         for row in 0..row_count {
             let row_off = row * buf_cols;
-            for col in 0..col_count {
+            let y0 = (pad_top + (row as f32) * cell_h).round() as i32;
+            let y1 = (pad_top + ((row + 1) as f32) * cell_h).round() as i32;
+            let mut col = 0;
+            while col < col_count {
                 let rgba = self.bg_cells[row_off + col].rgba;
                 let is_cursor =
                     cursor_bg_active && cursor_x == col as u32 && cursor_y == row as u32;
                 if rgba[3] == 0 && !is_cursor {
+                    col += 1;
                     continue;
                 }
+                // Adjacent equal backgrounds share a rectangle. Keep the cursor
+                // separate because it replaces the cell color, including alpha.
+                let mut end_col = col + 1;
+                if !is_cursor {
+                    while end_col < col_count
+                        && self.bg_cells[row_off + end_col].rgba == rgba
+                        && !(cursor_bg_active
+                            && cursor_x == end_col as u32
+                            && cursor_y == row as u32)
+                    {
+                        end_col += 1;
+                    }
+                }
                 let x0 = (pad_left + (col as f32) * cell_w).round() as i32;
-                let y0 = (pad_top + (row as f32) * cell_h).round() as i32;
-                let x1 = (pad_left + ((col + 1) as f32) * cell_w).round() as i32;
-                let y1 = (pad_top + ((row + 1) as f32) * cell_h).round() as i32;
+                let x1 = (pad_left + (end_col as f32) * cell_w).round() as i32;
                 let extend = uniforms.padding_extend;
                 let bounds = [
                     if col == 0 && extend & GridUniforms::PADDING_EXTEND_LEFT != 0 {
@@ -431,7 +446,7 @@ impl CpuGridRenderer {
                     } else {
                         y0
                     },
-                    if col + 1 == col_count
+                    if end_col == col_count
                         && extend & GridUniforms::PADDING_EXTEND_RIGHT != 0
                     {
                         (panel[0] + panel[2]).round() as i32
@@ -473,6 +488,7 @@ impl CpuGridRenderer {
                 } else {
                     paint(bounds, rgba);
                 }
+                col = end_col;
             }
         }
     }
@@ -795,6 +811,68 @@ fn blit_color(
 mod panel_tests {
     use super::*;
     use bytemuck::Zeroable;
+
+    #[test]
+    fn background_runs_match_cells_painted_individually() {
+        let mut grid = CpuGridRenderer::new(7, 3);
+        let mut isolated = CpuGridRenderer::new(7, 3);
+        for cell_size in [[9.6, 13.25], [0.4, 0.75], [12.0, 16.0]] {
+            for origin in [-3.5, 8.25] {
+                for alpha in [0, 127, 255] {
+                    for radius in [0.0, 17.0] {
+                        for extend in [0, 15] {
+                            for cursor in [[0, 0], [3, 1], [6, 2], [u32::MAX; 2]] {
+                                let u = GridUniforms {
+                                    grid_padding: [origin, 0.0, 0.0, origin],
+                                    cell_size,
+                                    grid_size: [7, 3],
+                                    panel_rect: [0.0, 0.0, 88.0, 64.0],
+                                    panel_radius: radius,
+                                    padding_extend: extend,
+                                    cursor_pos: cursor,
+                                    cursor_bg_color: [0.1, 0.8, 0.3, 0.5],
+                                    ..GridUniforms::zeroed()
+                                };
+                                let mut actual = vec![0x9912_3456; 88 * 64];
+                                let mut expected = actual.clone();
+                                for row in 0..3 {
+                                    let cells: Vec<_> = (0..7)
+                                        .map(|col| CellBg {
+                                            rgba: [
+                                                if col < 5 { 80 } else { 30 },
+                                                60,
+                                                20,
+                                                alpha,
+                                            ],
+                                        })
+                                        .collect();
+                                    grid.write_row(row, &cells, &[]);
+                                    for col in 0..7 {
+                                        let mut one = [CellBg::TRANSPARENT; 7];
+                                        one[col] = cells[col];
+                                        isolated.write_row(row, &one, &[]);
+                                        let mut cell_uniforms = u;
+                                        if cursor != [col as u32, row] {
+                                            cell_uniforms.cursor_bg_color[3] = 0.0;
+                                        }
+                                        isolated.render_bg(
+                                            &mut expected,
+                                            88,
+                                            64,
+                                            &cell_uniforms,
+                                        );
+                                    }
+                                    isolated.clear_row(row);
+                                }
+                                grid.render_bg(&mut actual, 88, 64, &u);
+                                assert_eq!(actual, expected, "cell_size={cell_size:?}, origin={origin}, alpha={alpha}, radius={radius}, extend={extend}, cursor={cursor:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn terminal_background_stays_out_of_all_padding_and_margins() {

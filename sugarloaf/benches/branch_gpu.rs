@@ -154,7 +154,15 @@ mod native {
                     for row in 0..48 {
                         grid.write_row(row, &bg, &cells);
                     }
-                    for mode in ["full", "one_row", "rotating_slots", "unchanged"] {
+                    for mode in [
+                        "full",
+                        "one_row",
+                        "rotating_slots",
+                        "unchanged",
+                        "row_length",
+                        "atlas_change",
+                        "atlas_then_edit",
+                    ] {
                         let name = format!("gpu/record/{buckets}_atlas/{mode}");
                         let mut sequence = 0usize;
                         support::measure(&name, 160 * 48, || {
@@ -164,6 +172,23 @@ mod native {
                                 && (mode != "rotating_slots" || slot == 0)
                             {
                                 cells[0].color[0] ^= 1;
+                                if mode == "row_length" {
+                                    if cells.len() == 160 {
+                                        cells.pop();
+                                    } else {
+                                        cells.push(CellText {
+                                            grid_pos: [159, 0],
+                                            atlas: (159 % buckets) as u8,
+                                            ..Default::default()
+                                        });
+                                    }
+                                }
+                                if mode == "atlas_change"
+                                    || (mode == "atlas_then_edit"
+                                        && sequence.is_multiple_of(2))
+                                {
+                                    cells[0].atlas ^= 1;
+                                }
                                 if mode == "full" {
                                     for row in 0..48 {
                                         grid.write_row(row, &bg, &cells);
@@ -246,8 +271,43 @@ mod native {
                     .and_then(|s| s.parse::<u32>().ok())
                     .unwrap_or(256)
                     .max(1);
-                for case in ["transparent", "sparse", "opaque", "cursor"] {
-                    let name = format!("gpu/background/{case}");
+                let mask: Vec<u8> = (0..128).map(|i| (i * 37) as u8).collect();
+                let color: Vec<u8> = mask
+                    .iter()
+                    .flat_map(|&a| [a / 2, a / 3, a / 4, a])
+                    .collect();
+                let key = GlyphKey {
+                    font_id: 0,
+                    glyph_id: 1,
+                    size_bucket: 64,
+                };
+                let raster = RasterizedGlyph {
+                    width: 8,
+                    height: 16,
+                    bearing_x: 0,
+                    bearing_y: 16,
+                    bytes: &mask,
+                };
+                let mono = grid.insert_glyph(key, raster).unwrap();
+                let rgba = grid
+                    .insert_glyph_color(
+                        key,
+                        RasterizedGlyph {
+                            bytes: &color,
+                            ..raster
+                        },
+                    )
+                    .unwrap();
+                for (pass, case) in [
+                    ("background", "transparent"),
+                    ("background", "sparse"),
+                    ("background", "opaque"),
+                    ("background", "cursor"),
+                    ("glyphs", "mask"),
+                    ("glyphs", "color"),
+                    ("glyphs", "mixed"),
+                ] {
+                    let name = format!("gpu/{pass}/{case}");
                     if !support::selected(&name) {
                         continue;
                     }
@@ -261,8 +321,48 @@ mod native {
                         });
                     }
                     for row in 0..48 {
-                        grid.write_row(row, &bg, &[]);
+                        let cells: Vec<_> = if pass == "glyphs" {
+                            (0..160)
+                                .map(|col| {
+                                    let is_color = case == "color"
+                                        || (case == "mixed" && col % 8 == 0);
+                                    let slot = if is_color { rgba } else { mono };
+                                    CellText {
+                                        glyph_pos: [slot.x as u32, slot.y as u32],
+                                        glyph_size: [8, 16],
+                                        bearings: [0, 16],
+                                        grid_pos: [col, row as u16],
+                                        color: [173, 193, 219, 255],
+                                        atlas: u8::from(is_color),
+                                        ..Default::default()
+                                    }
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        grid.write_row(row, &bg, &cells);
                     }
+                    // Actual glyph quads need a pixel-to-clip projection. The
+                    // recording-only fixtures above deliberately have zero area.
+                    uniforms.projection = [
+                        2.0 / 1536.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        2.0 / 960.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        0.0,
+                        -1.0,
+                        -1.0,
+                        0.0,
+                        1.0,
+                    ];
                     uniforms.cursor_bg_color = if case == "cursor" {
                         [0.8, 0.5, 0.3, 1.0]
                     } else {
@@ -276,6 +376,7 @@ mod native {
                     for sample in 0..21 {
                         let frame = ctx.acquire_frame().expect("acquire timestamp image");
                         let cmd = frame.cmd_buffer;
+                        grid.prepare(&ctx, cmd, frame.slot);
                         cmd_acquire_image_for_rendering(&device, cmd, frame.image);
                         device.cmd_reset_query_pool(cmd, query, 0, 2);
                         let attachments =
@@ -304,14 +405,28 @@ mod native {
                                 extent: frame.extent,
                             }],
                         );
+                        // Publish the current slot's uniforms before drawing text.
+                        if pass == "glyphs" {
+                            grid.render_bg(&ctx, cmd, frame.slot, &uniforms);
+                        }
                         device.cmd_write_timestamp(
                             cmd,
-                            vk::PipelineStageFlags::TOP_OF_PIPE,
+                            // Exclude the attachment clear and any setup work
+                            // before measuring actual glyph execution.
+                            if pass == "glyphs" {
+                                vk::PipelineStageFlags::BOTTOM_OF_PIPE
+                            } else {
+                                vk::PipelineStageFlags::TOP_OF_PIPE
+                            },
                             query,
                             0,
                         );
                         for _ in 0..draws {
-                            grid.render_bg(&ctx, cmd, frame.slot, &uniforms);
+                            if pass == "glyphs" {
+                                grid.render_text(&ctx, cmd, frame.slot, &uniforms);
+                            } else {
+                                grid.render_bg(&ctx, cmd, frame.slot, &uniforms);
+                            }
                         }
                         device.cmd_write_timestamp(
                             cmd,

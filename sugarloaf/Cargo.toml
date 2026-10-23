@@ -138,6 +138,10 @@ name = "branch_features"
 harness = false
 
 [[bench]]
+name = "rendering"
+harness = false
+
+[[bench]]
 name = "branch_gpu"
 harness = false
 

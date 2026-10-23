@@ -63,6 +63,242 @@ struct TextBucket {
     count: u32,
 }
 
+fn same_atlas_layout(previous: &[CellText], updated: &[CellText]) -> bool {
+    previous.len() == updated.len()
+        && previous
+            .iter()
+            .zip(updated)
+            .all(|(old, new)| (old.atlas, old.page) == (new.atlas, new.page))
+}
+
+/// Patch a row whose glyphs still belong to the same atlas buckets. Offsets
+/// refer to the grouped staging layout, which can place adjacent cells far apart.
+fn patch_mixed_row(
+    staging: &mut [CellText],
+    offsets: &[usize],
+    previous: &[CellText],
+    updated: &[CellText],
+) -> Option<Range<usize>> {
+    if offsets.len() != updated.len() || !same_atlas_layout(previous, updated) {
+        return None;
+    }
+    let mut range = staging.len()..0;
+    for (&offset, cell) in offsets.iter().zip(updated) {
+        staging[offset] = *cell;
+        range.start = range.start.min(offset);
+        range.end = range.end.max(offset + 1);
+    }
+    Some(if offsets.is_empty() { 0..0 } else { range })
+}
+
+#[cfg(test)]
+mod row_patch_tests {
+    use super::*;
+
+    mod x11 {
+        use crate as sugarloaf;
+        include!("../../../misc/benchmarks/x11.rs");
+    }
+
+    #[test]
+    #[ignore = "requires an X11 display and Vulkan device"]
+    fn mixed_atlas_edits_reach_every_frame_slot() {
+        use crate::renderer::vulkan as renderer;
+        use bytemuck::Zeroable;
+        let window = x11::Window::new();
+        let mut ctx = VulkanContext::new(window.handle());
+        let mut grid = VulkanGridRenderer::new(&ctx, 5, 3);
+        grid.insert_glyph_color(
+            GlyphKey {
+                font_id: 0,
+                glyph_id: 0,
+                size_bucket: 64,
+            },
+            RasterizedGlyph {
+                width: 1,
+                height: 1,
+                bearing_x: 0,
+                bearing_y: 0,
+                bytes: &[0, 0, 0, 0],
+            },
+        )
+        .unwrap();
+        let mut rows: Vec<Vec<CellText>> = (0..3)
+            .map(|row| {
+                (0..5)
+                    .map(|col| CellText {
+                        grid_pos: [col, row],
+                        atlas: (col % 2) as u8,
+                        ..Default::default()
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut u = GridUniforms::zeroed();
+        u.cell_size = [9.6, 20.0];
+        u.grid_size = [5, 3];
+        u.cursor_pos = [u32::MAX; 2];
+        for step in 0..24 {
+            // Several edits can accumulate before a slot is visited. Also force
+            // rebuilds by changing lengths, bucket membership, and empty rows.
+            if step == 5 {
+                rows[2].pop();
+            }
+            if step == 9 {
+                rows[0][0].atlas = 1;
+            }
+            if step == 12 {
+                rows[1].clear();
+            }
+            if step == 16 {
+                for cell in rows.iter_mut().flatten() {
+                    cell.atlas = 0;
+                }
+            }
+            if step == 20 {
+                rows[2][0].atlas = 1;
+            }
+            for (row, cells) in rows.iter_mut().enumerate() {
+                if step % 3 == row {
+                    for cell in cells.iter_mut() {
+                        cell.color[0] = step as u8;
+                    }
+                }
+                grid.write_row(row as u32, &[CellBg::TRANSPARENT; 5], cells);
+            }
+            let frame = ctx.acquire_frame().expect("test frame");
+            let device = ctx.device();
+            let cmd = frame.cmd_buffer;
+            grid.prepare(&ctx, cmd, frame.slot);
+            let attachments = [renderer::build_color_attachment(&frame, [0.0; 4])];
+            unsafe {
+                renderer::cmd_acquire_image_for_rendering(device, cmd, frame.image);
+                device.cmd_begin_rendering(
+                    cmd,
+                    &renderer::build_rendering_info(&frame, &attachments),
+                );
+                device.cmd_set_viewport(
+                    cmd,
+                    0,
+                    &[vk::Viewport {
+                        x: 0.0,
+                        y: 0.0,
+                        width: frame.extent.width as f32,
+                        height: frame.extent.height as f32,
+                        min_depth: 0.0,
+                        max_depth: 1.0,
+                    }],
+                );
+                device.cmd_set_scissor(
+                    cmd,
+                    0,
+                    &[vk::Rect2D {
+                        offset: vk::Offset2D::default(),
+                        extent: frame.extent,
+                    }],
+                );
+            }
+            grid.render_bg(&ctx, cmd, frame.slot, &u);
+            grid.render_text(&ctx, cmd, frame.slot, &u);
+            if matches!(step, 0 | 5 | 9 | 12 | 16 | 20) {
+                assert!(
+                    grid.fg_mixed_row_offsets.iter().all(Vec::is_empty),
+                    "structural edits must defer offset construction, step={step}"
+                );
+            }
+            let mut buckets: Vec<((u8, u8), Vec<CellText>)> = Vec::new();
+            for cell in rows.iter().flatten() {
+                let key = (cell.atlas, cell.page);
+                let index = buckets
+                    .iter()
+                    .position(|(old, _)| *old == key)
+                    .unwrap_or_else(|| {
+                        buckets.push((key, Vec::new()));
+                        buckets.len() - 1
+                    });
+                buckets[index].1.push(*cell);
+            }
+            let expected: Vec<_> =
+                buckets.into_iter().flat_map(|(_, cells)| cells).collect();
+            assert_eq!(grid.fg_staging, expected, "staging step={step}");
+            let uploaded = unsafe {
+                std::slice::from_raw_parts(
+                    grid.fg_buffers[frame.slot]
+                        .buffer
+                        .as_ref()
+                        .unwrap()
+                        .as_mut_ptr() as *const CellText,
+                    expected.len(),
+                )
+            };
+            assert_eq!(uploaded, expected, "upload step={step} slot={}", frame.slot);
+            unsafe {
+                device.cmd_end_rendering(cmd);
+                renderer::cmd_release_image_to_present(device, cmd, frame.image);
+            }
+            ctx.present_frame(frame);
+        }
+        unsafe {
+            ctx.device().device_wait_idle().unwrap();
+        }
+    }
+
+    #[test]
+    fn mixed_row_patch_preserves_other_rows_and_tracks_upload_bounds() {
+        let cell = |atlas, page, glyph| CellText {
+            atlas,
+            page,
+            glyph_pos: [glyph, 0],
+            ..Default::default()
+        };
+        let old = [cell(0, 0, 1), cell(1, 0, 2), cell(0, 1, 3), cell(0, 0, 4)];
+        let new = old.map(|mut cell| {
+            cell.color = [71, 129, 210, 192];
+            cell
+        });
+        let untouched = cell(0, 0, 99);
+        let mut staging = vec![untouched; 9];
+        let offsets = [1, 5, 8, 2];
+        for (&offset, cell) in offsets.iter().zip(old) {
+            staging[offset] = cell;
+        }
+        let before = staging.clone();
+        assert_eq!(
+            patch_mixed_row(&mut staging, &offsets, &old, &new),
+            Some(1..9)
+        );
+        for index in 0..staging.len() {
+            match offsets.iter().position(|&offset| offset == index) {
+                Some(cell) => assert_eq!(staging[index], new[cell]),
+                None => assert_eq!(staging[index], before[index]),
+            }
+        }
+        for change in 0..3 {
+            let mut changed = new.to_vec();
+            match change {
+                0 => {
+                    changed[2].page = 2;
+                }
+                1 => {
+                    changed[1].atlas = 0;
+                }
+                _ => {
+                    changed.pop();
+                }
+            }
+            let before = staging.clone();
+            assert_eq!(
+                patch_mixed_row(&mut staging, &offsets, &new, &changed),
+                None
+            );
+            assert_eq!(
+                staging, before,
+                "rejected layouts must not partially patch staging"
+            );
+        }
+    }
+}
+
 #[derive(Default)]
 struct TextBuffer {
     buffer: Option<VulkanBuffer>,
@@ -716,6 +952,10 @@ pub struct VulkanGridRenderer {
     /// Prefix offsets for a single-atlas layout. Atlas regrouping and row
     /// length changes rebuild the layout; same-length edits patch one range.
     fg_row_offsets: Vec<usize>,
+    /// Per-cell staging offsets for mixed-atlas layouts. Constructed on the first
+    /// same-layout edit, so structural churn only rebuilds the staging buffer.
+    fg_mixed_row_offsets: Vec<Vec<usize>>,
+    fg_mixed_row_offsets_valid: bool,
     fg_bucket_scratch: Vec<((u8, u8), Vec<CellText>)>,
     fg_buffers: [TextBuffer; FRAMES_IN_FLIGHT],
     fg_dirty: [Option<Range<usize>>; FRAMES_IN_FLIGHT],
@@ -818,6 +1058,8 @@ impl VulkanGridRenderer {
             fg_staging: Vec::new(),
             fg_staging_dirty: true,
             fg_row_offsets: Vec::new(),
+            fg_mixed_row_offsets: Vec::new(),
+            fg_mixed_row_offsets_valid: false,
             fg_bucket_scratch: Vec::with_capacity(4),
             fg_buffers: std::array::from_fn(|_| TextBuffer::default()),
             fg_dirty: std::array::from_fn(|_| None),
@@ -895,21 +1137,39 @@ impl VulkanGridRenderer {
         }
         // Identical row writes must not invalidate every frame-slot upload.
         let idx = (row as usize) + 1;
+        if !self.fg_staging_dirty
+            && !self.fg_mixed_row_offsets_valid
+            && self.fg_row_offsets.is_empty()
+            && self.fg_rows[idx].as_slice() != fg
+            && same_atlas_layout(&self.fg_rows[idx], fg)
+        {
+            self.cache_mixed_row_offsets();
+        }
         if let Some(slot) = self.fg_rows.get_mut(idx) {
             if bytemuck::cast_slice::<_, u8>(slot.as_slice()) != bytemuck::cast_slice(fg)
             {
-                if !self.fg_staging_dirty
+                let range = if !self.fg_staging_dirty
                     && slot.len() == fg.len()
                     && self.fg_row_offsets.len() == self.rows as usize + 1
                     && self.fg_buckets.first().is_some_and(|bucket| {
                         fg.iter().all(|cell| {
                             (cell.atlas, cell.page) == (bucket.kind, bucket.page)
                         })
-                    })
-                {
+                    }) {
                     let range = self.fg_row_offsets[row as usize]
                         ..self.fg_row_offsets[row as usize + 1];
                     self.fg_staging[range.clone()].copy_from_slice(fg);
+                    Some(range)
+                } else if !self.fg_staging_dirty && self.fg_mixed_row_offsets_valid {
+                    self.fg_mixed_row_offsets
+                        .get(row as usize)
+                        .and_then(|offsets| {
+                            patch_mixed_row(&mut self.fg_staging, offsets, slot, fg)
+                        })
+                } else {
+                    None
+                };
+                if let Some(range) = range {
                     for dirty in &mut self.fg_dirty {
                         *dirty = Some(match dirty.take() {
                             Some(old) => {
@@ -943,6 +1203,34 @@ impl VulkanGridRenderer {
                 self.bg_visible_rows + is_visible as usize - was_visible as usize;
             self.bg_dirty = [true; FRAMES_IN_FLIGHT];
         }
+    }
+
+    fn cache_mixed_row_offsets(&mut self) {
+        let mut next: smallvec::SmallVec<[usize; 4]> = self
+            .fg_buckets
+            .iter()
+            .map(|bucket| bucket.start as usize)
+            .collect();
+        self.fg_mixed_row_offsets
+            .resize_with(self.rows as usize, Vec::new);
+        for (row, offsets) in self.fg_rows[1..self.fg_rows.len() - 1]
+            .iter()
+            .zip(&mut self.fg_mixed_row_offsets)
+        {
+            offsets.clear();
+            for cell in row {
+                let bucket = self
+                    .fg_buckets
+                    .iter()
+                    .position(|bucket| {
+                        (bucket.kind, bucket.page) == (cell.atlas, cell.page)
+                    })
+                    .unwrap();
+                offsets.push(next[bucket]);
+                next[bucket] += 1;
+            }
+        }
+        self.fg_mixed_row_offsets_valid = true;
     }
 
     pub fn clear_row(&mut self, row: u32) {
@@ -1138,6 +1426,10 @@ impl VulkanGridRenderer {
             self.fg_staging.clear();
             self.fg_buckets.clear();
             self.fg_row_offsets.clear();
+            self.fg_mixed_row_offsets_valid = false;
+            for offsets in &mut self.fg_mixed_row_offsets {
+                offsets.clear();
+            }
             let rows = &self.fg_rows[1..content_end];
             // One atlas page keeps rows contiguous, allowing later row-range uploads.
             let first_key = rows
