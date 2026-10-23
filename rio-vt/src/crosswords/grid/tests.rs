@@ -7,6 +7,52 @@ use super::*;
 use crate::crosswords::square::Square;
 
 #[test]
+fn extras_intern_matches_fields_for_shared_and_distinct_links() {
+    use crate::crosswords::square::{Extras, Hyperlink};
+    let link = Hyperlink::new(Some("id"), "https://example.com");
+    let links = [
+        None,
+        Some(link.clone()),
+        Some(link),
+        Some(Hyperlink::new(Some("id"), "https://example.com")),
+        Some(Hyperlink::new(Some("other"), "https://example.com")),
+        Some(Hyperlink::new(Some("id"), "https://example.org")),
+    ];
+    let clusters = [
+        vec![],
+        vec!['\u{301}'],
+        vec!['\u{302}'],
+        vec!['\u{301}', '\u{302}'],
+    ];
+    for left_link in &links {
+        for right_link in &links {
+            for left_cluster in &clusters {
+                for right_cluster in &clusters {
+                    let left = Extras {
+                        zerowidth: left_cluster.clone(),
+                        hyperlink: left_link.clone(),
+                    };
+                    let right = Extras {
+                        zerowidth: right_cluster.clone(),
+                        hyperlink: right_link.clone(),
+                    };
+                    let mut table = ExtrasTable::new();
+                    let left_id = table.intern(&left);
+                    let right_id = table.intern(&right);
+                    assert_eq!(
+                        left_id == right_id,
+                        left_cluster == right_cluster && left_link == right_link
+                    );
+                    assert_eq!(table.intern(&left), left_id);
+                    assert_eq!(table.get(left_id), Some(&left));
+                    assert_eq!(table.get(right_id), Some(&right));
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn extras_last_allocation_survives_sweep_and_slot_reuse() {
     use crate::crosswords::square::Extras;
     let mut table = ExtrasTable::new();

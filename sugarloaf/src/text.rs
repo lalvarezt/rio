@@ -2206,6 +2206,12 @@ fn blit_text_color(
     ay: usize,
     color: [u8; 4],
 ) {
+    if color == [255; 4] {
+        crate::premul::blit_color(
+            buf, buf_w, buf_h, glyph_x, glyph_y, gw, gh, atlas, atlas_side, ax, ay,
+        );
+        return;
+    }
     let stride = buf_w as usize;
     let x_start = glyph_x.max(0);
     let y_start = glyph_y.max(0);
@@ -2234,20 +2240,16 @@ fn blit_text_color(
             if a == 0 {
                 continue;
             }
-            let src = if color == [255; 4] {
-                [r, g, b, a]
-            } else {
-                let alpha = color[3] as u32;
-                let tint = |value: u8, channel: u8| {
-                    ((value as u32 * channel as u32 * alpha + 32_512) / 65_025) as u8
-                };
-                [
-                    tint(r, color[0]),
-                    tint(g, color[1]),
-                    tint(b, color[2]),
-                    ((a as u32 * alpha + 127) / 255) as u8,
-                ]
+            let alpha = color[3] as u32;
+            let tint = |value: u8, channel: u8| {
+                ((value as u32 * channel as u32 * alpha + 32_512) / 65_025) as u8
             };
+            let src = [
+                tint(r, color[0]),
+                tint(g, color[1]),
+                tint(b, color[2]),
+                ((a as u32 * alpha + 127) / 255) as u8,
+            ];
             let idx = buf_row + (dst_x as usize);
             buf[idx] = blend_premul_over(src, buf[idx]);
         }

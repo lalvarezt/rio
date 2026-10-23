@@ -140,9 +140,109 @@ pub(crate) fn blit_mask(
     }
 }
 
+/// Composite an untinted premultiplied RGBA atlas glyph.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn blit_color(
+    buf: &mut [u32],
+    buf_w: i32,
+    buf_h: i32,
+    glyph_x: i32,
+    glyph_y: i32,
+    gw: i32,
+    gh: i32,
+    atlas: &[u8],
+    atlas_side: usize,
+    ax: usize,
+    ay: usize,
+) {
+    let x_start = glyph_x.max(0);
+    let y_start = glyph_y.max(0);
+    let x_end = (glyph_x + gw).min(buf_w);
+    let y_end = (glyph_y + gh).min(buf_h);
+    if x_end <= x_start || y_end <= y_start {
+        return;
+    }
+    let sx = (x_start - glyph_x) as usize + ax;
+    let sy = (y_start - glyph_y) as usize + ay;
+    if sx >= atlas_side || sy >= atlas_side {
+        return;
+    }
+    let width = ((x_end - x_start) as usize).min(atlas_side - sx);
+    let height = ((y_end - y_start) as usize).min(atlas_side - sy);
+    let stride = buf_w as usize;
+    let vector_width = width / 4 * 4;
+    for row in 0..height {
+        let source = ((sy + row) * atlas_side + sx) * 4;
+        let dest = (y_start as usize + row) * stride + x_start as usize;
+        let rgba = &atlas[source..source + width * 4];
+        let pixels = &mut buf[dest..dest + width];
+        for (src, dst) in rgba[..vector_width * 4]
+            .chunks_exact(16)
+            .zip(pixels[..vector_width].chunks_exact_mut(4))
+        {
+            let rgba = u32x4::new([
+                u32::from_le_bytes(src[..4].try_into().unwrap()),
+                u32::from_le_bytes(src[4..8].try_into().unwrap()),
+                u32::from_le_bytes(src[8..12].try_into().unwrap()),
+                u32::from_le_bytes(src[12..16].try_into().unwrap()),
+            ]);
+            let source = (rgba & u32x4::splat(0xff00_ff00))
+                | ((rgba & u32x4::splat(0xff)) << 16)
+                | ((rgba >> 16) & u32x4::splat(0xff));
+            let dest = u32x4::new([dst[0], dst[1], dst[2], dst[3]]);
+            dst.copy_from_slice(&blend_premul_over_x4(source, dest).to_array());
+        }
+        for (src, dst) in rgba[vector_width * 4..]
+            .chunks_exact(4)
+            .zip(&mut pixels[vector_width..])
+        {
+            *dst = blend_premul_over(src.try_into().unwrap(), *dst);
+        }
+    }
+}
+
+#[inline]
+fn blend_premul_over_x4(source: u32x4, dest: u32x4) -> u32x4 {
+    let alpha: u32x4 = source >> 24;
+    let inv = u32x4::splat(255) - alpha;
+    // Preserve transparent-source identity even for non-premultiplied input.
+    let active: u32x4 = u32x4::splat(0) - ((alpha + u32x4::splat(255)) >> 8);
+    let source = source & active;
+    let mask = u32x4::splat(0x00ff_00ff);
+    let pair = |src: u32x4, dst: u32x4| -> u32x4 {
+        let product = dst * inv + u32x4::splat(0x0080_0080);
+        let scaled = ((product + ((product >> 8) & mask)) >> 8) & mask;
+        let sum = src + scaled;
+        let overflow = sum & u32x4::splat(0x0100_0100);
+        (sum | (overflow - (overflow >> 8))) & mask
+    };
+    pair(source & mask, dest & mask)
+        | (pair((source >> 8) & mask, (dest >> 8) & mask) << 8)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn color_blit_matches_every_alpha_and_channel_with_scalar_tail() {
+        for alpha in 0..=255u8 {
+            let atlas: Vec<_> = (0..259u32)
+                .flat_map(|c| {
+                    [c as u8, (255 - c.min(255)) as u8, (c ^ 0x9b) as u8, alpha]
+                })
+                .collect();
+            let mut actual: Vec<_> =
+                (0..259u32).map(|i| i.wrapping_mul(0x7123_459b)).collect();
+            let expected: Vec<_> = atlas
+                .chunks_exact(4)
+                .zip(&actual)
+                .map(|(src, &dst)| blend_premul_over(src.try_into().unwrap(), dst))
+                .collect();
+            blit_color(&mut actual, 259, 1, 0, 0, 259, 1, &atlas, 259, 0, 0);
+            assert_eq!(actual, expected, "alpha={alpha}");
+        }
+    }
 
     #[test]
     fn mask_blit_matches_all_mask_and_text_alpha_pairs() {

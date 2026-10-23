@@ -128,6 +128,7 @@ def main():
             cases = [("rendering", "cpu/background/opaque"),
                      ("rendering", "cpu/background/translucent"),
                      ("rendering", "cpu/glyphs/mask"),
+                     ("rendering", "cpu/glyphs/color"),
                      ("branch_performance", "title_churn")]
             if args.gpu:
                 cases.extend(("branch_gpu", f"gpu/record/2_atlas/{mode}") for mode in ("full", "one_row", "unchanged"))

@@ -863,15 +863,11 @@ impl Parser {
     /// The aliasing is needed here for multiple slices into self.osc_raw.
     #[inline]
     fn osc_dispatch<P: Perform>(&self, performer: &mut P, byte: u8) {
-        let mut slices: [&[u8]; MAX_OSC_PARAMS] = [&[]; MAX_OSC_PARAMS];
-        for (slice, &(start, end)) in slices
-            .iter_mut()
-            .zip(self.osc_params.iter())
-            .take(self.osc_num_params)
-        {
-            *slice = self.osc_raw.slice(start, end);
+        let mut slices = smallvec::SmallVec::<[&[u8]; MAX_OSC_PARAMS]>::new();
+        for &(start, end) in self.osc_params.iter().take(self.osc_num_params) {
+            slices.push(self.osc_raw.slice(start, end));
         }
-        performer.osc_dispatch(&slices[..self.osc_num_params], byte == 0x07);
+        performer.osc_dispatch(&slices, byte == 0x07);
     }
 
     /// Advance the parser state from ground.
@@ -2222,6 +2218,33 @@ mod tests {
                 assert!(params.iter().all(Vec::is_empty));
             }
             _ => panic!("expected osc sequence"),
+        }
+    }
+
+    #[test]
+    fn osc_parameter_counts_match_at_every_split() {
+        for count in 1..=MAX_OSC_PARAMS + 2 {
+            let params: Vec<_> = (0..count).map(|i| format!("p{i}")).collect();
+            let expected: Vec<_> = params
+                .iter()
+                .take(MAX_OSC_PARAMS)
+                .map(|param| param.as_bytes().to_vec())
+                .collect();
+            for terminator in [0x07, 0x1b] {
+                let mut input = format!("\x1b]{}", params.join(";")).into_bytes();
+                input.push(terminator);
+                for split in 0..=input.len() {
+                    let mut parser = Parser::default();
+                    let mut dispatcher = Dispatcher::default();
+                    parser.advance(&mut dispatcher, &input[..split]);
+                    parser.advance(&mut dispatcher, &input[split..]);
+                    assert_eq!(
+                        dispatcher.dispatched,
+                        vec![Sequence::Osc(expected.clone(), terminator == 0x07)],
+                        "count={count} terminator={terminator} split={split}"
+                    );
+                }
+            }
         }
     }
 

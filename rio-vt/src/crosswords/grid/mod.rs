@@ -233,7 +233,15 @@ impl ExtrasTable {
 
     #[inline]
     fn find(&mut self, extras: &crate::crosswords::square::Extras) -> Option<u16> {
-        if self.slots[self.last_alloc as usize].as_deref() == Some(extras) {
+        let cached = self.slots[self.last_alloc as usize].as_deref();
+        if cached.is_some_and(|cached| {
+            // Hyperlink-only payloads need no combining-character comparison.
+            if cached.zerowidth.is_empty() && extras.zerowidth.is_empty() {
+                cached.hyperlink == extras.hyperlink
+            } else {
+                cached == extras
+            }
+        }) {
             return Some(self.last_alloc);
         }
         let id = *self.lookup.get(extras)?;

@@ -617,7 +617,9 @@ fn premul(c: [u8; 4]) -> [u8; 4] {
     ]
 }
 
-use crate::premul::{blend_premul_over as blend_over, blit_mask, pack_opaque};
+use crate::premul::{
+    blend_premul_over as blend_over, blit_color, blit_mask, pack_opaque,
+};
 
 fn fill_panel_rect(
     buf: &mut [u32],
@@ -693,61 +695,82 @@ fn fill_rect(buf: &mut [u32], buf_w: i32, buf_h: i32, bounds: [i32; 4], rgba: [u
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn blit_color(
-    buf: &mut [u32],
-    buf_w: i32,
-    buf_h: i32,
-    glyph_x: i32,
-    glyph_y: i32,
-    gw: i32,
-    gh: i32,
-    atlas: &[u8],
-    atlas_side: usize,
-    ax: usize,
-    ay: usize,
-) {
-    let stride = buf_w as usize;
-    let x_start = glyph_x.max(0);
-    let y_start = glyph_y.max(0);
-    let x_end = (glyph_x + gw).min(buf_w);
-    let y_end = (glyph_y + gh).min(buf_h);
-    if x_end <= x_start || y_end <= y_start {
-        return;
-    }
-    for dst_y in y_start..y_end {
-        let src_y = (dst_y - glyph_y) as usize + ay;
-        if src_y >= atlas_side {
-            continue;
-        }
-        let atlas_row = src_y * atlas_side * 4;
-        let buf_row = (dst_y as usize) * stride;
-        for dst_x in x_start..x_end {
-            let src_x = (dst_x - glyph_x) as usize + ax;
-            if src_x >= atlas_side {
-                continue;
-            }
-            let off = atlas_row + src_x * 4;
-            let r = atlas[off];
-            let g = atlas[off + 1];
-            let b = atlas[off + 2];
-            let a = atlas[off + 3];
-            if a == 0 {
-                continue;
-            }
-            // Atlas already holds premultiplied RGBA (color emoji
-            // rasterizer convention).
-            let src = [r, g, b, a];
-            let idx = buf_row + (dst_x as usize);
-            buf[idx] = blend_over(src, buf[idx]);
-        }
-    }
-}
-
 #[cfg(test)]
 mod panel_tests {
     use super::*;
     use bytemuck::Zeroable;
+
+    #[test]
+    fn color_blit_matches_pixel_reference_when_clipped() {
+        for side in [7, 16] {
+            let atlas: Vec<_> = (0..side * side)
+                .flat_map(|i| {
+                    let a = (i * 73) as u8;
+                    // Include non-premultiplied and transparent colored pixels
+                    // to preserve the scalar helper's saturation and identity.
+                    if i % 7 == 0 {
+                        [255, 127, 60, 0]
+                    } else {
+                        [a, a / 2, 255, a]
+                    }
+                })
+                .collect();
+            for width in [0, 1, 3, 4, 5, 8, 9] {
+                for x in [-3, 0, 13] {
+                    for y in [-2, 0, 9] {
+                        for (ax, ay) in
+                            [(0, 0), (1, 2), (side - 2, side - 1), (side + 1, 0)]
+                        {
+                            let mut actual: Vec<_> = (0..17 * 13)
+                                .map(|i| {
+                                    [0, 0xff12_3456, 0x9912_3456, 0x017f_ff80][i % 4]
+                                })
+                                .collect();
+                            let mut expected = actual.clone();
+                            for dy in 0..13i32 {
+                                for dx in 0..17i32 {
+                                    let sx = dx - x;
+                                    let sy = dy - y;
+                                    if !(0..width).contains(&sx) || !(0..7).contains(&sy)
+                                    {
+                                        continue;
+                                    }
+                                    let sx = sx as usize + ax;
+                                    let sy = sy as usize + ay;
+                                    if sx >= side || sy >= side {
+                                        continue;
+                                    }
+                                    let off = (sy * side + sx) * 4;
+                                    let idx = dy as usize * 17 + dx as usize;
+                                    expected[idx] = blend_over(
+                                        atlas[off..off + 4].try_into().unwrap(),
+                                        expected[idx],
+                                    );
+                                }
+                            }
+                            blit_color(
+                                &mut actual,
+                                17,
+                                13,
+                                x,
+                                y,
+                                width,
+                                7,
+                                &atlas,
+                                side,
+                                ax,
+                                ay,
+                            );
+                            assert_eq!(
+                                actual, expected,
+                                "side={side} width={width} x={x} y={y} atlas=({ax},{ay})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn mask_blit_matches_pixel_reference_when_clipped() {
