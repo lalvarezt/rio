@@ -2189,68 +2189,7 @@ impl Drop for TextVulkanState {
 
 //  CPU blit path for `Text::render_cpu`: premultiplied source-over into
 //  the shared `0xAARRGGBB` framebuffer (see `crate::premul`).
-use crate::premul::blend_premul_over;
-
-#[allow(clippy::too_many_arguments)]
-fn blit_text_mask(
-    buf: &mut [u32],
-    buf_w: i32,
-    buf_h: i32,
-    glyph_x: i32,
-    glyph_y: i32,
-    gw: i32,
-    gh: i32,
-    atlas: &[u8],
-    atlas_side: usize,
-    ax: usize,
-    ay: usize,
-    color: [u8; 4],
-) {
-    if color[3] == 0 {
-        return;
-    }
-    let stride = buf_w as usize;
-    let x_start = glyph_x.max(0);
-    let y_start = glyph_y.max(0);
-    let x_end = (glyph_x + gw).min(buf_w);
-    let y_end = (glyph_y + gh).min(buf_h);
-    if x_end <= x_start || y_end <= y_start {
-        return;
-    }
-    let r = color[0] as u32;
-    let g = color[1] as u32;
-    let b = color[2] as u32;
-    let ca = color[3] as u32;
-
-    for dst_y in y_start..y_end {
-        let src_y = (dst_y - glyph_y) as usize + ay;
-        if src_y >= atlas_side {
-            continue;
-        }
-        let atlas_row = src_y * atlas_side;
-        let buf_row = (dst_y as usize) * stride;
-        for dst_x in x_start..x_end {
-            let src_x = (dst_x - glyph_x) as usize + ax;
-            if src_x >= atlas_side {
-                continue;
-            }
-            let m = atlas[atlas_row + src_x] as u32;
-            if m == 0 {
-                continue;
-            }
-            let a = (m * ca + 127) / 255;
-            if a == 0 {
-                continue;
-            }
-            let pr = (r * a + 127) / 255;
-            let pg = (g * a + 127) / 255;
-            let pb = (b * a + 127) / 255;
-            let src = [pr as u8, pg as u8, pb as u8, a as u8];
-            let idx = buf_row + (dst_x as usize);
-            buf[idx] = blend_premul_over(src, buf[idx]);
-        }
-    }
-}
+use crate::premul::{blend_premul_over, blit_mask as blit_text_mask};
 
 #[allow(clippy::too_many_arguments)]
 fn blit_text_color(

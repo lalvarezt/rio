@@ -617,7 +617,7 @@ fn premul(c: [u8; 4]) -> [u8; 4] {
     ]
 }
 
-use crate::premul::{blend_premul_over as blend_over, pack_opaque};
+use crate::premul::{blend_premul_over as blend_over, blit_mask, pack_opaque};
 
 fn fill_panel_rect(
     buf: &mut [u32],
@@ -694,69 +694,6 @@ fn fill_rect(buf: &mut [u32], buf_w: i32, buf_h: i32, bounds: [i32; 4], rgba: [u
 }
 
 #[allow(clippy::too_many_arguments)]
-fn blit_mask(
-    buf: &mut [u32],
-    buf_w: i32,
-    buf_h: i32,
-    glyph_x: i32,
-    glyph_y: i32,
-    gw: i32,
-    gh: i32,
-    atlas: &[u8],
-    atlas_side: usize,
-    ax: usize,
-    ay: usize,
-    color: [u8; 4],
-) {
-    if color[3] == 0 {
-        return;
-    }
-    let stride = buf_w as usize;
-    // Clip glyph rect to buffer + atlas bounds in one step.
-    let x_start = glyph_x.max(0);
-    let y_start = glyph_y.max(0);
-    let x_end = (glyph_x + gw).min(buf_w);
-    let y_end = (glyph_y + gh).min(buf_h);
-    if x_end <= x_start || y_end <= y_start {
-        return;
-    }
-    let r = color[0] as u32;
-    let g = color[1] as u32;
-    let b = color[2] as u32;
-    let ca = color[3] as u32;
-
-    for dst_y in y_start..y_end {
-        let src_y = (dst_y - glyph_y) as usize + ay;
-        if src_y >= atlas_side {
-            continue;
-        }
-        let atlas_row = src_y * atlas_side;
-        let buf_row = (dst_y as usize) * stride;
-        for dst_x in x_start..x_end {
-            let src_x = (dst_x - glyph_x) as usize + ax;
-            if src_x >= atlas_side {
-                continue;
-            }
-            let m = atlas[atlas_row + src_x] as u32;
-            if m == 0 {
-                continue;
-            }
-            // mask alpha × text alpha → premultiplied src
-            let a = (m * ca + 127) / 255;
-            if a == 0 {
-                continue;
-            }
-            let pr = (r * a + 127) / 255;
-            let pg = (g * a + 127) / 255;
-            let pb = (b * a + 127) / 255;
-            let src = [pr as u8, pg as u8, pb as u8, a as u8];
-            let idx = buf_row + (dst_x as usize);
-            buf[idx] = blend_over(src, buf[idx]);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 fn blit_color(
     buf: &mut [u32],
     buf_w: i32,
@@ -811,6 +748,79 @@ fn blit_color(
 mod panel_tests {
     use super::*;
     use bytemuck::Zeroable;
+
+    #[test]
+    fn mask_blit_matches_pixel_reference_when_clipped() {
+        for side in [7, 16] {
+            let atlas: Vec<_> = (0..side * side).map(|i| (i * 73 % 256) as u8).collect();
+            for width in [0, 1, 3, 4, 5, 8, 9] {
+                for x in [-3, 0, 13] {
+                    for y in [-2, 0, 9] {
+                        for (ax, ay) in
+                            [(0, 0), (1, 2), (side - 2, side - 1), (side + 1, 0)]
+                        {
+                            for alpha in [0, 1, 127, 254, 255] {
+                                for rgb in [[0, 0, 0], [255, 255, 255], [37, 180, 91]] {
+                                    let color = [rgb[0], rgb[1], rgb[2], alpha];
+                                    let mut actual: Vec<_> = (0..17 * 13)
+                                        .map(|i| {
+                                            [0, 0xff12_3456, 0x9912_3456, 0x017f_ff80]
+                                                [i % 4]
+                                        })
+                                        .collect();
+                                    let mut expected = actual.clone();
+                                    for dy in 0..13i32 {
+                                        for dx in 0..17i32 {
+                                            let sx = dx - x;
+                                            let sy = dy - y;
+                                            if !(0..width).contains(&sx)
+                                                || !(0..7).contains(&sy)
+                                            {
+                                                continue;
+                                            }
+                                            let sx = sx as usize + ax;
+                                            let sy = sy as usize + ay;
+                                            if sx >= side || sy >= side {
+                                                continue;
+                                            }
+                                            let a = (atlas[sy * side + sx] as u32
+                                                * alpha as u32
+                                                + 127)
+                                                / 255;
+                                            let src = [
+                                                ((rgb[0] as u32 * a + 127) / 255) as u8,
+                                                ((rgb[1] as u32 * a + 127) / 255) as u8,
+                                                ((rgb[2] as u32 * a + 127) / 255) as u8,
+                                                a as u8,
+                                            ];
+                                            let idx = dy as usize * 17 + dx as usize;
+                                            expected[idx] =
+                                                blend_over(src, expected[idx]);
+                                        }
+                                    }
+                                    blit_mask(
+                                        &mut actual,
+                                        17,
+                                        13,
+                                        x,
+                                        y,
+                                        width,
+                                        7,
+                                        &atlas,
+                                        side,
+                                        ax,
+                                        ay,
+                                        color,
+                                    );
+                                    assert_eq!(actual, expected, "side={side} width={width} x={x} y={y} atlas=({ax},{ay}) color={color:?}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn background_runs_match_cells_painted_individually() {

@@ -68,7 +68,7 @@ def main():
     binary_hashes = {name: hashlib.sha256(Path(binary).read_bytes()).hexdigest()
                      for name, binary in binaries.items()}
     source_hashes = {name: hashlib.sha256((source / name).read_bytes()).hexdigest() for name in (
-        "sugarloaf/src/grid/cpu.rs", "sugarloaf/src/grid/vulkan.rs", "sugarloaf/src/premul.rs",
+        "sugarloaf/src/grid/cpu.rs", "sugarloaf/src/grid/vulkan.rs", "sugarloaf/src/premul.rs", "sugarloaf/src/text.rs",
         "sugarloaf/benches/rendering.rs", "sugarloaf/benches/branch_gpu.rs")}
     if args.reference:
         reference_hashes = {name: hashlib.sha256((out.parent / args.reference / name).read_bytes()).hexdigest()
