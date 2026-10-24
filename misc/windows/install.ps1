@@ -10,30 +10,19 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Destination = [IO.Path]::GetFullPath($Destination)
-if ($Binary) { $Binary = [IO.Path]::GetFullPath($Binary) }
+. "$PSScriptRoot/runtime-utils.ps1"
+$Destination = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Destination)
+if ($Binary) { $Binary = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Binary) }
 $oldDebug = $env:CARGO_PROFILE_DEV_DEBUG
 $oldIncremental = $env:CARGO_INCREMENTAL
 Push-Location (Join-Path $PSScriptRoot '../..')
 try {
-    # Check before building so a running installation cannot be partly updated.
-    foreach ($name in @('rio.exe', 'conpty.dll', 'OpenConsole.exe', 'ConPTY-LICENSE.txt')) {
-        $installed = Join-Path $Destination $name
-        if (Test-Path $installed) {
-            try {
-                $handle = [IO.File]::Open($installed, 'Open', 'ReadWrite', 'None')
-                $handle.Dispose()
-            } catch {
-                throw "Cannot update $installed. Close Rio windows using this installation, then rerun just install. $($_.Exception.Message)"
-            }
-        }
-    }
-
+    $runtimeFiles = @('conpty.dll', 'OpenConsole.exe', 'ConPTY-LICENSE.txt', 'Font-LICENSE.txt')
     if ($Binary -and -not [IO.File]::Exists($Binary)) { throw "Rio executable not found: $Binary" }
 
-    # Resolve runtime/download errors before spending time on compilation.
-    & "$PSScriptRoot/prepare-conpty.ps1" -Architecture $Architecture
-    $runtime = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "../../target/conpty/$Architecture"))
+    # Prepare the pinned local runtime before spending time on compilation.
+    & "$PSScriptRoot/prepare-runtime.ps1" -Architecture $Architecture
+    $runtime = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "../../target/runtime/$Architecture"))
     if (-not $Binary) {
         $cargoProfile = if ($Profile -eq 'release') { 'release' } else { 'dev' }
         if ($Profile -eq 'debug') {
@@ -51,17 +40,24 @@ try {
     }
     if (-not $Binary -or -not [IO.File]::Exists($Binary)) { throw 'Cargo did not produce a Rio executable.' }
 
-    [void][IO.Directory]::CreateDirectory($Destination)
     $build = [IO.Path]::GetDirectoryName($Binary)
-    foreach ($name in @('conpty.dll', 'OpenConsole.exe', 'ConPTY-LICENSE.txt')) {
-        foreach ($directory in @($build, $Destination)) {
-            $target = Join-Path $directory $name
-            if ((Join-Path $runtime $name) -ine $target) { [IO.File]::Copy((Join-Path $runtime $name), $target, $true) }
+    $updates = @(
+        foreach ($name in $runtimeFiles) {
+            $source = Join-Path $runtime $name
+            $hash = Get-FileHashString $source
+            foreach ($directory in (@($build, $Destination) | Select-Object -Unique)) {
+                Get-FileUpdate $source (Join-Path $directory $name) $hash
+            }
         }
+        Get-FileUpdate $Binary (Join-Path $Destination 'rio.exe')
+    )
+    # Unchanged files may remain in use. Preflight every changed file before
+    # copying any of them, including dependencies beside the Cargo executable.
+    foreach ($update in $updates) { Assert-FileCanChange $update.Target }
+    foreach ($update in $updates) {
+        [void](Copy-FileIfChanged $update.Source $update.Target $update.Hash)
     }
-    $installedBinary = Join-Path $Destination 'rio.exe'
-    if ($Binary -ine $installedBinary) { [IO.File]::Copy($Binary, $installedBinary, $true) }
-    Write-Output "Installed Rio ($Profile) and ConPTY to $Destination"
+    Write-Output "Installed Rio ($Profile) to $Destination ($($updates.Count) files updated)"
 } finally {
     $env:CARGO_PROFILE_DEV_DEBUG = $oldDebug
     $env:CARGO_INCREMENTAL = $oldIncremental

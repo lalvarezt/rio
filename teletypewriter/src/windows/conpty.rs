@@ -8,12 +8,12 @@ use tracing::*;
 use crate::windows::pipes::{EventedAnonRead, EventedAnonWrite};
 
 use windows_sys::core::{HRESULT, PWSTR};
+use windows_sys::s;
 use windows_sys::Win32::Foundation::{FreeLibrary, HANDLE};
 use windows_sys::Win32::System::Console::{
     ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, COORD, HPCON,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-use windows_sys::{s, w};
 
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
@@ -38,8 +38,7 @@ const PIPE_BUFFER_SIZE: u32 = 64 * 1024;
 /// supports loading OpenConsole.exe, which offers many improvements and
 /// bugfixes compared to the standard conpty that ships with Windows.
 ///
-/// The conpty.dll and OpenConsole.exe files will be searched in PATH and in
-/// the directory where Rio's executable is located.
+/// Load the bundled conpty.dll beside Rio. OpenConsole.exe must accompany it.
 type CreatePseudoConsoleFn =
     unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> HRESULT;
 type ResizePseudoConsoleFn = unsafe extern "system" fn(HPCON, COORD) -> HRESULT;
@@ -80,8 +79,11 @@ impl ConptyApi {
     /// Try loading ConptyApi from conpty.dll library.
     fn load_conpty() -> Option<Self> {
         type LoadedFn = unsafe extern "system" fn() -> isize;
+        let executable = std::env::current_exe().ok()?;
+        let library = executable.parent()?.join("conpty.dll");
+        let library = win32_string(library.as_os_str());
         unsafe {
-            let hmodule = LoadLibraryW(w!("conpty.dll"));
+            let hmodule = LoadLibraryW(library.as_ptr());
             if hmodule.is_null() {
                 return None;
             }
