@@ -138,6 +138,7 @@ mod row_patch_tests {
         u.cell_size = [9.6, 20.0];
         u.grid_size = [5, 3];
         u.cursor_pos = [u32::MAX; 2];
+        let mut sparse_uploads = 0;
         for step in 0..24 {
             // Several edits can accumulate before a slot is visited. Also force
             // rebuilds by changing lengths, bucket membership, and empty rows.
@@ -159,7 +160,7 @@ mod row_patch_tests {
                 rows[2][0].atlas = 1;
             }
             for (row, cells) in rows.iter_mut().enumerate() {
-                if step % 3 == row {
+                if row == 0 || (step % 7 == 0 && row == 2) {
                     for cell in cells.iter_mut() {
                         cell.color[0] = step as u8;
                     }
@@ -221,6 +222,20 @@ mod row_patch_tests {
                 )
             };
             assert_eq!(uploaded_bg, grid.bg_cpu, "background upload step={step}");
+            if !grid.fg_staging_dirty && grid.fg_dirty[frame.slot].is_none() {
+                let ranges = &grid.fg_mixed_dirty[frame.slot];
+                let nonempty = ranges.iter().filter(|range| !range.is_empty()).count();
+                let copied: usize = ranges.iter().map(Range::len).sum();
+                if nonempty > 1 && copied < grid.fg_staging.len() {
+                    sparse_uploads += 1;
+                }
+                for (range, bucket) in ranges.iter().zip(&grid.fg_buckets) {
+                    if !range.is_empty() {
+                        assert!(range.start >= bucket.start as usize);
+                        assert!(range.end <= (bucket.start + bucket.count) as usize);
+                    }
+                }
+            }
             grid.render_text(&ctx, cmd, frame.slot, &u);
             if matches!(step, 0 | 5 | 9 | 12 | 16 | 20) {
                 assert!(
@@ -260,6 +275,10 @@ mod row_patch_tests {
             }
             ctx.present_frame(frame);
         }
+        assert!(
+            sparse_uploads > 0,
+            "test must exercise separated partial uploads"
+        );
         unsafe {
             ctx.device().device_wait_idle().unwrap();
         }
@@ -375,6 +394,32 @@ impl TextBuffer {
                     range.len(),
                 );
             }
+        }
+    }
+
+    fn upload_ranges(
+        &mut self,
+        ctx: &VulkanContext,
+        cells: &[CellText],
+        ranges: &mut [Range<usize>],
+    ) {
+        let mut pending = 0..0;
+        for range in ranges {
+            let range = std::mem::replace(range, cells.len()..0);
+            if range.is_empty() {
+                continue;
+            }
+            if pending.end == range.start {
+                pending.end = range.end;
+            } else {
+                if !pending.is_empty() {
+                    self.upload_range(ctx, cells, pending);
+                }
+                pending = range;
+            }
+        }
+        if !pending.is_empty() {
+            self.upload_range(ctx, cells, pending);
         }
     }
 }
@@ -982,10 +1027,13 @@ pub struct VulkanGridRenderer {
     /// Per-cell staging offsets for mixed-atlas layouts. Constructed on the first
     /// same-layout edit, so structural churn only rebuilds the staging buffer.
     fg_mixed_row_offsets: Vec<Vec<usize>>,
+    /// One staging span per atlas bucket, including empty spans for absent buckets.
+    fg_mixed_row_ranges: Vec<smallvec::SmallVec<[Range<usize>; 4]>>,
     fg_mixed_row_offsets_valid: bool,
     fg_bucket_scratch: Vec<((u8, u8), Vec<CellText>)>,
     fg_buffers: [TextBuffer; FRAMES_IN_FLIGHT],
     fg_dirty: [Option<Range<usize>>; FRAMES_IN_FLIGHT],
+    fg_mixed_dirty: [smallvec::SmallVec<[Range<usize>; 4]>; FRAMES_IN_FLIGHT],
     cursor_buffers: [TextBuffer; FRAMES_IN_FLIGHT],
     cursor_dirty: [bool; FRAMES_IN_FLIGHT],
     /// Layout of the current CPU staging data. Each dirty GPU slot receives
@@ -1087,10 +1135,12 @@ impl VulkanGridRenderer {
             fg_staging_dirty: true,
             fg_row_offsets: Vec::new(),
             fg_mixed_row_offsets: Vec::new(),
+            fg_mixed_row_ranges: Vec::new(),
             fg_mixed_row_offsets_valid: false,
             fg_bucket_scratch: Vec::with_capacity(4),
             fg_buffers: std::array::from_fn(|_| TextBuffer::default()),
             fg_dirty: std::array::from_fn(|_| None),
+            fg_mixed_dirty: std::array::from_fn(|_| smallvec::SmallVec::new()),
             cursor_buffers: std::array::from_fn(|_| TextBuffer::default()),
             cursor_dirty: [true; FRAMES_IN_FLIGHT],
             fg_buckets: Vec::new(),
@@ -1177,6 +1227,7 @@ impl VulkanGridRenderer {
                 self.cache_mixed_row_offsets();
             }
             let slot = &mut self.fg_rows[idx];
+            let mut mixed_patched = false;
             let range = if !self.fg_staging_dirty
                 && slot.len() == fg.len()
                 && self.fg_row_offsets.len() == self.rows as usize + 1
@@ -1189,11 +1240,18 @@ impl VulkanGridRenderer {
                 self.fg_staging[range.clone()].copy_from_slice(fg);
                 Some(range)
             } else if !self.fg_staging_dirty && self.fg_mixed_row_offsets_valid {
-                self.fg_mixed_row_offsets
-                    .get(row as usize)
-                    .and_then(|offsets| {
-                        patch_mixed_row(&mut self.fg_staging, offsets, slot, fg)
-                    })
+                let range =
+                    self.fg_mixed_row_offsets
+                        .get(row as usize)
+                        .and_then(|offsets| {
+                            patch_mixed_row(&mut self.fg_staging, offsets, slot, fg)
+                        });
+                if range.is_some() && !self.fg_dirty.iter().all(Option::is_some) {
+                    mixed_patched = true;
+                    None
+                } else {
+                    range
+                }
             } else {
                 None
             };
@@ -1204,11 +1262,14 @@ impl VulkanGridRenderer {
                         None => range.clone(),
                     });
                 }
-            } else {
+            } else if !mixed_patched {
                 self.fg_staging_dirty = true;
             }
             slot.clear();
             slot.extend_from_slice(fg);
+            if mixed_patched {
+                self.mark_mixed_row_dirty(row as usize);
+            }
         }
 
         let row_start = (row as usize) * (self.cols as usize);
@@ -1231,6 +1292,30 @@ impl VulkanGridRenderer {
         }
     }
 
+    // Keep bucket bookkeeping from enlarging the row-copy hot path.
+    #[inline(never)]
+    fn mark_mixed_row_dirty(&mut self, row: usize) {
+        let ranges = &self.fg_mixed_row_ranges[row];
+        for (full, dirty) in self.fg_dirty.iter_mut().zip(&mut self.fg_mixed_dirty) {
+            if full.is_none() {
+                for (dirty, range) in dirty.iter_mut().zip(ranges) {
+                    if !range.is_empty() {
+                        dirty.start = dirty.start.min(range.start);
+                        dirty.end = dirty.end.max(range.end);
+                    }
+                }
+                // Broad edits use one copy and stop tracking bucket spans until upload.
+                let limit = (self.fg_buckets[0].count as usize / 4).max(64);
+                if dirty[0].len() >= limit {
+                    *full = Some(0..self.fg_staging.len());
+                    dirty.fill(self.fg_staging.len()..0);
+                }
+            }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
     fn cache_mixed_row_offsets(&mut self) {
         let mut next: smallvec::SmallVec<[usize; 4]> = self
             .fg_buckets
@@ -1239,11 +1324,16 @@ impl VulkanGridRenderer {
             .collect();
         self.fg_mixed_row_offsets
             .resize_with(self.rows as usize, Vec::new);
-        for (row, offsets) in self.fg_rows[1..self.fg_rows.len() - 1]
+        self.fg_mixed_row_ranges
+            .resize_with(self.rows as usize, smallvec::SmallVec::new);
+        for ((row, offsets), ranges) in self.fg_rows[1..self.fg_rows.len() - 1]
             .iter()
             .zip(&mut self.fg_mixed_row_offsets)
+            .zip(&mut self.fg_mixed_row_ranges)
         {
             offsets.clear();
+            ranges.clear();
+            ranges.extend(next.iter().map(|&start| start..start));
             for cell in row {
                 let bucket = self
                     .fg_buckets
@@ -1255,6 +1345,13 @@ impl VulkanGridRenderer {
                 offsets.push(next[bucket]);
                 next[bucket] += 1;
             }
+            for (range, &end) in ranges.iter_mut().zip(&next) {
+                range.end = end;
+            }
+        }
+        for dirty in &mut self.fg_mixed_dirty {
+            dirty.clear();
+            dirty.resize(self.fg_buckets.len(), self.fg_staging.len()..0);
         }
         self.fg_mixed_row_offsets_valid = true;
     }
@@ -1525,10 +1622,19 @@ impl VulkanGridRenderer {
             for dirty in &mut self.fg_dirty {
                 *dirty = Some(0..self.fg_staging.len());
             }
+            for dirty in &mut self.fg_mixed_dirty {
+                dirty.clear();
+            }
             self.fg_staging_dirty = false;
         }
         if let Some(range) = self.fg_dirty[slot].take() {
             self.fg_buffers[slot].upload_range(ctx, &self.fg_staging, range);
+        } else {
+            self.fg_buffers[slot].upload_ranges(
+                ctx,
+                &self.fg_staging,
+                &mut self.fg_mixed_dirty[slot],
+            );
         }
         let block = &self.fg_rows[0];
         let non_block = &self.fg_rows[content_end];
