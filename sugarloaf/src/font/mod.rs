@@ -2210,6 +2210,37 @@ fn find_font(
     slot: Slot,
     evictable: bool,
 ) -> FindResult {
+    #[cfg(target_os = "windows")]
+    {
+        let bundled: Option<&'static [u8]> = match (font_spec.family.as_str(), slot) {
+            ("JetBrainsMono Nerd Font Mono", _) => Some(include_bytes!(
+                "../../../vendor/fonts/JetBrainsMonoNerdFontMono-Regular.ttf"
+            )),
+            ("Maple Mono", Slot::Italic) => {
+                Some(include_bytes!("../../../vendor/fonts/MapleMono-Italic.ttf"))
+            }
+            ("Maple Mono", Slot::BoldItalic) => Some(include_bytes!(
+                "../../../vendor/fonts/MapleMono-BoldItalic.ttf"
+            )),
+            ("Symbols Nerd Font Mono", _) => Some(include_bytes!(
+                "../../../vendor/fonts/SymbolsNerdFontMono-Regular.ttf"
+            )),
+            _ => None,
+        };
+        if let Some(bytes) = bundled {
+            return match FontData::from_data(
+                SharedData::from_static(bytes),
+                PathBuf::from(&font_spec.family),
+                false,
+                slot,
+                &font_spec,
+                0,
+            ) {
+                Ok(data) => FindResult::Found(data),
+                Err(_) => FindResult::NotFound(font_spec),
+            };
+        }
+    }
     if !font_spec.is_default_family() {
         let family = font_spec.family.to_string();
         let mut query = crate::font::loader::Query {
