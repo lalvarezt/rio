@@ -656,6 +656,24 @@ impl Island {
                 .appearance
                 .icon_padding(tab.remote, self.tab_icon_size)
         {
+            // Crowded strips can shrink below the normal icon padding. Keep
+            // one centered icon visible so compressed tabs remain identifiable.
+            let size = self.tab_icon_size.min((width - 4.0).max(0.0));
+            if size > 0.0 {
+                draw_tab_icon(
+                    sugarloaf,
+                    [x + (width - size) / 2.0, self.tabs.appearance.center_y()],
+                    color,
+                    order,
+                    if tab.remote {
+                        super::app_icons::SSH_ICON
+                    } else {
+                        tab.icon
+                    },
+                    self.window_header.app_font,
+                    size,
+                );
+            }
             return;
         }
         let mut x = x + self.tabs.appearance.geometry.padding.left;
