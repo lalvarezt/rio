@@ -91,9 +91,206 @@ fn patch_mixed_row(
     Some(if offsets.is_empty() { 0..0 } else { range })
 }
 
+/// Preserve first-seen bucket order while writing each glyph directly to staging.
+#[cold]
+#[inline(never)]
+fn pack_mixed_rows(
+    rows: &[Vec<CellText>],
+    staging: &mut Vec<CellText>,
+    buckets: &mut Vec<TextBucket>,
+) {
+    buckets.clear();
+    let Some(first) = rows.iter().flatten().next() else {
+        staging.clear();
+        return;
+    };
+    // Keep the common one/two-bucket counts and write positions in locals.
+    let first_key = (first.atlas, first.page);
+    let mut second_key = None;
+    let mut first_count = 0;
+    let mut second_count = 0;
+    for cell in rows.iter().flatten() {
+        let key = (cell.atlas, cell.page);
+        if key == first_key {
+            first_count += 1;
+        } else if second_key.is_none() || second_key == Some(key) {
+            second_key = Some(key);
+            second_count += 1;
+        } else {
+            pack_many_bucket_rows(rows, staging, buckets);
+            return;
+        }
+    }
+    buckets.push(TextBucket {
+        kind: first_key.0,
+        page: first_key.1,
+        start: 0,
+        count: first_count as u32,
+    });
+    if let Some((kind, page)) = second_key {
+        buckets.push(TextBucket {
+            kind,
+            page,
+            start: first_count as u32,
+            count: second_count as u32,
+        });
+    }
+    staging.resize(first_count + second_count, CellText::default());
+    let (first, second) = staging.split_at_mut(first_count);
+    let mut first = first.iter_mut();
+    let mut second = second.iter_mut();
+    for cell in rows.iter().flatten() {
+        let destination = if (cell.atlas, cell.page) == first_key {
+            first.next().unwrap()
+        } else {
+            second.next().unwrap()
+        };
+        *destination = *cell;
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn pack_many_bucket_rows(
+    rows: &[Vec<CellText>],
+    staging: &mut Vec<CellText>,
+    buckets: &mut Vec<TextBucket>,
+) {
+    buckets.clear();
+    // The two atlas kinds use byte-sized page indices. Other kinds retain
+    // the general lookup behavior rather than indexing outside this table.
+    let mut counts = [0usize; 512];
+    for cell in rows.iter().flatten() {
+        let key = ((cell.atlas as usize) << 8) | cell.page as usize;
+        if let Some(count) = counts.get_mut(key) {
+            if *count == 0 {
+                buckets.push(TextBucket {
+                    kind: cell.atlas,
+                    page: cell.page,
+                    start: 0,
+                    count: 0,
+                });
+            }
+            *count += 1;
+        } else {
+            let index = buckets
+                .iter()
+                .position(|bucket| (bucket.kind, bucket.page) == (cell.atlas, cell.page))
+                .unwrap_or_else(|| {
+                    buckets.push(TextBucket {
+                        kind: cell.atlas,
+                        page: cell.page,
+                        start: 0,
+                        count: 0,
+                    });
+                    buckets.len() - 1
+                });
+            buckets[index].count += 1;
+        }
+    }
+    let mut total = 0;
+    // Reuse the histogram for each bucket's next staging position.
+    for bucket in buckets.iter_mut() {
+        let key = ((bucket.kind as usize) << 8) | bucket.page as usize;
+        if let Some(count) = counts.get_mut(key) {
+            bucket.count = *count as u32;
+            *count = total;
+        }
+        bucket.start = total as u32;
+        total += bucket.count as usize;
+    }
+    // Keep initialized storage so same-sized rebuilds do not zero it again.
+    staging.resize(total, CellText::default());
+    let mut next: smallvec::SmallVec<[usize; MAX_PAGES * 2]> =
+        buckets.iter().map(|bucket| bucket.start as usize).collect();
+    for cell in rows.iter().flatten() {
+        let key = ((cell.atlas as usize) << 8) | cell.page as usize;
+        let offset = if let Some(offset) = counts.get_mut(key) {
+            let current = *offset;
+            *offset += 1;
+            current
+        } else {
+            let index = buckets
+                .iter()
+                .position(|bucket| (bucket.kind, bucket.page) == (cell.atlas, cell.page))
+                .unwrap();
+            let current = next[index];
+            next[index] += 1;
+            current
+        };
+        staging[offset] = *cell;
+    }
+}
+
 #[cfg(test)]
 mod row_patch_tests {
     use super::*;
+
+    #[test]
+    fn mixed_packing_matches_first_seen_grouping_across_rebuilds() {
+        let mut staging = vec![CellText::default(); 400];
+        let mut buckets = Vec::new();
+        let mut seed = 0x12345678u32;
+        for iteration in 0..200 {
+            let mut random = || {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                seed
+            };
+            let rows: Vec<Vec<_>> = (0..random() % 9)
+                .map(|row| {
+                    (0..random() % 40)
+                        .map(|col| {
+                            let key = random();
+                            CellText {
+                                atlas: if iteration % 3 == 0 {
+                                    (key >> 8) as u8
+                                } else {
+                                    (key & 1) as u8
+                                },
+                                page: if iteration % 3 == 1 {
+                                    0
+                                } else {
+                                    (key >> 16) as u8
+                                },
+                                grid_pos: [col as u16, row as u16],
+                                color: key.to_le_bytes(),
+                                ..Default::default()
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            let mut expected: Vec<((u8, u8), Vec<CellText>)> = Vec::new();
+            for cell in rows.iter().flatten() {
+                let key = (cell.atlas, cell.page);
+                let index = expected
+                    .iter()
+                    .position(|(old, _)| *old == key)
+                    .unwrap_or_else(|| {
+                        expected.push((key, Vec::new()));
+                        expected.len() - 1
+                    });
+                expected[index].1.push(*cell);
+            }
+            pack_mixed_rows(&rows, &mut staging, &mut buckets);
+            assert_eq!(
+                staging,
+                expected
+                    .iter()
+                    .flat_map(|(_, cells)| cells.iter())
+                    .copied()
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(buckets.len(), expected.len());
+            let mut start = 0;
+            for (bucket, (key, cells)) in buckets.iter().zip(&expected) {
+                assert_eq!((bucket.kind, bucket.page), *key);
+                assert_eq!(bucket.start as usize, start);
+                assert_eq!(bucket.count as usize, cells.len());
+                start += cells.len();
+            }
+        }
+    }
 
     mod x11 {
         use crate as sugarloaf;
@@ -1030,7 +1227,6 @@ pub struct VulkanGridRenderer {
     /// One staging span per atlas bucket, including empty spans for absent buckets.
     fg_mixed_row_ranges: Vec<smallvec::SmallVec<[Range<usize>; 4]>>,
     fg_mixed_row_offsets_valid: bool,
-    fg_bucket_scratch: Vec<((u8, u8), Vec<CellText>)>,
     fg_buffers: [TextBuffer; FRAMES_IN_FLIGHT],
     fg_dirty: [Option<Range<usize>>; FRAMES_IN_FLIGHT],
     fg_mixed_dirty: [smallvec::SmallVec<[Range<usize>; 4]>; FRAMES_IN_FLIGHT],
@@ -1137,7 +1333,6 @@ impl VulkanGridRenderer {
             fg_mixed_row_offsets: Vec::new(),
             fg_mixed_row_ranges: Vec::new(),
             fg_mixed_row_offsets_valid: false,
-            fg_bucket_scratch: Vec::with_capacity(4),
             fg_buffers: std::array::from_fn(|_| TextBuffer::default()),
             fg_dirty: std::array::from_fn(|_| None),
             fg_mixed_dirty: std::array::from_fn(|_| smallvec::SmallVec::new()),
@@ -1553,9 +1748,6 @@ impl VulkanGridRenderer {
             // Each `cmd_draw` binds exactly one page's descriptor set
             // + one kind, so cells with different `(kind, page)` go
             // into separate ranges of the same vertex buffer.
-            // Typical session: ≤ 4 buckets (2 kinds × 1–2 pages), so
-            // the linear-search bucketing here is cheap.
-            self.fg_staging.clear();
             self.fg_buckets.clear();
             self.fg_row_offsets.clear();
             self.fg_mixed_row_offsets_valid = false;
@@ -1573,6 +1765,7 @@ impl VulkanGridRenderer {
                     .flatten()
                     .all(|cell| (cell.atlas, cell.page) == key)
             }) {
+                self.fg_staging.clear();
                 self.fg_row_offsets.push(0);
                 for row in rows {
                     self.fg_staging.extend_from_slice(row);
@@ -1585,39 +1778,7 @@ impl VulkanGridRenderer {
                     count: self.fg_staging.len() as u32,
                 });
             } else {
-                let scratch = &mut self.fg_bucket_scratch;
-                let mut used = 0;
-                for row in rows {
-                    for cell in row {
-                        let key = (cell.atlas, cell.page);
-                        let bucket =
-                            match scratch[..used].iter().position(|(k, _)| *k == key) {
-                                Some(index) => index,
-                                None => {
-                                    if used == scratch.len() {
-                                        scratch.push((key, Vec::new()));
-                                    } else {
-                                        scratch[used].0 = key;
-                                        scratch[used].1.clear();
-                                    }
-                                    used += 1;
-                                    used - 1
-                                }
-                            };
-                        scratch[bucket].1.push(*cell);
-                    }
-                }
-                for ((kind, page), cells) in &scratch[..used] {
-                    let start = self.fg_staging.len() as u32;
-                    let count = cells.len() as u32;
-                    self.fg_staging.extend_from_slice(cells);
-                    self.fg_buckets.push(TextBucket {
-                        kind: *kind,
-                        page: *page,
-                        start,
-                        count,
-                    });
-                }
+                pack_mixed_rows(rows, &mut self.fg_staging, &mut self.fg_buckets);
             }
             for dirty in &mut self.fg_dirty {
                 *dirty = Some(0..self.fg_staging.len());
