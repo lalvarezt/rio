@@ -85,6 +85,10 @@ impl SearchOverlay {
         self.active_search.is_some()
     }
 
+    pub fn clear_hover(&mut self) -> bool {
+        self.hovered_button.take().is_some()
+    }
+
     #[inline]
     pub fn set_active_search(&mut self, active_search: Option<&str>) -> bool {
         // Frame synchronization must not allocate another copy of an unchanged query.
@@ -226,9 +230,20 @@ impl SearchOverlay {
             oy,
             ow,
             oh,
-            BG_COLOR,
+            BUTTON_HOVER_BG,
             DEPTH_BG,
             OVERLAY_CORNER_RADIUS,
+            ORDER,
+        );
+        let pixel = 1.0 / scale_factor;
+        sugarloaf.rounded_rect(
+            ox + pixel,
+            oy + pixel,
+            ow - pixel * 2.0,
+            oh - pixel * 2.0,
+            BG_COLOR,
+            DEPTH_BG + 0.01,
+            (OVERLAY_CORNER_RADIUS - pixel).max(0.0),
             ORDER,
         );
 

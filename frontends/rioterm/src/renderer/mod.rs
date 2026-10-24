@@ -16,6 +16,7 @@ pub mod island;
 pub mod scrollbar;
 pub mod search;
 mod tab_glass;
+mod text_layout;
 pub mod trail_cursor;
 pub mod utils;
 pub mod window_chrome;
@@ -837,6 +838,7 @@ impl Renderer {
         self.assistant.render(
             sugarloaf,
             (window_size.width, window_size.height, scale_factor),
+            &self.named_colors,
         );
 
         self.search.render(
@@ -870,6 +872,7 @@ impl Renderer {
         self.confirm_quit.render(
             sugarloaf,
             (window_size.width, window_size.height, scale_factor),
+            &self.named_colors,
         );
 
         // Render scrollbars for each panel

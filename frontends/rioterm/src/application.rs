@@ -76,7 +76,9 @@ impl Application<'_> {
         event_loop.listen_device_events(DeviceEvents::Never);
 
         #[cfg(any(target_os = "macos", target_os = "windows"))]
-        event_loop.set_confirm_before_quit(config.confirm_before_quit);
+        event_loop.set_confirm_before_quit(
+            cfg!(target_os = "macos") && config.confirm_before_quit,
+        );
 
         rio_notifier::request_authorization();
 
@@ -606,6 +608,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             RioEventType::Rio(RioEvent::ReportToAssistant(error)) => {
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
                     route.report_error(&error);
+                    route.request_redraw();
                 }
             }
             RioEventType::Rio(RioEvent::UpdateConfig) => {
@@ -1261,18 +1264,9 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
 
         match event {
             WindowEvent::CloseRequested => {
-                // macOS: Cmd+Q quit confirmation is handled by
-                // `applicationShouldTerminate` in rio-window.
-                // Windows: per-window close confirmation is handled
-                // by `MessageBoxW` in rio-window's WM_CLOSE handler
-                // (see `set_confirm_before_quit` plumbing).
-                // Either way, by the time we see `CloseRequested`
-                // the user has already confirmed — just close.
-                self.close_window(
-                    window_id,
-                    event_loop,
-                    cfg!(any(target_os = "macos", target_os = "windows")),
-                );
+                // macOS confirms in applicationShouldTerminate. Other platforms
+                // use Rio's themed confirmation overlay.
+                self.close_window(window_id, event_loop, cfg!(target_os = "macos"));
             }
 
             WindowEvent::ModifiersChanged(modifiers) => {
@@ -1304,6 +1298,67 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
+                // The topmost dialog owns the pointer, including clicks over chrome.
+                if route.window.screen.renderer.confirm_quit.is_active() {
+                    if button == MouseButton::Left {
+                        use crate::renderer::confirm_quit::ConfirmQuitAction;
+                        let screen = &mut route.window.screen;
+                        let scale = screen.sugarloaf.scale_factor();
+                        let size = screen.sugarloaf.window_size();
+                        let dimensions = (size.width, size.height, scale);
+                        let x = screen.mouse.x as f32 / scale;
+                        let y = screen.mouse.y as f32 / scale;
+                        screen.mouse.left_button_state = state;
+                        screen.mouse.hint_click_latched = None;
+                        let _ = screen.take_chrome_press();
+                        if state == ElementState::Pressed {
+                            screen.renderer.confirm_quit.press(x, y, dimensions);
+                        } else {
+                            match screen.renderer.confirm_quit.release(x, y, dimensions) {
+                                Some(ConfirmQuitAction::Close) => route.quit(),
+                                Some(ConfirmQuitAction::Cancel) => {
+                                    route
+                                        .window
+                                        .screen
+                                        .renderer
+                                        .confirm_quit
+                                        .set_active(false);
+                                    route
+                                        .window
+                                        .winit_window
+                                        .set_cursor(CursorIcon::Default);
+                                }
+                                None => {}
+                            }
+                        }
+                        route.request_overlay_redraw();
+                    }
+                    return;
+                }
+                if route.window.screen.renderer.assistant.is_active() {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        let _ = route.window.screen.take_chrome_press();
+                        route.window.screen.handle_assistant_click();
+                        route.request_overlay_redraw();
+                    }
+                    return;
+                }
+                if state == ElementState::Pressed && button == MouseButton::Left {
+                    if route
+                        .window
+                        .screen
+                        .handle_palette_click(&mut self.router.clipboard)
+                        || (route.path == RoutePath::Terminal
+                            && route
+                                .window
+                                .screen
+                                .handle_search_click(&mut self.router.clipboard))
+                    {
+                        let _ = route.window.screen.take_chrome_press();
+                        route.request_overlay_redraw();
+                        return;
+                    }
+                }
                 if state == ElementState::Pressed
                     && button != MouseButton::Left
                     && route.window.screen.header_action().is_some()
@@ -1442,29 +1497,6 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                                         });
                                     return;
                                 }
-                            }
-
-                            if route.window.screen.handle_assistant_click() {
-                                route.request_redraw();
-                                return;
-                            }
-
-                            if route
-                                .window
-                                .screen
-                                .handle_palette_click(&mut self.router.clipboard)
-                            {
-                                route.request_redraw();
-                                return;
-                            }
-
-                            if route
-                                .window
-                                .screen
-                                .handle_search_click(&mut self.router.clipboard)
-                            {
-                                route.request_redraw();
-                                return;
                             }
 
                             let handled_by_island =
@@ -1708,8 +1740,12 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             }
 
             WindowEvent::CursorLeft { .. } => {
-                if route.window.screen.clear_close_button_hover() {
-                    route.request_redraw();
+                let header = route.window.screen.clear_close_button_hover();
+                let quit = route.window.screen.renderer.confirm_quit.clear_hover();
+                let assistant = route.window.screen.renderer.assistant.clear_hover();
+                let search = route.window.screen.renderer.search.clear_hover();
+                if header || quit || assistant || search {
+                    route.request_overlay_redraw();
                 }
             }
 
@@ -1730,11 +1766,48 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 route.window.screen.mouse.y = y;
                 route.window.screen.mouse.raw_y = position.y;
 
-                if route.window.screen.update_header_hover(x, y) {
-                    route.request_overlay_redraw();
+                if route.window.screen.renderer.confirm_quit.is_active() {
+                    let screen = &mut route.window.screen;
+                    let scale = screen.sugarloaf.scale_factor();
+                    let size = screen.sugarloaf.window_size();
+                    let changed = screen.renderer.confirm_quit.hover(
+                        x as f32 / scale,
+                        y as f32 / scale,
+                        (size.width, size.height, scale),
+                    );
+                    let cursor =
+                        if screen.renderer.confirm_quit.hovered_button().is_some() {
+                            CursorIcon::Pointer
+                        } else {
+                            CursorIcon::Default
+                        };
+                    route.window.winit_window.set_cursor(cursor);
+                    if changed {
+                        route.request_overlay_redraw();
+                    }
+                    return;
                 }
-                if route.window.screen.header_action().is_some() {
-                    route.window.winit_window.set_cursor(CursorIcon::Default);
+
+                // Diagnostics must receive hover even on nonterminal routes and over chrome.
+                if route.window.screen.renderer.assistant.is_active() {
+                    let screen = &mut route.window.screen;
+                    let scale = screen.sugarloaf.scale_factor();
+                    let win_w = screen.sugarloaf.window_size().width;
+                    let changed = screen.renderer.assistant.hover(
+                        x as f32 / scale,
+                        y as f32 / scale,
+                        win_w,
+                        scale,
+                    );
+                    let cursor = if screen.renderer.assistant.hovered_button().is_some() {
+                        CursorIcon::Pointer
+                    } else {
+                        CursorIcon::Default
+                    };
+                    route.window.winit_window.set_cursor(cursor);
+                    if changed {
+                        route.request_overlay_redraw();
+                    }
                     return;
                 }
 
@@ -1742,37 +1815,6 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     || route.window.screen.renderer.confirm_quit.is_active()
                 {
                     route.window.winit_window.set_cursor(CursorIcon::Default);
-                    return;
-                }
-
-                // Handle assistant overlay hover
-                if route.window.screen.renderer.assistant.is_active() {
-                    let scale = route.window.screen.sugarloaf.scale_factor();
-                    let win_w = route.window.screen.sugarloaf.window_size().width;
-                    let mx = x as f32 / scale;
-                    let my = y as f32 / scale;
-                    if route
-                        .window
-                        .screen
-                        .renderer
-                        .assistant
-                        .hover(mx, my, win_w, scale)
-                    {
-                        route.request_overlay_redraw();
-                    }
-
-                    if route
-                        .window
-                        .screen
-                        .renderer
-                        .assistant
-                        .hovered_button()
-                        .is_some()
-                    {
-                        route.window.winit_window.set_cursor(CursorIcon::Pointer);
-                    } else {
-                        route.window.winit_window.set_cursor(CursorIcon::Default);
-                    }
                     return;
                 }
 
@@ -1825,6 +1867,28 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                             .set_dirty();
                         route.request_redraw();
                     }
+                    if let Ok(action) = route
+                        .window
+                        .screen
+                        .renderer
+                        .search
+                        .hit_test(mx, my, win_w, scale)
+                    {
+                        route.window.winit_window.set_cursor(if action.is_some() {
+                            CursorIcon::Pointer
+                        } else {
+                            CursorIcon::Text
+                        });
+                        return;
+                    }
+                }
+
+                if route.window.screen.update_header_hover(x, y) {
+                    route.request_overlay_redraw();
+                }
+                if route.window.screen.header_action().is_some() {
+                    route.window.winit_window.set_cursor(CursorIcon::Default);
+                    return;
                 }
 
                 if route.window.screen.mouse.left_button_state == ElementState::Pressed

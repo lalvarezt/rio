@@ -186,6 +186,9 @@ impl Route<'_> {
     /// hover/click, the application.rs pointer handlers) still walk
     /// their own overlay checks and need separate wiring.
     pub fn active_modal(&self) -> Option<Modal> {
+        if self.window.screen.renderer.confirm_quit.is_active() {
+            return Some(Modal::ConfirmQuit);
+        }
         if self
             .window
             .screen
@@ -198,9 +201,6 @@ impl Route<'_> {
         }
         if self.window.screen.renderer.command_palette.is_enabled() {
             return Some(Modal::CommandPalette);
-        }
-        if self.window.screen.renderer.confirm_quit.is_active() {
-            return Some(Modal::ConfirmQuit);
         }
         // Only hard errors are modal: a warning toast (font not
         // found on live reload, say) renders over a WORKING terminal
@@ -353,8 +353,34 @@ impl Route<'_> {
             }
 
             Modal::ConfirmQuit => {
+                use crate::renderer::confirm_quit::ConfirmQuitAction;
                 if key_event.state == rio_window::event::ElementState::Pressed {
                     match &key_event.logical_key {
+                        Key::Named(
+                            NamedKey::Tab | NamedKey::ArrowLeft | NamedKey::ArrowRight,
+                        ) => {
+                            self.window.screen.renderer.confirm_quit.toggle_focus();
+                            self.request_overlay_redraw();
+                        }
+                        Key::Named(NamedKey::Enter | NamedKey::Space) => {
+                            match self
+                                .window
+                                .screen
+                                .renderer
+                                .confirm_quit
+                                .focused_button()
+                            {
+                                ConfirmQuitAction::Close => self.quit(),
+                                ConfirmQuitAction::Cancel => {
+                                    self.window
+                                        .screen
+                                        .renderer
+                                        .confirm_quit
+                                        .set_active(false);
+                                    self.request_overlay_redraw();
+                                }
+                            }
+                        }
                         Key::Character(c) if c.as_str() == "n" || c.as_str() == "N" => {
                             self.window.screen.renderer.confirm_quit.set_active(false);
                             self.request_overlay_redraw();
