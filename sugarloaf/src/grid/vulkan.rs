@@ -71,8 +71,27 @@ fn same_atlas_layout(previous: &[CellText], updated: &[CellText]) -> bool {
             .all(|(old, new)| (old.atlas, old.page) == (new.atlas, new.page))
 }
 
+fn changed_cell_range(previous: &[CellText], updated: &[CellText]) -> Range<usize> {
+    debug_assert_eq!(previous.len(), updated.len());
+    let previous: &[[u8; std::mem::size_of::<CellText>()]] =
+        bytemuck::cast_slice(previous);
+    let updated: &[[u8; std::mem::size_of::<CellText>()]] = bytemuck::cast_slice(updated);
+    let start = previous
+        .iter()
+        .zip(updated)
+        .position(|(old, new)| old != new)
+        .unwrap_or(updated.len());
+    let end = previous[start..]
+        .iter()
+        .zip(&updated[start..])
+        .rposition(|(old, new)| old != new)
+        .map_or(start, |last| start + last + 1);
+    start..end
+}
+
 /// Patch a row whose glyphs still belong to the same atlas buckets. Offsets
 /// refer to the grouped staging layout, which can place adjacent cells far apart.
+#[inline(never)]
 fn patch_mixed_row(
     staging: &mut [CellText],
     offsets: &[usize],
@@ -300,11 +319,17 @@ mod row_patch_tests {
     #[test]
     #[ignore = "requires an X11 display and Vulkan device"]
     fn mixed_atlas_edits_reach_every_frame_slot() {
+        for cols in [5, 160] {
+            check_mixed_atlas_edits(cols);
+        }
+    }
+
+    fn check_mixed_atlas_edits(cols: u32) {
         use crate::renderer::vulkan as renderer;
         use bytemuck::Zeroable;
         let window = x11::Window::new();
         let mut ctx = VulkanContext::new(window.handle());
-        let mut grid = VulkanGridRenderer::new(&ctx, 5, 3);
+        let mut grid = VulkanGridRenderer::new(&ctx, cols, 3);
         grid.insert_glyph_color(
             GlyphKey {
                 font_id: 0,
@@ -322,7 +347,7 @@ mod row_patch_tests {
         .unwrap();
         let mut rows: Vec<Vec<CellText>> = (0..3)
             .map(|row| {
-                (0..5)
+                (0..cols as u16)
                     .map(|col| CellText {
                         grid_pos: [col, row],
                         atlas: (col % 2) as u8,
@@ -333,10 +358,11 @@ mod row_patch_tests {
             .collect();
         let mut u = GridUniforms::zeroed();
         u.cell_size = [9.6, 20.0];
-        u.grid_size = [5, 3];
+        u.grid_size = [cols, 3];
         u.cursor_pos = [u32::MAX; 2];
         let mut sparse_uploads = 0;
-        for step in 0..24 {
+        let mut bounded_uploads = 0;
+        for step in 0..30 {
             // Several edits can accumulate before a slot is visited. Also force
             // rebuilds by changing lengths, bucket membership, and empty rows.
             if step == 5 {
@@ -344,6 +370,12 @@ mod row_patch_tests {
             }
             if step == 9 {
                 rows[0][0].atlas = 1;
+            }
+            if step == 10 {
+                rows[0][2].atlas ^= 1;
+            }
+            if step == 11 {
+                rows[2].last_mut().unwrap().atlas ^= 1;
             }
             if step == 12 {
                 rows[1].clear();
@@ -356,17 +388,30 @@ mod row_patch_tests {
             if step == 20 {
                 rows[2][0].atlas = 1;
             }
+            // After structural churn, consume a bounded broad upload, then
+            // extend the other slots' pending bounds into the last bucket.
+            if step == 25 {
+                rows[2][0].color[1] ^= 1;
+            }
             for (row, cells) in rows.iter_mut().enumerate() {
-                if row == 0 || (step % 7 == 0 && row == 2) {
-                    for cell in cells.iter_mut() {
-                        cell.color[0] = step as u8;
+                if (row == 0 && step != 25) || (step % 7 == 0 && row == 2) {
+                    let len = cells.len();
+                    for (index, cell) in cells.iter_mut().enumerate() {
+                        if step % 5 == 0
+                            || (step % 5 == 1 && index == 0)
+                            || (step % 5 == 2 && index == len / 2)
+                            || (step % 5 == 3 && index + 1 == len)
+                            || (step % 5 == 4 && (index == 0 || index + 1 == len))
+                        {
+                            cell.color[0] = step as u8;
+                        }
                     }
                 }
-                let mut bg = [CellBg::TRANSPARENT; 5];
+                let mut bg = vec![CellBg::TRANSPARENT; cols as usize];
                 bg[4].rgba = [step as u8, 0, 0, 255];
-                let len = (step + row) % 6;
+                let len = (step + row) % (cols as usize + 1);
                 grid.write_row(row as u32, &bg[..len], cells);
-                if step % 4 == 0 {
+                if step < 24 && step % 4 == 0 {
                     grid.clear_row(row as u32);
                     grid.clear_row(row as u32);
                     grid.write_row(row as u32, &[], cells);
@@ -374,7 +419,7 @@ mod row_patch_tests {
             }
             let visible: Vec<_> = grid
                 .bg_cpu
-                .chunks(5)
+                .chunks(cols as usize)
                 .map(|row| row.iter().any(|cell| *cell != CellBg::TRANSPARENT))
                 .collect();
             assert_eq!(grid.bg_row_visible, visible, "visibility step={step}");
@@ -419,6 +464,14 @@ mod row_patch_tests {
                 )
             };
             assert_eq!(uploaded_bg, grid.bg_cpu, "background upload step={step}");
+            if !grid.fg_staging_dirty
+                && grid.fg_mixed_row_offsets_valid
+                && grid.fg_dirty[frame.slot]
+                    .as_ref()
+                    .is_some_and(|range| range.len() < grid.fg_staging.len())
+            {
+                bounded_uploads += 1;
+            }
             if !grid.fg_staging_dirty && grid.fg_dirty[frame.slot].is_none() {
                 let ranges = &grid.fg_mixed_dirty[frame.slot];
                 let nonempty = ranges.iter().filter(|range| !range.is_empty()).count();
@@ -476,6 +529,12 @@ mod row_patch_tests {
             sparse_uploads > 0,
             "test must exercise separated partial uploads"
         );
+        if cols == 160 {
+            assert!(
+                bounded_uploads > 0,
+                "test must exercise bounded broad uploads"
+            );
+        }
         unsafe {
             ctx.device().device_wait_idle().unwrap();
         }
@@ -1422,27 +1481,42 @@ impl VulkanGridRenderer {
                 self.cache_mixed_row_offsets();
             }
             let slot = &mut self.fg_rows[idx];
-            let mut mixed_patched = false;
+            let changed = if !self.fg_staging_dirty
+                && self.fg_mixed_row_offsets_valid
+                && slot.len() == fg.len()
+            {
+                changed_cell_range(slot, fg)
+            } else {
+                0..fg.len()
+            };
+            let mut mixed_range = None;
             let range = if !self.fg_staging_dirty
                 && slot.len() == fg.len()
                 && self.fg_row_offsets.len() == self.rows as usize + 1
                 && self.fg_buckets.first().is_some_and(|bucket| {
-                    fg.iter()
+                    fg[changed.clone()]
+                        .iter()
                         .all(|cell| (cell.atlas, cell.page) == (bucket.kind, bucket.page))
                 }) {
-                let range = self.fg_row_offsets[row as usize]
-                    ..self.fg_row_offsets[row as usize + 1];
-                self.fg_staging[range.clone()].copy_from_slice(fg);
+                let start = self.fg_row_offsets[row as usize];
+                let range = start + changed.start..start + changed.end;
+                self.fg_staging[range.clone()].copy_from_slice(&fg[changed.clone()]);
                 Some(range)
             } else if !self.fg_staging_dirty && self.fg_mixed_row_offsets_valid {
-                let range =
-                    self.fg_mixed_row_offsets
-                        .get(row as usize)
-                        .and_then(|offsets| {
-                            patch_mixed_row(&mut self.fg_staging, offsets, slot, fg)
-                        });
+                let range = self
+                    .fg_mixed_row_offsets
+                    .get(row as usize)
+                    .filter(|offsets| offsets.len() == fg.len())
+                    .and_then(|offsets| {
+                        patch_mixed_row(
+                            &mut self.fg_staging,
+                            &offsets[changed.clone()],
+                            &slot[changed.clone()],
+                            &fg[changed.clone()],
+                        )
+                    });
                 if range.is_some() && !self.fg_dirty.iter().all(Option::is_some) {
-                    mixed_patched = true;
+                    mixed_range = range;
                     None
                 } else {
                     range
@@ -1457,13 +1531,17 @@ impl VulkanGridRenderer {
                         None => range.clone(),
                     });
                 }
-            } else if !mixed_patched {
+            } else if mixed_range.is_none() {
                 self.fg_staging_dirty = true;
             }
-            slot.clear();
-            slot.extend_from_slice(fg);
-            if mixed_patched {
-                self.mark_mixed_row_dirty(row as usize);
+            if slot.len() == fg.len() {
+                slot[changed.clone()].copy_from_slice(&fg[changed]);
+            } else {
+                slot.clear();
+                slot.extend_from_slice(fg);
+            }
+            if let Some(range) = mixed_range {
+                self.mark_mixed_row_dirty(row as usize, range);
             }
         }
 
@@ -1489,20 +1567,30 @@ impl VulkanGridRenderer {
 
     // Keep bucket bookkeeping from enlarging the row-copy hot path.
     #[inline(never)]
-    fn mark_mixed_row_dirty(&mut self, row: usize) {
+    fn mark_mixed_row_dirty(&mut self, row: usize, changed: Range<usize>) {
         let ranges = &self.fg_mixed_row_ranges[row];
         for (full, dirty) in self.fg_dirty.iter_mut().zip(&mut self.fg_mixed_dirty) {
-            if full.is_none() {
+            if let Some(full) = full {
+                full.start = full.start.min(changed.start);
+                full.end = full.end.max(changed.end);
+            } else {
                 for (dirty, range) in dirty.iter_mut().zip(ranges) {
-                    if !range.is_empty() {
-                        dirty.start = dirty.start.min(range.start);
-                        dirty.end = dirty.end.max(range.end);
+                    let start = range.start.max(changed.start);
+                    let end = range.end.min(changed.end);
+                    if start < end {
+                        dirty.start = dirty.start.min(start);
+                        dirty.end = dirty.end.max(end);
                     }
                 }
                 // Broad edits use one copy and stop tracking bucket spans until upload.
                 let limit = (self.fg_buckets[0].count as usize / 4).max(64);
                 if dirty[0].len() >= limit {
-                    *full = Some(0..self.fg_staging.len());
+                    *full = Some(dirty.iter().filter(|range| !range.is_empty()).fold(
+                        self.fg_staging.len()..0,
+                        |bounds, range| {
+                            bounds.start.min(range.start)..bounds.end.max(range.end)
+                        },
+                    ));
                     dirty.fill(self.fg_staging.len()..0);
                 }
             }

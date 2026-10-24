@@ -136,7 +136,7 @@ def main():
                      ("branch_performance", "title_churn")]
             if args.gpu:
                 cases.append(("branch_gpu", "gpu/row_storage/tail_change"))
-                cases.extend(("branch_gpu", f"gpu/record/2_atlas/{mode}") for mode in ("full", "one_row", "unchanged", "atlas_change"))
+                cases.extend(("branch_gpu", f"gpu/record/2_atlas/{mode}") for mode in ("full", "full_all_cells", "one_row", "unchanged", "atlas_change"))
             for suite, case in cases:
                 if args.filter and args.filter not in case:
                     continue

@@ -157,6 +157,7 @@ mod native {
                     }
                     for mode in [
                         "full",
+                        "full_all_cells",
                         "one_row",
                         "rotating_slots",
                         "unchanged",
@@ -187,7 +188,13 @@ mod native {
                             } else if mode != "unchanged"
                                 && (mode != "rotating_slots" || slot == 0)
                             {
-                                cells[0].color[0] ^= 1;
+                                if mode == "full_all_cells" {
+                                    for cell in &mut cells {
+                                        cell.color[0] ^= 1;
+                                    }
+                                } else {
+                                    cells[0].color[0] ^= 1;
+                                }
                                 if mode == "row_length" {
                                     if cells.len() == 160 {
                                         cells.pop();
@@ -205,7 +212,7 @@ mod native {
                                 {
                                     cells[0].atlas ^= 1;
                                 }
-                                if mode == "full" {
+                                if mode == "full" || mode == "full_all_cells" {
                                     for row in 0..48 {
                                         grid.write_row(row, &bg, &cells);
                                     }
