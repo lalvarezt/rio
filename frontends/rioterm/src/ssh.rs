@@ -1,5 +1,5 @@
-//! SSH launch recipes. Each pane owns a shell, while OpenSSH owns the shared
-//! authenticated transport. Reopening a recipe never replays a remote command.
+//! SSH launch recipes. Windows panes use independent native OpenSSH processes;
+//! other platforms reuse an authenticated transport. Recipes omit commands.
 
 use rio_backend::config::Shell;
 use serde::{Deserialize, Serialize};
@@ -7,11 +7,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+#[path = "ssh/windows.rs"]
+mod windows;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Connection {
     pub destination: String,
     #[serde(default)]
     pub powershell: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote_shell: Option<String>,
     #[serde(default)]
     options: Vec<String>,
 }
@@ -30,6 +36,7 @@ impl Connection {
         Ok(Self {
             destination: destination.into(),
             powershell,
+            remote_shell: None,
             options: Vec::new(),
         })
     }
@@ -104,10 +111,25 @@ impl Connection {
         connection.powershell = args.get(index).is_some_and(|arg| {
             arg.eq_ignore_ascii_case("powershell") || arg.eq_ignore_ascii_case("pwsh")
         });
+        // Preserve an explicitly selected interactive shell, never an arbitrary
+        // remote command. This includes `ssh host /path/to/fish` workflows.
+        if args.len() == index + 1 {
+            if let Some(shell) = args.get(index) {
+                if matches!(
+                    shell.rsplit('/').next(),
+                    Some("fish" | "bash" | "zsh" | "sh" | "ksh" | "dash")
+                ) {
+                    connection.remote_shell = Some(shell.clone());
+                }
+            }
+        }
         Some(connection)
     }
 
     fn command(&self) -> Command {
+        #[cfg(windows)]
+        let mut command = Command::new(windows::program());
+        #[cfg(not(windows))]
         let mut command = Command::new("ssh");
         command.args(&self.options);
         command
@@ -118,32 +140,38 @@ impl Connection {
         command.args(["-G", &self.destination]);
         let output = local_output(command)?;
         if !output.status.success() {
-            return Err("Could not read SSH configuration for this connection.".into());
+            return Err(command_error("Could not read SSH configuration", &output));
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
-    /// New connections honor an existing ControlPath, including a connection
-    /// opened outside Rio. Supply a private socket directory when none is set.
+    /// Windows uses native SSH. Unix connections reuse a ControlMaster socket.
     pub fn connect_shell(&self) -> Result<Shell, String> {
-        let settings = self.settings()?;
-        let path = setting(&settings, "controlpath")
-            .filter(|path| *path != "none")
-            .map(str::to_owned)
-            .map(Ok)
-            .unwrap_or_else(default_control_path)?;
-        let mut args = vec![
-            "-oControlMaster=auto".into(),
-            "-oControlPersist=600".into(),
-            "-S".into(),
-            path,
-        ];
-        args.extend(self.options.clone());
-        self.finish_shell(args, None)
+        #[cfg(windows)]
+        {
+            self.settings()?;
+            return windows::shell(self, None, false);
+        }
+        #[cfg(not(windows))]
+        {
+            let settings = self.settings()?;
+            let path = setting(&settings, "controlpath")
+                .filter(|path| *path != "none")
+                .map(str::to_owned)
+                .map(Ok)
+                .unwrap_or_else(default_control_path)?;
+            let mut args = vec![
+                "-oControlMaster=auto".into(),
+                "-oControlPersist=600".into(),
+                "-S".into(),
+                path,
+            ];
+            args.extend(self.options.clone());
+            self.finish_shell(args, None)
+        }
     }
 
-    /// Reuse an authenticated master. If it dies after the check, disable fresh
-    /// authentication instead of prompting for credentials or using another key.
+    /// Siblings preserve the destination and directory, without replaying commands.
     pub fn duplicate_shell(
         &self,
         directory: Option<&Path>,
@@ -156,31 +184,45 @@ impl Connection {
                     .is_some_and(|host| same_host(host, reported))
             })
         });
-        let path = setting(&settings, "controlpath")
-            .filter(|path| *path != "none")
-            .ok_or("SSH sharing is unavailable. Use Connect via SSH to open a shared connection first.")?;
-        let mut check = self.command();
-        check.args(["-S", path, "-O", "check", &self.destination]);
-        if !local_output(check)?.status.success() {
-            return Err("The shared SSH connection is unavailable. Reconnect with Connect via SSH before opening another tab or split.".into());
+        #[cfg(windows)]
+        return windows::shell(self, directory, true);
+        #[cfg(not(windows))]
+        {
+            let mut args = {
+                let path = setting(&settings, "controlpath")
+                .filter(|path| *path != "none")
+                .ok_or("SSH sharing is unavailable. Use Connect via SSH to open a shared connection first.")?;
+                let mut check = self.command();
+                check.args(["-S", path, "-O", "check", &self.destination]);
+                let output = local_output(check)?;
+                if !output.status.success() {
+                    return Err(command_error("The shared SSH connection is unavailable. Reconnect with Connect via SSH before opening another tab or split", &output));
+                }
+                vec![
+                    "-S".into(),
+                    path.into(),
+                    "-oControlMaster=no".into(),
+                    // If the master dies after the check, do not authenticate again.
+                    "-oPreferredAuthentications=none".into(),
+                ]
+            };
+            args.extend(
+                [
+                    "-oBatchMode=yes",
+                    "-oConnectTimeout=5",
+                    "-oConnectionAttempts=1",
+                    "-oClearAllForwardings=yes",
+                    "-oRemoteCommand=none",
+                    "-oSessionType=default",
+                    "-oForkAfterAuthentication=no",
+                    "-oStdinNull=no",
+                    "-oPermitLocalCommand=no",
+                ]
+                .map(String::from),
+            );
+            args.extend(self.options.clone());
+            self.finish_shell(args, directory)
         }
-        let mut args = vec![
-            "-S".into(),
-            path.into(),
-            "-oControlMaster=no".into(),
-            "-oBatchMode=yes".into(),
-            "-oPreferredAuthentications=none".into(),
-            "-oConnectTimeout=5".into(),
-            "-oConnectionAttempts=1".into(),
-            "-oClearAllForwardings=yes".into(),
-            "-oRemoteCommand=none".into(),
-            "-oSessionType=default".into(),
-            "-oForkAfterAuthentication=no".into(),
-            "-oStdinNull=no".into(),
-            "-oPermitLocalCommand=no".into(),
-        ];
-        args.extend(self.options.clone());
-        self.finish_shell(args, directory)
     }
 
     fn finish_shell(
@@ -226,11 +268,15 @@ impl Connection {
                 encoded,
             ]);
         } else if let Some(directory) = directory {
-            let script = format!(
-                "cd {} && exec \"${{SHELL:-/bin/sh}}\" -l",
-                posix_quote(directory)
-            );
+            let shell = self
+                .remote_shell
+                .as_deref()
+                .map(posix_quote)
+                .unwrap_or_else(|| "\"${SHELL:-/bin/sh}\"".into());
+            let script = format!("cd {} && exec {shell} -l", posix_quote(directory));
             args.push(format!("sh -c {}", posix_quote(&script)));
+        } else if let Some(shell) = &self.remote_shell {
+            args.push(posix_quote(shell));
         }
         Ok(Shell {
             program: Some("ssh".into()),
@@ -265,6 +311,16 @@ fn setting<'a>(settings: &'a str, key: &str) -> Option<&'a str> {
         .find_map(|line| line.strip_prefix(key)?.strip_prefix(' '))
 }
 
+fn command_error(context: &str, output: &std::process::Output) -> String {
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    let diagnostic = diagnostic.trim();
+    if diagnostic.is_empty() {
+        format!("{context} ({}).", output.status)
+    } else {
+        format!("{context}:\n{diagnostic}")
+    }
+}
+
 fn same_host(expected: &str, reported: &str) -> bool {
     let expected = expected.trim_end_matches('.');
     let reported = reported.trim_end_matches('.');
@@ -295,6 +351,7 @@ fn posix_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+#[cfg(not(windows))]
 fn default_control_path() -> Result<String, String> {
     let dir = dirs::cache_dir()
         .ok_or("Could not locate the SSH socket directory.")?
@@ -310,16 +367,23 @@ fn default_control_path() -> Result<String, String> {
     Ok(dir.join("%C").to_string_lossy().into_owned())
 }
 
-/// Only local configuration and control-socket commands run here. Bound them:
-/// Match exec in a user's SSH config can otherwise freeze the window thread.
+/// Bound configuration and sharing checks. Match exec in a user's SSH config
+/// must not leave the window waiting indefinitely.
 fn local_output(mut command: Command) -> Result<std::process::Output, String> {
     use std::io::Read;
+    let program = command.get_program().to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Preflight checks have no terminal and must not flash a console window.
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Could not start OpenSSH: {e}"))?;
+        .map_err(|e| format!("Could not start {program}: {e}"))?;
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
     let stdout = std::thread::spawn(move || {
@@ -370,7 +434,7 @@ fn history_path() -> Option<PathBuf> {
     Some(dirs::config_dir()?.join("rio/ssh-connections.toml"))
 }
 
-/// Store connection recipes only. Authentication stays with OpenSSH.
+/// Store connection recipes only, without credentials.
 pub fn remember(connection: &Connection) -> Result<(), String> {
     let path = history_path().ok_or("Could not locate the connection history.")?;
     let mut history = read_history();
@@ -522,6 +586,71 @@ mod tests {
             saved_options(&connection.options),
             ["-p", "2222", "-o", "User=alice", "-J", "jump"]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configuration_failure_preserves_openssh_diagnostic() {
+        let missing = std::env::temp_dir()
+            .join(format!("rio-missing-ssh-config-{}", std::process::id()));
+        let connection =
+            parse(&["-F", missing.to_str().unwrap(), "no-network.invalid"]).unwrap();
+        let error = connection.settings().unwrap_err();
+        assert!(error.contains(missing.to_str().unwrap()), "{error}");
+        assert!(error.contains("No such file"), "{error}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_delegates_host_trust_and_authentication_to_native_ssh() {
+        let connection = parse(&[
+            "-F",
+            "NUL",
+            "-oUserKnownHostsFile=NUL",
+            "-oGlobalKnownHostsFile=NUL",
+            "example.invalid",
+        ])
+        .unwrap();
+        let shell = connection.connect_shell().unwrap();
+        assert_eq!(shell.program.as_deref(), windows::program().to_str());
+        assert!(!shell
+            .args
+            .iter()
+            .any(|arg| arg.contains("StrictHostKeyChecking=no")));
+        assert!(!shell.args.iter().any(|arg| arg.contains("BatchMode=yes")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_sibling_needs_no_shared_master() {
+        let connection = parse(&["-F", "NUL", "user@example.invalid"]).unwrap();
+        let shell = connection
+            .duplicate_shell(Some(Path::new("/tmp/a'b")), Some("example.invalid"))
+            .unwrap();
+        assert!(shell.args.iter().any(|arg| arg == "-oControlPath=none"));
+        assert!(shell.args.last().unwrap().contains("exec"));
+    }
+
+    #[test]
+    fn selected_fish_survives_siblings_without_replaying_arbitrary_commands() {
+        let connection =
+            parse(&["-A", "host", "-t", "/home/linuxbrew/.linuxbrew/bin/fish"]).unwrap();
+        assert_eq!(
+            connection.remote_shell.as_deref(),
+            Some("/home/linuxbrew/.linuxbrew/bin/fish")
+        );
+        let shell = connection
+            .finish_shell(vec![], Some(Path::new("/tmp/a b")))
+            .unwrap();
+        assert!(shell.args.last().unwrap().contains("fish"));
+        assert!(shell.args.last().unwrap().contains("exec"));
+        for command in [
+            vec!["host", "rm", "file"],
+            vec!["host", "fish", "-c", "deploy"],
+            vec!["host", "fish;deploy"],
+        ] {
+            assert!(parse(&command).unwrap().remote_shell.is_none());
+        }
     }
 
     #[cfg(unix)]

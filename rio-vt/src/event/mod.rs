@@ -186,6 +186,7 @@ pub enum RioEvent {
     SelectNativeTabPrev,
 
     ReportToAssistant(RioError),
+    SshError(String),
 
     /// Grid has changed possibly requiring a mouse cursor shape change.
     MouseCursorDirty,
@@ -386,6 +387,7 @@ impl Debug for RioEvent {
             RioEvent::ReportToAssistant(error_report) => {
                 write!(f, "ReportToAssistant({})", error_report.report)
             }
+            RioEvent::SshError(message) => write!(f, "SshError({message})"),
             RioEvent::ToggleFullScreen => write!(f, "FullScreen"),
             RioEvent::ToggleAppearanceTheme => write!(f, "ToggleAppearanceTheme"),
             RioEvent::BlinkCursor(timeout, route_id) => {

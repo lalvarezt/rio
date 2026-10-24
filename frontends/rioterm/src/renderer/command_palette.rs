@@ -46,6 +46,7 @@ const RESULT_FONT_SIZE: f32 = 14.0;
 const SHORTCUT_FONT_SIZE: f32 = 12.0;
 const MAX_VISIBLE_RESULTS: usize = 12;
 const GROUP_HEIGHT: f32 = 26.0;
+const ERROR_LINE_HEIGHT: f32 = 18.0;
 const ORDER: u8 = 20;
 
 /// Actions that can be triggered from the command palette.
@@ -413,6 +414,7 @@ struct Layout {
 /// navigation, and pointer handling share those results and the same layout.
 pub struct CommandPalette {
     enabled: bool,
+    error: Option<String>,
     query: String,
     pub selected_index: usize,
     scroll_offset: usize,
@@ -423,6 +425,7 @@ pub struct CommandPalette {
     theme: super::window_chrome::Theme,
     font_library: Option<rio_backend::sugarloaf::font::FontLibrary>,
     font_id: Option<usize>,
+    wrapped_error: Vec<String>,
     viewport_height: f32,
     visible_results: usize,
     caret_blink_start: Instant,
@@ -434,6 +437,7 @@ impl Default for CommandPalette {
     fn default() -> Self {
         let mut palette = Self {
             enabled: false,
+            error: None,
             query: String::new(),
             selected_index: 0,
             scroll_offset: 0,
@@ -444,6 +448,7 @@ impl Default for CommandPalette {
             theme: super::window_chrome::Theme::new(&Default::default()),
             font_library: None,
             font_id: None,
+            wrapped_error: Vec::new(),
             viewport_height: f32::INFINITY,
             visible_results: MAX_VISIBLE_RESULTS,
             caret_blink_start: Instant::now(),
@@ -476,6 +481,21 @@ impl CommandPalette {
 
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    pub fn show_error(&mut self, message: String) {
+        self.enabled = true;
+        self.wrapped_error = message.lines().map(str::to_owned).collect();
+        self.error = Some(message);
+        self.caret_blink_start = Instant::now();
+    }
+
+    fn error_lines(&self) -> &[String] {
+        if self.error.is_some() {
+            &self.wrapped_error
+        } else {
+            &[]
+        }
     }
 
     pub fn set_enabled(&mut self, enabled: bool) {
@@ -539,6 +559,7 @@ impl CommandPalette {
     }
 
     fn query_changed(&mut self) {
+        self.error = None;
         self.selected_index = 0;
         self.scroll_offset = 0;
         self.caret_blink_start = Instant::now();
@@ -736,7 +757,9 @@ impl CommandPalette {
             PALETTE_MARGIN_TOP.min(self.viewport_height * PALETTE_TOP_FRACTION),
             scale,
         );
-        let results_top = y + PALETTE_PADDING + INPUT_HEIGHT + PALETTE_PADDING;
+        let error_height = self.error_lines().len() as f32 * ERROR_LINE_HEIGHT;
+        let results_top =
+            y + PALETTE_PADDING + INPUT_HEIGHT + PALETTE_PADDING + error_height;
         // Group headings consume space inside this viewport, never change its
         // height as selection or the first visible group changes.
         let results_height = self
@@ -875,6 +898,21 @@ impl CommandPalette {
             self.font_id = super::window_chrome::load_ui_font(library);
             self.font_library = Some(library.clone());
         }
+        if let Some(error) = &self.error {
+            let width = PALETTE_WIDTH
+                .min((window_width / scale - VIEWPORT_MARGIN * 2.0).max(1.0));
+            let opts = DrawOpts {
+                font_size: snap(SHORTCUT_FONT_SIZE, scale),
+                font_id: self.font_id,
+                ..DrawOpts::default()
+            };
+            self.wrapped_error = super::text_layout::wrap_text(
+                error,
+                (width - 2.0 * (PALETTE_PADDING + INPUT_PADDING_X)).max(1.0),
+                |text| sugarloaf.text_mut().measure(text, &opts),
+            );
+            self.wrapped_error.truncate(8);
+        }
         let mut layout = self.layout(window_width, scale);
         if self.scroll_offset > layout.max_scroll_offset {
             self.scroll_offset = layout.max_scroll_offset;
@@ -918,6 +956,18 @@ impl CommandPalette {
         let input_x = x + PALETTE_PADDING;
         let input_y = y + PALETTE_PADDING;
         let input_width = width - PALETTE_PADDING * 2.0;
+        let error_opts = opts(SHORTCUT_FONT_SIZE, theme.foreground);
+        for (index, line) in self.error_lines().iter().enumerate() {
+            sugarloaf.text_mut().draw(
+                input_x + INPUT_PADDING_X,
+                input_y
+                    + INPUT_HEIGHT
+                    + PALETTE_PADDING
+                    + index as f32 * ERROR_LINE_HEIGHT,
+                line,
+                &error_opts,
+            );
+        }
         sugarloaf.rounded_rect(
             input_x,
             input_y,
@@ -1150,6 +1200,28 @@ impl CommandPalette {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_error_reopens_picker_and_preserves_destination_for_retry() {
+        let mut palette = CommandPalette::new();
+        palette.mode = PaletteMode::Ssh {
+            connections: Vec::new(),
+            powershell: false,
+        };
+        palette.set_query("user@example.invalid".into());
+        palette.set_enabled(false);
+        let old_top = palette.layout(1200.0, 1.0).rows[0].1;
+        palette.show_error("Could not read SSH configuration:\nBad option".into());
+        assert!(palette.is_enabled());
+        assert_eq!(
+            palette.get_selected_ssh().unwrap().destination,
+            "user@example.invalid"
+        );
+        assert!(palette.layout(1200.0, 1.0).rows[0].1 > old_top);
+        assert!(palette.error_lines().join("\n").contains("Bad option"));
+        palette.backspace();
+        assert!(palette.error.is_none());
+    }
 
     #[test]
     fn ssh_picker_accepts_a_destination_without_running_it() {

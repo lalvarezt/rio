@@ -611,6 +611,17 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     route.request_redraw();
                 }
             }
+            RioEventType::Rio(RioEvent::SshError(message)) => {
+                if let Some(route) = self.router.routes.get_mut(&window_id) {
+                    route
+                        .window
+                        .screen
+                        .renderer
+                        .command_palette
+                        .show_error(message);
+                    route.request_redraw();
+                }
+            }
             RioEventType::Rio(RioEvent::UpdateConfig) => {
                 let (mut config, config_error) =
                     match rio_backend::config::Config::try_load() {

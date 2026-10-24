@@ -309,7 +309,26 @@ fn read_hostname() -> Option<String> {
         .map(str::to_owned)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn read_hostname() -> Option<String> {
+    use windows_sys::Win32::System::SystemInformation::{
+        ComputerNameDnsHostname, GetComputerNameExW,
+    };
+    let mut buffer = [0_u16; 256];
+    let mut length = buffer.len() as u32;
+    // SAFETY: the buffer contains `length` writable UTF-16 code units.
+    if unsafe {
+        GetComputerNameExW(ComputerNameDnsHostname, buffer.as_mut_ptr(), &mut length)
+    } == 0
+    {
+        return None;
+    }
+    String::from_utf16(&buffer[..length as usize])
+        .ok()
+        .filter(|hostname| !hostname.is_empty())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn read_hostname() -> Option<String> {
     // No lookup here, so `host_is_local` falls back to accepting the payload,
     // which is what rio did on every platform before.
@@ -687,12 +706,43 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn kitty_shell_cwd_rejects_remote_hosts() {
         assert_eq!(
             cwd("kitty-shell-cwd://other-machine.example/home/user"),
             None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_current_directory_keeps_remote_posix_paths_separate() {
+        use crate::ansi::CursorShape;
+        use crate::crosswords::{Crosswords, CrosswordsSize};
+        use crate::event::{VoidListener, WindowId};
+        use crate::performer::handler::Processor;
+        let mut term = Crosswords::new(
+            CrosswordsSize::new(20, 5),
+            CursorShape::Block,
+            VoidListener,
+            WindowId::from(0),
+            0,
+            10,
+        );
+        let mut processor = Processor::default();
+        processor.advance(&mut term, b"\x1b]7;file:///C:/Windows\x07");
+        processor.advance(
+            &mut term,
+            b"\x1b]7;kitty-shell-cwd://other-machine.invalid/tmp\x07",
+        );
+        assert_eq!(
+            term.current_directory.as_deref(),
+            Some(std::path::Path::new("C:/Windows"))
+        );
+        assert_eq!(
+            term.remote_directory,
+            Some(("other-machine.invalid".into(), "/tmp".into()))
         );
     }
 

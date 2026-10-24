@@ -1,14 +1,21 @@
 # SSH tabs and splits
 
-Rio can open independent remote shells over an authenticated OpenSSH connection.
-New Tab Here, Split Right, and Split Down use the focused pane's SSH connection.
+Rio can open remote shells with OpenSSH.
+New Tab Here, Split Right, and Split Down use the focused pane's SSH destination.
 The original shell and its programs keep running.
 
 Open the command palette and choose **Connect via SSH…**. Enter an SSH config
 alias, `user@host`, or an `ssh://` address. The picker also lists saved connections
 and literal aliases from `~/.ssh/config`. OpenSSH handles authentication, host keys,
-agents, and jump hosts. Rio enables connection sharing and keeps an idle master
-for up to ten minutes after its last session closes.
+agents, and jump hosts. On Unix clients, Rio enables connection sharing and keeps
+an idle master for up to ten minutes after its last session closes.
+
+On Windows clients, Rio uses native Windows OpenSSH. Each tab or split opens its
+own connection, using OpenSSH's configuration, host-key verification and Windows
+agent directly. Authentication prompts appear in the terminal. Rio does not
+require a Plink executable or agent bridge. SSH configuration failures appear in
+the picker with OpenSSH's diagnostic text, and the destination stays available
+for retry.
 
 For a Windows server, choose **Connect via SSH with PowerShell…**. This starts
 PowerShell even when the server's default shell is cmd.exe. Rio sends its prompt
@@ -37,11 +44,13 @@ On Unix clients, Rio also recognizes foreground OpenSSH commands launched manual
 inside a pane. Such a connection must already have sharing enabled, for example
 through `ControlMaster`, `ControlPath`, and `ControlPersist` in SSH configuration.
 Rio cannot retrofit sharing onto an existing non-shared connection. On Windows
-clients, foreground command discovery is unavailable, and reuse requires an
-OpenSSH client with multiplexing support.
+clients, foreground command discovery is unavailable. Rio can preserve SSH when
+it launches the client itself, through the picker or its `-e ssh ...` option.
+An explicitly selected POSIX shell, such as `ssh host /path/to/fish`, is retained
+in sibling panes. Arbitrary remote commands are not replayed.
 
-Before creating a sibling, Rio checks the control socket. A missing connection
-produces an error instead of a credential prompt. If the master disappears during
+On Unix clients, Rio checks the shared connection before creating a sibling. A
+missing connection produces an error instead of a credential prompt. If the master disappears during
 creation, fresh authentication is disabled. Forwarding requests and remote commands
 are not replayed in sibling panes. Shell variables and running programs are not
 copied. Saved recipes can establish a new login after a disconnect; they do not
@@ -59,3 +68,22 @@ That test uses real PTYs and Rio's parser. It verifies directory inheritance,
 independent shell state, the same server-side SSH transport, foreground SSH
 discovery, and survival of a sibling after the original shell closes. It exercises
 the shared launch path used by both split directions without creating a GPU window.
+
+On a Windows client, `live_windows_ssh_connection_uses_conpty` verifies a real
+SSH login through Rio's ConPTY backend. It requires working authentication and
+remote shell integration that reports `RIO_SSH`. `RIO_TEST_SSH_TARGET` selects
+the destination. Optional `RIO_TEST_SSH_COMMAND` selects the remote shell:
+
+```powershell
+$env:RIO_TEST_SSH_TARGET = 'user@linux-host'
+$env:RIO_TEST_SSH_COMMAND = '/path/to/fish'
+cargo test -p rioterm live_windows_ssh_connection_uses_conpty -- --ignored --nocapture
+```
+
+This test verifies independent Windows SSH transports, remote directory
+inheritance, Unicode, resize, Ctrl+C and survival after the parent pane closes.
+`windows_fish_arrow_editing` additionally checks arrows, history, word movement
+and autosuggestions through ConPTY. `windows_local_and_ssh_performance` compares
+local, direct native SSH and Rio-generated SSH command round trips. Both use
+`RIO_PERF_SSH_TARGET`; the Fish check accepts `RIO_TEST_SSH_COMMAND` for its shell
+executable.

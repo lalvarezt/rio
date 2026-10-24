@@ -262,6 +262,7 @@ impl Screen<'_> {
         );
 
         let context_manager_config = context::ContextManagerConfig {
+            ssh: None,
             #[cfg(test)]
             dead_pty: false,
             cwd: config.navigation.current_working_directory,
