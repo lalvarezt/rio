@@ -19,7 +19,7 @@ def main():
     parser.add_argument("label", help="Capture directory name, e.g. baseline or optimized")
     parser.add_argument("--gpu", action="store_true", help="Use the isolated KWin/Xwayland display")
     parser.add_argument("--profile", action="store_true", help="Record perf stacks for selected workloads")
-    parser.add_argument("--validate", action="store_true", help="Run library tests and, with --gpu, the Vulkan frame-slot test")
+    parser.add_argument("--validate", action="store_true", help="Run library tests and, with --gpu, native Vulkan byte and pixel checks")
     parser.add_argument("--reference", help="Compare binaries retained in an earlier capture")
     parser.add_argument("--source", type=Path, default=ROOT, help="Build a separate checkout with the same benchmark fixtures")
     parser.add_argument("--repeats", type=int, default=1, help="Alternate reference/current run order on each repeat")
@@ -75,6 +75,8 @@ def main():
         "sugarloaf/src/premul.rs", "sugarloaf/src/text.rs",
         "sugarloaf/benches/rendering.rs", "sugarloaf/benches/branch_gpu.rs",
         "misc/benchmarks/cpu_state.rs", "misc/benchmarks/support.rs")}
+    for shader in sorted((source / "sugarloaf/src/grid/shaders").glob("*.glsl")):
+        source_hashes[str(shader.relative_to(source))] = hashlib.sha256(shader.read_bytes()).hexdigest()
     if args.reference:
         reference_hashes = {name: hashlib.sha256((out.parent / args.reference / name).read_bytes()).hexdigest()
                             for name in binaries}
@@ -98,6 +100,8 @@ def main():
             if args.gpu:
                 tests.append(tests[0] + ["mixed_atlas_edits_reach_every_frame_slot", "--", "--ignored"])
                 tests.append(tests[0] + ["retained_pixels_match_compact_across_frame_slots", "--", "--ignored"])
+                tests.append(tests[0] + ["background_pixels_match_fullscreen_reference", "--", "--ignored"])
+                tests.append(tests[0] + ["color_glyph_pixels_ignore_foreground_and_cursor_tint", "--", "--ignored"])
             for index, test in enumerate(tests):
                 print("Validating " + " ".join(test), flush=True)
                 with (out / f"tests-{index}.log").open("w") as log:

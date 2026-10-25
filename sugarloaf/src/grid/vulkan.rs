@@ -688,6 +688,17 @@ mod row_patch_tests {
         slot: usize,
         uniforms: &GridUniforms,
     ) -> Vec<u8> {
+        read_grid_pixels(ctx, grid, slot, uniforms, None, [0.0; 4])
+    }
+
+    fn read_grid_pixels(
+        ctx: &VulkanContext,
+        grid: &mut VulkanGridRenderer,
+        slot: usize,
+        uniforms: &GridUniforms,
+        reference_bg: Option<vk::Pipeline>,
+        clear: [f32; 4],
+    ) -> Vec<u8> {
         // A separate attachment avoids requiring TRANSFER_SRC on the swapchain.
         let image = ctx.allocate_sampled_image(
             64,
@@ -737,7 +748,7 @@ mod row_patch_tests {
                 .load_op(vk::AttachmentLoadOp::CLEAR)
                 .store_op(vk::AttachmentStoreOp::STORE)
                 .clear_value(vk::ClearValue {
-                    color: vk::ClearColorValue { float32: [0.0; 4] },
+                    color: vk::ClearColorValue { float32: clear },
                 })];
             let rect = vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -767,6 +778,28 @@ mod row_patch_tests {
             );
             device.cmd_set_scissor(cmd, 0, &[rect]);
             grid.render_bg(ctx, cmd, slot, uniforms);
+            if let Some(pipeline) = reference_bg {
+                // render_bg publishes the slot's cells/uniforms. Clear its draw
+                // before replaying the original fullscreen shader independently.
+                device.cmd_clear_attachments(
+                    cmd,
+                    &[vk::ClearAttachment::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .color_attachment(0)
+                        .clear_value(attachments[0].clear_value)],
+                    &[vk::ClearRect::default().rect(rect).layer_count(1)],
+                );
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    grid.pipelines.bg_pipeline_layout,
+                    0,
+                    &[grid.bg_descriptor_sets[slot]],
+                    &[],
+                );
+                device.cmd_draw(cmd, 3, 1, 0, 0);
+            }
             grid.render_text(ctx, cmd, slot, uniforms);
             device.cmd_end_rendering(cmd);
             device.cmd_pipeline_barrier(
@@ -818,6 +851,200 @@ mod row_patch_tests {
         });
         // submit_oneshot waits for its fence before buffers/images are read/dropped.
         unsafe { std::slice::from_raw_parts(output.as_mut_ptr(), 64 * 64 * 4).to_vec() }
+    }
+
+    #[test]
+    #[ignore = "requires an X11 display and Vulkan device"]
+    fn background_pixels_match_fullscreen_reference() {
+        use bytemuck::Zeroable;
+        let window = x11::Window::new();
+        let ctx = VulkanContext::new(window.handle());
+        let mut grid = VulkanGridRenderer::new(&ctx, 4, 3);
+        let reference = build_pipeline(
+            ctx.device(),
+            ctx.pipeline_cache(),
+            grid.pipelines.bg_pipeline_layout,
+            ctx.swapchain_format(),
+            include_bytes!(concat!(env!("OUT_DIR"), "/grid_bg_reference.vert.spv")),
+            include_bytes!(concat!(env!("OUT_DIR"), "/grid_bg_reference.frag.spv")),
+            &[],
+            &[],
+            vk::PrimitiveTopology::TRIANGLE_LIST,
+            BlendMode::Premultiplied,
+        );
+        let clear = [0.13, 0.27, 0.41, 0.67];
+        for colorspace in 0..3 {
+            for padding in 0..16 {
+                for pattern in 0..3 {
+                    for geometry in 0..5 {
+                        let mut u = GridUniforms::zeroed();
+                        u.projection = [
+                            2.0 / 64.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            2.0 / 64.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            1.0,
+                            0.0,
+                            -1.0,
+                            -1.0,
+                            0.0,
+                            1.0,
+                        ];
+                        u.grid_size = [4, 3];
+                        u.input_colorspace = colorspace;
+                        u.padding_extend = padding;
+                        u.cell_size = [
+                            [12.0, 14.0],
+                            [10.5, 11.25],
+                            [9.6, 13.6],
+                            [0.25, 0.375],
+                            [4096.25, 8192.5],
+                        ][geometry];
+                        let [left, top] = [
+                            [0.0, 0.0],
+                            [4.25, 3.75],
+                            [-3.25, -1.5],
+                            [0.4, 0.3],
+                            [-4096.0, -8192.25],
+                        ][geometry];
+                        u.grid_padding = [top, 0.0, 0.0, left];
+                        u.cursor_pos =
+                            [[0, 0], [u32::MAX; 2], [3, 2], [1, 1], [1, 1]][geometry];
+                        u.cursor_bg_color = [0.71, 0.29, 0.13, 0.63];
+                        if geometry == 1 {
+                            u.panel_rect = [2.25, 1.5, 54.5, 55.5];
+                            u.panel_radius = 7.25;
+                        }
+                        for y in 0..3 {
+                            let cells: Vec<_> = (0..4)
+                                .map(|x| {
+                                    let i = y * 4 + x;
+                                    CellBg {
+                                        rgba: if pattern == 0 && padding & 1 == 0 {
+                                            [0; 4]
+                                        } else if pattern == 0 || (pattern == 1 && i != 5)
+                                        {
+                                            [137, 61, 229, 0]
+                                        } else {
+                                            [
+                                                17 + i * 19,
+                                                241 - i * 13,
+                                                23 + i * 11,
+                                                [255, 128, 33][i as usize % 3],
+                                            ]
+                                        },
+                                    }
+                                })
+                                .collect();
+                            grid.write_row(y as u32, &cells, &[]);
+                        }
+                        let slot = (padding as usize + geometry) % FRAMES_IN_FLIGHT;
+                        let expected = read_grid_pixels(
+                            &ctx,
+                            &mut grid,
+                            slot,
+                            &u,
+                            Some(reference),
+                            clear,
+                        );
+                        let actual =
+                            read_grid_pixels(&ctx, &mut grid, slot, &u, None, clear);
+                        assert_eq!(actual, expected,
+                            "colorspace={colorspace} padding={padding} pattern={pattern} geometry={geometry}");
+                    }
+                }
+            }
+        }
+        unsafe {
+            ctx.device().destroy_pipeline(reference, None);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an X11 display and Vulkan device"]
+    fn color_glyph_pixels_ignore_foreground_and_cursor_tint() {
+        use bytemuck::Zeroable;
+        let window = x11::Window::new();
+        let ctx = VulkanContext::new(window.handle());
+        let mut grid = VulkanGridRenderer::new(&ctx, 1, 1);
+        let bytes = [30, 110, 190, 192].repeat(8 * 16);
+        let slot = grid
+            .insert_glyph_color(
+                GlyphKey {
+                    font_id: 0,
+                    glyph_id: 1,
+                    size_bucket: 64,
+                },
+                RasterizedGlyph {
+                    width: 8,
+                    height: 16,
+                    bearing_x: 0,
+                    bearing_y: 16,
+                    bytes: &bytes,
+                },
+            )
+            .unwrap();
+        let mut u = GridUniforms::zeroed();
+        u.projection = [
+            2.0 / 64.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            2.0 / 64.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            -1.0,
+            -1.0,
+            0.0,
+            1.0,
+        ];
+        u.grid_size = [1, 1];
+        u.cell_size = [16.0, 16.0];
+        u.cursor_pos = [0, 0];
+        let mut expected = None;
+        for cs in 0..3 {
+            for (index, color) in [[255; 4], [0; 4], [213, 17, 91, 71]]
+                .into_iter()
+                .enumerate()
+            {
+                u.input_colorspace = cs;
+                u.cursor_color = if index == 0 {
+                    [0.0; 4]
+                } else {
+                    [0.9, 0.1, 0.7, 0.5]
+                };
+                grid.write_row(
+                    0,
+                    &[],
+                    &[CellText {
+                        glyph_pos: [slot.x as u32, slot.y as u32],
+                        glyph_size: [slot.w as u32, slot.h as u32],
+                        bearings: [0, 16],
+                        color,
+                        atlas: CellText::ATLAS_COLOR,
+                        ..CellText::default()
+                    }],
+                );
+                let pixels = read_text_pixels(&ctx, &mut grid, index, &u);
+                if let Some(expected) = &expected {
+                    assert_eq!(&pixels, expected, "colorspace={cs} tint={index}");
+                } else {
+                    assert!(pixels.iter().any(|&b| b != 0));
+                    expected = Some(pixels);
+                }
+            }
+        }
     }
 
     #[test]
@@ -2348,8 +2575,8 @@ impl VulkanGridRenderer {
     }
 
     /// Record the cell-bg pass into `cmd`. Uploads bg cells +
-    /// uniforms for `frame_slot` first, then issues the fullscreen
-    /// triangle. Caller must have opened the dynamic-rendering pass +
+    /// uniforms for `frame_slot` first, then issues instanced cell quads.
+    /// Caller must have opened the dynamic-rendering pass +
     /// set viewport/scissor + flushed atlas uploads via `prepare()`.
     /// Pair with `render_text`, with any `kitty_below_text` images
     /// composited in between.
@@ -2383,6 +2610,16 @@ impl VulkanGridRenderer {
             return;
         }
 
+        let (instances, first) = if self.bg_visible_rows == 0 {
+            let [x, y] = uniforms.cursor_pos;
+            if x >= self.cols || y >= self.rows {
+                return;
+            }
+            (1, y * self.cols + x)
+        } else {
+            (self.cols * self.rows, 0)
+        };
+
         unsafe {
             self.shared.cmd_bind_pipeline(
                 cmd,
@@ -2397,7 +2634,7 @@ impl VulkanGridRenderer {
                 &[self.bg_descriptor_sets[slot]],
                 &[],
             );
-            self.shared.cmd_draw(cmd, 3, 1, 0, 0);
+            self.shared.cmd_draw(cmd, 4, instances, 0, first);
         }
     }
 
@@ -2869,7 +3106,7 @@ fn create_bg_descriptor_set_layout(device: &ash::Device) -> vk::DescriptorSetLay
             .binding(1)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
     ];
     let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
     unsafe {
@@ -3101,8 +3338,8 @@ fn create_bg_pipeline(
         BG_FRAG_SPV,
         &[], // no vertex bindings
         &[],
-        vk::PrimitiveTopology::TRIANGLE_LIST,
-        BlendMode::Premultiplied, // bg uses src=SRC_ALPHA
+        vk::PrimitiveTopology::TRIANGLE_STRIP,
+        BlendMode::Premultiplied,
     )
 }
 
