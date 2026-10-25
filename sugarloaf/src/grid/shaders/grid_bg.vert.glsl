@@ -108,8 +108,11 @@ void main() {
         gl_Position.x = -gl_Position.w;
     if (cell.x + 1u == uniforms.grid_size.x && corner.x == 1.0 && (uniforms.padding_extend & 2u) != 0u)
         gl_Position.x = gl_Position.w;
+    // Production flips both the projection and Vulkan viewport vertically.
+    // Padding follows framebuffer edges under either coordinate convention.
+    float top_clip = uniforms.projection[1][1] < 0.0 ? 1.0 : -1.0;
     if (cell.y == 0u && corner.y == 0.0 && (uniforms.padding_extend & 4u) != 0u)
-        gl_Position.y = -gl_Position.w;
+        gl_Position.y = top_clip * gl_Position.w;
     if (cell.y + 1u == uniforms.grid_size.y && corner.y == 1.0 && (uniforms.padding_extend & 8u) != 0u)
-        gl_Position.y = gl_Position.w;
+        gl_Position.y = -top_clip * gl_Position.w;
 }

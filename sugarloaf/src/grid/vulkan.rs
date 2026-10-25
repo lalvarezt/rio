@@ -764,14 +764,15 @@ mod row_patch_tests {
                     .layer_count(1)
                     .color_attachments(&attachments),
             );
+            let flipped = uniforms.projection[5] < 0.0;
             device.cmd_set_viewport(
                 cmd,
                 0,
                 &[vk::Viewport {
                     x: 0.0,
-                    y: 0.0,
+                    y: if flipped { 64.0 } else { 0.0 },
                     width: 64.0,
-                    height: 64.0,
+                    height: if flipped { -64.0 } else { 64.0 },
                     min_depth: 0.0,
                     max_depth: 1.0,
                 }],
@@ -873,7 +874,7 @@ mod row_patch_tests {
             BlendMode::Premultiplied,
         );
         let clear = [0.13, 0.27, 0.41, 0.67];
-        for colorspace in 0..3 {
+        for (colorspace, flipped) in (0..3).flat_map(|cs| [(cs, false), (cs, true)]) {
             for padding in 0..16 {
                 for pattern in 0..3 {
                     for geometry in 0..5 {
@@ -896,6 +897,10 @@ mod row_patch_tests {
                             0.0,
                             1.0,
                         ];
+                        if flipped {
+                            u.projection[5] = -u.projection[5];
+                            u.projection[13] = -u.projection[13];
+                        }
                         u.grid_size = [4, 3];
                         u.input_colorspace = colorspace;
                         u.padding_extend = padding;
@@ -956,7 +961,7 @@ mod row_patch_tests {
                         let actual =
                             read_grid_pixels(&ctx, &mut grid, slot, &u, None, clear);
                         assert_eq!(actual, expected,
-                            "colorspace={colorspace} padding={padding} pattern={pattern} geometry={geometry}");
+                            "colorspace={colorspace} flipped={flipped} padding={padding} pattern={pattern} geometry={geometry}");
                     }
                 }
             }
