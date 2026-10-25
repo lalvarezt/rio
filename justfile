@@ -9,6 +9,15 @@ default:
 bench *args:
     python3 misc/ghostty-bench/compare.py {{ args }}
 
+# Regenerate the improvement chart from stored measurements without benchmarking.
+bench-chart *args:
+    node misc/ghostty-bench/timeline-chart.cjs {{ args }}
+
+# Regenerate a run's comparison table from its report.json.
+[unix]
+bench-report report:
+    python3 misc/ghostty-bench/report.py {{ quote(report) }}
+
 # Build and install Rio, including the platform's runtime and desktop files.
 # Reuse a build with --binary PATH on Unix or -Binary PATH on Windows.
 [windows]
