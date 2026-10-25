@@ -37,6 +37,7 @@ use rio_backend::crosswords::square::{ContentTag, Square, Wide};
 use rio_backend::crosswords::style::{Style, StyleFlags, UnderlineKind};
 use rio_backend::selection::SelectionRange;
 use rustc_hash::FxHashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// Snapshot's per-frame extras map. Keyed by the cell's `extras_id`,
@@ -46,6 +47,8 @@ pub use rio_backend::crosswords::snapshot::SnapshotExtras as ExtrasMap;
 
 pub mod preedit;
 pub mod prepared;
+#[cfg(not(target_os = "macos"))]
+mod shape_reuse;
 use preedit::{PreeditCaret, PreeditCell, PreeditLine};
 
 /// The IME composition threaded into a row build. Only handed to the
@@ -1282,6 +1285,64 @@ struct ShapedRun {
     advance: f32,
     ascent_px: i16,
     glyphs: Vec<ShapedGlyph>,
+    reused: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Clone, Copy)]
+struct ResolvedGlyph {
+    slot: AtlasSlot,
+    is_color: bool,
+}
+
+struct RunGeometry {
+    // Keep the shape alive so its address cannot be recycled under this key.
+    _run: Arc<ShapedRun>,
+    glyphs: Arc<[ResolvedGlyph]>,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct GeometryCache {
+    entries: FxHashMap<(u64, usize), RunGeometry>,
+    order: VecDeque<(u64, usize)>,
+    bytes: usize,
+}
+
+impl GeometryCache {
+    fn insert(
+        &mut self,
+        generation: u64,
+        run: &Arc<ShapedRun>,
+        glyphs: &Arc<[ResolvedGlyph]>,
+    ) {
+        const MAX_BYTES: usize = 16 * 1024 * 1024;
+        let bytes = std::mem::size_of_val(glyphs.as_ref())
+            + run.glyphs.capacity() * std::mem::size_of::<ShapedGlyph>()
+            + std::mem::size_of::<RunGeometry>()
+            + std::mem::size_of::<ShapedRun>();
+        if bytes > MAX_BYTES {
+            return;
+        }
+        while self.bytes + bytes > MAX_BYTES || self.entries.len() >= 2048 {
+            let Some(key) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(old) = self.entries.remove(&key) {
+                self.bytes -= old.bytes;
+            }
+        }
+        let key = (generation, Arc::as_ptr(run) as usize);
+        self.entries.insert(
+            key,
+            RunGeometry {
+                _run: run.clone(),
+                glyphs: glyphs.clone(),
+                bytes,
+            },
+        );
+        self.order.push_back(key);
+        self.bytes += bytes;
+    }
 }
 
 struct RunCacheEntry {
@@ -1309,6 +1370,7 @@ pub struct GridGlyphRasterizer {
     /// convention.
     synthesis_cache: FxHashMap<u32, (bool, bool)>,
     run_cache: Vec<Vec<RunCacheEntry>>,
+    geometry_cache: GeometryCache,
 
     // macOS: stage the run in UTF-16 (what CoreText wants natively)
     // so the shaper call can hand the buffer straight to
@@ -1354,6 +1416,8 @@ pub struct GridGlyphRasterizer {
     #[cfg(not(target_os = "macos"))]
     shape_ctx: rio_backend::sugarloaf::swash::shape::ShapeContext,
     #[cfg(not(target_os = "macos"))]
+    simple_plans: FxHashMap<(u32, u16, u16), Option<shape_reuse::SimpleRunPlan>>,
+    #[cfg(not(target_os = "macos"))]
     scale_ctx: rio_backend::sugarloaf::swash::scale::ScaleContext,
     // Raster misses reuse one bitmap allocation across glyphs.
     #[cfg(not(target_os = "macos"))]
@@ -1384,6 +1448,7 @@ impl GridGlyphRasterizer {
             run_cache: (0..RUN_BUCKET_COUNT)
                 .map(|_| Vec::with_capacity(RUN_BUCKET_SIZE))
                 .collect(),
+            geometry_cache: GeometryCache::default(),
             #[cfg(target_os = "macos")]
             run_utf16_scratch: Vec::new(),
             run_cell_starts: Vec::new(),
@@ -1397,6 +1462,8 @@ impl GridGlyphRasterizer {
             wght_cache: FxHashMap::default(),
             #[cfg(not(target_os = "macos"))]
             shape_ctx: rio_backend::sugarloaf::swash::shape::ShapeContext::new(),
+            #[cfg(not(target_os = "macos"))]
+            simple_plans: FxHashMap::default(),
             #[cfg(not(target_os = "macos"))]
             scale_ctx: rio_backend::sugarloaf::swash::scale::ScaleContext::new(),
             #[cfg(not(target_os = "macos"))]
@@ -1412,6 +1479,7 @@ impl GridGlyphRasterizer {
         self.font_resolve.clear();
         self.ascent_cache.clear();
         self.synthesis_cache.clear();
+        self.geometry_cache = GeometryCache::default();
         for bucket in &mut self.run_cache {
             bucket.clear();
         }
@@ -1422,6 +1490,7 @@ impl GridGlyphRasterizer {
         {
             self.wght_cache.clear();
             self.font_data_cache.clear();
+            self.simple_plans.clear();
         }
     }
 
@@ -1679,6 +1748,7 @@ fn shape_run_ct(
         glyphs,
         ascent_px,
         advance,
+        reused: std::sync::atomic::AtomicBool::new(false),
     })
 }
 
@@ -1726,6 +1796,73 @@ fn shape_run_swash(
         tag: WGHT_TAG,
         value: v,
     });
+    let plan_key = (font_id, size_u16, size_bucket);
+    if !rasterizer.simple_plans.contains_key(&plan_key) {
+        if rasterizer.simple_plans.len() >= 128 {
+            rasterizer.simple_plans.clear();
+        }
+        rasterizer.simple_plans.insert(
+            plan_key,
+            shape_reuse::SimpleRunPlan::new(font_ref.data, font_ref.offset).ok(),
+        );
+    }
+    if let Some(plan) = rasterizer
+        .simple_plans
+        .get_mut(&plan_key)
+        .and_then(Option::as_mut)
+    {
+        let simple = plan.shape(
+            &rasterizer.run_str_scratch,
+            &rasterizer.run_cell_starts,
+            |byte| {
+                let mut shaper = rasterizer
+                    .shape_ctx
+                    .builder(font_ref)
+                    .size(size_u16 as f32)
+                    .features(features.iter().copied())
+                    .variations(wght_var.iter().copied())
+                    .build();
+                let bytes = [byte];
+                shaper.add_str(std::str::from_utf8(&bytes).ok()?);
+                let mut result = None;
+                let mut valid = true;
+                shaper.shape_with(|cluster| {
+                    if cluster.source.start != 0
+                        || cluster.glyphs.len() != 1
+                        || result.is_some()
+                    {
+                        valid = false;
+                    } else {
+                        let glyph = cluster.glyphs[0];
+                        result = Some(shape_reuse::SimpleGlyph {
+                            id: glyph.id,
+                            advance: glyph.advance,
+                        });
+                    }
+                });
+                if valid {
+                    result
+                } else {
+                    None
+                }
+            },
+        );
+        if let Some(simple) = simple {
+            return Some(ShapedRun {
+                advance: simple.advance,
+                ascent_px,
+                glyphs: simple
+                    .glyphs
+                    .into_iter()
+                    .map(|g| ShapedGlyph {
+                        id: g.id,
+                        cell: g.cell,
+                    })
+                    .collect(),
+                reused: std::sync::atomic::AtomicBool::new(false),
+            });
+        }
+    }
     let mut shaper = rasterizer
         .shape_ctx
         .builder(font_ref)
@@ -1751,6 +1888,7 @@ fn shape_run_swash(
         glyphs,
         ascent_px,
         advance,
+        reused: std::sync::atomic::AtomicBool::new(false),
     })
 }
 
@@ -1778,6 +1916,10 @@ fn shape_cached(
     rasterizer.run_cell_starts.hash(&mut hasher);
     let hash = hasher.finish();
     if let Some(entry) = run_cache_get(&mut rasterizer.run_cache, hash) {
+        entry
+            .run
+            .reused
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         return Some(entry.run.clone());
     }
     #[cfg(target_os = "macos")]
@@ -2248,7 +2390,19 @@ pub fn build_row_fg<P: GridPalette>(
             rasterizer.get_synthesis(font_id, font_library);
 
         let ascent_px = run.ascent_px;
-        for glyph in &run.glyphs {
+        let geometry = resolve_run_geometry(
+            &run,
+            rasterizer,
+            grid,
+            font_id,
+            size_bucket,
+            size_u16,
+            cell_h,
+            is_emoji,
+            synthetic_italic,
+            synthetic_bold,
+        );
+        for (index, glyph) in run.glyphs.iter().enumerate() {
             // Map the appended-cell index back to its actual grid
             // column. Spacer cells were skipped from the run text so
             // the cached cell index no longer equals `column - run_start`;
@@ -2263,19 +2417,24 @@ pub fn build_row_fg<P: GridPalette>(
                 continue;
             }
 
-            let Some((_, slot, is_color)) = ensure_glyph_by_id(
-                rasterizer,
-                grid,
-                font_id,
-                glyph.id,
-                size_bucket,
-                size_u16,
-                cell_h,
-                ascent_px,
-                is_emoji,
-                synthetic_italic,
-                synthetic_bold,
-            ) else {
+            let resolved = geometry.as_ref().map(|cells| cells[index]);
+            let resolved = resolved.or_else(|| {
+                ensure_glyph_by_id(
+                    rasterizer,
+                    grid,
+                    font_id,
+                    glyph.id,
+                    size_bucket,
+                    size_u16,
+                    cell_h,
+                    ascent_px,
+                    is_emoji,
+                    synthetic_italic,
+                    synthetic_bold,
+                )
+                .map(|(_, slot, is_color)| ResolvedGlyph { slot, is_color })
+            });
+            let Some(ResolvedGlyph { slot, is_color }) = resolved else {
                 continue;
             };
             if slot.w == 0 || slot.h == 0 {
@@ -2802,6 +2961,122 @@ fn emit_strikethroughs<P: GridPalette>(
             page: slot.page,
             _pad: 0,
         });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_run_geometry(
+    run: &Arc<ShapedRun>,
+    rasterizer: &mut GridGlyphRasterizer,
+    grid: &mut GridRenderer,
+    font_id: u32,
+    size_bucket: u16,
+    size_u16: u16,
+    cell_h: f32,
+    is_emoji: bool,
+    synthetic_italic: bool,
+    synthetic_bold: bool,
+) -> Option<Arc<[ResolvedGlyph]>> {
+    // Bound both entries and bytes across all panes, rather than letting a
+    // third pane evict two per-run atlas records on every frame.
+    if run.glyphs.len() > 1024 || !run.reused.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let generation = grid.atlas_generation();
+    if let Some(entry) = rasterizer
+        .geometry_cache
+        .entries
+        .get(&(generation, Arc::as_ptr(run) as usize))
+    {
+        return Some(entry.glyphs.clone());
+    }
+    let mut glyphs = Vec::with_capacity(run.glyphs.len());
+    for glyph in &run.glyphs {
+        let (_, slot, is_color) = ensure_glyph_by_id(
+            rasterizer,
+            grid,
+            font_id,
+            glyph.id,
+            size_bucket,
+            size_u16,
+            cell_h,
+            run.ascent_px,
+            is_emoji,
+            synthetic_italic,
+            synthetic_bold,
+        )?;
+        glyphs.push(ResolvedGlyph { slot, is_color });
+    }
+    let glyphs: Arc<[ResolvedGlyph]> = glyphs.into();
+    // A capacity reset while resolving glyphs invalidates earlier slots in
+    // this very run. The frontend will retry the row after the full rebuild.
+    if grid.atlas_generation() == generation {
+        rasterizer.geometry_cache.insert(generation, run, &glyphs);
+    }
+    Some(glyphs)
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+    use rio_backend::sugarloaf::grid::cpu::CpuGridRenderer;
+
+    #[test]
+    fn resolved_slots_follow_grid_identity_and_atlas_resets() {
+        let fonts = FontLibrary::default();
+        let mut rasterizer = GridGlyphRasterizer::new();
+        let (font, emoji) = rasterizer.resolve_font('A', 0, &fonts, 0);
+        let (bold, italic) = rasterizer.get_synthesis(font, &fonts);
+        let run =
+            shape_preedit_text(&mut rasterizer, "ABC", font, 16, 64, &fonts).unwrap();
+        let run_again =
+            shape_preedit_text(&mut rasterizer, "ABC", font, 16, 64, &fonts).unwrap();
+        assert!(Arc::ptr_eq(&run, &run_again));
+        let mut a = GridRenderer::Cpu(CpuGridRenderer::new(80, 24));
+        let mut b = GridRenderer::Cpu(CpuGridRenderer::new(80, 24));
+        let resolve = |rasterizer: &mut GridGlyphRasterizer, grid: &mut GridRenderer| {
+            resolve_run_geometry(
+                &run, rasterizer, grid, font, 64, 16, 20.0, emoji, italic, bold,
+            )
+            .unwrap()
+        };
+        let first = resolve(&mut rasterizer, &mut a);
+        assert!(Arc::ptr_eq(&first, &resolve(&mut rasterizer, &mut a)));
+        let second = resolve(&mut rasterizer, &mut b);
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "panes cannot share atlas slots"
+        );
+        a.clear_atlas();
+        let changed = resolve(&mut rasterizer, &mut a);
+        assert!(
+            !Arc::ptr_eq(&first, &changed),
+            "cleared slots cannot survive a reset"
+        );
+        assert!(Arc::ptr_eq(&second, &resolve(&mut rasterizer, &mut b)));
+        a.insert_glyph(
+            GlyphKey {
+                font_id: font,
+                glyph_id: run.glyphs[0].id as u32,
+                size_bucket: 64,
+            },
+            RasterizedGlyph {
+                width: 1,
+                height: 1,
+                bearing_x: 0,
+                bearing_y: 1,
+                bytes: &[255],
+            },
+        )
+        .unwrap();
+        let replaced = resolve(&mut rasterizer, &mut a);
+        assert!(!Arc::ptr_eq(&changed, &replaced));
+        assert_eq!(
+            replaced[0].slot.w, 1,
+            "replacing a key invalidates resolved locations"
+        );
+        rasterizer.clear_font_caches();
+        assert!(rasterizer.geometry_cache.entries.is_empty());
     }
 }
 

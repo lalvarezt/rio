@@ -4440,6 +4440,8 @@ impl Screen<'_> {
                     prepared,
                 } = grid;
 
+                prepared.sync_atlas_generation(grid.atlas_generation());
+
                 // New buffers need every row even if terminal damage is partial.
                 let force_full = grid.needs_full_rebuild()
                     || matches!(p.damage, rio_backend::event::TerminalDamage::Full);
@@ -4568,8 +4570,8 @@ impl Screen<'_> {
                             if grid.needs_full_rebuild() {
                                 prepared.clear();
                             } else if let Some(cached) = prepared.get(input) {
-                                cached.restore(y as u16, bg_scratch, fg_scratch);
-                                grid.write_row(y as u32, bg_scratch, fg_scratch);
+                                let (background, foreground) = cached.retained();
+                                grid.write_retained_row(y as u32, background, foreground);
                                 return;
                             }
                         }

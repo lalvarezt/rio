@@ -10,6 +10,7 @@ use rio_backend::crosswords::snapshot::{RowStyles, SnapshotCells};
 use rio_backend::crosswords::square::Square;
 use rio_backend::sugarloaf::grid::{CellBg, CellText};
 use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
 pub struct RowInput<'a> {
     hash: u64,
@@ -50,11 +51,16 @@ pub struct PreparedRow {
     hints: Vec<RowHint>,
     cursor: Option<u16>,
     background: Vec<CellBg>,
-    foreground: Vec<CellText>,
+    foreground: Arc<[CellText]>,
     used: u64,
 }
 
 impl PreparedRow {
+    /// Immutable row-local geometry. Placement belongs to the renderer.
+    pub fn retained(&self) -> (&[CellBg], &Arc<[CellText]>) {
+        (&self.background, &self.foreground)
+    }
+
     fn matches(&self, input: &RowInput<'_>) -> bool {
         self.selection == input.selection
             && self.cursor == input.cursor
@@ -72,7 +78,8 @@ impl PreparedRow {
         foreground: &mut Vec<CellText>,
     ) {
         background.clone_from(&self.background);
-        foreground.clone_from(&self.foreground);
+        foreground.clear();
+        foreground.extend_from_slice(&self.foreground);
         for cell in foreground {
             cell.grid_pos[1] = row;
         }
@@ -83,7 +90,7 @@ impl PreparedRow {
         self.styles.clone_from(&RowStyles::DEFAULT);
         self.hints.clear();
         self.background.clear();
-        self.foreground.clear();
+        // Preserve reusable storage. put() only mutates uniquely owned payloads.
     }
 }
 
@@ -99,9 +106,19 @@ pub struct PreparedRows {
     spare: Vec<PreparedRow>,
     settings: Option<Box<Settings>>,
     frame: u64,
+    atlas_generation: Option<u64>,
 }
 
 impl PreparedRows {
+    /// Atlas pages may append without changing this token. Destructive clears
+    /// and renderer replacement mint a different token, invalidating all UVs.
+    pub fn sync_atlas_generation(&mut self, generation: u64) {
+        if self.atlas_generation != Some(generation) {
+            self.clear();
+            self.atlas_generation = Some(generation);
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
@@ -159,8 +176,16 @@ impl PreparedRows {
         row.hints.extend_from_slice(input.hints);
         row.background.clear();
         row.background.extend_from_slice(background);
-        row.foreground.clear();
-        row.foreground.extend_from_slice(foreground);
+        if row.foreground.len() != foreground.len()
+            || Arc::get_mut(&mut row.foreground).is_none()
+        {
+            row.foreground = Arc::from(foreground);
+        }
+        let local = Arc::get_mut(&mut row.foreground).unwrap();
+        local.copy_from_slice(foreground);
+        for cell in local {
+            cell.grid_pos[1] = 0;
+        }
         row.used = self.frame;
     }
 
@@ -269,5 +294,40 @@ mod tests {
         assert_eq!(rows.spare.len(), 1);
         rows.clear();
         assert!(rows.get(&first).is_none());
+    }
+
+    #[test]
+    fn retained_geometry_stays_local_and_atlas_clear_retires_identity() {
+        let styles = RowStyles::default();
+        let extras = ExtrasMap::default();
+        let colors = TermColors::default();
+        let cells = [Square::from_char('a')];
+        let input = RowInput::new(&cells, &styles, &extras, None, &[], None);
+        let mut rows = PreparedRows::default();
+        rows.sync_atlas_generation(11);
+        rows.begin(1, [16.0, 9.0, 20.0], &colors);
+        rows.put(
+            &input,
+            &[],
+            &[CellText {
+                grid_pos: [0, 9],
+                ..Default::default()
+            }],
+        );
+        let geometry = rows.get(&input).unwrap().retained().1.clone();
+        assert_eq!(geometry[0].grid_pos, [0, 0]);
+        rows.sync_atlas_generation(11);
+        assert!(Arc::ptr_eq(
+            rows.get(&input).unwrap().retained().1,
+            &geometry
+        ));
+        let mut fg = Vec::new();
+        rows.get(&input)
+            .unwrap()
+            .restore(4, &mut Vec::new(), &mut fg);
+        assert_eq!(fg[0].grid_pos[1], 4);
+        assert_eq!(geometry[0].grid_pos[1], 0);
+        rows.sync_atlas_generation(12);
+        assert!(rows.get(&input).is_none());
     }
 }
