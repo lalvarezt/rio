@@ -108,14 +108,26 @@ pub fn atlases() {
         support::measure(&format!("{prefix}/lookup"), 1, || {
             black_box(atlas.lookup(black_box(key(0))).unwrap()).x as u64
         });
-        support::measure_cold(&format!("{prefix}/insert_batch"), 128, new, |atlas| {
-            for id in 0..128 {
-                black_box(atlas.insert(key(id), glyph).unwrap());
-            }
-            atlas.side() as u64
-        });
-        for side in [1024u16, 2048] {
-            let name = format!("{prefix}/grow_{side}");
+        support::measure_cold(
+            &format!("{prefix}/insert_batch"),
+            128,
+            || {
+                // Match the old fixture: its constructor allocated the first page
+                // outside the timer. append_page_after_0 measures initial allocation.
+                let mut atlas = new();
+                assert!(atlas.grow());
+                atlas
+            },
+            |atlas| {
+                for id in 0..128 {
+                    black_box(atlas.insert(key(id), glyph).unwrap());
+                }
+                atlas.side() as u64
+            },
+        );
+        for pages in [0u32, 1, 8] {
+            let side = 1024u16;
+            let name = format!("{prefix}/append_page_after_{pages}");
             if !support::selected(&name) {
                 continue;
             }
@@ -131,17 +143,17 @@ pub fn atlases() {
                 side as usize * side as usize * bpp,
                 || {
                     let mut atlas = new();
-                    if side == 2048 {
-                        assert!(atlas.grow());
+                    for id in 0..pages {
+                        atlas.insert(key(id), full).unwrap();
                     }
-                    atlas.insert(key(0), full).unwrap();
                     atlas
                 },
                 |atlas| {
-                    assert!(atlas.grow());
+                    let slot = atlas.insert(key(pages), full).unwrap();
+                    assert_eq!(slot.page as u32, pages);
                     assert!(atlas.lookup(key(0)).is_some());
-                    black_box(atlas.pixels());
-                    atlas.side() as u64
+                    black_box(atlas.page_pixels(slot.page));
+                    slot.page as u64
                 },
             );
         }

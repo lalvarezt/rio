@@ -69,6 +69,8 @@ def main():
                      for name, binary in binaries.items()}
     source_hashes = {name: hashlib.sha256((source / name).read_bytes()).hexdigest() for name in (
         "sugarloaf/src/grid/cpu.rs", "sugarloaf/src/grid/vulkan.rs", "sugarloaf/src/renderer/cpu.rs",
+        "sugarloaf/src/grid/mod.rs", "sugarloaf/src/grid/atlas.rs",
+        "sugarloaf/src/grid/shaders/grid_text.vert.glsl",
         "sugarloaf/src/premul.rs", "sugarloaf/src/text.rs",
         "sugarloaf/benches/rendering.rs", "sugarloaf/benches/branch_gpu.rs",
         "misc/benchmarks/cpu_state.rs", "misc/benchmarks/support.rs")}
@@ -90,9 +92,10 @@ def main():
     with display() if args.gpu else contextlib.nullcontext({}) as graphics:
         env.update(graphics)
         if args.validate:
-            tests = [["cargo", "test", "-p", "sugarloaf", "--profile", "bench", "--features", "rio-window/x11", "--lib"]]
+            tests = [["cargo", "test", "-p", "sugarloaf", "-p", "rio-grid", "--profile", "bench", "--lib"]]
             if args.gpu:
                 tests.append(tests[0] + ["mixed_atlas_edits_reach_every_frame_slot", "--", "--ignored"])
+                tests.append(tests[0] + ["retained_pixels_match_compact_across_frame_slots", "--", "--ignored"])
             for index, test in enumerate(tests):
                 print("Validating " + " ".join(test), flush=True)
                 with (out / f"tests-{index}.log").open("w") as log:
@@ -132,7 +135,7 @@ def main():
                      ("rendering", "cpu/glyphs/mask"),
                      ("rendering", "cpu/glyphs/color"),
                      ("rendering", "cpu/state_hash/160x48/unchanged"),
-                     ("rendering", "cpu/atlas/color/grow_2048"),
+                     ("rendering", "cpu/atlas/color/append_page_after_8"),
                      ("branch_performance", "title_churn")]
             if args.gpu:
                 cases.append(("branch_gpu", "gpu/row_storage/tail_change"))

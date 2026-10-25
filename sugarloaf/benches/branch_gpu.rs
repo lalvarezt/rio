@@ -15,6 +15,7 @@ mod native {
     use std::{
         ffi::{c_int, c_ulong, c_void},
         ptr::NonNull,
+        sync::Arc,
     };
     use sugarloaf::{
         context::vulkan::{VulkanContext, FRAMES_IN_FLIGHT},
@@ -143,7 +144,11 @@ mod native {
                     .unwrap()[0];
                 let frame = ctx.acquire_frame().expect("acquire benchmark image");
                 let mut bg = vec![CellBg::TRANSPARENT; 160];
-                for buckets in [1, 2] {
+                // Preserve the original controls' history before exercising the
+                // retained cache, whose payloads and buffers remain allocated.
+                for (buckets, retained_cases) in
+                    [(1, false), (2, false), (1, true), (2, true)]
+                {
                     bg.fill(CellBg::TRANSPARENT);
                     let mut cells: Vec<_> = (0..160)
                         .map(|x| CellText {
@@ -155,7 +160,23 @@ mod native {
                     for row in 0..48 {
                         grid.write_row(row, &bg, &cells);
                     }
+                    let retained: Vec<Arc<[CellText]>> =
+                        (0..if retained_cases { 64 } else { 0 })
+                            .map(|i| {
+                                cells
+                                    .iter()
+                                    .map(|cell| CellText {
+                                        grid_pos: [cell.grid_pos[0], 0],
+                                        color: [i as u8, 200, 255, 255],
+                                        ..*cell
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .into()
+                            })
+                            .collect();
                     for mode in [
+                        "copied_scroll",
+                        "retained_scroll",
                         "full",
                         "full_all_cells",
                         "one_row",
@@ -168,12 +189,32 @@ mod native {
                         "bg_distant_rows",
                         "bg_full",
                     ] {
+                        if mode.ends_with("_scroll") != retained_cases {
+                            continue;
+                        }
                         let name = format!("gpu/record/{buckets}_atlas/{mode}");
                         let mut sequence = 0usize;
                         support::measure(&name, 160 * 48, || {
                             sequence += 1;
                             let slot = sequence % FRAMES_IN_FLIGHT;
-                            if mode.starts_with("bg_") {
+                            if mode.ends_with("_scroll") {
+                                for row in 0..48 {
+                                    let payload =
+                                        &retained[(row + sequence) % retained.len()];
+                                    if mode == "retained_scroll" {
+                                        grid.write_retained_row(row as u32, &bg, payload);
+                                    } else {
+                                        cells.clear();
+                                        cells.extend(payload.iter().map(|cell| {
+                                            CellText {
+                                                grid_pos: [cell.grid_pos[0], row as u16],
+                                                ..*cell
+                                            }
+                                        }));
+                                        grid.write_row(row as u32, &bg, &cells);
+                                    }
+                                }
+                            } else if mode.starts_with("bg_") {
                                 bg[0].rgba[3] ^= 255;
                                 if mode == "bg_full" {
                                     for row in 0..48 {
@@ -327,13 +368,17 @@ mod native {
                     ("background", "opaque"),
                     ("background", "cursor"),
                     ("glyphs", "mask"),
+                    ("glyphs", "mask_retained"),
                     ("glyphs", "color"),
                     ("glyphs", "mixed"),
+                    ("glyphs", "mixed_retained"),
                 ] {
                     let name = format!("gpu/{pass}/{case}");
                     if !support::selected(&name) {
                         continue;
                     }
+                    let retain = case.ends_with("_retained");
+                    let kind = case.strip_suffix("_retained").unwrap_or(case);
                     let mut bg = vec![CellBg::TRANSPARENT; 160];
                     if case == "sparse" {
                         bg[0].rgba = [40, 100, 200, 160];
@@ -347,14 +392,17 @@ mod native {
                         let cells: Vec<_> = if pass == "glyphs" {
                             (0..160)
                                 .map(|col| {
-                                    let is_color = case == "color"
-                                        || (case == "mixed" && col % 8 == 0);
+                                    let is_color = kind == "color"
+                                        || (kind == "mixed" && col % 8 == 0);
                                     let slot = if is_color { rgba } else { mono };
                                     CellText {
                                         glyph_pos: [slot.x as u32, slot.y as u32],
                                         glyph_size: [8, 16],
                                         bearings: [0, 16],
-                                        grid_pos: [col, row as u16],
+                                        grid_pos: [
+                                            col,
+                                            if retain { 0 } else { row as u16 },
+                                        ],
                                         color: [173, 193, 219, 255],
                                         atlas: u8::from(is_color),
                                         ..Default::default()
@@ -364,7 +412,11 @@ mod native {
                         } else {
                             Vec::new()
                         };
-                        grid.write_row(row, &bg, &cells);
+                        if retain {
+                            grid.write_retained_row(row, &bg, &Arc::from(cells));
+                        } else {
+                            grid.write_row(row, &bg, &cells);
+                        }
                     }
                     // Actual glyph quads need a pixel-to-clip projection. The
                     // recording-only fixtures above deliberately have zero area.

@@ -1,3 +1,5 @@
+#[path = "../../misc/benchmarks/frame_pipeline.rs"]
+mod frame_pipeline;
 #[path = "../../misc/benchmarks/support.rs"]
 mod support;
 
@@ -65,6 +67,7 @@ fn main() {
     let fonts = FontLibrary::default();
     let palette = Palette(Colors::default());
     let term_colors = TermColors::default();
+    frame_pipeline::measure(&fonts, &palette, &term_colors);
     for kind in ["plain", "styled", "unicode", "combining", "preedit"] {
         let columns = 160;
         let mut term = Crosswords::new(
