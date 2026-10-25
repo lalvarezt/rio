@@ -2,6 +2,7 @@
 """Capture Sugarloaf timings, allocations, pixel hashes, and sampled CPU stacks."""
 import argparse
 import contextlib
+import datetime
 import hashlib
 import json
 import os
@@ -79,7 +80,8 @@ def main():
                             for name in binaries}
         if binary_hashes == reference_hashes:
             raise RuntimeError("All reference/current executables are identical; check the build directories")
-    metadata = {"head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=args.source, text=True).strip(),
+    metadata = {"date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=args.source, text=True).strip(),
                 "source": str(source), "binaries_sha256": binary_hashes, "source_sha256": source_hashes,
                 "cpu": args.cpu, "samples": args.samples, "ms": args.ms,
                 "rustc": subprocess.check_output(["rustc", "-Vv"], text=True),
