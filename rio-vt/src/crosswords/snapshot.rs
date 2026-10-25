@@ -226,11 +226,16 @@ impl RowStyles {
         self.mixed.extend(remainder);
     }
 
+    #[inline]
     pub(super) fn resolve(&mut self, src: &Row<Square>, styles: &[Style]) {
         if !src.has_styles {
             self.set_uniform(Style::DEFAULT);
             return;
         }
+        self.resolve_styled(src, styles);
+    }
+
+    fn resolve_styled(&mut self, src: &Row<Square>, styles: &[Style]) {
         let first = src
             .inner
             .first()
@@ -732,10 +737,14 @@ impl SnapshotExtras {
 
     #[inline]
     pub(super) fn refresh(&mut self, y: usize, row: &Row<Square>, table: &ExtrasTable) {
-        let ids = &mut self.rows[y];
-        if !row.has_extras && ids.is_empty() {
+        if !row.has_extras && self.rows[y].is_empty() {
             return;
         }
+        self.refresh_row(y, row, table);
+    }
+
+    fn refresh_row(&mut self, y: usize, row: &Row<Square>, table: &ExtrasTable) {
+        let ids = &mut self.rows[y];
         for id in ids.drain(..) {
             if let Entry::Occupied(mut entry) = self.entries.entry(id) {
                 entry.get_mut().rows -= 1;

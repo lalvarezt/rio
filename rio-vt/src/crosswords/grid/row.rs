@@ -26,10 +26,9 @@ pub enum SemanticPrompt {
 pub struct Row<T> {
     pub inner: Vec<T>,
 
-    /// Maximum number of occupied entries.
-    ///
-    /// This is the upper bound on the number of elements in the row, which have been modified
-    /// since the last reset. All cells after this point are guaranteed to be equal.
+    /// Conservative end of the modified prefix. Plain tails contain the last
+    /// reset's fill, optionally followed by defaults appended during growth.
+    /// Arbitrary appended data carries `has_extras` and uses full snapshots.
     pub(crate) occ: usize,
 
     /// Set when at least one cell in the row contains a kitty Unicode
@@ -124,6 +123,42 @@ impl<T: Clone + Default> Row<T> {
     #[inline]
     pub fn copy_from(&mut self, src: &Self) {
         self.inner.clone_from(&src.inner);
+        self.copy_metadata_from(src);
+    }
+
+    /// Copy a renderer snapshot, retaining an equal plain fill tail. Managed
+    /// rows and changed dimensions or fill values keep the full-copy path.
+    #[inline]
+    pub(crate) fn copy_snapshot_from(&mut self, src: &Self)
+    where
+        T: PartialEq,
+    {
+        let prefix = self.occ.max(src.occ);
+        let len = src.inner.len();
+        if self.inner.len() == len
+            && prefix < len
+            && !self.has_styles
+            && !self.has_extras
+            && !src.has_styles
+            && !src.has_extras
+            && self.inner[len - 1] == src.inner[len - 1]
+            && self.inner[prefix] == self.inner[len - 1]
+            && src.inner[prefix] == src.inner[len - 1]
+        {
+            // Plain rows retain equal fill tails across output frames. Include
+            // the old occupied prefix so shorter lines erase previous text.
+            // Matching both ends excludes a reset-fill/default transition
+            // inside either tail after column growth.
+            // Managed/from_vec rows keep the complete-copy path.
+            self.inner[..prefix].clone_from_slice(&src.inner[..prefix]);
+        } else {
+            self.inner.clone_from(&src.inner);
+        }
+        self.copy_metadata_from(src);
+    }
+
+    #[inline]
+    fn copy_metadata_from(&mut self, src: &Self) {
         self.occ = src.occ;
         self.kitty_virtual_placeholder = src.kitty_virtual_placeholder;
         self.has_extras = src.has_extras;
@@ -300,7 +335,7 @@ impl<T> Row<T> {
         T: Copy + GridSquare,
     {
         self.inner.extend_from_slice(&src.inner[..count]);
-        self.occ += count;
+        self.occ = self.inner.len();
         self.dirty = true;
         // Reflow moves cells between rows, so their conservative hints must
         // follow them too. A false source hint also avoids scanning plain rows.
@@ -472,7 +507,7 @@ impl<T> Index<RangeToInclusive<Column>> for Row<T> {
 impl<T> IndexMut<RangeToInclusive<Column>> for Row<T> {
     #[inline]
     fn index_mut(&mut self, index: RangeToInclusive<Column>) -> &mut [T] {
-        self.occ = max(self.occ, *index.end);
+        self.occ = max(self.occ, *index.end + 1);
         self.dirty = true;
         &mut self.inner[..=(index.end.0)]
     }

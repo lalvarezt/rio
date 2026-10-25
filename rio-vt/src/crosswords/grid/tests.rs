@@ -619,6 +619,161 @@ fn row_hint_follows_erased_background() {
 }
 
 #[test]
+fn row_snapshot_copy_skips_equal_uniform_tails() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    #[derive(Default)]
+    struct Counted {
+        value: u8,
+        copies: Rc<Cell<usize>>,
+    }
+    impl Clone for Counted {
+        fn clone(&self) -> Self {
+            self.copies.set(self.copies.get() + 1);
+            Self {
+                value: self.value,
+                copies: self.copies.clone(),
+            }
+        }
+    }
+    impl PartialEq for Counted {
+        fn eq(&self, other: &Self) -> bool {
+            self.value == other.value
+        }
+    }
+    let copies = Rc::new(Cell::new(0));
+    let mut source: Row<Counted> = Row::new(120);
+    let mut saved: Row<Counted> = Row::new(120);
+    for row in [&mut source, &mut saved] {
+        for cell in &mut row.inner {
+            cell.copies = copies.clone();
+        }
+    }
+    source[Column(2)].value = 1;
+    saved[Column(6)].value = 2;
+    copies.set(0);
+    saved.copy_snapshot_from(&source);
+    assert!(saved == source);
+    assert_eq!(
+        copies.get(),
+        7,
+        "copy the larger occupied prefix, including erased cells"
+    );
+}
+
+#[test]
+fn row_tail_bound_survives_growth_splices_and_inclusive_writes() {
+    let filled = Square::from_char('x');
+    let mut row: Row<Square> = Row::new(6);
+    row.reset_to(filled);
+    row.grow(10);
+    assert_eq!(
+        row.occ, 0,
+        "growth must preserve the no-reflow resize bound"
+    );
+    assert_eq!(row.inner[0], filled);
+    assert_eq!(row.inner[9], Square::default());
+    row.append(&mut vec![Square::default(), filled, Square::default()]);
+    assert!(
+        row.has_extras,
+        "arbitrary appends must use full snapshot copying"
+    );
+
+    let mut other: Row<Square> = Row::new(4);
+    other[Column(1)] = filled;
+    let mut dst: Row<Square> = Row::new(6);
+    dst.append_front_of(&mut other, 3);
+    assert!(dst.inner[dst.occ..]
+        .iter()
+        .all(|cell| *cell == dst.inner[8]));
+    assert!(other.inner[other.occ..]
+        .iter()
+        .all(|cell| *cell == other.inner[0]));
+
+    let mut inclusive: Row<Square> = Row::new(10);
+    inclusive[..=Column(3)].fill(filled);
+    assert!(inclusive.occ >= 4);
+}
+
+#[test]
+fn snapshot_copy_checks_both_ends_of_grown_fill_tails() {
+    let blue = Square::blank_with_bg(
+        crate::config::colors::AnsiColor::Indexed(4),
+        |_| unreachable!(),
+    );
+    let mut source: Row<Square> = Row::new(4);
+    let mut saved: Row<Square> = Row::new(6);
+    source.reset_to(blue);
+    saved.reset_to(blue);
+    source.grow(8);
+    saved.grow(8);
+    // Equal tail endpoints alone must not hide different fill transitions.
+    assert_eq!(source.inner[7], saved.inner[7]);
+    saved.copy_snapshot_from(&source);
+    assert_eq!(saved.inner, source.inner);
+}
+
+#[test]
+fn snapshot_prefix_copy_matches_full_copy_after_row_mutations() {
+    let mut source: Row<Square> = Row::new(17);
+    let mut saved: Row<Square> = Row::new(17);
+    let mut seed = 17_u64;
+    for step in 0..2048 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let col = (seed >> 32) as usize % source.len();
+        match step % 10 {
+            0 => source[Column(col)] = Square::from_char('界'),
+            1 => source[..=Column(col)].fill(Square::from_char('x')),
+            2 => source.reset_to(Square::blank_with_bg(
+                crate::config::colors::AnsiColor::Indexed((seed >> 32) as u8),
+                |_| unreachable!(),
+            )),
+            3 => source.grow(source.len() + 3),
+            4 => source.truncate_columns((source.len() / 2).max(1)),
+            5 => source.append(&mut vec![Square::from_char('a'), Square::default()]),
+            6 => {
+                let mut next: Row<Square> = Row::new(5);
+                next[Column(1)] = Square::from_char('b');
+                source.append_front_of(&mut next, 3);
+            }
+            7 => {
+                source = Row::from_vec(
+                    vec![Square::default(), Square::from_char('c'), Square::default()],
+                    0,
+                );
+            }
+            8 => source.reset_to(Square::default()),
+            _ => {
+                // Renderer-side edits must also be erased by the next copy.
+                let last = saved.len() - 1;
+                saved[Column(last)] = Square::from_char('z');
+            }
+        }
+        source.semantic_prompt = if step % 2 == 0 {
+            row::SemanticPrompt::Prompt
+        } else {
+            row::SemanticPrompt::None
+        };
+        source.kitty_virtual_placeholder = step % 3 == 0;
+        let dirty = saved.dirty;
+        let mut expected = saved.clone();
+        expected.copy_from(&source);
+        saved.copy_snapshot_from(&source);
+        assert_eq!(saved.inner, expected.inner, "step={step}");
+        assert_eq!(saved.occ, expected.occ);
+        assert_eq!(saved.has_styles, expected.has_styles);
+        assert_eq!(saved.has_extras, expected.has_extras);
+        assert_eq!(saved.semantic_prompt, expected.semantic_prompt);
+        assert_eq!(
+            saved.kitty_virtual_placeholder,
+            expected.kitty_virtual_placeholder
+        );
+        assert_eq!(saved.dirty, dirty);
+    }
+}
+
+#[test]
 fn row_hint_propagates_and_clears() {
     let mut styled: Row<Square> = Row::new(4);
     styled[Column(0)].set_style_id(9);

@@ -2297,7 +2297,7 @@ impl<U: EventListener> Crosswords<U> {
             // The branchless reduction vectorizes over compact cell words;
             // managed values are still checked against their live tables.
             let unchanged = snapshot::metadata_matches(src, &dst[y]);
-            dst[y].copy_from(src);
+            dst[y].copy_snapshot_from(src);
             dst[y].dirty = true;
             if !src.has_styles
                 || !deferred
@@ -2353,7 +2353,7 @@ impl<U: EventListener> Crosswords<U> {
             // IDs alone never establish that their values are unchanged.
             let unchanged = retained && snapshot::metadata_matches(src, &dst[i]);
             if retained {
-                dst[i].copy_from(src);
+                dst[i].copy_snapshot_from(src);
             }
             dst[i].dirty = true;
             if !src.has_styles
@@ -2398,7 +2398,7 @@ impl<U: EventListener> Crosswords<U> {
         for (i, row_idx) in (start..end).enumerate() {
             let src = &self.grid[Line(row_idx)];
             if let Some(dst_row) = dst.get_mut(i) {
-                dst_row.copy_from(src);
+                dst_row.copy_snapshot_from(src);
             } else {
                 dst.push(src.clone());
             }
