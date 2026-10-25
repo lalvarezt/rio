@@ -6,7 +6,7 @@
 // data layout, but rasterises directly into the softbuffer u32 pixel
 // buffer instead of recording draw calls. Storage matches the Metal
 // renderer cell-for-cell: one flat `Vec<CellBg>` indexed by
-// `row * cols + col`, plus per-row `Vec<CellText>` slots (slot 0 =
+// `row * cols + col`, plus owned or retained per-row text slots (slot 0 =
 // block-cursor cells, 1..=rows = content rows, last = non-block
 // cursor) so the row-rebuild path in `frontends/rioterm/src/grid_emit`
 // stays backend-agnostic.
@@ -24,6 +24,7 @@
 
 use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use super::atlas::{AtlasSlot, GlyphKey, RasterizedGlyph};
 use super::cell::{CellBg, CellText, GridUniforms};
@@ -261,6 +262,84 @@ impl CpuGridAtlas {
     }
 }
 
+#[derive(Default)]
+struct CpuTextRow {
+    // Keep ordinary-write capacity when a row switches to retained storage.
+    owned: Vec<CellText>,
+    // Prepared text stays row-local. Placement is applied only while painting.
+    retained: Option<(Arc<[CellText]>, u16)>,
+}
+
+impl CpuTextRow {
+    #[inline]
+    fn cells(&self) -> &[CellText] {
+        self.retained
+            .as_ref()
+            .map_or(self.owned.as_slice(), |(cells, _)| cells.as_ref())
+    }
+
+    #[inline]
+    fn placement(&self) -> Option<u16> {
+        self.retained.as_ref().map(|(_, row)| *row)
+    }
+
+    #[inline]
+    fn matches(&self, cells: &[CellText], row: Option<u16>) -> bool {
+        let previous = self.cells();
+        if previous.len() != cells.len() {
+            return false;
+        }
+        let old_row = self.placement();
+        if old_row == row {
+            return bytemuck::cast_slice::<_, u8>(previous)
+                == bytemuck::cast_slice(cells);
+        }
+        previous.iter().zip(cells).all(|(old, new)| {
+            let mut old = *old;
+            let mut new = *new;
+            if let Some(row) = old_row {
+                old.grid_pos[1] = row;
+            }
+            if let Some(row) = row {
+                new.grid_pos[1] = row;
+            }
+            bytemuck::bytes_of(&old) == bytemuck::bytes_of(&new)
+        })
+    }
+
+    #[inline]
+    fn replace(&mut self, cells: &[CellText]) -> bool {
+        if self.matches(cells, None) {
+            return false;
+        }
+        self.retained = None;
+        self.owned.clear();
+        self.owned.extend_from_slice(cells);
+        true
+    }
+
+    fn retain(&mut self, cells: &Arc<[CellText]>, row: u16) -> bool {
+        if self
+            .retained
+            .as_ref()
+            .is_some_and(|(old, old_row)| *old_row == row && Arc::ptr_eq(old, cells))
+        {
+            return false;
+        }
+        let changed = !self.matches(cells, Some(row));
+        self.retained = Some((cells.clone(), row));
+        self.owned.clear();
+        changed
+    }
+
+    fn clear(&mut self) -> bool {
+        let changed = !self.cells().is_empty();
+        self.retained = None;
+        self.owned.clear();
+        changed
+    }
+}
+
 pub struct CpuGridRenderer {
     id: u64,
     atlas_generation: u64,
@@ -272,8 +351,7 @@ pub struct CpuGridRenderer {
     /// Per-row fg storage with the same indexing scheme as the GPU
     /// backends — slot 0 holds the block cursor, 1..=rows hold content
     /// rows, slot `rows + 1` holds the non-block cursor decoration.
-    fg_rows: Vec<Vec<CellText>>,
-    retained_scratch: Vec<CellText>,
+    fg_rows: Vec<CpuTextRow>,
     atlas_grayscale: CpuGridAtlas,
     atlas_color: CpuGridAtlas,
     needs_full_rebuild: bool,
@@ -289,7 +367,6 @@ impl CpuGridRenderer {
             rows,
             bg_cells: vec![CellBg::TRANSPARENT; bg_capacity(cols, rows)],
             fg_rows: init_fg_rows(rows),
-            retained_scratch: Vec::new(),
             atlas_grayscale: CpuGridAtlas::new_grayscale(),
             atlas_color: CpuGridAtlas::new_color(),
             needs_full_rebuild: true,
@@ -310,25 +387,30 @@ impl CpuGridRenderer {
         self.needs_full_rebuild = true;
     }
 
-    pub fn write_retained_row(&mut self, row: u32, bg: &[CellBg], fg: &[CellText]) {
-        let mut cells = std::mem::take(&mut self.retained_scratch);
-        cells.clear();
-        cells.extend(fg.iter().map(|cell| {
-            let mut cell = *cell;
-            cell.grid_pos[1] = row as u16;
-            cell
-        }));
-        self.write_row(row, bg, &cells);
-        self.retained_scratch = cells;
+    pub fn write_retained_row(&mut self, row: u32, bg: &[CellBg], fg: &Arc<[CellText]>) {
+        let mut changed = false;
+        if let Some(slot) = self.fg_rows.get_mut(row as usize + 1) {
+            changed |= slot.retain(fg, row as u16);
+        }
+        changed |= self.write_background(row, bg);
+        if changed {
+            self.paint_revision = self.paint_revision.wrapping_add(1);
+        }
     }
 
     pub fn write_row(&mut self, row: u32, bg: &[CellBg], fg: &[CellText]) {
         let idx = (row as usize) + 1;
         let mut changed = false;
         if let Some(slot) = self.fg_rows.get_mut(idx) {
-            changed |= replace_text_row(slot, fg);
+            changed |= slot.replace(fg);
         }
+        changed |= self.write_background(row, bg);
+        if changed {
+            self.paint_revision = self.paint_revision.wrapping_add(1);
+        }
+    }
 
+    fn write_background(&mut self, row: u32, bg: &[CellBg]) -> bool {
         if row < self.rows {
             let cols = self.cols as usize;
             let row_start = (row as usize) * cols;
@@ -342,20 +424,17 @@ impl CpuGridRenderer {
             {
                 dst[..row_len].copy_from_slice(&bg[..row_len]);
                 dst[row_len..].fill(CellBg::TRANSPARENT);
-                changed = true;
+                return true;
             }
         }
-        if changed {
-            self.paint_revision = self.paint_revision.wrapping_add(1);
-        }
+        false
     }
 
     pub fn clear_row(&mut self, row: u32) {
         let idx = (row as usize) + 1;
         let mut changed = false;
         if let Some(slot) = self.fg_rows.get_mut(idx) {
-            changed |= !slot.is_empty();
-            slot.clear();
+            changed |= slot.clear();
         }
         if row < self.rows {
             let cols = self.cols as usize;
@@ -374,12 +453,12 @@ impl CpuGridRenderer {
     pub fn set_cursor(&mut self, block: &[CellText], non_block: &[CellText]) {
         let mut changed = false;
         if let Some(slot) = self.fg_rows.first_mut() {
-            changed |= replace_text_row(slot, block);
+            changed |= slot.replace(block);
         }
         let last = self.fg_rows.len().saturating_sub(1);
         if last > 0 {
             if let Some(slot) = self.fg_rows.get_mut(last) {
-                changed |= replace_text_row(slot, non_block);
+                changed |= slot.replace(non_block);
             }
         }
         if changed {
@@ -655,7 +734,8 @@ impl CpuGridRenderer {
         let cursor_fg = normalize_color(uniforms.cursor_color);
 
         for fg in &self.fg_rows {
-            for glyph in fg {
+            let row = fg.placement();
+            for glyph in fg.cells() {
                 let gw = glyph.glyph_size[0] as i32;
                 let gh = glyph.glyph_size[1] as i32;
                 if gw <= 0 || gh <= 0 {
@@ -663,7 +743,8 @@ impl CpuGridRenderer {
                 }
 
                 let cell_pos_x = (glyph.grid_pos[0] as f32) * cell_w + pad_left;
-                let cell_pos_y = (glyph.grid_pos[1] as f32) * cell_h + pad_top;
+                let grid_y = row.unwrap_or(glyph.grid_pos[1]);
+                let cell_pos_y = (grid_y as f32) * cell_h + pad_top;
                 let glyph_x = (cell_pos_x + glyph.bearings[0] as f32) as i32;
                 let glyph_y = (cell_pos_y + cell_h - glyph.bearings[1] as f32) as i32;
 
@@ -671,7 +752,7 @@ impl CpuGridRenderer {
                 if cursor_fg_active
                     && (glyph.bools & CellText::BOOL_IS_CURSOR_GLYPH) == 0
                     && cursor_x == glyph.grid_pos[0] as u32
-                    && cursor_y == glyph.grid_pos[1] as u32
+                    && cursor_y == grid_y as u32
                 {
                     color = cursor_fg;
                 }
@@ -727,19 +808,9 @@ fn bg_capacity(cols: u32, rows: u32) -> usize {
     (cols as usize) * (rows as usize)
 }
 
-#[inline]
-fn replace_text_row(slot: &mut Vec<CellText>, cells: &[CellText]) -> bool {
-    if bytemuck::cast_slice::<_, u8>(slot.as_slice()) == bytemuck::cast_slice(cells) {
-        return false;
-    }
-    slot.clear();
-    slot.extend_from_slice(cells);
-    true
-}
-
-fn init_fg_rows(rows: u32) -> Vec<Vec<CellText>> {
+fn init_fg_rows(rows: u32) -> Vec<CpuTextRow> {
     (0..(rows as usize + CURSOR_ROW_SLOTS))
-        .map(|_| Vec::new())
+        .map(|_| CpuTextRow::default())
         .collect()
 }
 
@@ -1133,6 +1204,142 @@ mod panel_tests {
             assert_eq!(generation, grid.atlas_generation());
             grid.clear_atlas();
             assert_ne!(generation, grid.atlas_generation());
+        }
+    }
+
+    #[test]
+    fn retained_rows_preserve_exact_frame_gate_and_release_shared_storage() {
+        let mut grid = CpuGridRenderer::new(2, 2);
+        let local: Arc<[CellText]> = Arc::from([CellText {
+            color: [73, 151, 211, 255],
+            ..CellText::default()
+        }]);
+        let absolute = [CellText {
+            grid_pos: [0, 1],
+            ..local[0]
+        }];
+        grid.write_row(1, &[], &absolute);
+        let revision = grid.paint_revision;
+        grid.write_retained_row(1, &[], &local);
+        assert_eq!(revision, grid.paint_revision);
+        assert_eq!(Arc::strong_count(&local), 2);
+        grid.write_retained_row(1, &[], &local);
+        assert_eq!(revision, grid.paint_revision);
+        let equal: Arc<[CellText]> = Arc::from(local.as_ref());
+        grid.write_retained_row(1, &[], &equal);
+        assert_eq!(revision, grid.paint_revision);
+        assert_eq!(Arc::strong_count(&local), 1);
+        grid.write_row(1, &[], &absolute);
+        assert_eq!(revision, grid.paint_revision);
+
+        let edited = [CellText {
+            color: [1, 2, 3, 255],
+            ..absolute[0]
+        }];
+        grid.write_row(1, &[], &edited);
+        assert_ne!(revision, grid.paint_revision);
+        assert_eq!(Arc::strong_count(&equal), 1);
+        grid.write_retained_row(0, &[], &local);
+        grid.write_retained_row(1, &[], &local);
+        assert_eq!(Arc::strong_count(&local), 3);
+        grid.clear_row(0);
+        let cleared = grid.paint_revision;
+        grid.clear_row(0);
+        assert_eq!(cleared, grid.paint_revision);
+        assert_eq!(Arc::strong_count(&local), 2);
+        grid.resize(3, 3);
+        assert_eq!(Arc::strong_count(&local), 1);
+    }
+
+    #[test]
+    fn retained_pixels_match_owned_rows_through_moves_edits_and_cursors() {
+        use bytemuck::Zeroable;
+        let mut owned = CpuGridRenderer::new(3, 3);
+        let mut retained = CpuGridRenderer::new(3, 3);
+        let mut cells = Vec::new();
+        for color in [false, true] {
+            let bytes = if color {
+                [31, 71, 131, 192].repeat(6 * 7)
+            } else {
+                (0..6 * 7).map(|i| (i * 31) as u8).collect()
+            };
+            let mut slots = Vec::new();
+            for grid in [&mut owned, &mut retained] {
+                let key = GlyphKey {
+                    font_id: 0,
+                    glyph_id: 1,
+                    size_bucket: 64,
+                };
+                let glyph = RasterizedGlyph {
+                    width: 6,
+                    height: 7,
+                    bearing_x: -1,
+                    bearing_y: 8,
+                    bytes: &bytes,
+                };
+                slots.push(if color {
+                    grid.insert_glyph_color(key, glyph).unwrap()
+                } else {
+                    grid.insert_glyph(key, glyph).unwrap()
+                });
+            }
+            assert_eq!(slots[0].x, slots[1].x);
+            assert_eq!(slots[0].y, slots[1].y);
+            cells.push(CellText {
+                glyph_pos: [slots[0].x as u32, slots[0].y as u32],
+                glyph_size: [6, 7],
+                bearings: [-1, 8],
+                grid_pos: [u16::from(color), 0],
+                color: [190, 130, 70, 160],
+                atlas: u8::from(color),
+                ..CellText::default()
+            });
+        }
+        let mut uniforms = GridUniforms::zeroed();
+        uniforms.cell_size = [5.5, 6.5];
+        uniforms.grid_size = [3, 3];
+        uniforms.grid_padding = [1.5, 0.0, 0.0, 0.5];
+        uniforms.cursor_color = [0.2, 0.8, 0.4, 0.7];
+        for step in 0..8 {
+            cells[0].color[0] = 50 + step * 20;
+            let shared: Arc<[CellText]> = Arc::from(cells.as_slice());
+            uniforms.cursor_pos = [0, u32::from(step % 3)];
+            for row in 0..3 {
+                let background = [CellBg {
+                    rgba: [10, 30, 50, 120],
+                }; 3];
+                let absolute: Vec<_> = shared
+                    .iter()
+                    .map(|cell| CellText {
+                        grid_pos: [cell.grid_pos[0], row as u16],
+                        ..*cell
+                    })
+                    .collect();
+                owned.write_row(row, &background, &absolute);
+                if (step + row as u8).is_multiple_of(3) {
+                    retained.write_row(row, &background, &absolute);
+                } else {
+                    retained.write_retained_row(row, &background, &shared);
+                }
+            }
+            let cursor = [CellText {
+                bools: CellText::BOOL_IS_CURSOR_GLYPH,
+                ..cells[0]
+            }];
+            owned.set_cursor(&cursor, &cursor);
+            retained.set_cursor(&cursor, &cursor);
+            if step.is_multiple_of(2) {
+                owned.clear_row(2);
+                retained.clear_row(2);
+            }
+            let mut expected = vec![0x00334455; 24 * 24];
+            let mut actual = expected.clone();
+            owned.render_bg(&mut expected, 24, 24, &uniforms);
+            owned.render_text(&mut expected, 24, 24, &uniforms);
+            retained.render_bg(&mut actual, 24, 24, &uniforms);
+            retained.render_text(&mut actual, 24, 24, &uniforms);
+            assert!(expected.iter().any(|&pixel| pixel != 0x00334455));
+            assert_eq!(actual, expected, "step={step}");
         }
     }
 
