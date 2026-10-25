@@ -133,6 +133,7 @@ impl AtlasAllocator {
     }
 
     /// Get the atlas dimensions
+    #[cfg(target_os = "macos")]
     pub fn dimensions(&self) -> (u16, u16) {
         (self.width, self.height)
     }
@@ -142,6 +143,7 @@ impl AtlasAllocator {
     /// top-left of the old region; the new area is appended on the
     /// right and bottom. Caller is responsible for growing the backing
     /// texture in lock-step.
+    #[cfg(target_os = "macos")]
     pub fn grow_to(&mut self, new_width: u16, new_height: u16) {
         debug_assert!(new_width >= self.width && new_height >= self.height);
         self.width = new_width;

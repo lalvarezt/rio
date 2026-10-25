@@ -12,7 +12,7 @@
 // stays backend-agnostic.
 //
 // The atlases live in RAM. `CpuGridAtlas` packs glyph bitmaps into a
-// shelf-allocated grayscale (R8) or color (RGBA8 premul) buffer with
+// shelf-allocated grayscale (R8) or color (RGBA8 premul) pages with
 // the same `AtlasAllocator` the GPU paths use, so the atlas slot
 // coordinates round-trip across backends.
 //
@@ -29,9 +29,8 @@ use super::atlas::{AtlasSlot, GlyphKey, RasterizedGlyph};
 use super::cell::{CellBg, CellText, GridUniforms};
 use crate::renderer::image_cache::atlas::AtlasAllocator;
 
-/// Initial atlas side. 1024² bytes_per_pixel = 1 MiB grayscale,
-/// 4 MiB color. Smaller than the Metal default (2048²) since CPU
-/// builds are usually memory-constrained machines.
+/// Standard page side. Pages are lazy: 1 MiB grayscale or 4 MiB color.
+/// Large glyphs use a larger page, charged against the same texel budget.
 const ATLAS_SIZE: u16 = 1024;
 const ATLAS_MAX_SIZE: u16 = 4096;
 
@@ -41,26 +40,28 @@ const CURSOR_ROW_SLOTS: usize = 2;
 static NEXT_GRID_ID: AtomicU64 = AtomicU64::new(1);
 
 /// CPU-side glyph atlas. R8 for grayscale masks, RGBA8 premultiplied
-/// for color emoji. Uses the same shelf allocator as the GPU atlases
-/// so `AtlasSlot` coords round-trip.
+/// for color emoji. Pages and slots are append-only until a full clear.
+/// The pixel budget is 16 MiB grayscale or 64 MiB color. Large pages
+/// consume that budget sooner, and shelf fragmentation can force a clear
+/// before every texel is occupied.
 pub struct CpuGridAtlas {
+    pages: Vec<CpuAtlasPage>,
+    bytes_per_pixel: u8,
+    slots: FxHashMap<GlyphKey, AtlasSlot>,
+}
+
+struct CpuAtlasPage {
     pixels: Vec<u8>,
     side: u16,
-    bytes_per_pixel: u8,
     allocator: AtlasAllocator,
-    slots: FxHashMap<GlyphKey, AtlasSlot>,
+    clear_padding: bool,
 }
 
 impl CpuGridAtlas {
     fn new(bytes_per_pixel: u8) -> Self {
-        let side = ATLAS_SIZE;
-        let pixels =
-            vec![0u8; (side as usize) * (side as usize) * (bytes_per_pixel as usize)];
         Self {
-            pixels,
-            side,
+            pages: Vec::new(),
             bytes_per_pixel,
-            allocator: AtlasAllocator::new(side, side),
             slots: FxHashMap::default(),
         }
     }
@@ -106,7 +107,31 @@ impl CpuGridAtlas {
             return Some(slot);
         }
 
-        let (x, y) = self.allocator.allocate(glyph.width, glyph.height)?;
+        if !self.accepts(glyph) {
+            return None;
+        }
+        let mut allocation = None;
+        for (index, page) in self.pages.iter_mut().enumerate() {
+            if let Some((x, y)) = page.allocator.allocate(glyph.width, glyph.height) {
+                allocation = Some((index, x, y));
+                break;
+            }
+        }
+        let (page_index, x, y) = match allocation {
+            Some(allocation) => allocation,
+            None => {
+                let side = ATLAS_SIZE
+                    .max((glyph.width.max(glyph.height) + 1).next_power_of_two());
+                if !self.append_page(side) {
+                    return None;
+                }
+                let index = self.pages.len() - 1;
+                let (x, y) = self.pages[index]
+                    .allocator
+                    .allocate(glyph.width, glyph.height)?;
+                (index, x, y)
+            }
+        };
         let slot = AtlasSlot {
             x,
             y,
@@ -114,9 +139,10 @@ impl CpuGridAtlas {
             h: glyph.height,
             bearing_x: glyph.bearing_x,
             bearing_y: glyph.bearing_y,
-            page: 0,
+            page: page_index as u8,
         };
         self.write_pixels(
+            page_index,
             x as usize,
             y as usize,
             glyph.width as usize,
@@ -126,66 +152,118 @@ impl CpuGridAtlas {
         Some(slot)
     }
 
-    fn write_pixels(&mut self, x: usize, y: usize, w: usize, h: usize, src: &[u8]) {
+    fn accepts(&self, glyph: RasterizedGlyph<'_>) -> bool {
+        glyph.width < ATLAS_MAX_SIZE
+            && glyph.height < ATLAS_MAX_SIZE
+            && glyph.bytes.len()
+                >= glyph.width as usize
+                    * glyph.height as usize
+                    * self.bytes_per_pixel as usize
+    }
+
+    fn write_pixels(
+        &mut self,
+        page: usize,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        src: &[u8],
+    ) {
         let bpp = self.bytes_per_pixel as usize;
-        let stride = self.side as usize * bpp;
+        let page = &mut self.pages[page];
+        let stride = page.side as usize * bpp;
         let row_bytes = w * bpp;
         for row in 0..h {
             let src_off = row * row_bytes;
             let dst_off = (y + row) * stride + x * bpp;
-            self.pixels[dst_off..dst_off + row_bytes]
+            page.pixels[dst_off..dst_off + row_bytes]
                 .copy_from_slice(&src[src_off..src_off + row_bytes]);
+        }
+        if page.clear_padding {
+            // Reset pages retain old pixels. Only the new allocation and its
+            // one-pixel border can be sampled, so leave unused texels alone.
+            for row in 0..h {
+                let right = (y + row) * stride + (x + w) * bpp;
+                page.pixels[right..right + bpp].fill(0);
+            }
+            let bottom = (y + h) * stride + x * bpp;
+            page.pixels[bottom..bottom + row_bytes + bpp].fill(0);
         }
     }
 
-    /// Double the atlas side, copying old pixels into the top-left of
-    /// the new buffer. Existing `AtlasSlot`s stay valid because their
-    /// `(x, y)` fall inside the unchanged old region. Returns `false`
-    /// when already at `ATLAS_MAX_SIZE`.
+    /// Append an empty standard page without moving existing pixels or slots.
+    /// Insertion also allocates pages lazily. The budget is 4096² texels per kind.
     pub fn grow(&mut self) -> bool {
-        let (old_w, old_h) = self.allocator.dimensions();
-        if old_w >= ATLAS_MAX_SIZE {
-            return false;
-        }
-        let new_side = old_w.saturating_mul(2).min(ATLAS_MAX_SIZE);
-        if new_side <= old_w {
-            return false;
-        }
-        let bpp = self.bytes_per_pixel as usize;
-        let mut new_pixels = vec![0u8; (new_side as usize) * (new_side as usize) * bpp];
+        self.append_page(ATLAS_SIZE)
+    }
 
-        let old_stride = old_w as usize * bpp;
-        let new_stride = new_side as usize * bpp;
-        for row in 0..old_h as usize {
-            let src_off = row * old_stride;
-            let dst_off = row * new_stride;
-            new_pixels[dst_off..dst_off + old_stride]
-                .copy_from_slice(&self.pixels[src_off..src_off + old_stride]);
+    fn append_page(&mut self, side: u16) -> bool {
+        let area = (side as usize).pow(2);
+        let used: usize = self
+            .pages
+            .iter()
+            .map(|page| (page.side as usize).pow(2))
+            .sum();
+        if used + area > (ATLAS_MAX_SIZE as usize).pow(2) {
+            return false;
         }
-        self.pixels = new_pixels;
-        self.side = new_side;
-        self.allocator.grow_to(new_side, new_side);
+        self.pages.push(CpuAtlasPage {
+            pixels: vec![0; area * self.bytes_per_pixel as usize],
+            side,
+            allocator: AtlasAllocator::new(side, side),
+            clear_padding: false,
+        });
         true
     }
 
     pub fn clear(&mut self) {
-        self.allocator.clear();
+        // Dropping pages also removes stale padding before slot reuse.
+        self.pages.clear();
         self.slots.clear();
     }
 
-    #[inline]
-    pub fn pixels(&self) -> &[u8] {
-        &self.pixels
+    fn reset_for(&mut self, glyph: RasterizedGlyph<'_>) {
+        // Capacity exhaustion does not need to fault a new allocation back in.
+        // Reuse pages if one can hold this glyph after resetting its allocator.
+        let required = glyph.width.max(glyph.height);
+        if !self.pages.iter().any(|page| page.side > required) {
+            self.clear();
+            return;
+        }
+        self.slots.clear();
+        for page in &mut self.pages {
+            page.allocator.clear();
+            page.clear_padding = true;
+        }
     }
 
     #[inline]
+    /// First-page pixels, or an empty slice before the first allocation.
+    pub fn pixels(&self) -> &[u8] {
+        self.page_pixels(0).unwrap_or(&[])
+    }
+
+    #[inline]
+    /// First-page side, or the standard side before the first allocation.
     pub fn side(&self) -> u16 {
-        self.side
+        self.page_side(0).unwrap_or(ATLAS_SIZE)
+    }
+
+    pub fn page_pixels(&self, page: u8) -> Option<&[u8]> {
+        self.pages
+            .get(page as usize)
+            .map(|page| page.pixels.as_slice())
+    }
+
+    pub fn page_side(&self, page: u8) -> Option<u16> {
+        self.pages.get(page as usize).map(|page| page.side)
     }
 }
 
 pub struct CpuGridRenderer {
     id: u64,
+    atlas_generation: u64,
     paint_revision: u64,
     cols: u32,
     rows: u32,
@@ -195,6 +273,7 @@ pub struct CpuGridRenderer {
     /// backends — slot 0 holds the block cursor, 1..=rows hold content
     /// rows, slot `rows + 1` holds the non-block cursor decoration.
     fg_rows: Vec<Vec<CellText>>,
+    retained_scratch: Vec<CellText>,
     atlas_grayscale: CpuGridAtlas,
     atlas_color: CpuGridAtlas,
     needs_full_rebuild: bool,
@@ -204,11 +283,13 @@ impl CpuGridRenderer {
     pub fn new(cols: u32, rows: u32) -> Self {
         Self {
             id: NEXT_GRID_ID.fetch_add(1, Ordering::Relaxed),
+            atlas_generation: super::next_atlas_generation(),
             paint_revision: 0,
             cols,
             rows,
             bg_cells: vec![CellBg::TRANSPARENT; bg_capacity(cols, rows)],
             fg_rows: init_fg_rows(rows),
+            retained_scratch: Vec::new(),
             atlas_grayscale: CpuGridAtlas::new_grayscale(),
             atlas_color: CpuGridAtlas::new_color(),
             needs_full_rebuild: true,
@@ -227,6 +308,18 @@ impl CpuGridRenderer {
         // Fresh buffers = zero contents; emission path must rewrite
         // every row on the next frame even if no damage came in.
         self.needs_full_rebuild = true;
+    }
+
+    pub fn write_retained_row(&mut self, row: u32, bg: &[CellBg], fg: &[CellText]) {
+        let mut cells = std::mem::take(&mut self.retained_scratch);
+        cells.clear();
+        cells.extend(fg.iter().map(|cell| {
+            let mut cell = *cell;
+            cell.grid_pos[1] = row as u16;
+            cell
+        }));
+        self.write_row(row, bg, &cells);
+        self.retained_scratch = cells;
     }
 
     pub fn write_row(&mut self, row: u32, bg: &[CellBg], fg: &[CellText]) {
@@ -302,10 +395,15 @@ impl CpuGridRenderer {
     /// Drop every cached glyph and force a full rebuild. Called when
     /// the font library is swapped, since the new library reuses font ids.
     pub fn clear_atlas(&mut self) {
+        self.atlas_generation = super::next_atlas_generation();
         self.atlas_grayscale.clear();
         self.atlas_color.clear();
         self.needs_full_rebuild = true;
         self.paint_revision = self.paint_revision.wrapping_add(1);
+    }
+
+    pub fn atlas_generation(&self) -> u64 {
+        self.atlas_generation
     }
 
     pub fn insert_glyph(
@@ -313,19 +411,25 @@ impl CpuGridRenderer {
         key: GlyphKey,
         glyph: RasterizedGlyph<'_>,
     ) -> Option<AtlasSlot> {
+        if self.atlas_grayscale.lookup(key).is_some() {
+            self.atlas_generation = super::next_atlas_generation();
+            self.needs_full_rebuild = true;
+        }
+        if !self.atlas_grayscale.accepts(glyph) {
+            return None;
+        }
         let mut cleared = false;
         loop {
             if let Some(slot) = self.atlas_grayscale.insert(key, glyph) {
                 self.paint_revision = self.paint_revision.wrapping_add(1);
                 return Some(slot);
             }
-            if self.atlas_grayscale.grow() {
-                continue;
-            }
             if cleared {
                 return None;
             }
-            self.atlas_grayscale.clear();
+            self.atlas_grayscale.reset_for(glyph);
+            self.atlas_generation = super::next_atlas_generation();
+            self.paint_revision = self.paint_revision.wrapping_add(1);
             self.needs_full_rebuild = true;
             cleared = true;
         }
@@ -341,19 +445,25 @@ impl CpuGridRenderer {
         key: GlyphKey,
         glyph: RasterizedGlyph<'_>,
     ) -> Option<AtlasSlot> {
+        if self.atlas_color.lookup(key).is_some() {
+            self.atlas_generation = super::next_atlas_generation();
+            self.needs_full_rebuild = true;
+        }
+        if !self.atlas_color.accepts(glyph) {
+            return None;
+        }
         let mut cleared = false;
         loop {
             if let Some(slot) = self.atlas_color.insert(key, glyph) {
                 self.paint_revision = self.paint_revision.wrapping_add(1);
                 return Some(slot);
             }
-            if self.atlas_color.grow() {
-                continue;
-            }
             if cleared {
                 return None;
             }
-            self.atlas_color.clear();
+            self.atlas_color.reset_for(glyph);
+            self.atlas_generation = super::next_atlas_generation();
+            self.paint_revision = self.paint_revision.wrapping_add(1);
             self.needs_full_rebuild = true;
             cleared = true;
         }
@@ -544,11 +654,6 @@ impl CpuGridRenderer {
         let cursor_fg_active = uniforms.cursor_color[3] > 0.0;
         let cursor_fg = normalize_color(uniforms.cursor_color);
 
-        let mask = self.atlas_grayscale.pixels();
-        let mask_side = self.atlas_grayscale.side as usize;
-        let color_atlas = self.atlas_color.pixels();
-        let color_side = self.atlas_color.side as usize;
-
         for fg in &self.fg_rows {
             for glyph in fg {
                 let gw = glyph.glyph_size[0] as i32;
@@ -575,6 +680,10 @@ impl CpuGridRenderer {
                 let ay = glyph.glyph_pos[1] as usize;
 
                 if glyph.atlas == CellText::ATLAS_COLOR {
+                    let Some(page) = self.atlas_color.pages.get(glyph.page as usize)
+                    else {
+                        continue;
+                    };
                     blit_color(
                         buf,
                         buf_w_i,
@@ -583,15 +692,29 @@ impl CpuGridRenderer {
                         glyph_y,
                         gw,
                         gh,
-                        color_atlas,
-                        color_side,
+                        &page.pixels,
+                        page.side as usize,
                         ax,
                         ay,
                     );
                 } else {
+                    let Some(page) = self.atlas_grayscale.pages.get(glyph.page as usize)
+                    else {
+                        continue;
+                    };
                     blit_mask(
-                        buf, buf_w_i, buf_h_i, glyph_x, glyph_y, gw, gh, mask, mask_side,
-                        ax, ay, color,
+                        buf,
+                        buf_w_i,
+                        buf_h_i,
+                        glyph_x,
+                        glyph_y,
+                        gw,
+                        gh,
+                        &page.pixels,
+                        page.side as usize,
+                        ax,
+                        ay,
+                        color,
                     );
                 }
             }
@@ -731,7 +854,7 @@ mod panel_tests {
     use bytemuck::Zeroable;
 
     #[test]
-    fn atlas_growth_preserves_pixels_slots_and_zero_padding() {
+    fn atlas_pages_preserve_pixels_slots_and_zero_padding() {
         for bpp in [1, 4] {
             let mut atlas = CpuGridAtlas::new(bpp);
             let bytes: Vec<_> = (0..13 * 17 * bpp as usize)
@@ -754,10 +877,13 @@ mod panel_tests {
                     },
                 )
                 .unwrap();
-            for _ in 0..2 {
+            let original = atlas.pixels().as_ptr();
+            for _ in 0..15 {
                 let side = atlas.side() as usize;
                 let pixels = atlas.pixels().to_vec();
                 assert!(atlas.grow());
+                assert_eq!(original, atlas.pixels().as_ptr());
+                assert!(atlas.pages.last().unwrap().pixels.iter().all(|&b| b == 0));
                 let found = atlas.lookup(key).unwrap();
                 assert_eq!(
                     (
@@ -793,6 +919,220 @@ mod panel_tests {
                 }
                 assert!(atlas.pixels()[side * new_stride..].iter().all(|&b| b == 0));
             }
+            assert!(!atlas.grow());
+            assert_eq!(atlas.pages.len(), 16);
+            atlas.clear();
+            assert!(atlas.lookup(key).is_none());
+            assert!(atlas.pages.is_empty());
+            let fresh = atlas
+                .insert(
+                    key,
+                    RasterizedGlyph {
+                        width: 1,
+                        height: 1,
+                        bearing_x: 0,
+                        bearing_y: 0,
+                        bytes: &[255; 4],
+                    },
+                )
+                .unwrap();
+            assert_eq!(fresh.page, 0);
+            assert!(atlas.pixels()[bpp as usize..].iter().all(|&b| b == 0));
+        }
+    }
+
+    #[test]
+    fn atlas_exhaustion_invalidates_generation_and_preserves_large_glyph_padding() {
+        for color in [false, true] {
+            let mut grid = CpuGridRenderer::new(1, 1);
+            let bpp = if color { 4 } else { 1 };
+            let bytes = vec![127; 4095 * 4095 * bpp];
+            let glyph = RasterizedGlyph {
+                width: 4095,
+                height: 4095,
+                bearing_x: 0,
+                bearing_y: 0,
+                bytes: &bytes,
+            };
+            let key = GlyphKey {
+                font_id: 0,
+                glyph_id: 1,
+                size_bucket: 64,
+            };
+            let generation = grid.atlas_generation();
+            let insert = |grid: &mut CpuGridRenderer, key| {
+                if color {
+                    grid.insert_glyph_color(key, glyph)
+                } else {
+                    grid.insert_glyph(key, glyph)
+                }
+            };
+            assert!(insert(&mut grid, key).is_some());
+            assert_eq!(generation, grid.atlas_generation());
+            let original_pixels = if color {
+                grid.atlas_color.pixels().as_ptr()
+            } else {
+                grid.atlas_grayscale.pixels().as_ptr()
+            };
+            grid.mark_full_rebuild_done();
+            let next_key = GlyphKey { glyph_id: 2, ..key };
+            assert!(insert(&mut grid, next_key).is_some());
+            assert_ne!(generation, grid.atlas_generation());
+            assert!(grid.needs_full_rebuild());
+            let atlas = if color {
+                &grid.atlas_color
+            } else {
+                &grid.atlas_grayscale
+            };
+            assert!(atlas.lookup(key).is_none());
+            assert_eq!(atlas.pages.len(), 1);
+            let pixels = atlas.pixels();
+            assert_eq!(
+                pixels.as_ptr(),
+                original_pixels,
+                "capacity reset reuses committed pixel storage"
+            );
+            for row in 0..4095 {
+                let offset = row * 4096 * bpp;
+                assert!(pixels[offset..offset + 4095 * bpp]
+                    .iter()
+                    .all(|&b| b == 127));
+                assert!(pixels[offset + 4095 * bpp..offset + 4096 * bpp]
+                    .iter()
+                    .all(|&b| b == 0));
+            }
+            assert!(pixels[4095 * 4096 * bpp..].iter().all(|&b| b == 0));
+        }
+    }
+
+    #[test]
+    fn reused_pages_clear_new_padding_without_clearing_unused_pixels() {
+        for bpp in [1, 4] {
+            let mut atlas = CpuGridAtlas::new(bpp);
+            let bytes = vec![127; 13 * 17 * bpp as usize];
+            atlas
+                .upload(RasterizedGlyph {
+                    width: 13,
+                    height: 17,
+                    bearing_x: 0,
+                    bearing_y: 0,
+                    bytes: &bytes,
+                })
+                .unwrap();
+            let glyph = RasterizedGlyph {
+                width: 1,
+                height: 1,
+                bearing_x: 0,
+                bearing_y: 0,
+                bytes: &[31; 4],
+            };
+            atlas.reset_for(glyph);
+            let slot = atlas.upload(glyph).unwrap();
+            assert_eq!((slot.x, slot.y), (0, 0));
+            let bpp = bpp as usize;
+            let pixels = atlas.pixels();
+            assert!(pixels[..bpp].iter().all(|&b| b == 31));
+            assert!(pixels[bpp..2 * bpp].iter().all(|&b| b == 0));
+            let next_row = ATLAS_SIZE as usize * bpp;
+            assert!(pixels[next_row..next_row + 2 * bpp].iter().all(|&b| b == 0));
+            assert!(pixels[2 * bpp..3 * bpp].iter().all(|&b| b == 127));
+        }
+    }
+
+    #[test]
+    fn invalid_glyphs_do_not_allocate_or_invalidate() {
+        let mut grid = CpuGridRenderer::new(1, 1);
+        grid.mark_full_rebuild_done();
+        let generation = grid.atlas_generation();
+        let key = GlyphKey {
+            font_id: 0,
+            glyph_id: 1,
+            size_bucket: 64,
+        };
+        for (width, height) in [(4096, 1), (1, 4096), (2, 2)] {
+            let glyph = RasterizedGlyph {
+                width,
+                height,
+                bearing_x: 0,
+                bearing_y: 0,
+                bytes: &[],
+            };
+            assert!(grid.insert_glyph(key, glyph).is_none());
+            assert!(grid.insert_glyph_color(key, glyph).is_none());
+        }
+        assert_eq!(generation, grid.atlas_generation());
+        assert!(!grid.needs_full_rebuild());
+        assert!(grid.atlas_grayscale.pages.is_empty());
+        assert!(grid.atlas_color.pages.is_empty());
+    }
+
+    #[test]
+    fn render_text_samples_the_selected_page_for_each_atlas_kind() {
+        for color in [false, true] {
+            let mut grid = CpuGridRenderer::new(1, 1);
+            let generation = grid.atlas_generation();
+            let bpp = if color { 4 } else { 1 };
+            let full_bytes = vec![0; 1023 * 1023 * bpp];
+            let full = RasterizedGlyph {
+                width: 1023,
+                height: 1023,
+                bearing_x: 0,
+                bearing_y: 1,
+                bytes: &full_bytes,
+            };
+            let small = RasterizedGlyph {
+                width: 1,
+                height: 1,
+                bytes: &[255; 4],
+                ..full
+            };
+            let key = GlyphKey {
+                font_id: 0,
+                glyph_id: 1,
+                size_bucket: 64,
+            };
+            let slot = if color {
+                grid.insert_glyph_color(key, full).unwrap();
+                grid.insert_glyph_color(GlyphKey { glyph_id: 2, ..key }, small)
+                    .unwrap()
+            } else {
+                grid.insert_glyph(key, full).unwrap();
+                grid.insert_glyph(GlyphKey { glyph_id: 2, ..key }, small)
+                    .unwrap()
+            };
+            assert_eq!(slot.page, 1);
+            assert_eq!(generation, grid.atlas_generation());
+            let cell = CellText {
+                glyph_pos: [slot.x as u32, slot.y as u32],
+                glyph_size: [1, 1],
+                bearings: [0, 1],
+                color: [255; 4],
+                atlas: if color {
+                    CellText::ATLAS_COLOR
+                } else {
+                    CellText::ATLAS_GRAYSCALE
+                },
+                page: slot.page,
+                ..Default::default()
+            };
+            grid.write_row(0, &[], &[cell]);
+            let mut uniforms = GridUniforms::zeroed();
+            uniforms.cell_size = [1.0, 1.0];
+            uniforms.grid_size = [1, 1];
+            let mut pixels = [0];
+            grid.render_text(&mut pixels, 1, 1, &uniforms);
+            assert_eq!(pixels[0] & 0x00ff_ffff, 0x00ff_ffff);
+            grid.write_row(0, &[], &[CellText { page: 0, ..cell }]);
+            pixels.fill(0);
+            grid.render_text(&mut pixels, 1, 1, &uniforms);
+            assert_eq!(pixels, [0]);
+            grid.write_row(0, &[], &[CellText { page: 255, ..cell }]);
+            grid.render_text(&mut pixels, 1, 1, &uniforms);
+            assert_eq!(pixels, [0]);
+            grid.resize(2, 1);
+            assert_eq!(generation, grid.atlas_generation());
+            grid.clear_atlas();
+            assert_ne!(generation, grid.atlas_generation());
         }
     }
 

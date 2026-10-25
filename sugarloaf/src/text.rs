@@ -34,9 +34,9 @@ pub struct TextInstance {
     // `0` = grayscale atlas; `1` = color atlas.
     pub atlas: u8,
     // Index of the atlas page this glyph lives in. Used host-side by
-    // the Vulkan overlay to bucket instances per (kind, page) and
-    // bind the right page's descriptor set per draw; other backends
-    // use a single texture and leave this at 0.
+    // the Vulkan overlay to bind the right descriptor set per draw
+    // and by CPU text to select the pixel page. Other backends use
+    // a single texture and leave this at 0.
     pub page: u8,
     pub _pad: [u8; 2],
 }
@@ -1038,6 +1038,15 @@ impl Text {
             let ay = inst.glyph_pos[1] as usize;
 
             if inst.atlas == 1 {
+                let (color_atlas, color_side) = if inst.page == 0 {
+                    (color_atlas, color_side)
+                } else {
+                    let Some(pixels) = state.atlas_color.page_pixels(inst.page) else {
+                        continue;
+                    };
+                    let side = state.atlas_color.page_side(inst.page).unwrap() as usize;
+                    (pixels, side)
+                };
                 blit_text_color(
                     buf,
                     buf_w_i,
@@ -1053,6 +1062,17 @@ impl Text {
                     inst.color,
                 );
             } else {
+                let (mask, mask_side) = if inst.page == 0 {
+                    (mask, mask_side)
+                } else {
+                    let Some(pixels) = state.atlas_grayscale.page_pixels(inst.page)
+                    else {
+                        continue;
+                    };
+                    let side =
+                        state.atlas_grayscale.page_side(inst.page).unwrap() as usize;
+                    (pixels, side)
+                };
                 blit_text_mask(
                     buf, buf_w_i, buf_h_i, glyph_x, glyph_y, gw, gh, mask, mask_side, ax,
                     ay, inst.color,
@@ -2253,5 +2273,59 @@ fn blit_text_color(
             let idx = buf_row + (dst_x as usize);
             buf[idx] = blend_premul_over(src, buf[idx]);
         }
+    }
+}
+
+#[cfg(test)]
+mod cpu_page_tests {
+    use super::*;
+    use crate::grid::RasterizedGlyph;
+
+    #[test]
+    fn ui_text_samples_later_mask_and_color_pages() {
+        let mut text = Text::new(&FontLibrary::default());
+        text.init_cpu();
+        let state = text.cpu.as_mut().unwrap();
+        for (kind, atlas, bpp, pixel) in [
+            (0, &mut state.atlas_grayscale, 1, [255; 4]),
+            (1, &mut state.atlas_color, 4, [10, 20, 30, 255]),
+        ] {
+            let empty = vec![0; 1023 * 1023 * bpp];
+            atlas
+                .upload(RasterizedGlyph {
+                    width: 1023,
+                    height: 1023,
+                    bearing_x: 0,
+                    bearing_y: 0,
+                    bytes: &empty,
+                })
+                .unwrap();
+            let slot = atlas
+                .upload(RasterizedGlyph {
+                    width: 1,
+                    height: 1,
+                    bearing_x: 0,
+                    bearing_y: 0,
+                    bytes: &pixel[..bpp],
+                })
+                .unwrap();
+            assert_eq!(slot.page, 1);
+            text.instances.push(TextInstance {
+                pos: [kind as f32, 0.0],
+                glyph_pos: [slot.x as u32, slot.y as u32],
+                glyph_size: [1, 1],
+                color: if kind == 0 {
+                    [200, 100, 50, 255]
+                } else {
+                    [255; 4]
+                },
+                atlas: kind,
+                page: slot.page,
+                ..TextInstance::default()
+            });
+        }
+        let mut pixels = [0; 2];
+        text.render_cpu(&mut pixels, 2, 1);
+        assert_eq!(pixels, [0xffc86432, 0xff0a141e]);
     }
 }

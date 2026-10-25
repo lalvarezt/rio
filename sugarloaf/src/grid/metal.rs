@@ -368,6 +368,8 @@ pub struct MetalGridRenderer {
     /// `Noop`. Cleared via
     /// `mark_full_rebuild_done` after the emission loop runs.
     needs_full_rebuild: bool,
+    retained_scratch: Vec<CellText>,
+    atlas_generation: u64,
 
     cursor_buffers: [Buffer; FRAMES_IN_FLIGHT],
     cursor_dirty: [bool; FRAMES_IN_FLIGHT],
@@ -414,6 +416,8 @@ impl MetalGridRenderer {
             atlas_grayscale,
             atlas_color: None,
             needs_full_rebuild: true,
+            retained_scratch: Vec::new(),
+            atlas_generation: super::next_atlas_generation(),
             cursor_buffers,
             cursor_dirty: [true; FRAMES_IN_FLIGHT],
             cursor_live: [(0, 0); FRAMES_IN_FLIGHT],
@@ -423,6 +427,10 @@ impl MetalGridRenderer {
     #[inline]
     pub fn needs_full_rebuild(&self) -> bool {
         self.needs_full_rebuild
+    }
+
+    pub fn atlas_generation(&self) -> u64 {
+        self.atlas_generation
     }
 
     #[inline]
@@ -443,6 +451,7 @@ impl MetalGridRenderer {
     /// Drop every cached glyph and force a full rebuild. Called when
     /// the font library is swapped, since the new library reuses font ids.
     pub fn clear_atlas(&mut self) {
+        self.atlas_generation = super::next_atlas_generation();
         self.atlas_grayscale.clear();
         if let Some(atlas) = &mut self.atlas_color {
             atlas.clear();
@@ -462,6 +471,10 @@ impl MetalGridRenderer {
         key: GlyphKey,
         glyph: RasterizedGlyph<'_>,
     ) -> Option<AtlasSlot> {
+        if self.atlas_grayscale.lookup(key).is_some() {
+            self.atlas_generation = super::next_atlas_generation();
+            self.needs_full_rebuild = true;
+        }
         let mut cleared = false;
         loop {
             if let Some(slot) = self.atlas_grayscale.insert(key, glyph) {
@@ -474,6 +487,7 @@ impl MetalGridRenderer {
                 return None;
             }
             self.atlas_grayscale.clear();
+            self.atlas_generation = super::next_atlas_generation();
             self.needs_full_rebuild = true;
             self.fg_dirty = [true; FRAMES_IN_FLIGHT];
             cleared = true;
@@ -492,6 +506,10 @@ impl MetalGridRenderer {
         key: GlyphKey,
         glyph: RasterizedGlyph<'_>,
     ) -> Option<AtlasSlot> {
+        if self.lookup_glyph_color(key).is_some() {
+            self.atlas_generation = super::next_atlas_generation();
+            self.needs_full_rebuild = true;
+        }
         if self.atlas_color.is_none() {
             self.atlas_color = Some(MetalGlyphAtlas::new_color(&self.device));
         }
@@ -509,6 +527,7 @@ impl MetalGridRenderer {
             }
             atlas.clear();
             self.needs_full_rebuild = true;
+            self.atlas_generation = super::next_atlas_generation();
             self.fg_dirty = [true; FRAMES_IN_FLIGHT];
             cleared = true;
         }
@@ -538,6 +557,18 @@ impl MetalGridRenderer {
         self.bg_dirty = [true; FRAMES_IN_FLIGHT];
         self.fg_dirty = [true; FRAMES_IN_FLIGHT];
         self.fg_live_count = [0; FRAMES_IN_FLIGHT];
+    }
+
+    pub fn write_retained_row(&mut self, row: u32, bg: &[CellBg], fg: &[CellText]) {
+        let mut cells = std::mem::take(&mut self.retained_scratch);
+        cells.clear();
+        cells.extend(fg.iter().map(|cell| {
+            let mut cell = *cell;
+            cell.grid_pos[1] = row as u16;
+            cell
+        }));
+        self.write_row(row, bg, &cells);
+        self.retained_scratch = cells;
     }
 
     pub fn write_row(&mut self, row: u32, bg: &[CellBg], fg: &[CellText]) {

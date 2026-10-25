@@ -544,6 +544,283 @@ mod row_patch_tests {
     }
 
     #[test]
+    #[ignore = "requires an X11 display and Vulkan device"]
+    fn retained_pixels_match_compact_across_frame_slots() {
+        use bytemuck::Zeroable;
+        let window = x11::Window::new();
+        let ctx = VulkanContext::new(window.handle());
+        let mut reference = VulkanGridRenderer::new(&ctx, 4, 3);
+        let mut retained = VulkanGridRenderer::new(&ctx, 4, 3);
+        let mut glyphs = Vec::new();
+        for grid in [&mut reference, &mut retained] {
+            let mut slots = Vec::new();
+            for kind in 0..2 {
+                let bytes = if kind == 0 {
+                    vec![160; 24 * 24]
+                } else {
+                    [30, 110, 190, 192].repeat(24 * 24)
+                };
+                let glyph = RasterizedGlyph {
+                    width: 24,
+                    height: 24,
+                    bearing_x: 0,
+                    bearing_y: 16,
+                    bytes: &bytes,
+                };
+                let key = GlyphKey {
+                    font_id: 0,
+                    glyph_id: kind,
+                    size_bucket: 64,
+                };
+                slots.push(
+                    if kind == 0 {
+                        grid.insert_glyph(key, glyph)
+                    } else {
+                        grid.insert_glyph_color(key, glyph)
+                    }
+                    .unwrap(),
+                );
+            }
+            glyphs.push(slots);
+        }
+        let mut uniforms = GridUniforms::zeroed();
+        uniforms.cell_size = [12.0, 12.0];
+        uniforms.grid_size = [4, 3];
+        uniforms.cursor_pos = [u32::MAX; 2];
+        uniforms.projection = [
+            2.0 / 64.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            2.0 / 64.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            -1.0,
+            -1.0,
+            0.0,
+            1.0,
+        ];
+        // Reuse immutable payloads, move them, and exceed the seven-entry cache
+        // to exercise replacement while other slots still contain old bytes.
+        let make_rows =
+            |slots: &[AtlasSlot], generation: usize| -> Vec<Arc<[CellText]>> {
+                (0..3)
+                    .map(|row| {
+                        (0..3)
+                            .map(|col| {
+                                let kind = (row + col + generation) % 2;
+                                let slot = slots[kind];
+                                CellText {
+                                    glyph_pos: [slot.x as u32, slot.y as u32],
+                                    glyph_size: [24, 24],
+                                    bearings: [-3, 16],
+                                    grid_pos: [col as u16, 0],
+                                    atlas: kind as u8,
+                                    page: slot.page,
+                                    color: [
+                                        40 + generation as u8 * 3,
+                                        180 - row as u8 * 40,
+                                        70,
+                                        170,
+                                    ],
+                                    ..Default::default()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .into()
+                    })
+                    .collect()
+            };
+        let mut payloads = [make_rows(&glyphs[0], 0), make_rows(&glyphs[1], 0)];
+        for step in 0..24 {
+            if step % 3 == 0 {
+                payloads = [make_rows(&glyphs[0], step), make_rows(&glyphs[1], step)];
+            }
+            for (which, grid) in [&mut reference, &mut retained].into_iter().enumerate() {
+                for row in 0..3 {
+                    let cells = &payloads[which][(row + step) % 3];
+                    if which == 1 && row != step % 3 {
+                        grid.write_retained_row(row as u32, &[], cells);
+                    } else {
+                        let absolute: Vec<_> = cells
+                            .iter()
+                            .map(|cell| {
+                                let mut cell = *cell;
+                                cell.grid_pos[1] = row as u16;
+                                cell
+                            })
+                            .collect();
+                        grid.write_row(row as u32, &[], &absolute);
+                    }
+                }
+                let mut cursor = payloads[which][0][0];
+                cursor.color = [200, 30, 60, 210];
+                grid.set_cursor(
+                    &[cursor],
+                    &[CellText {
+                        grid_pos: [1, 1],
+                        ..cursor
+                    }],
+                );
+            }
+            // Leave the other slots untouched until their next fence-safe turn.
+            {
+                let slot = step % FRAMES_IN_FLIGHT;
+                let expected = read_text_pixels(&ctx, &mut reference, slot, &uniforms);
+                let actual = read_text_pixels(&ctx, &mut retained, slot, &uniforms);
+                assert!(
+                    expected.chunks_exact(4).any(|pixel| pixel != [0, 0, 0, 0]),
+                    "reference must draw visible pixels"
+                );
+                assert_eq!(actual, expected, "step={step} slot={slot}");
+            }
+        }
+    }
+
+    fn read_text_pixels(
+        ctx: &VulkanContext,
+        grid: &mut VulkanGridRenderer,
+        slot: usize,
+        uniforms: &GridUniforms,
+    ) -> Vec<u8> {
+        // A separate attachment avoids requiring TRANSFER_SRC on the swapchain.
+        let image = ctx.allocate_sampled_image(
+            64,
+            64,
+            ctx.swapchain_format(),
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+        );
+        let output = ctx.allocate_host_visible_buffer(
+            64 * 64 * 4,
+            vk::BufferUsageFlags::TRANSFER_DST,
+        );
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1)
+            .layer_count(1);
+        ctx.submit_oneshot(|cmd| unsafe {
+            let device = ctx.device();
+            let barrier = |old, new, src, dst| {
+                vk::ImageMemoryBarrier::default()
+                    .image(image.handle())
+                    .subresource_range(range)
+                    .old_layout(old)
+                    .new_layout(new)
+                    .src_access_mask(src)
+                    .dst_access_mask(dst)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            };
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier(
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    vk::AccessFlags::empty(),
+                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                )],
+            );
+            grid.prepare(ctx, cmd, slot);
+            let attachments = [vk::RenderingAttachmentInfo::default()
+                .image_view(image.view())
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue { float32: [0.0; 4] },
+                })];
+            let rect = vk::Rect2D {
+                offset: vk::Offset2D::default(),
+                extent: vk::Extent2D {
+                    width: 64,
+                    height: 64,
+                },
+            };
+            device.cmd_begin_rendering(
+                cmd,
+                &vk::RenderingInfo::default()
+                    .render_area(rect)
+                    .layer_count(1)
+                    .color_attachments(&attachments),
+            );
+            device.cmd_set_viewport(
+                cmd,
+                0,
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 64.0,
+                    height: 64.0,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            device.cmd_set_scissor(cmd, 0, &[rect]);
+            grid.render_bg(ctx, cmd, slot, uniforms);
+            grid.render_text(ctx, cmd, slot, uniforms);
+            device.cmd_end_rendering(cmd);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier(
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                    vk::AccessFlags::TRANSFER_READ,
+                )],
+            );
+            device.cmd_copy_image_to_buffer(
+                cmd,
+                image.handle(),
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                output.handle(),
+                &[vk::BufferImageCopy::default()
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D {
+                        width: 64,
+                        height: 64,
+                        depth: 1,
+                    })],
+            );
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[vk::BufferMemoryBarrier::default()
+                    .buffer(output.handle())
+                    .size(vk::WHOLE_SIZE)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)],
+                &[],
+            );
+        });
+        // submit_oneshot waits for its fence before buffers/images are read/dropped.
+        unsafe { std::slice::from_raw_parts(output.as_mut_ptr(), 64 * 64 * 4).to_vec() }
+    }
+
+    #[test]
     fn mixed_row_patch_preserves_other_rows_and_tracks_upload_bounds() {
         let cell = |atlas, page, glyph| CellText {
             atlas,
@@ -603,6 +880,248 @@ mod row_patch_tests {
 struct TextBuffer {
     buffer: Option<VulkanBuffer>,
     capacity: usize,
+}
+
+/// Bounded immutable payload cache. Replacing an entry only marks its three
+/// buffers dirty: an in-flight slot's allocation is never touched or dropped.
+/// Each slot is refreshed only when that slot becomes available for rendering.
+#[derive(Default)]
+struct RetainedTextRow {
+    cells: Arc<[CellText]>,
+    packed: Vec<CellText>,
+    buckets: Vec<TextBucket>,
+    buffers: [TextBuffer; FRAMES_IN_FLIGHT],
+    dirty: [bool; FRAMES_IN_FLIGHT],
+    used: u64,
+}
+
+impl RetainedTextRow {
+    fn set_cells(&mut self, cells: &Arc<[CellText]>) {
+        self.cells = cells.clone();
+        self.buckets.clear();
+        for cell in cells.iter() {
+            if let Some(bucket) = self
+                .buckets
+                .iter_mut()
+                .find(|b| (b.kind, b.page) == (cell.atlas, cell.page))
+            {
+                bucket.count += 1;
+            } else {
+                self.buckets.push(TextBucket {
+                    kind: cell.atlas,
+                    page: cell.page,
+                    start: 0,
+                    count: 1,
+                });
+            }
+        }
+        let mut offset = 0;
+        for bucket in &mut self.buckets {
+            bucket.start = offset;
+            offset += bucket.count;
+        }
+        let mut positions: smallvec::SmallVec<[usize; 4]> =
+            self.buckets.iter().map(|b| b.start as usize).collect();
+        self.packed.resize(cells.len(), CellText::default());
+        for cell in cells.iter() {
+            let bucket = self
+                .buckets
+                .iter()
+                .position(|b| (b.kind, b.page) == (cell.atlas, cell.page))
+                .unwrap();
+            self.packed[positions[bucket]] = *cell;
+            positions[bucket] += 1;
+        }
+        self.dirty = [true; FRAMES_IN_FLIGHT];
+    }
+}
+
+#[derive(Default)]
+struct RetainedText {
+    entries: Vec<RetainedTextRow>,
+    placement: Vec<Option<usize>>,
+    active: usize,
+    clock: u64,
+}
+
+impl RetainedText {
+    // At most 32 MiB of original/packed CPU payload and 48 MiB of GPU payload,
+    // including power-of-two buffer rounding. Oversized/unusual rows fall back.
+    const MAX_ENTRIES: usize = 256;
+    const MAX_CELLS: usize = 2048;
+
+    fn place(&mut self, row: usize, cells: &Arc<[CellText]>) -> bool {
+        if row >= self.placement.len() || cells.len() > Self::MAX_CELLS {
+            return false;
+        }
+        let existing = self
+            .entries
+            .iter()
+            .position(|entry| Arc::ptr_eq(&entry.cells, cells));
+        let index = if let Some(index) = existing {
+            index
+        } else {
+            // Keep up to one previous viewport for scroll reuse. Never replace
+            // an entry referenced by another visible row (duplicates may share).
+            let limit =
+                (self.placement.len().saturating_mul(2) + 1).min(Self::MAX_ENTRIES);
+            let index = if self.entries.len() < limit {
+                self.entries.push(RetainedTextRow::default());
+                self.entries.len() - 1
+            } else if let Some(index) = (0..self.entries.len())
+                .filter(|index| {
+                    !self
+                        .placement
+                        .iter()
+                        .enumerate()
+                        .any(|(y, entry)| y != row && *entry == Some(*index))
+                })
+                .min_by_key(|&index| self.entries[index].used)
+            {
+                index
+            } else {
+                return false;
+            };
+            self.entries[index].set_cells(cells);
+            index
+        };
+        self.clock = self.clock.wrapping_add(1);
+        self.entries[index].used = self.clock;
+        if self.placement[row].replace(index).is_none() {
+            self.active += 1;
+        }
+        true
+    }
+
+    fn unplace(&mut self, row: usize) {
+        if self.placement[row].take().is_some() {
+            self.active -= 1;
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.placement.fill(None);
+        self.active = 0;
+        for entry in &mut self.entries {
+            entry.cells = Arc::default();
+            entry.packed.clear();
+            entry.buckets.clear();
+            entry.dirty = [true; FRAMES_IN_FLIGHT];
+        }
+    }
+}
+
+#[cfg(test)]
+mod retained_text_tests {
+    use super::*;
+
+    fn cells(keys: &[(u8, u8)]) -> Arc<[CellText]> {
+        keys.iter()
+            .enumerate()
+            .map(|(x, &(atlas, page))| CellText {
+                grid_pos: [x as u16, 0],
+                atlas,
+                page,
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn moves_and_duplicate_rows_share_payload_without_uploads() {
+        let mut retained = RetainedText {
+            placement: vec![None; 3],
+            ..Default::default()
+        };
+        let a = cells(&[(0, 0); 2]);
+        let b = cells(&[(0, 0); 4]);
+        assert!(retained.place(0, &a));
+        assert!(retained.place(1, &b));
+        for entry in &mut retained.entries {
+            entry.dirty.fill(false);
+        }
+        let a_index = retained.placement[0];
+        let b_index = retained.placement[1];
+        assert!(retained.place(2, &a));
+        assert!(retained.place(0, &b));
+        assert!(retained.place(1, &a));
+        assert_eq!(retained.placement, [b_index, a_index, a_index]);
+        assert_eq!(retained.active, 3);
+        assert_eq!(retained.entries.len(), 2);
+        assert!(retained
+            .entries
+            .iter()
+            .all(|entry| entry.dirty == [false; FRAMES_IN_FLIGHT]));
+        assert!(Arc::ptr_eq(&retained.entries[a_index.unwrap()].cells, &a));
+        assert!(a.iter().all(|cell| cell.grid_pos[1] == 0));
+        retained.unplace(1);
+        retained.unplace(1);
+        assert_eq!(retained.active, 2);
+        assert!(retained.place(1, &a));
+        assert_eq!(retained.active, 3);
+        retained.invalidate();
+        assert_eq!(retained.active, 0);
+    }
+
+    #[test]
+    fn changed_lengths_and_atlas_runs_propagate_to_each_slot_independently() {
+        assert_eq!(FRAMES_IN_FLIGHT, 3);
+        let mut retained = RetainedText {
+            placement: vec![None],
+            ..Default::default()
+        };
+        let old = cells(&[(0, 0); 2]);
+        let changed = cells(&[(0, 1), (1, 0), (0, 1)]);
+        assert!(retained.place(0, &old));
+        let index = retained.placement[0].unwrap();
+        // Model slots completing in a different order, with a content change
+        // between completions. Unavailable slots must still receive the latest row.
+        retained.entries[index].dirty[2] = false;
+        assert!(retained.place(0, &changed));
+        let index = retained.placement[0].unwrap();
+        assert_eq!(retained.entries[index].dirty, [true; 3]);
+        for slot in [1, 0, 2] {
+            let entry = &mut retained.entries[index];
+            assert!(entry.dirty[slot]);
+            assert_eq!(entry.cells.len(), 3);
+            entry.dirty[slot] = false;
+        }
+        assert_eq!(retained.entries[index].dirty, [false; 3]);
+        let runs: Vec<_> = text_runs(&changed, 0)
+            .map(|run| (run.kind, run.page, run.start, run.count))
+            .collect();
+        assert_eq!(runs, [(0, 1, 0, 1), (1, 0, 1, 1), (0, 1, 2, 1)]);
+        assert_eq!(
+            retained.entries[0].cells.len(),
+            2,
+            "changing one row does not repack an older payload"
+        );
+    }
+
+    #[test]
+    fn eviction_is_bounded_and_clear_invalidates_all_placements() {
+        let mut retained = RetainedText {
+            placement: vec![None; 2],
+            ..Default::default()
+        };
+        for len in 1..20 {
+            assert!(retained.place(0, &cells(&vec![(0, 0); len])));
+        }
+        assert_eq!(retained.entries.len(), 5);
+        let oversized = cells(&vec![(0, 0); RetainedText::MAX_CELLS + 1]);
+        assert!(!retained.place(1, &oversized));
+        retained.invalidate();
+        assert!(retained.placement.iter().all(Option::is_none));
+        assert!(retained
+            .entries
+            .iter()
+            .all(|entry| entry.cells.is_empty() && entry.dirty == [true; 3]));
+        let fresh = cells(&[(1, 2)]);
+        assert!(retained.place(1, &fresh));
+        let entry = &retained.entries[retained.placement[1].unwrap()];
+        assert!(Arc::ptr_eq(&entry.cells, &fresh));
+        assert_eq!(entry.dirty, [true; 3]);
+    }
 }
 
 impl TextBuffer {
@@ -1188,10 +1707,16 @@ impl GridPipelines {
         let text_atlas_descriptor_set_layout =
             create_text_atlas_descriptor_set_layout(device);
         // Push constant `is_color: u32` switches sampling mode per draw.
-        let text_push_constants = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-            .offset(0)
-            .size(4)];
+        let text_push_constants = [
+            vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                .offset(0)
+                .size(4),
+            vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::VERTEX)
+                .offset(4)
+                .size(4),
+        ];
         let text_pipeline_layout = create_pipeline_layout(
             device,
             &[
@@ -1275,6 +1800,7 @@ pub struct VulkanGridRenderer {
     bg_descriptor_sets: [vk::DescriptorSet; FRAMES_IN_FLIGHT],
 
     fg_rows: Vec<Vec<CellText>>,
+    retained_text: RetainedText,
     fg_staging: Vec<CellText>,
     fg_staging_dirty: bool,
     /// Prefix offsets for a single-atlas layout. Atlas regrouping and row
@@ -1302,6 +1828,7 @@ pub struct VulkanGridRenderer {
 
     pub atlas_grayscale: VulkanGlyphAtlas,
     pub atlas_color: VulkanGlyphAtlas,
+    atlas_generation: u64,
 
     needs_full_rebuild: bool,
 }
@@ -1386,6 +1913,10 @@ impl VulkanGridRenderer {
             bg_descriptor_pool,
             bg_descriptor_sets,
             fg_rows: init_fg_rows(rows),
+            retained_text: RetainedText {
+                placement: vec![None; rows as usize],
+                ..Default::default()
+            },
             fg_staging: Vec::new(),
             fg_staging_dirty: true,
             fg_row_offsets: Vec::new(),
@@ -1402,6 +1933,7 @@ impl VulkanGridRenderer {
             text_uniform_descriptor_sets,
             atlas_grayscale,
             atlas_color,
+            atlas_generation: super::next_atlas_generation(),
             needs_full_rebuild: true,
         }
     }
@@ -1409,6 +1941,10 @@ impl VulkanGridRenderer {
     #[inline]
     pub fn needs_full_rebuild(&self) -> bool {
         self.needs_full_rebuild
+    }
+
+    pub fn atlas_generation(&self) -> u64 {
+        self.atlas_generation
     }
 
     #[inline]
@@ -1459,6 +1995,11 @@ impl VulkanGridRenderer {
 
         // Reset fg state — emit loop will re-populate after resize.
         self.fg_rows = init_fg_rows(rows);
+        // resize waited for all slots above, so dropping their buffers is safe.
+        self.retained_text = RetainedText {
+            placement: vec![None; rows as usize],
+            ..Default::default()
+        };
         self.fg_staging_dirty = true;
         self.cursor_dirty = [true; FRAMES_IN_FLIGHT];
         self.needs_full_rebuild = true;
@@ -1468,6 +2009,7 @@ impl VulkanGridRenderer {
         if row >= self.rows {
             return;
         }
+        self.retained_text.unplace(row as usize);
         // Identical row writes must not invalidate every frame-slot upload.
         let idx = (row as usize) + 1;
         if bytemuck::cast_slice::<_, u8>(self.fg_rows[idx].as_slice())
@@ -1565,6 +2107,31 @@ impl VulkanGridRenderer {
         }
     }
 
+    /// Place immutable row-local glyphs without translating or uploading them
+    /// again. Ordinary writes retain the compact atlas-bucket path.
+    pub fn write_retained_row(&mut self, row: u32, bg: &[CellBg], fg: &Arc<[CellText]>) {
+        if row >= self.rows {
+            return;
+        }
+        // Clear any ordinary payload and update backgrounds through the existing
+        // damage path. place() sets the retained mapping after write_row clears it.
+        if fg.len() <= RetainedText::MAX_CELLS {
+            self.write_row(row, bg, &[]);
+            if self.retained_text.place(row as usize, fg) {
+                return;
+            }
+        }
+        let translated: Vec<_> = fg
+            .iter()
+            .map(|cell| {
+                let mut cell = *cell;
+                cell.grid_pos[1] = row as u16;
+                cell
+            })
+            .collect();
+        self.write_row(row, bg, &translated);
+    }
+
     // Keep bucket bookkeeping from enlarging the row-copy hot path.
     #[inline(never)]
     fn mark_mixed_row_dirty(&mut self, row: usize, changed: Range<usize>) {
@@ -1643,6 +2210,7 @@ impl VulkanGridRenderer {
         if row >= self.rows {
             return;
         }
+        self.retained_text.unplace(row as usize);
         let idx = (row as usize) + 1;
         if let Some(slot) = self.fg_rows.get_mut(idx) {
             if !slot.is_empty() {
@@ -1707,6 +2275,8 @@ impl VulkanGridRenderer {
     /// Drop every cached glyph and force a full rebuild. Called when
     /// the font library is swapped, since the new library reuses font ids.
     pub fn clear_atlas(&mut self) {
+        self.atlas_generation = super::next_atlas_generation();
+        self.retained_text.invalidate();
         self.atlas_grayscale.clear();
         self.atlas_color.clear();
         self.needs_full_rebuild = true;
@@ -1723,11 +2293,18 @@ impl VulkanGridRenderer {
         key: GlyphKey,
         glyph: RasterizedGlyph<'_>,
     ) -> Option<AtlasSlot> {
+        if self.atlas_grayscale.lookup(key).is_some() {
+            self.atlas_generation = super::next_atlas_generation();
+            self.retained_text.invalidate();
+            self.needs_full_rebuild = true;
+        }
         if let Some(slot) = self.atlas_grayscale.insert(key, glyph) {
             return Some(slot);
         }
         self.atlas_grayscale.clear();
         self.needs_full_rebuild = true;
+        self.atlas_generation = super::next_atlas_generation();
+        self.retained_text.invalidate();
         self.cursor_dirty = [true; FRAMES_IN_FLIGHT];
         self.fg_staging_dirty = true;
         self.atlas_grayscale.insert(key, glyph)
@@ -1738,11 +2315,18 @@ impl VulkanGridRenderer {
         key: GlyphKey,
         glyph: RasterizedGlyph<'_>,
     ) -> Option<AtlasSlot> {
+        if self.atlas_color.lookup(key).is_some() {
+            self.atlas_generation = super::next_atlas_generation();
+            self.retained_text.invalidate();
+            self.needs_full_rebuild = true;
+        }
         if let Some(slot) = self.atlas_color.insert(key, glyph) {
             return Some(slot);
         }
         self.atlas_color.clear();
         self.needs_full_rebuild = true;
+        self.atlas_generation = super::next_atlas_generation();
+        self.retained_text.invalidate();
         self.cursor_dirty = [true; FRAMES_IN_FLIGHT];
         self.fg_staging_dirty = true;
         self.atlas_color.insert(key, glyph)
@@ -1891,7 +2475,21 @@ impl VulkanGridRenderer {
             self.cursor_buffers[slot].upload(ctx, &[block, non_block]);
             self.cursor_dirty[slot] = false;
         }
-        if self.fg_staging.is_empty() && block.is_empty() && non_block.is_empty() {
+        let has_retained = self.retained_text.active != 0;
+        if has_retained {
+            for index in self.retained_text.placement.iter().flatten().copied() {
+                let entry = &mut self.retained_text.entries[index];
+                if entry.dirty[slot] {
+                    entry.buffers[slot].upload(ctx, &[&entry.packed]);
+                    entry.dirty[slot] = false;
+                }
+            }
+        }
+        if self.fg_staging.is_empty()
+            && block.is_empty()
+            && non_block.is_empty()
+            && !has_retained
+        {
             return;
         }
 
@@ -1912,17 +2510,98 @@ impl VulkanGridRenderer {
             );
         }
         if !block.is_empty() {
-            self.draw_text(cmd, &self.cursor_buffers[slot], text_runs(block, 0));
+            self.draw_text(cmd, &self.cursor_buffers[slot], text_runs(block, 0), 0);
         }
-        if !self.fg_staging.is_empty() {
-            self.draw_text(cmd, &self.fg_buffers[slot], self.fg_buckets.iter().copied());
+        if !has_retained {
+            if !self.fg_staging.is_empty() {
+                self.draw_text(
+                    cmd,
+                    &self.fg_buffers[slot],
+                    self.fg_buckets.iter().copied(),
+                    0,
+                );
+            }
+        } else {
+            self.draw_content_with_retained(cmd, slot);
         }
         if !non_block.is_empty() {
             self.draw_text(
                 cmd,
                 &self.cursor_buffers[slot],
                 text_runs(non_block, block.len() as u32),
+                0,
             );
+        }
+    }
+
+    fn draw_content_with_retained(&self, cmd: vk::CommandBuffer, slot: usize) {
+        // Match pack_mixed_rows: first-seen atlas buckets, then row/cell order
+        // within each bucket. Overhanging glyphs can overlap adjacent rows, so
+        // drawing ordinary rows and retained rows in separate passes is invalid.
+        let mut keys = smallvec::SmallVec::<[(u8, u8); 4]>::new();
+        for row in 0..self.rows as usize {
+            if let Some(index) = self.retained_text.placement[row] {
+                for bucket in &self.retained_text.entries[index].buckets {
+                    let key = (bucket.kind, bucket.page);
+                    if !keys.contains(&key) {
+                        keys.push(key);
+                    }
+                }
+                continue;
+            }
+            let cells = match self.retained_text.placement[row] {
+                Some(index) => &*self.retained_text.entries[index].cells,
+                None => &self.fg_rows[row + 1],
+            };
+            for cell in cells {
+                let key = (cell.atlas, cell.page);
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+        }
+        for (kind, page) in keys {
+            let mut ordinary_start = self
+                .fg_buckets
+                .iter()
+                .find(|bucket| (bucket.kind, bucket.page) == (kind, page))
+                .map_or(0, |bucket| bucket.start);
+            for row in 0..self.rows as usize {
+                if let Some(index) = self.retained_text.placement[row] {
+                    let entry = &self.retained_text.entries[index];
+                    if let Some(bucket) = entry
+                        .buckets
+                        .iter()
+                        .find(|b| (b.kind, b.page) == (kind, page))
+                    {
+                        self.draw_text(
+                            cmd,
+                            &entry.buffers[slot],
+                            std::iter::once(*bucket),
+                            row as u32,
+                        );
+                    }
+                } else {
+                    let count = self.fg_rows[row + 1]
+                        .iter()
+                        .filter(|cell| (cell.atlas, cell.page) == (kind, page))
+                        .count() as u32;
+                    if count != 0 {
+                        self.draw_text(
+                            cmd,
+                            &self.fg_buffers[slot],
+                            std::iter::once(TextBucket {
+                                kind,
+                                page,
+                                start: ordinary_start,
+                                count,
+                            }),
+                            0,
+                        );
+                        ordinary_start += count;
+                    }
+                }
+            }
         }
     }
 
@@ -1931,8 +2610,16 @@ impl VulkanGridRenderer {
         cmd: vk::CommandBuffer,
         buffer: &TextBuffer,
         buckets: impl Iterator<Item = TextBucket>,
+        row_offset: u32,
     ) {
         unsafe {
+            self.shared.cmd_push_constants(
+                cmd,
+                self.pipelines.text_pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                4,
+                &row_offset.to_ne_bytes(),
+            );
             let buf = buffer.buffer.as_ref().unwrap();
             self.shared
                 .cmd_bind_vertex_buffers(cmd, 0, &[buf.handle()], &[0]);

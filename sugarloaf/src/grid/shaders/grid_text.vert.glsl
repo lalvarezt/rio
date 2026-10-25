@@ -54,6 +54,10 @@ layout(location = 5) in uint  in_bools;
 layout(location = 0) flat out vec4 out_color;
 layout(location = 1)      out vec2 out_tex_coord;
 
+layout(push_constant) uniform Placement {
+    layout(offset = 4) uint row_offset;
+} placement;
+
 const uint BOOL_IS_CURSOR_GLYPH = 2u;
 
 // Colorspace helpers — same as grid_bg.frag.glsl. We need them in the
@@ -95,7 +99,8 @@ vec3 grid_prepare_output_rgb(vec3 srgb, uint cs) {
 
 void main() {
     // Cell origin in pixel space.
-    vec2 cell_pos = uniforms.cell_size * vec2(in_grid_pos);
+    uvec2 grid_pos = in_grid_pos + uvec2(0, placement.row_offset);
+    vec2 cell_pos = uniforms.cell_size * vec2(grid_pos);
 
     // Quad corner 0..1 from vertex id (4-vertex TRIANGLE_STRIP).
     vec2 corner;
@@ -129,8 +134,8 @@ void main() {
     // Skip when cursor_color.a == 0 — that's the hollow / unfocused
     // path where the underlying glyph colour should stay intact.
     bool is_cursor_pos =
-        (in_grid_pos.x == uniforms.cursor_pos.x) &&
-        (in_grid_pos.y == uniforms.cursor_pos.y);
+        (grid_pos.x == uniforms.cursor_pos.x) &&
+        (grid_pos.y == uniforms.cursor_pos.y);
     if ((in_bools & BOOL_IS_CURSOR_GLYPH) == 0u
         && is_cursor_pos
         && uniforms.cursor_color.a > 0.0) {

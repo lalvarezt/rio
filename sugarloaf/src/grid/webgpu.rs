@@ -266,6 +266,8 @@ pub struct WgpuGridRenderer {
     /// Mirror of `MetalGridRenderer::needs_full_rebuild`. Set on
     /// `new` / `resize`, cleared via `mark_full_rebuild_done`.
     needs_full_rebuild: bool,
+    retained_scratch: Vec<CellText>,
+    atlas_generation: u64,
 }
 
 impl WgpuGridRenderer {
@@ -341,12 +343,18 @@ impl WgpuGridRenderer {
             atlas_grayscale,
             atlas_color,
             needs_full_rebuild: true,
+            retained_scratch: Vec::new(),
+            atlas_generation: super::next_atlas_generation(),
         }
     }
 
     #[inline]
     pub fn needs_full_rebuild(&self) -> bool {
         self.needs_full_rebuild
+    }
+
+    pub fn atlas_generation(&self) -> u64 {
+        self.atlas_generation
     }
 
     #[inline]
@@ -384,6 +392,18 @@ impl WgpuGridRenderer {
             &self.uniform_buffer,
             &self.bg_buffer,
         );
+    }
+
+    pub fn write_retained_row(&mut self, row: u32, bg: &[CellBg], fg: &[CellText]) {
+        let mut cells = std::mem::take(&mut self.retained_scratch);
+        cells.clear();
+        cells.extend(fg.iter().map(|cell| {
+            let mut cell = *cell;
+            cell.grid_pos[1] = row as u16;
+            cell
+        }));
+        self.write_row(row, bg, &cells);
+        self.retained_scratch = cells;
     }
 
     pub fn write_row(&mut self, row: u32, bg: &[CellBg], fg: &[CellText]) {
@@ -464,6 +484,7 @@ impl WgpuGridRenderer {
     /// Drop every cached glyph and force a full rebuild. Called when
     /// the font library is swapped, since the new library reuses font ids.
     pub fn clear_atlas(&mut self) {
+        self.atlas_generation = super::next_atlas_generation();
         self.atlas_grayscale.clear();
         self.atlas_color.clear();
         self.needs_full_rebuild = true;
@@ -478,11 +499,16 @@ impl WgpuGridRenderer {
         key: GlyphKey,
         glyph: RasterizedGlyph<'_>,
     ) -> Option<AtlasSlot> {
+        if self.atlas_grayscale.lookup(key).is_some() {
+            self.atlas_generation = super::next_atlas_generation();
+            self.needs_full_rebuild = true;
+        }
         if let Some(slot) = self.atlas_grayscale.insert(key, glyph) {
             return Some(slot);
         }
         self.atlas_grayscale.clear();
         self.needs_full_rebuild = true;
+        self.atlas_generation = super::next_atlas_generation();
         self.fg_dirty = 0..self.fg_rows.len();
         self.atlas_grayscale.insert(key, glyph)
     }
@@ -492,12 +518,17 @@ impl WgpuGridRenderer {
         key: GlyphKey,
         glyph: RasterizedGlyph<'_>,
     ) -> Option<AtlasSlot> {
+        if self.atlas_color.lookup(key).is_some() {
+            self.atlas_generation = super::next_atlas_generation();
+            self.needs_full_rebuild = true;
+        }
         let deferred = self.atlas_color.texture.width() != ATLAS_SIZE;
         let slot = if let Some(slot) = self.atlas_color.insert(key, glyph) {
             Some(slot)
         } else {
             self.atlas_color.clear();
             self.needs_full_rebuild = true;
+            self.atlas_generation = super::next_atlas_generation();
             self.fg_dirty = 0..self.fg_rows.len();
             self.atlas_color.insert(key, glyph)
         };

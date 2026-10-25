@@ -29,9 +29,8 @@ pub struct GlyphKey {
 /// `glyph_pos`, `glyph_size`, `bearings`.
 ///
 /// `page` is the index of the atlas page this glyph lives in. The
-/// Vulkan backend's per-kind atlas is a list of fixed-size pages
-/// (`grid/vulkan.rs`); the other backends use a single image / texture
-/// and leave `page` at 0.
+/// Vulkan and CPU backends keep per-kind pages. Metal and wgpu use a
+/// single image / texture and leave `page` at 0.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AtlasSlot {
     pub x: u16,

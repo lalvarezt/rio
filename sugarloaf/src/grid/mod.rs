@@ -34,6 +34,13 @@ use crate::context::{Context, ContextType};
 pub use atlas::{AtlasSlot, GlyphKey, RasterizedGlyph};
 pub use cell::{CellBg, CellText, GridUniforms};
 
+// A fresh value also identifies a newly constructed grid. Reusing a font or
+// glyph id after an atlas clear must never reuse another grid's cached slots.
+pub(crate) fn next_atlas_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Backend-dispatching grid renderer. One of these lives per terminal
 /// panel; it owns the per-panel cell buffers and submits grid draw
 /// calls to the sugarloaf context's encoder / render pass.
@@ -64,6 +71,36 @@ pub enum GridRenderer {
 }
 
 impl GridRenderer {
+    /// Place immutable geometry whose glyph rows are all zero.
+    pub fn write_retained_row(
+        &mut self,
+        row: u32,
+        bg: &[CellBg],
+        fg: &std::sync::Arc<[CellText]>,
+    ) {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Metal(grid) => grid.write_retained_row(row, bg, fg),
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(grid) => grid.write_retained_row(row, bg, fg),
+            #[cfg(target_os = "linux")]
+            Self::Vulkan(grid) => grid.write_retained_row(row, bg, fg),
+            Self::Cpu(grid) => grid.write_retained_row(row, bg, fg),
+        }
+    }
+
+    pub fn atlas_generation(&self) -> u64 {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Metal(grid) => grid.atlas_generation(),
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(grid) => grid.atlas_generation(),
+            #[cfg(target_os = "linux")]
+            Self::Vulkan(grid) => grid.atlas_generation(),
+            Self::Cpu(grid) => grid.atlas_generation(),
+        }
+    }
+
     /// Construct a grid renderer matching `context`'s backend.
     pub fn new(context: &Context<'_>, cols: u32, rows: u32) -> Self {
         match &context.inner {
