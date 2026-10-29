@@ -47,8 +47,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     HTTOPRIGHT, MENU_ITEM_STATE, MFS_DISABLED, MFS_ENABLED, MF_BYCOMMAND, NID_READY,
     PM_NOREMOVE, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_MOVE, SC_RESTORE, SC_SIZE,
     SM_DIGITIZER, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
-    TPM_LEFTALIGN, TPM_RETURNCMD, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_NCLBUTTONDOWN,
-    WM_SYSCOMMAND, WNDCLASSEXW,
+    TPM_LEFTALIGN, TPM_RETURNCMD, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WINDOWPLACEMENT,
+    WM_NCLBUTTONDOWN, WM_SYSCOMMAND, WNDCLASSEXW,
 };
 
 use tracing::warn;
@@ -801,6 +801,26 @@ impl Window {
 
         self.thread_executor.execute_in_thread(move || {
             let _ = &window;
+            let fullscreen_monitor =
+                fullscreen.as_ref().map(|fullscreen| match fullscreen {
+                    Fullscreen::Exclusive(video_mode) => video_mode.monitor(),
+                    Fullscreen::Borderless(Some(monitor)) => monitor.clone(),
+                    Fullscreen::Borderless(None) => {
+                        monitor::current_monitor(window.hwnd())
+                    }
+                });
+            if old_fullscreen.is_none() && fullscreen.is_some() {
+                // Restoring the maximized window below changes its placement.
+                // Keep the original placement across fullscreen monitor changes.
+                let placement = unsafe {
+                    let mut placement: WINDOWPLACEMENT = mem::zeroed();
+                    placement.length = mem::size_of::<WINDOWPLACEMENT>() as u32;
+                    GetWindowPlacement(window.hwnd(), &mut placement);
+                    placement
+                };
+                window_state.lock().unwrap().saved_window =
+                    Some(SavedWindow { placement });
+            }
             // Change video mode if we're transitioning to or from exclusive
             // fullscreen
             match (&old_fullscreen, &fullscreen) {
@@ -863,6 +883,9 @@ impl Window {
                 window_state.lock().unwrap(),
                 window.hwnd(),
                 |f| {
+                    if fullscreen.is_some() {
+                        f.remove(WindowFlags::MAXIMIZED);
+                    }
                     f.set(
                         WindowFlags::MARKER_EXCLUSIVE_FULLSCREEN,
                         matches!(fullscreen, Some(Fullscreen::Exclusive(_))),
@@ -885,24 +908,8 @@ impl Window {
 
             // Update window bounds
             match &fullscreen {
-                Some(fullscreen) => {
-                    // Save window bounds before entering fullscreen
-                    let placement = unsafe {
-                        let mut placement = mem::zeroed();
-                        GetWindowPlacement(window.hwnd(), &mut placement);
-                        placement
-                    };
-
-                    window_state.lock().unwrap().saved_window =
-                        Some(SavedWindow { placement });
-
-                    let monitor = match &fullscreen {
-                        Fullscreen::Exclusive(video_mode) => video_mode.monitor(),
-                        Fullscreen::Borderless(Some(monitor)) => monitor.clone(),
-                        Fullscreen::Borderless(None) => {
-                            monitor::current_monitor(window.hwnd())
-                        }
-                    };
+                Some(_) => {
+                    let monitor = fullscreen_monitor.unwrap();
 
                     let position: (i32, i32) = monitor.position().into();
                     let size: (u32, u32) = monitor.size().into();
