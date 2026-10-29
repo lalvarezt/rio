@@ -57,10 +57,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GWL_USERDATA, HTCAPTION, HTCLIENT, IDYES, MB_ICONQUESTION, MB_TASKMODAL, MB_YESNO,
     MINMAXINFO, MNC_CLOSE, MSG, MWMO_INPUTAVAILABLE, NCCALCSIZE_PARAMS, PM_REMOVE,
     PT_PEN, PT_TOUCH, QS_ALLINPUT, RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL, SC_MINIMIZE,
-    SC_RESTORE, SIZE_MAXIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    WHEEL_DELTA, WINDOWPOS, WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT, WMSZ_LEFT,
-    WMSZ_RIGHT, WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT, WM_CAPTURECHANGED, WM_CLOSE,
-    WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE,
+    SC_RESTORE, SIZE_MAXIMIZED, SIZE_MINIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, WHEEL_DELTA, WINDOWPOS, WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT,
+    WMSZ_LEFT, WMSZ_RIGHT, WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT, WM_CAPTURECHANGED,
+    WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE,
     WM_GETMINMAXINFO, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT,
     WM_IME_STARTCOMPOSITION, WM_INPUT, WM_INPUT_DEVICE_CHANGE, WM_KEYDOWN, WM_KEYUP,
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
@@ -428,6 +428,11 @@ impl<T: 'static> EventLoop<T> {
         // `MsgWaitForMultipleObjectsEx`.
         //
         runner.prepare_wait();
+        // AboutToWait can request exit. In Wait mode there may be no
+        // later message to wake the thread and let the outer loop see it.
+        if runner.exit_code().is_some() {
+            return;
+        }
         wait_for_messages_impl(
             &mut self.high_resolution_timer,
             runner.control_flow(),
@@ -1278,6 +1283,64 @@ unsafe fn public_window_callback_inner(
     // the closure to catch_unwind directly so that the match body indentation wouldn't change and
     // the git blame and history would be preserved.
     let callback = || match msg {
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_NCHITTEST => {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT,
+                HTTOP, HTTOPLEFT, HTTOPRIGHT,
+            };
+            let state = userdata.window_state_lock();
+            let flags = state.window_flags;
+            let border = (6.0 * state.scale_factor).ceil() as i32;
+            drop(state);
+            if flags.contains(WindowFlags::MARKER_DECORATIONS) {
+                result = ProcResult::DefWindowProc(wparam);
+                return;
+            }
+            if !flags.contains(WindowFlags::RESIZABLE)
+                || util::is_maximized(window)
+                || flags.intersects(
+                    WindowFlags::MARKER_EXCLUSIVE_FULLSCREEN
+                        | WindowFlags::MARKER_BORDERLESS_FULLSCREEN,
+                )
+            {
+                result = ProcResult::Value(HTCLIENT as LRESULT);
+                return;
+            }
+            let mut rect = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            if unsafe { GetWindowRect(window, &mut rect) } == 0 {
+                result = ProcResult::DefWindowProc(wparam);
+                return;
+            }
+            // LPARAM coordinates are signed; monitors can sit left or above
+            // the primary display.
+            let x = lparam as i16 as i32;
+            let y = (lparam >> 16) as i16 as i32;
+            let col = if x < rect.left + border {
+                0
+            } else if x >= rect.right - border {
+                2
+            } else {
+                1
+            };
+            let row = if y < rect.top + border {
+                0
+            } else if y >= rect.bottom - border {
+                2
+            } else {
+                1
+            };
+            let hits = [
+                [HTTOPLEFT, HTTOP, HTTOPRIGHT],
+                [HTLEFT, HTCLIENT, HTRIGHT],
+                [HTBOTTOMLEFT, HTBOTTOM, HTBOTTOMRIGHT],
+            ];
+            result = ProcResult::Value(hits[row][col] as LRESULT);
+        }
         WM_NCCALCSIZE => {
             let window_flags = userdata.window_state_lock().window_flags;
             if wparam == 0 || window_flags.contains(WindowFlags::MARKER_DECORATIONS) {
@@ -1384,12 +1447,11 @@ unsafe fn public_window_callback_inner(
         }
 
         WM_PAINT => {
-            userdata.window_state_lock().redraw_requested =
-                userdata.event_loop_runner.should_buffer();
+            let previous_redraw = userdata
+                .window_state_lock()
+                .redraw_requested
+                .replace(userdata.event_loop_runner.should_buffer());
 
-            // We'll buffer only in response to `UpdateWindow`, if win32 decides to redraw the
-            // window outside the normal flow of the event loop. This way mark event as handled
-            // and request a normal redraw with `RedrawWindow`.
             if !userdata.event_loop_runner.should_buffer() {
                 userdata.send_event(Event::WindowEvent {
                     window_id: RootWindowId(WindowId(window)),
@@ -1397,16 +1459,19 @@ unsafe fn public_window_callback_inner(
                 });
             }
 
-            // NOTE: calling `RedrawWindow` during `WM_PAINT` does nothing, since to mark
-            // `WM_PAINT` as handled we should call the `DefWindowProcW`. Call it and check whether
-            // user asked for redraw during `RedrawRequested` event handling and request it again
-            // after marking `WM_PAINT` as handled.
             result =
                 ProcResult::Value(unsafe { DefWindowProcW(window, msg, wparam, lparam) });
-            if std::mem::take(&mut userdata.window_state_lock().redraw_requested) {
-                unsafe {
-                    RedrawWindow(window, ptr::null(), ptr::null_mut(), RDW_INTERNALPAINT)
-                };
+            // Rearm after clearing this paint, including requests made while rendering.
+            // Immediate invalidation here would bypass the display clock.
+            let requested = {
+                let mut state = userdata.window_state_lock();
+                let requested = state.redraw_requested.take().unwrap_or(false);
+                state.redraw_requested =
+                    previous_redraw.map(|before| before || requested);
+                requested
+            };
+            if requested {
+                userdata.vsync_state.request_redraw(window);
             }
         }
         WM_WINDOWPOSCHANGING => {
@@ -1523,7 +1588,13 @@ unsafe fn public_window_callback_inner(
             let w = super::loword(lparam as u32) as u32;
             let h = super::hiword(lparam as u32) as u32;
 
-            let physical_size = PhysicalSize::new(w, h);
+            // Undecorated windows can retain an iconic client area while minimized.
+            // It is not a usable render size and must not reflow the terminal.
+            let physical_size = if wparam == SIZE_MINIMIZED as usize {
+                PhysicalSize::new(0, 0)
+            } else {
+                PhysicalSize::new(w, h)
+            };
             let event = Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
                 event: Resized(physical_size),

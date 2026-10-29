@@ -718,6 +718,11 @@ pub struct Modifiers {
 impl Modifiers {
     /// The state of the modifiers.
     pub fn state(&self) -> ModifiersState {
+        self.state & !(ModifiersState::CAPS_LOCK | ModifiersState::NUM_LOCK)
+    }
+
+    /// Modifier state including toggled keyboard locks, for input protocols.
+    pub fn state_with_locks(&self) -> ModifiersState {
         self.state
     }
 

@@ -1,8 +1,8 @@
-//! DwmFlush-driven vsync worker that drives all window repaints.
+//! DwmFlush-driven vsync worker for window repaint continuations.
 //!
-//! Mirrors the macOS CVDisplayLink model: `Window::request_redraw`
-//! sets a per-window `Arc<AtomicBool>` dirty flag, and the worker
-//! is the single source of frame timing. Per composition cycle it
+//! Requests made during WM_PAINT rearm a per-window dirty flag after the
+//! paint completes. Fresh input invalidates immediately; continuations use
+//! this worker as their frame clock. Per composition cycle it
 //! iterates the window registry and, for each window where
 //! `dirty || should_present_after_input`, fires
 //! `RedrawWindow(.., RDW_INVALIDATE)`. The app's `WM_PAINT` /
@@ -14,6 +14,7 @@
 //! same gate macOS / Wayland / X11 use via `InputRateTracker`.
 //! Single keystrokes / lone mouse events no longer force a
 //! 1-second redraw storm.
+//! With no dirty window or input sustain, the worker parks until new work arrives.
 //!
 //! When DWM is disabled, the monitor is unplugged, or under some
 //! RDP modes, `DwmFlush` returns immediately. The 1 ms threshold
@@ -23,8 +24,8 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::thread::JoinHandle;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::thread::{JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
 use crate::platform_impl::input_rate::InputRateTracker;
@@ -45,7 +46,7 @@ const DEFAULT_VSYNC_INTERVAL: Duration = Duration::from_micros(16_666); // ~60Hz
 /// registry plus the rate-gated post-input sustain tracker.
 pub(crate) struct VSyncSharedState {
     /// HWND (as `usize` for `Hash`/`Eq`) → per-window dirty flag.
-    /// `Window::request_redraw` sets the flag; the worker reads
+    /// WM_PAINT continuations set the flag; the worker reads
     /// and clears it on each tick.
     windows: RwLock<HashMap<usize, Arc<AtomicBool>>>,
     /// Rate-gated post-input sustain. Only sustained high-rate
@@ -54,6 +55,7 @@ pub(crate) struct VSyncSharedState {
     /// `Mutex` because the worker thread and the window-message
     /// thread both touch this. See `platform_impl::input_rate`.
     input_rate_tracker: Mutex<InputRateTracker>,
+    worker: OnceLock<Thread>,
 }
 
 impl VSyncSharedState {
@@ -61,24 +63,24 @@ impl VSyncSharedState {
         Arc::new(Self {
             windows: RwLock::new(HashMap::new()),
             input_rate_tracker: Mutex::new(InputRateTracker::new()),
+            worker: OnceLock::new(),
         })
     }
 
-    /// Insert a window and return its dirty-flag handle. The
-    /// caller (the `Window` constructor) keeps the returned `Arc`
-    /// so `request_redraw` can flip it without taking the registry
-    /// lock.
-    pub(crate) fn register_window(&self, hwnd: HWND) -> Arc<AtomicBool> {
+    pub(crate) fn register_window(&self, hwnd: HWND) {
         let flag = Arc::new(AtomicBool::new(false));
-        self.windows
-            .write()
-            .unwrap()
-            .insert(hwnd as usize, flag.clone());
-        flag
+        self.windows.write().unwrap().insert(hwnd as usize, flag);
     }
 
     pub(crate) fn unregister_window(&self, hwnd: HWND) {
         self.windows.write().unwrap().remove(&(hwnd as usize));
+    }
+
+    pub(crate) fn request_redraw(&self, hwnd: HWND) {
+        if let Some(flag) = self.windows.read().unwrap().get(&(hwnd as usize)) {
+            flag.store(true, Ordering::Release);
+            self.wake();
+        }
     }
 
     pub(crate) fn window_count(&self) -> usize {
@@ -87,12 +89,35 @@ impl VSyncSharedState {
 
     #[inline]
     pub(crate) fn mark_input_received(&self) {
-        self.input_rate_tracker.lock().unwrap().record_input();
+        let high_rate = {
+            let mut tracker = self.input_rate_tracker.lock().unwrap();
+            tracker.record_input();
+            tracker.is_high_rate()
+        };
+        if high_rate {
+            self.wake();
+        }
     }
 
     #[inline]
     pub(crate) fn should_present_after_input(&self) -> bool {
         self.input_rate_tracker.lock().unwrap().is_high_rate()
+    }
+
+    fn has_work(&self) -> bool {
+        self.should_present_after_input()
+            || self
+                .windows
+                .read()
+                .unwrap()
+                .values()
+                .any(|flag| flag.load(Ordering::Acquire))
+    }
+
+    fn wake(&self) {
+        if let Some(worker) = self.worker.get() {
+            worker.unpark();
+        }
     }
 }
 
@@ -110,8 +135,18 @@ impl VSyncThread {
         let handle = std::thread::Builder::new()
             .name("rio-window::vsync".to_owned())
             .spawn(move || {
+                state
+                    .worker
+                    .set(std::thread::current())
+                    .expect("vsync worker already registered");
                 let provider = VSyncProvider::new();
                 while !stop_worker.load(Ordering::Acquire) {
+                    if !state.has_work() {
+                        // unpark retains a token if work arrives before park,
+                        // so an idle worker cannot lose a repaint request.
+                        std::thread::park();
+                        continue;
+                    }
                     provider.wait_for_vsync();
                     if stop_worker.load(Ordering::Acquire) {
                         break;
@@ -163,6 +198,7 @@ impl Drop for VSyncThread {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
             // Worker exits at the start of the next iteration after
             // the current DwmFlush returns (typically <16 ms).
             let _ = handle.join();
@@ -218,6 +254,26 @@ fn query_dwm_interval() -> Option<Duration> {
 
 #[inline]
 fn ticks_to_duration(counts: u64, ticks_per_second: u64) -> Duration {
-    let ticks_per_microsecond = (ticks_per_second / 1_000_000).max(1);
-    Duration::from_micros(counts / ticks_per_microsecond)
+    Duration::from_secs_f64(counts as f64 / ticks_per_second as f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ticks_to_duration;
+    use std::time::Duration;
+
+    #[test]
+    fn refresh_intervals_support_qpc_and_rational_rates() {
+        for (ticks, frequency, expected_nanos) in [
+            (166_667, 10_000_000, 16_666_700),
+            (1, 60, 16_666_667),
+            (1_001, 60_000, 16_683_333),
+            (1, 144, 6_944_444),
+        ] {
+            assert_eq!(
+                ticks_to_duration(ticks, frequency),
+                Duration::from_nanos(expected_nanos),
+            );
+        }
+    }
 }

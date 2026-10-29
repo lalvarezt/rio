@@ -1690,6 +1690,10 @@ bitflags! {
         const ALT = 0b100 << 6;
         /// This is the "windows" key on PC and "command" key on Mac.
         const SUPER = 0b100 << 9;
+        /// Caps Lock is active.
+        const CAPS_LOCK = 1 << 12;
+        /// Num Lock is active.
+        const NUM_LOCK = 1 << 13;
     }
 }
 

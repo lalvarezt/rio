@@ -618,6 +618,9 @@ fn new_window(
         if let Some(identifier) = &attrs.platform_specific.tabbing_identifier {
             window.setTabbingIdentifier(&NSString::from_str(identifier));
             window.setTabbingMode(NSWindowTabbingMode::Preferred);
+        } else {
+            // Keep custom tab strips separate from AppKit window tab groups.
+            window.setTabbingMode(NSWindowTabbingMode::Disallowed);
         }
 
         if attrs.content_protected {

@@ -25,6 +25,9 @@ before:
     - if: '{{ eq .Runtime.Goos "windows" }}'
       cmd: wix extension add -g WixToolset.UI.wixext/5.0.2 WixToolset.Util.wixext/5.0.2
       output: true
+    - if: '{{ eq .Runtime.Goos "windows" }}'
+      cmd: powershell -NoProfile -ExecutionPolicy Bypass -File misc/windows/prepare-conpty.ps1
+      output: true
 
 builds:
   - id: windows-x86_64
@@ -103,13 +106,29 @@ checksum:
 
 archives:
   - id: win-x64
-    formats: [binary]
+    formats: [zip]
     ids: [windows-x86_64]
     name_template: "{{ .ProjectName }}-portable-x86_64"
+    files:
+      - LICENSE
+      - src: misc/windows/ConPTY-LICENSE.txt
+        strip_parent: true
+      - src: target/conpty/x64/conpty.dll
+        strip_parent: true
+      - src: target/conpty/x64/OpenConsole.exe
+        strip_parent: true
   - id: win-arm64
-    formats: [binary]
+    formats: [zip]
     ids: [windows-arm64]
     name_template: "{{ .ProjectName }}-portable-aarch64"
+    files:
+      - LICENSE
+      - src: misc/windows/ConPTY-LICENSE.txt
+        strip_parent: true
+      - src: target/conpty/arm64/conpty.dll
+        strip_parent: true
+      - src: target/conpty/arm64/OpenConsole.exe
+        strip_parent: true
 
 universal_binaries:
   - id: rio
@@ -246,13 +265,13 @@ msi:
   - id: win-x64
     name: "{{ .ProjectName }}-installer-x86_64"
     wxs: ./misc/windows/rio.wxs
-    ids: [windows-x86_64]
+    ids: [win-x64]
     extensions: [WixToolset.UI.wixext, WixToolset.Util.wixext]
     extra_files: [./misc/windows/rio.ico, ./misc/windows/License.rtf]
   - id: win-arm64
     name: "{{ .ProjectName }}-installer-aarch64"
     wxs: ./misc/windows/rio.wxs
-    ids: [windows-arm64]
+    ids: [win-arm64]
     extensions: [WixToolset.UI.wixext, WixToolset.Util.wixext]
     extra_files: [./misc/windows/rio.ico, ./misc/windows/License.rtf]
 

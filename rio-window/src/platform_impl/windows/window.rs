@@ -3,7 +3,6 @@
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::mem::{self, MaybeUninit};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::{io, panic, ptr};
@@ -13,21 +12,23 @@ use windows_sys::Win32::Foundation::{
     RPC_E_CHANGED_MODE, S_OK, TRUE, WPARAM,
 };
 use windows_sys::Win32::Graphics::Dwm::{
-    DwmEnableBlurBehindWindow, DwmSetWindowAttribute, DWMWA_BORDER_COLOR,
-    DWMWA_CAPTION_COLOR, DWMWA_CLOAK, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_TEXT_COLOR,
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWM_BB_BLURREGION, DWM_BB_ENABLE, DWM_BLURBEHIND,
-    DWM_SYSTEMBACKDROP_TYPE, DWM_WINDOW_CORNER_PREFERENCE,
+    DwmEnableBlurBehindWindow, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
+    DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_CLOAK, DWMWA_SYSTEMBACKDROP_TYPE,
+    DWMWA_TEXT_COLOR, DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWM_BB_BLURREGION, DWM_BB_ENABLE, DWM_BLURBEHIND, DWM_SYSTEMBACKDROP_TYPE,
+    DWM_WINDOW_CORNER_PREFERENCE,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     ChangeDisplaySettingsExW, ClientToScreen, CreateRectRgn, DeleteObject, InvalidateRgn,
-    CDS_FULLSCREEN, DISP_CHANGE_BADFLAGS, DISP_CHANGE_BADMODE, DISP_CHANGE_BADPARAM,
-    DISP_CHANGE_FAILED, DISP_CHANGE_SUCCESSFUL,
+    RedrawWindow, CDS_FULLSCREEN, DISP_CHANGE_BADFLAGS, DISP_CHANGE_BADMODE,
+    DISP_CHANGE_BADPARAM, DISP_CHANGE_FAILED, DISP_CHANGE_SUCCESSFUL, RDW_INVALIDATE,
 };
 use windows_sys::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL,
     COINIT_APARTMENTTHREADED,
 };
 use windows_sys::Win32::System::Ole::{OleInitialize, RegisterDragDrop};
+use windows_sys::Win32::UI::Controls::MARGINS;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetActiveWindow, MapVirtualKeyW, ReleaseCapture, SendInput, ToUnicode,
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
@@ -104,11 +105,6 @@ pub(crate) struct Window {
 
     // The events loop proxy.
     thread_executor: event_loop::EventLoopThreadExecutor,
-
-    /// Per-window dirty flag set by `request_redraw`. The
-    /// DwmFlush worker reads/clears this each tick to decide
-    /// whether to invalidate this window.
-    redraw_pending: Arc<AtomicBool>,
 
     /// Shared registry; `Drop` removes our HWND.
     vsync_state: Arc<event_loop::vsync::VSyncSharedState>,
@@ -199,12 +195,22 @@ impl Window {
 
     #[inline]
     pub fn request_redraw(&self) {
-        // Defer the actual `RedrawWindow` to the DwmFlush worker;
-        // we just flag the window as dirty here. Mirrors macOS's
-        // `needs_redraw` flag consumed by the CVDisplayLink
-        // callback.
-        self.window_state.lock().unwrap().redraw_requested = true;
-        self.redraw_pending.store(true, Ordering::Release);
+        let mut state = self.window_state.lock().unwrap();
+        if let Some(requested) = state.redraw_requested.as_mut() {
+            // Continuations are rearmed on the display clock after this paint.
+            *requested = true;
+        } else {
+            // Fresh input must not wait for an extra composition cycle.
+            drop(state);
+            unsafe {
+                RedrawWindow(
+                    self.window.hwnd(),
+                    ptr::null(),
+                    ptr::null_mut(),
+                    RDW_INVALIDATE,
+                );
+            }
+        }
     }
 
     #[inline]
@@ -1116,12 +1122,31 @@ impl Window {
     #[inline]
     pub fn set_system_backdrop(&self, backdrop_type: BackdropType) {
         unsafe {
-            DwmSetWindowAttribute(
+            let result = DwmSetWindowAttribute(
                 self.hwnd(),
                 DWMWA_SYSTEMBACKDROP_TYPE as u32,
                 &(backdrop_type as i32) as *const _ as _,
                 mem::size_of::<DWM_SYSTEMBACKDROP_TYPE>() as _,
             );
+            if result >= 0 {
+                // Undecorated windows draw their own frame. Extending the
+                // native frame across them also paints native caption buttons
+                // underneath transparent client content.
+                let inset = if !self.is_decorated()
+                    || matches!(backdrop_type, BackdropType::Auto | BackdropType::None)
+                {
+                    0
+                } else {
+                    -1
+                };
+                let margins = MARGINS {
+                    cxLeftWidth: inset,
+                    cxRightWidth: inset,
+                    cyTopHeight: inset,
+                    cyBottomHeight: inset,
+                };
+                DwmExtendFrameIntoClientArea(self.hwnd(), &margins);
+            }
         }
     }
 
@@ -1184,6 +1209,17 @@ impl Window {
         }
     }
 
+    pub fn request_close(&self) {
+        unsafe {
+            PostMessageW(
+                self.hwnd(),
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+                0,
+                0,
+            );
+        }
+    }
+
     #[inline]
     pub fn set_title_background_color(&self, color: Color) {
         unsafe {
@@ -1237,6 +1273,18 @@ impl Window {
 impl Drop for Window {
     #[inline]
     fn drop(&mut self) {
+        // Destruction is queued below, while the owner can release its GPU
+        // surface before that message runs. Disable the close transition now
+        // so DWM cannot animate an empty frame and shadow over the desktop.
+        let disabled: BOOL = TRUE;
+        unsafe {
+            DwmSetWindowAttribute(
+                self.hwnd(),
+                DWMWA_TRANSITIONS_FORCEDISABLED as u32,
+                &disabled as *const BOOL as *const c_void,
+                mem::size_of::<BOOL>() as u32,
+            );
+        }
         // Stop the vsync worker from invalidating this HWND once
         // we've started its destruction.
         self.vsync_state.unregister_window(self.hwnd());
@@ -1294,13 +1342,12 @@ impl InitData<'_> {
         unsafe { ImeContext::set_ime_allowed(window, false) };
 
         let vsync_state = self.event_loop.vsync_state.clone();
-        let redraw_pending = vsync_state.register_window(window);
+        vsync_state.register_window(window);
 
         Window {
             window: SyncWindowHandle(window),
             window_state,
             thread_executor: self.event_loop.create_thread_executor(),
-            redraw_pending,
             vsync_state,
         }
     }

@@ -143,20 +143,12 @@ pub struct ActiveEventLoop {
     ime: Option<RefCell<Ime>>,
     windows: RefCell<HashMap<WindowId, Weak<UnownedWindow>>>,
     redraw_sender: WakeSender<WindowId>,
-    /// Per-window vsync ticks land here; the pump drains and applies
-    /// the dirty + sustain gate before fanning out `RedrawRequested`.
-    /// Separate from `redraw_sender` so the pump can distinguish a
-    /// "timer fired" hint from an explicit `request_redraw` (the
-    /// latter bypasses the dirty check).
-    vsync_sender: WakeSender<WindowId>,
+    /// Redraw requests arm a timer; ready notifications deliver the frame.
+    /// Native expose events use `redraw_sender` directly.
+    refresh_sender: WakeSender<RefreshEvent>,
     activation_sender: WakeSender<ActivationToken>,
     device_events: Cell<DeviceEvents>,
-    /// Rate-gated post-input sustain tracker. Only sustained high-rate
-    /// input (≥ 60 events/sec over 100 ms) extends the 1-second
-    /// presentation window — single keystrokes don't. See
-    /// `platform_impl::input_rate`.
-    input_rate_tracker: RefCell<crate::platform_impl::input_rate::InputRateTracker>,
-    /// Waker ping so `request_redraw` can unblock calloop dispatch.
+    /// Wakes calloop for background events such as theme changes.
     pub(super) waker: Ping,
     /// Calloop loop handle so per-window vsync timers can be
     /// registered/torn down from event handlers (`map_notify`,
@@ -171,11 +163,7 @@ pub struct EventLoop<T: 'static> {
     waker: calloop::ping::Ping,
     event_processor: EventProcessor,
     redraw_receiver: PeekableReceiver<WindowId>,
-    /// Per-window vsync hints — drained in the main pump where the
-    /// dirty + sustain gate decides whether to fan out
-    /// `RedrawRequested`. Each hint corresponds to one fire of one
-    /// window's calloop `Timer`.
-    vsync_receiver: PeekableReceiver<WindowId>,
+    refresh_receiver: PeekableReceiver<RefreshEvent>,
     user_receiver: PeekableReceiver<T>,
     activation_receiver: PeekableReceiver<ActivationToken>,
     user_sender: Sender<T>,
@@ -195,22 +183,25 @@ pub(crate) struct EventLoopState {
     x11_readiness: Readiness,
 }
 
-/// Per-window vsync timer state. Mirrors zed's
-/// `gpui_linux::linux::x11::client::RefreshState`. The point of
-/// keeping the rate around in the `Hidden` variant is so we don't
-/// have to re-query XRandR on every map/unmap cycle.
+/// Per-window refresh pacing. Retain the monitor rate across idle periods and
+/// map/unmap cycles, and arm a timer only for pending visible work.
 pub(crate) enum RefreshState {
     /// Window is unmapped or `VisibilityFullyObscured` — timer is
     /// torn down so we don't burn CPU on invisible windows.
-    Hidden {
-        #[allow(dead_code)]
+    Hidden { rate: Duration },
+    /// Visible windows retain their pacing deadline while idle. A timer is
+    /// armed only when a redraw is pending.
+    Visible {
         rate: Duration,
+        next_frame: Instant,
+        token: Option<calloop::RegistrationToken>,
     },
-    /// Timer registered with calloop, firing at `rate`.
-    PeriodicRefresh {
-        rate: Duration,
-        token: calloop::RegistrationToken,
-    },
+}
+
+#[derive(Clone, Copy)]
+enum RefreshEvent {
+    Requested(WindowId),
+    Ready(WindowId),
 }
 
 pub struct EventLoopProxy<T: 'static> {
@@ -302,11 +293,15 @@ impl<T: 'static> EventLoop<T> {
         let handle = event_loop.handle();
 
         // Create the X11 event dispatcher.
+        // Xlib shares this socket with XCB readers, including the renderer.
+        // Readability need not mean an event is available to Xlib. Level
+        // polling spins until the other reader consumes that data; queued
+        // Xlib events are checked by has_pending before each wait instead.
         let source = X11Source::new(
             // SAFETY: xcb owns the FD and outlives the source.
             unsafe { BorrowedFd::borrow_raw(xconn.xcb_connection().as_raw_fd()) },
             calloop::Interest::READ,
-            calloop::Mode::Level,
+            calloop::Mode::Edge,
         );
         handle
             .insert_source(source, |readiness, _, state| {
@@ -324,18 +319,10 @@ impl<T: 'static> EventLoop<T> {
             })
             .expect("Failed to register the event loop waker source");
 
-        // No global vsync timer here — each window registers its own
-        // calloop `Timer` against the refresh rate of *its* monitor
-        // (queried via XRandR), and tears it down when the window is
-        // unmapped or `VisibilityFullyObscured`. Mirrors zed's
-        // `RefreshState` pattern in `gpui_linux::linux::x11::client`.
-        // The per-window timer fires window_id into `vsync_channel`;
-        // the main pump drains and runs the dirty + sustain gate.
-
         // Create a channel for handling redraw requests.
         let (redraw_sender, redraw_channel) = mpsc::channel();
-        // Per-window vsync hint channel.
-        let (vsync_sender, vsync_channel) = mpsc::channel();
+        // Per-window paced redraw requests and timer completions.
+        let (refresh_sender, refresh_channel) = mpsc::channel();
 
         // Create a channel for sending activation tokens.
         let (activation_token_sender, activation_token_channel) = mpsc::channel();
@@ -364,8 +351,8 @@ impl<T: 'static> EventLoop<T> {
                 sender: redraw_sender, // not used again so no clone
                 waker: waker.clone(),
             },
-            vsync_sender: WakeSender {
-                sender: vsync_sender,
+            refresh_sender: WakeSender {
+                sender: refresh_sender,
                 waker: waker.clone(),
             },
             activation_sender: WakeSender {
@@ -373,9 +360,6 @@ impl<T: 'static> EventLoop<T> {
                 waker: waker.clone(),
             },
             device_events: Default::default(),
-            input_rate_tracker: RefCell::new(
-                crate::platform_impl::input_rate::InputRateTracker::new(),
-            ),
             waker: waker.clone(),
             loop_handle: handle.clone(),
         };
@@ -439,7 +423,7 @@ impl<T: 'static> EventLoop<T> {
             waker,
             event_processor,
             redraw_receiver: PeekableReceiver::from_recv(redraw_channel),
-            vsync_receiver: PeekableReceiver::from_recv(vsync_channel),
+            refresh_receiver: PeekableReceiver::from_recv(refresh_channel),
             activation_receiver: PeekableReceiver::from_recv(activation_token_channel),
             user_receiver: PeekableReceiver::from_recv(user_channel),
             user_sender,
@@ -527,10 +511,13 @@ impl<T: 'static> EventLoop<T> {
     }
 
     fn has_pending(&mut self) -> bool {
-        self.vsync_receiver.has_incoming()
+        self.refresh_receiver.has_incoming()
             || self.event_processor.poll()
             || self.user_receiver.has_incoming()
             || self.redraw_receiver.has_incoming()
+            || self.activation_receiver.has_incoming()
+            || crate::platform_impl::common::theme_monitor::get_cached_theme()
+                != self.last_system_theme
     }
 
     pub fn poll_events_with_timeout<F>(
@@ -689,37 +676,9 @@ impl<T: 'static> EventLoop<T> {
             }
         }
 
-        // Drain per-window vsync hints (one per timer fire). Each
-        // hint corresponds to a single window — we apply the dirty
-        // + sustain gate and forward to `redraw_sender` if either
-        // says "yes". Windows whose timer was torn down (hidden /
-        // fully obscured) won't appear here, which is the whole
-        // point of the per-window timer registration.
-        {
-            let wt = EventProcessor::window_target(&self.event_processor.target);
-            // Coalesce multiple hints for the same window in this
-            // tick. The previous global vsync block iterated all
-            // windows once per vblank; this loop iterates only those
-            // that actually fired, also at most once each.
-            let mut hinted: HashSet<WindowId> = HashSet::new();
-            while let Ok(window_id) = self.vsync_receiver.try_recv() {
-                hinted.insert(window_id);
-            }
-            if !hinted.is_empty() {
-                let present_after_input = wt.should_present_after_input();
-                let windows = wt.windows.borrow();
-                for id in hinted {
-                    if let Some(window) = windows.get(&id).and_then(|w| w.upgrade()) {
-                        let was_dirty = window
-                            .redraw_pending
-                            .swap(false, std::sync::atomic::Ordering::AcqRel);
-                        if was_dirty || present_after_input {
-                            let _ = wt.redraw_sender.sender.send(id);
-                        }
-                    }
-                }
-            }
-        }
+        // Requesting work and delivering a paced frame share one wake channel.
+        // Idle windows have no timer and generate no refresh notifications.
+        self.process_refresh_events();
 
         // Empty the redraw requests
         {
@@ -741,9 +700,24 @@ impl<T: 'static> EventLoop<T> {
             }
         }
 
+        // Animation continuations can request their next frame from inside
+        // RedrawRequested. Arm them now instead of waking another iteration
+        // just to register the timer.
+        self.process_refresh_events();
+
         // This is always the last event we dispatch before poll again
         {
             callback(Event::AboutToWait, &self.event_processor.target);
+        }
+    }
+
+    fn process_refresh_events(&mut self) {
+        let wt = EventProcessor::window_target(&self.event_processor.target);
+        while let Ok(event) = self.refresh_receiver.try_recv() {
+            match event {
+                RefreshEvent::Requested(id) => wt.update_refresh_loop(id),
+                RefreshEvent::Ready(id) => wt.refresh_ready(id),
+            }
         }
     }
 
@@ -805,16 +779,6 @@ impl<T> AsRawFd for EventLoop<T> {
 }
 
 impl ActiveEventLoop {
-    #[inline]
-    pub(crate) fn mark_input_received(&self) {
-        self.input_rate_tracker.borrow_mut().record_input();
-    }
-
-    #[inline]
-    pub(crate) fn should_present_after_input(&self) -> bool {
-        self.input_rate_tracker.borrow().is_high_rate()
-    }
-
     /// Refresh-rate lookup for `window_id`'s current monitor. Falls
     /// back to the primary monitor (then 60 Hz) if the window has no
     /// monitor yet (between create and first map). Same fallback
@@ -839,11 +803,7 @@ impl ActiveEventLoop {
         Duration::from_micros(micros)
     }
 
-    /// Re-evaluate whether `window_id`'s vsync timer should be
-    /// running (visible & mapped) or torn down (hidden / fully
-    /// obscured). Idempotent — call from any visibility-change
-    /// handler. Mirrors zed's
-    /// `LinuxClient::update_refresh_loop`.
+    /// Reconcile pending work and visibility with the window's refresh timer.
     pub(crate) fn update_refresh_loop(&self, window_id: WindowId) {
         let window = {
             let windows = self.windows.borrow();
@@ -852,11 +812,8 @@ impl ActiveEventLoop {
         let Some(window) = window else {
             return;
         };
-        // Match zed's `is_mapped && !FullyObscured`. Keeping the two
-        // signals separate matters: a `MapNotify` arriving while the
-        // window is still fully obscured (some WMs do this) must not
-        // restart the timer until the next `VisibilityNotify` clears
-        // the obscured state.
+        // A map while fully obscured must wait for VisibilityNotify before
+        // pending work can resume.
         let is_mapped = window.is_mapped.load(std::sync::atomic::Ordering::Acquire);
         let is_fully_obscured = window
             .is_fully_obscured
@@ -864,60 +821,86 @@ impl ActiveEventLoop {
         let is_visible = is_mapped && !is_fully_obscured;
 
         let mut slot = window.refresh_state.lock().unwrap();
-        let cur = slot.take();
-        match (is_visible, cur) {
-            // Already in the right state.
-            (false, hidden @ Some(RefreshState::Hidden { .. }))
-            | (false, hidden @ None)
-            | (true, hidden @ Some(RefreshState::PeriodicRefresh { .. })) => {
-                *slot = hidden;
-            }
-            // Becoming hidden — tear the timer down, remember rate.
-            (false, Some(RefreshState::PeriodicRefresh { rate, token })) => {
+        let (rate, next_frame, mut token) = match slot.take() {
+            Some(RefreshState::Visible {
+                rate,
+                next_frame,
+                token,
+            }) => (rate, next_frame, token),
+            Some(RefreshState::Hidden { rate }) => (rate, Instant::now(), None),
+            None => (self.current_refresh_rate(window_id), Instant::now(), None),
+        };
+        if !is_visible {
+            if let Some(token) = token {
                 self.loop_handle.remove(token);
-                *slot = Some(RefreshState::Hidden { rate });
             }
-            // Becoming visible — reuse stored rate, register a fresh timer.
-            (true, Some(RefreshState::Hidden { rate })) => {
-                let token = self.start_refresh_loop(window_id, rate);
-                *slot = Some(RefreshState::PeriodicRefresh { rate, token });
-            }
-            // First-time entry — query XRandR for the rate.
-            (true, None) => {
-                let rate = self.current_refresh_rate(window_id);
-                let token = self.start_refresh_loop(window_id, rate);
-                *slot = Some(RefreshState::PeriodicRefresh { rate, token });
-            }
+            *slot = Some(RefreshState::Hidden { rate });
+            return;
+        }
+        if token.is_none()
+            && window
+                .redraw_pending
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            token = Some(self.start_refresh_loop(window_id, next_frame));
+        }
+        *slot = Some(RefreshState::Visible {
+            rate,
+            next_frame,
+            token,
+        });
+    }
+
+    fn refresh_ready(&self, window_id: WindowId) {
+        let window = self
+            .windows
+            .borrow()
+            .get(&window_id)
+            .and_then(|w| w.upgrade());
+        let Some(window) = window else {
+            return;
+        };
+        let mut state = window.refresh_state.lock().unwrap();
+        let Some(RefreshState::Visible {
+            rate,
+            next_frame,
+            token,
+        }) = state.as_mut()
+        else {
+            return;
+        };
+        // Usually the callback already dropped this timer. If visibility or
+        // refresh-rate handling rearmed it before the ready message arrived,
+        // this ready frame consumes that request too.
+        if let Some(token) = token.take() {
+            self.loop_handle.remove(token);
+        }
+        *next_frame = Instant::now() + *rate;
+        if window
+            .redraw_pending
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            let _ = self.redraw_sender.sender.send(window_id);
         }
     }
 
-    /// Register a calloop `Timer` that fires `window_id` into
-    /// `vsync_sender` at the given `rate`. Caller stores the
-    /// returned token in `RefreshState::PeriodicRefresh` so it can
-    /// be removed when the window goes hidden.
+    /// Arm one frame at the window's next allowed refresh deadline.
     fn start_refresh_loop(
         &self,
         window_id: WindowId,
-        rate: Duration,
+        deadline: Instant,
     ) -> calloop::RegistrationToken {
-        let timer = calloop::timer::Timer::immediate();
-        let sender = self.vsync_sender.sender.clone();
-        let waker = self.vsync_sender.waker.clone();
+        let timer = calloop::timer::Timer::from_deadline(deadline);
+        let sender = self.refresh_sender.sender.clone();
         self.loop_handle
             .insert_source(timer, move |_deadline, _, _state| {
-                let _ = sender.send(window_id);
-                waker.ping();
-                calloop::timer::TimeoutAction::ToInstant(Instant::now() + rate)
+                let _ = sender.send(RefreshEvent::Ready(window_id));
+                calloop::timer::TimeoutAction::Drop
             })
             .expect("Failed to register per-window vsync timer")
     }
 
-    /// React to a RandR mode/refresh-rate change by re-pacing the
-    /// per-window timer. `update_refresh_loop` is intentionally a
-    /// no-op when the window is already in `PeriodicRefresh` (it's
-    /// driven by visibility flips), so we need a separate path that
-    /// queries XRandR and only restarts the timer when the rate
-    /// actually moved — avoids thrashing on no-op CRTC events.
+    /// Re-query XRandR and rearm pending work only if its rate changed.
     pub(crate) fn refresh_rate_changed(&self, window_id: WindowId) {
         let window = {
             let windows = self.windows.borrow();
@@ -937,19 +920,31 @@ impl ActiveEventLoop {
                 *slot = Some(RefreshState::Hidden { rate: new_rate });
             }
             // Active — restart only if the rate actually changed.
-            Some(RefreshState::PeriodicRefresh { rate, token }) => {
+            Some(RefreshState::Visible {
+                rate,
+                next_frame,
+                token,
+            }) => {
                 if rate == new_rate {
-                    *slot = Some(RefreshState::PeriodicRefresh { rate, token });
+                    *slot = Some(RefreshState::Visible {
+                        rate,
+                        next_frame,
+                        token,
+                    });
                 } else {
-                    self.loop_handle.remove(token);
-                    let new_token = self.start_refresh_loop(window_id, new_rate);
-                    *slot = Some(RefreshState::PeriodicRefresh {
+                    if let Some(token) = token {
+                        self.loop_handle.remove(token);
+                    }
+                    *slot = Some(RefreshState::Visible {
                         rate: new_rate,
-                        token: new_token,
+                        next_frame: Instant::now(),
+                        token: None,
                     });
                 }
             }
         }
+        drop(slot);
+        self.update_refresh_loop(window_id);
     }
 
     /// Drop a window's refresh state — called from the destroy /
@@ -965,7 +960,7 @@ impl ActiveEventLoop {
         let token = {
             let mut slot = window.refresh_state.lock().unwrap();
             match slot.take() {
-                Some(RefreshState::PeriodicRefresh { token, .. }) => Some(token),
+                Some(RefreshState::Visible { token, .. }) => token,
                 _ => None,
             }
         };
@@ -1155,11 +1150,7 @@ impl Window {
             .windows
             .borrow_mut()
             .insert(window_id, Arc::downgrade(&window));
-        // The per-window vsync timer is started by the first
-        // `MapNotify` (matches zed). The window is constructed with
-        // `is_mapped=false`, so there's no useful work to do here —
-        // `update_refresh_loop` would be a no-op until the X server
-        // reports the window as mapped.
+        // MapNotify and VisibilityNotify enable pacing for pending redraws.
         Ok(Window(window))
     }
 }

@@ -36,6 +36,16 @@ On Windows, the config file will be looked for in:
 
 	Default: _true_
 
+*confirm-before-close-tab* = _true_ | _false_
+
+	Show confirmation before closing a tab or closing other tabs, including
+	close buttons, keyboard shortcuts, and command palette actions. Cancel is
+	focused by default. Closing the last tab closes its window after confirmation.
+	Set to _false_ to close tabs immediately. Window quit confirmation is
+	controlled separately by *confirm-before-quit*.
+
+	Default: _true_
+
 *draw-bold-text-with-light-colors* = _true_ | _false_
 
 	When _true_, bold text is drawn using the bright color variants.
@@ -304,27 +314,57 @@ This section documents the *[scroll]* table of the configuration file.
 
 This section documents the *[navigation]* table of the configuration file.
 
-*mode* = _"NativeTab"_ | _"Tab"_ | _"Plain"_
+*preset* = _"pill"_ | _"square"_
 
-Navigation display mode.
+	Supply defaults for tab and split geometry. Explicit settings override the
+	preset. Square tabs touch the upper-left edge, have no gaps, and keep close
+	buttons visible. Square splits use rectangular corners and one-pixel borders.
+	Dialogs, the command palette, search, tab customization, and hint tooltips
+	also use square corners with this preset. Pill uses rounded corners.
 
-Default: _"Tab"_
+	Default: _"pill"_
 
-*clickable* = _true_ | _false_
+The optional *[navigation.tabs]* table overrides *height*, *margin*, *padding*,
+*gap*, *radius*, *font-size*, *text-offset-y*, *icon-gap*, *close-button*,
+*close-button-size*, *close-button-inset*, and *close-button-gap*.
+Close-button modes are _"always"_, _"hover"_, and _"never"_. Geometry is in
+logical pixels. Margins and padding accept arrays of one, two, or four values
+in CSS order. Width and icon size remain configured with *min-tab-width*,
+*max-tab-width*, and *tab-icon-size* in *[navigation]*.
 
-	Enable clickable navigation elements.
+Root *margin* controls the pane layout's distance from the window edge and
+tabs. The existing *[panel]* table controls per-pane *margin*, *padding*,
+*row-gap*, *column-gap*, *border-width*, and *border-radius*. These settings
+also override preset defaults. Each pane has an outer margin, then its border,
+then inner padding around the terminal cells. Border width is in physical
+pixels; other pane geometry uses logical pixels. Geometry changes reload for
+existing panes.
+*divider-width* sets the horizontal and vertical split line width in logical
+pixels (default: _1_). Set it to _0_ to hide the lines. Lines use the theme's
+neutral border color. Spacing is measured from their center, so changing the
+width does not move or resize panes. A single pane has no dividers.
+Set *[panel].hide-if-single* to _true_ to hide a lone pane's frame and remove
+only the border's inset. Root margin, pane margin, and padding still apply.
+Default: _false_.
 
-	Default: _false_
+*hide-if-single* = _true_ | _false_
 
-*use-current-path* = _true_ | _false_
+	Hide the tab strip when the window contains one tab. The default is _true_
+	on macOS and _false_ on Linux and Windows. Tab shortcuts remain available.
 
-	Show current working directory in navigation.
+*current-working-directory* = _true_ | _false_
 
-	Default: _false_
+	Open new tabs and splits in the focused pane's reported working directory.
+	This also applies to SSH connections. Configure tab labels in *[title]*.
 
-*color-automation* = [{ program = _"<string>"_, path = _"<string>"_, color = _"<string>"_ },]
+	Default: _true_
 
-	Automatic color assignment based on program or path.
+Tabs support only the _"pill"_ and _"square"_ presets. Remove *navigation.mode*,
+*navigation.clickable*, *navigation.color-automation*, and
+*navigation.use-terminal-title* from existing configurations. Replace the
+former *tab-style* key with *preset* and its _"windows"_ value with _"square"_.
+Removed navigation options produce a configuration error. The former
+*window.macos-use-unified-titlebar* setting is no longer used.
 
 # SHELL
 

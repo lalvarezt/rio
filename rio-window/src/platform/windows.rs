@@ -295,6 +295,9 @@ pub trait WindowExtWindows {
     /// Supported starting with Windows 11 Build 22000.
     fn set_border_color(&self, color: Option<Color>);
 
+    /// Requests a normal window close, including configured quit confirmation.
+    fn request_close(&self);
+
     /// Sets the background color of the title bar.
     ///
     /// Supported starting with Windows 11 Build 22000.
@@ -410,6 +413,11 @@ impl WindowExtWindows for Window {
     #[inline]
     fn set_border_color(&self, color: Option<Color>) {
         self.window.set_border_color(color.unwrap_or(Color::NONE))
+    }
+
+    #[inline]
+    fn request_close(&self) {
+        self.window.request_close();
     }
 
     #[inline]
