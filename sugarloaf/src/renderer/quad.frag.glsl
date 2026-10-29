@@ -48,28 +48,35 @@ vec3 linear_to_srgb(vec3 c) {
     vec3 hi = pow(c, vec3(1.0 / 2.4)) * 1.055 - 0.055;
     return mix(lo, hi, greaterThan(c, vec3(0.0031308)));
 }
-vec3 srgb_to_p3(vec3 linear_srgb) {
+// The Vulkan swapchain uses SRGB_NONLINEAR, so convert wide-gamut
+// terminal inputs to sRGB rather than the Metal renderer's Display-P3.
+vec3 p3_to_srgb(vec3 linear_p3) {
     return vec3(
-        dot(linear_srgb, vec3(0.82246197, 0.17753803, 0.0)),
-        dot(linear_srgb, vec3(0.03319420, 0.96680580, 0.0)),
-        dot(linear_srgb, vec3(0.01708263, 0.07239744, 0.91051993))
+        dot(linear_p3, vec3( 1.22494018, -0.22494018,  0.0)),
+        dot(linear_p3, vec3(-0.04205695,  1.04205695,  0.0)),
+        dot(linear_p3, vec3(-0.01963755, -0.07863605,  1.09827360))
     );
 }
-vec3 rec2020_to_p3(vec3 linear_r2020) {
+
+vec3 rec2020_to_srgb(vec3 linear_r2020) {
     return vec3(
-        dot(linear_r2020, vec3( 1.34357825, -0.28217967, -0.06139858)),
-        dot(linear_r2020, vec3(-0.06529745,  1.08782226, -0.02252481)),
-        dot(linear_r2020, vec3( 0.00282179, -0.02598807,  1.02316628))
+        dot(linear_r2020, vec3( 1.66049100, -0.58764114, -0.07284986)),
+        dot(linear_r2020, vec3(-0.12455047,  1.13289990, -0.00834943)),
+        dot(linear_r2020, vec3(-0.01815076, -0.10057890,  1.11872966))
     );
 }
+
 vec3 prepare_output_rgb(vec3 srgb, uint cs) {
-    vec3 lin = srgb_to_linear(srgb);
     if (cs == 0u) {
-        lin = srgb_to_p3(lin);
-    } else if (cs == 2u) {
-        lin = rec2020_to_p3(lin);
+        return srgb;
     }
-    return linear_to_srgb(lin);
+    vec3 lin = srgb_to_linear(srgb);
+    if (cs == 1u) {
+        lin = p3_to_srgb(lin);
+    } else if (cs == 2u) {
+        lin = rec2020_to_srgb(lin);
+    }
+    return linear_to_srgb(clamp(lin, 0.0, 1.0));
 }
 
 // ----- SDF rounded-rect helpers (mirror renderer.metal) -----

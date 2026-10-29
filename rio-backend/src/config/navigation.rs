@@ -1,6 +1,9 @@
-use crate::config::colors::{deserialize_to_arr, deserialize_to_arr_opt, ColorArray};
+use crate::config::colors::{deserialize_to_arr_opt, ColorArray};
 use crate::config::default_bool_true;
 use serde::{Deserialize, Serialize};
+
+pub mod tabs;
+pub use tabs::{CloseButton, TabGeometry, Tabs};
 
 #[inline]
 pub fn default_unfocused_split_opacity() -> f32 {
@@ -8,7 +11,7 @@ pub fn default_unfocused_split_opacity() -> f32 {
 }
 
 /// macOS hides the strip for a lone tab (the native-app feel);
-/// Linux/Windows keep it, drawn as a centred title.
+/// Linux and Windows keep the tab pill visible.
 #[inline]
 pub fn default_hide_if_single() -> bool {
     cfg!(target_os = "macos")
@@ -19,15 +22,71 @@ pub fn default_max_tab_width() -> f32 {
     240.0
 }
 
-/// Clamp `max_tab_width` to `[80.0, 280.0]`.
-///
-/// Below the lower bound the close button and title no longer fit.
+#[inline]
+pub fn default_min_tab_width() -> f32 {
+    120.0
+}
+
+#[inline]
+pub fn default_tab_icon_size() -> f32 {
+    24.0
+}
+
+#[inline]
+pub fn default_tab_glass_intensity() -> f32 {
+    0.5
+}
+
+#[inline]
+pub fn default_tab_status_width() -> f32 {
+    1.0
+}
+
+#[inline]
+pub fn clamp_tab_status_width(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(0.0, 6.0)
+    } else {
+        default_tab_status_width()
+    }
+}
+
+#[inline]
+pub fn clamp_tab_glass_intensity(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        default_tab_glass_intensity()
+    }
+}
+
+/// Clamp tab widths to a finite, usable range in logical pixels.
 #[inline]
 pub fn clamp_max_tab_width(v: f32) -> f32 {
     if !v.is_finite() {
         return default_max_tab_width();
     }
-    v.clamp(80.0, 280.0)
+    v.clamp(80.0, 1024.0)
+}
+
+#[inline]
+pub fn clamp_min_tab_width(v: f32, max: f32) -> f32 {
+    let v = if v.is_finite() {
+        v
+    } else {
+        default_min_tab_width()
+    };
+    v.clamp(80.0, max)
+}
+
+#[inline]
+pub fn clamp_tab_icon_size(v: f32) -> f32 {
+    let v = if v.is_finite() {
+        v
+    } else {
+        default_tab_icon_size()
+    };
+    v.clamp(8.0, 32.0)
 }
 
 /// Clamp `unfocused_split_opacity` to `[0.15, 1.0]`.
@@ -40,116 +99,34 @@ pub fn clamp_unfocused_split_opacity(v: f32) -> f32 {
     v.clamp(0.15, 1.0)
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
-pub enum NavigationMode {
-    #[serde(alias = "plain")]
-    Plain,
-    #[serde(alias = "tab")]
-    Tab,
-    #[cfg(target_os = "macos")]
-    #[serde(alias = "nativetab")]
-    NativeTab,
+/// Medium keeps geometric motion but skips fades; Full adds hover and opacity
+/// transitions. Both stop requesting frames once the visible motion settles.
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Animation {
+    None,
+    Medium,
+    #[default]
+    Full,
 }
 
-#[allow(clippy::derivable_impls)]
-impl Default for NavigationMode {
-    fn default() -> NavigationMode {
-        #[cfg(target_os = "macos")]
-        {
-            // Use Tab for full GPU rendering
-            NavigationMode::Tab
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        NavigationMode::Tab
-    }
-}
-
-impl NavigationMode {
-    const PLAIN_STR: &'static str = "Plain";
-    const TAB_STR: &'static str = "Tab";
-    #[cfg(target_os = "macos")]
-    const NATIVE_TAB_STR: &'static str = "NativeTab";
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Plain => Self::PLAIN_STR,
-            Self::Tab => Self::TAB_STR,
-            #[cfg(target_os = "macos")]
-            Self::NativeTab => Self::NATIVE_TAB_STR,
-        }
-    }
-}
-
-#[inline]
-pub fn modes_as_vec_string() -> Vec<String> {
-    [
-        NavigationMode::Plain,
-        NavigationMode::Tab,
-        #[cfg(target_os = "macos")]
-        NavigationMode::NativeTab,
-    ]
-    .iter()
-    .map(|navigation_mode| navigation_mode.to_string())
-    .collect()
-}
-
-impl std::fmt::Display for NavigationMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct ParseNavigationModeError;
-
-impl std::str::FromStr for NavigationMode {
-    type Err = ParseNavigationModeError;
-
-    fn from_str(s: &str) -> Result<NavigationMode, ParseNavigationModeError> {
-        match s {
-            Self::PLAIN_STR => Ok(NavigationMode::Plain),
-            Self::TAB_STR => Ok(NavigationMode::Tab),
-            #[cfg(target_os = "macos")]
-            Self::NATIVE_TAB_STR => Ok(NavigationMode::NativeTab),
-            _ => Ok(NavigationMode::default()),
-        }
-    }
-}
-
-#[derive(Default, Debug, Serialize, Deserialize, PartialEq, Clone)]
-pub struct ColorAutomation {
-    #[serde(default = "String::new")]
-    pub program: String,
-    #[serde(default = "String::new")]
-    pub path: String,
-    #[serde(
-        deserialize_with = "deserialize_to_arr",
-        default = "crate::config::colors::defaults::tabs"
-    )]
-    pub color: ColorArray,
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TabStyle {
+    #[default]
+    Pill,
+    Square,
 }
 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Navigation {
-    #[serde(default = "NavigationMode::default")]
-    pub mode: NavigationMode,
-    #[serde(
-        default = "Vec::default",
-        rename = "color-automation",
-        skip_serializing
-    )]
-    pub color_automation: Vec<ColorAutomation>,
-    #[serde(default = "bool::default", skip_serializing)]
-    pub clickable: bool,
     #[serde(
         default = "default_bool_true",
         rename = "current-working-directory",
         alias = "cwd"
     )]
     pub current_working_directory: bool,
-    #[serde(default = "bool::default", rename = "use-terminal-title")]
-    pub use_terminal_title: bool,
     #[serde(default = "default_hide_if_single", rename = "hide-if-single")]
     pub hide_if_single: bool,
     #[serde(default = "default_bool_true", rename = "use-split")]
@@ -173,75 +150,88 @@ pub struct Navigation {
         rename = "unfocused-split-fill"
     )]
     pub unfocused_split_fill: Option<ColorArray>,
-    /// Maximum width of a tab in logical pixels. Tabs shrink below
-    /// this as more open; the cap only limits how wide a tab grows
-    /// when few are open. Clamped to `[80.0, 280.0]` at load time.
+    /// Maximum tab width in logical pixels, clamped to `[80.0, 1024.0]`.
+    /// Desktop tabs size to their titles between the configured bounds.
+    /// Tabs shrink further when necessary to fit the window.
     #[serde(default = "default_max_tab_width", rename = "max-tab-width")]
     pub max_tab_width: f32,
+    /// Minimum preferred Desktop tab width, bounded by `max-tab-width`.
+    #[serde(default = "default_min_tab_width", rename = "min-tab-width")]
+    pub min_tab_width: f32,
+    /// Desktop tab icon size in logical pixels, clamped to `[8.0, 32.0]`.
+    #[serde(default = "default_tab_icon_size", rename = "tab-icon-size")]
+    pub tab_icon_size: f32,
+    /// UI preset; explicit tab and panel settings override its defaults.
+    #[serde(default, rename = "preset")]
+    pub tab_style: TabStyle,
+    #[serde(default)]
+    pub tabs: Tabs,
+    /// Desktop tab border reflections, from `0.0` (off) to `1.0`.
+    #[serde(
+        default = "default_tab_glass_intensity",
+        rename = "tab-glass-intensity"
+    )]
+    pub tab_glass_intensity: f32,
+    /// Program status border thickness in physical pixels, from `0.0` to `6.0`.
+    /// Zero hides the status border, preserving the ordinary glass reflection.
+    #[serde(default = "default_tab_status_width", rename = "tab-status-width")]
+    pub tab_status_width: f32,
+    /// Tab motion and hover transitions. Defaults to the full effect.
+    #[serde(default)]
+    pub animation: Animation,
+    /// Map command names to a bundled app or named icon in Desktop tabs.
+    #[serde(default, rename = "app-icons")]
+    pub app_icons: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Navigation {
     fn default() -> Navigation {
         Navigation {
-            mode: NavigationMode::default(),
-            color_automation: Vec::default(),
-            clickable: false,
             current_working_directory: true,
-            use_terminal_title: false,
             hide_if_single: default_hide_if_single(),
             use_split: true,
             unfocused_split_opacity: default_unfocused_split_opacity(),
             unfocused_split_fill: None,
             open_config_with_split: true,
             max_tab_width: default_max_tab_width(),
+            min_tab_width: default_min_tab_width(),
+            tab_icon_size: default_tab_icon_size(),
+            tab_style: TabStyle::default(),
+            tabs: Tabs::default(),
+            tab_glass_intensity: default_tab_glass_intensity(),
+            tab_status_width: default_tab_status_width(),
+            animation: Animation::default(),
+            app_icons: std::collections::BTreeMap::new(),
         }
     }
 }
 
 impl Navigation {
-    #[inline]
-    pub fn is_native(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        {
-            self.mode == NavigationMode::NativeTab
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            false
-        }
-    }
-
-    #[inline]
-    pub fn has_navigation_key_bindings(&self) -> bool {
-        self.mode != NavigationMode::Plain
-    }
-
-    #[inline]
-    pub fn is_enabled(&self) -> bool {
-        self.mode == NavigationMode::Tab
+    pub fn tab_geometry(&self) -> TabGeometry {
+        self.tabs
+            .resolve(self.tab_style, clamp_tab_icon_size(self.tab_icon_size))
     }
 
     /// Whether the rio-rendered tab strip ("island") is actually painted
-    /// this frame. Mirrors the gate at `island.rs:358` — input layers
+    /// this frame. Input layers
     /// (click routing, cursor override) must agree with the renderer so
     /// the empty band over a hidden island doesn't intercept events.
     #[inline]
     pub fn island_visible(&self, num_tabs: usize) -> bool {
-        self.is_enabled() && !(self.hide_if_single && num_tabs == 1)
+        !(self.hide_if_single && num_tabs == 1)
     }
 
     /// Whether the top band is reserved as custom window chrome this
     /// frame, painted island or not. On macOS the full-size content
-    /// view keeps the band whenever Tab navigation is enabled, even
+    /// view keeps the band even
     /// with `hide-if-single` hiding the strip; other platforms render
     /// the terminal from the top when the island is hidden. Must agree
     /// with `padding_top_from_config`, which reserves the band's
     /// height under the same condition.
     #[inline]
     pub fn chrome_band_reserved(&self, num_tabs: usize) -> bool {
-        if cfg!(target_os = "macos") {
-            self.is_enabled()
+        if cfg!(any(target_os = "macos", target_os = "windows")) {
+            true
         } else {
             self.island_visible(num_tabs)
         }
@@ -250,200 +240,41 @@ impl Navigation {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    fn chrome_band_follows_padding_contract() {
-        use crate::config::navigation::{Navigation, NavigationMode};
-
-        let mut nav = Navigation {
-            mode: NavigationMode::Tab,
-            hide_if_single: true,
-            ..Navigation::default()
-        };
-
-        // Visible island: band reserved everywhere.
-        assert!(nav.island_visible(2));
-        assert!(nav.chrome_band_reserved(2));
-
-        // Hidden island (single tab): macOS keeps the band as chrome,
-        // other platforms hand it to the terminal, matching
-        // padding_top_from_config.
-        assert!(!nav.island_visible(1));
-        assert_eq!(nav.chrome_band_reserved(1), cfg!(target_os = "macos"));
-
-        // Non-Tab modes never reserve the band.
-        nav.mode = NavigationMode::Plain;
-        assert!(!nav.island_visible(1));
-        assert!(!nav.chrome_band_reserved(1));
-        assert!(!nav.chrome_band_reserved(2));
-
-        #[cfg(target_os = "macos")]
-        {
-            nav.mode = NavigationMode::NativeTab;
-            assert!(!nav.chrome_band_reserved(1));
-            assert!(!nav.chrome_band_reserved(2));
+    fn chrome_band_follows_padding_contract_for_both_styles() {
+        for tab_style in [TabStyle::Pill, TabStyle::Square] {
+            let nav = Navigation {
+                tab_style,
+                hide_if_single: true,
+                ..Navigation::default()
+            };
+            assert!(nav.island_visible(2));
+            assert!(nav.chrome_band_reserved(2));
+            assert!(!nav.island_visible(1));
+            assert_eq!(
+                nav.chrome_band_reserved(1),
+                cfg!(any(target_os = "macos", target_os = "windows"))
+            );
         }
     }
 
-    use crate::config::colors::hex_to_color_arr;
-    use crate::config::navigation::{Navigation, NavigationMode};
-    use serde::Deserialize;
-
-    #[derive(Debug, Clone, Deserialize, PartialEq)]
-    struct Root {
-        #[serde(default = "Navigation::default")]
-        navigation: Navigation,
-    }
-
-    /// The default is platform-split: macOS hides the strip for a lone
-    /// tab, Linux/Windows keep it as a centred title with no island
-    /// behind it.
     #[test]
     fn hide_if_single_platform_default() {
-        let decoded = toml::from_str::<Root>("[navigation]\nmode = 'Tab'\n").unwrap();
-        assert_eq!(decoded.navigation.hide_if_single, cfg!(target_os = "macos"));
-        assert_eq!(
-            decoded.navigation.island_visible(1),
-            !cfg!(target_os = "macos")
-        );
-        assert_eq!(
-            Navigation::default().island_visible(1),
-            !cfg!(target_os = "macos")
-        );
-        // More than one tab always shows the strip.
-        assert!(decoded.navigation.island_visible(2));
+        let nav: Navigation = toml::from_str("").unwrap();
+        assert_eq!(nav.hide_if_single, cfg!(target_os = "macos"));
+        assert_eq!(nav.island_visible(1), !cfg!(target_os = "macos"));
+        assert!(nav.island_visible(2));
     }
 
-    /// Both explicit values must override the platform default.
     #[test]
     fn hide_if_single_explicit_override() {
-        let on =
-            toml::from_str::<Root>("[navigation]\nmode = 'Tab'\nhide-if-single = true\n")
-                .unwrap();
-        assert!(on.navigation.hide_if_single);
-        assert!(!on.navigation.island_visible(1));
-        assert!(on.navigation.island_visible(2));
-
-        let off = toml::from_str::<Root>(
-            "[navigation]\nmode = 'Tab'\nhide-if-single = false\n",
-        )
-        .unwrap();
-        assert!(!off.navigation.hide_if_single);
-        assert!(off.navigation.island_visible(1));
-    }
-
-    #[test]
-    fn test_plain() {
-        let content = r#"
-            [navigation]
-            mode = 'Plain'
-        "#;
-
-        let decoded = toml::from_str::<Root>(content).unwrap();
-        assert_eq!(decoded.navigation.mode, NavigationMode::Plain);
-        assert!(!decoded.navigation.clickable);
-        assert!(decoded.navigation.color_automation.is_empty());
-    }
-
-    #[test]
-    fn test_tab() {
-        let content = r#"
-            [navigation]
-            mode = 'Tab'
-        "#;
-
-        let decoded = toml::from_str::<Root>(content).unwrap();
-        assert_eq!(decoded.navigation.mode, NavigationMode::Tab);
-        assert!(!decoded.navigation.clickable);
-        assert!(decoded.navigation.color_automation.is_empty());
-    }
-
-    #[test]
-    fn test_color_automation() {
-        let content = r#"
-            [navigation]
-            mode = 'Tab'
-            color-automation = [
-                { program = 'vim', color = '#333333' }
-            ]
-        "#;
-
-        let decoded = toml::from_str::<Root>(content).unwrap();
-        assert_eq!(decoded.navigation.mode, NavigationMode::Tab);
-        assert!(!decoded.navigation.clickable);
-        assert!(!decoded.navigation.color_automation.is_empty());
-        assert_eq!(
-            decoded.navigation.color_automation[0].program,
-            "vim".to_string()
-        );
-        assert_eq!(decoded.navigation.color_automation[0].path, String::new());
-        assert_eq!(
-            decoded.navigation.color_automation[0].color,
-            hex_to_color_arr("#333333")
-        );
-    }
-
-    #[test]
-    fn test_color_automation_arr() {
-        let content = r#"
-            [navigation]
-            mode = 'Tab'
-            color-automation = [
-                { program = 'ssh', color = '#F1F1F1' },
-                { program = 'tmux', color = '#333333' },
-                { path = '/home', color = '#ffffff' },
-                { program = 'nvim', path = '/usr', color = '#00b952' },
-            ]
-        "#;
-
-        let decoded = toml::from_str::<Root>(content).unwrap();
-        assert_eq!(decoded.navigation.mode, NavigationMode::Tab);
-        assert!(!decoded.navigation.clickable);
-        assert!(!decoded.navigation.color_automation.is_empty());
-
-        assert_eq!(
-            decoded.navigation.color_automation[0].program,
-            "ssh".to_string()
-        );
-        assert_eq!(decoded.navigation.color_automation[0].path, String::new());
-        assert_eq!(
-            decoded.navigation.color_automation[0].color,
-            hex_to_color_arr("#F1F1F1")
-        );
-
-        assert_eq!(
-            decoded.navigation.color_automation[1].program,
-            "tmux".to_string()
-        );
-        assert_eq!(decoded.navigation.color_automation[1].path, String::new());
-        assert_eq!(
-            decoded.navigation.color_automation[1].color,
-            hex_to_color_arr("#333333")
-        );
-
-        assert_eq!(
-            decoded.navigation.color_automation[2].program,
-            String::new()
-        );
-        assert_eq!(
-            decoded.navigation.color_automation[2].path,
-            "/home".to_string()
-        );
-        assert_eq!(
-            decoded.navigation.color_automation[2].color,
-            hex_to_color_arr("#ffffff")
-        );
-
-        assert_eq!(
-            decoded.navigation.color_automation[3].program,
-            "nvim".to_string()
-        );
-        assert_eq!(
-            decoded.navigation.color_automation[3].path,
-            "/usr".to_string()
-        );
-        assert_eq!(
-            decoded.navigation.color_automation[3].color,
-            hex_to_color_arr("#00b952")
-        );
+        for hidden in [true, false] {
+            let nav: Navigation =
+                toml::from_str(&format!("hide-if-single = {hidden}")).unwrap();
+            assert_eq!(nav.island_visible(1), !hidden);
+            assert!(nav.island_visible(2));
+        }
     }
 }

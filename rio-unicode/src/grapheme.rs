@@ -55,7 +55,7 @@ impl GraphemeClass {
     pub const COUNT: usize = 18;
 
     /// Inverse of `as u8`, for table builders enumerating classes.
-    pub fn from_u8(value: u8) -> Option<Self> {
+    pub const fn from_u8(value: u8) -> Option<Self> {
         use GraphemeClass as G;
         Some(match value {
             0 => G::Other,
@@ -81,21 +81,108 @@ impl GraphemeClass {
     }
 }
 
-/// Class lookup: binary search over the generated ranges.
+// Most Unicode pages contain only Other. Share one empty block for those
+// pages and materialize only pages intersecting a generated property range.
+// Everything is computed at compile time from the conformance-tested data.
+static CLASS_PAGES: [(u16, u16); 0x1100] = {
+    assert!(GRAPHEME_CLASS_RANGES.len() <= u16::MAX as usize);
+    let mut pages = [(0, 0); 0x1100];
+    let mut page = 0;
+    let mut start = 0;
+    while page < pages.len() {
+        let lo = (page as u32) << 8;
+        while start < GRAPHEME_CLASS_RANGES.len() && GRAPHEME_CLASS_RANGES[start].1 < lo {
+            start += 1;
+        }
+        let mut end = start;
+        while end < GRAPHEME_CLASS_RANGES.len()
+            && GRAPHEME_CLASS_RANGES[end].0 <= lo + 255
+        {
+            end += 1;
+        }
+        pages[page] = (start as u16, end as u16);
+        page += 1;
+    }
+    pages
+};
+
+const CLASS_BLOCK_COUNT: usize = {
+    let mut count = 1; // Block zero is the shared Other page.
+    let mut page = 0;
+    while page < CLASS_PAGES.len() {
+        if CLASS_PAGES[page].0 != CLASS_PAGES[page].1 {
+            count += 1;
+        }
+        page += 1;
+    }
+    count
+};
+
+struct ClassTable {
+    pages: [u16; 0x1100],
+    blocks: [[GraphemeClass; 256]; CLASS_BLOCK_COUNT],
+}
+
+static CLASS_TABLE: ClassTable = {
+    let mut table = ClassTable {
+        pages: [0; 0x1100],
+        blocks: [[GraphemeClass::Other; 256]; CLASS_BLOCK_COUNT],
+    };
+    let mut block = 0;
+    let mut page = 0;
+    while page < CLASS_PAGES.len() {
+        let (start, end) = CLASS_PAGES[page];
+        if start != end {
+            block += 1;
+            table.pages[page] = block as u16;
+            let base = (page as u32) << 8;
+            let mut range = start as usize;
+            while range < end as usize {
+                let (lo, hi, class) = GRAPHEME_CLASS_RANGES[range];
+                let mut cp = if lo > base { lo } else { base };
+                let limit = if hi < base + 255 { hi } else { base + 255 };
+                while cp <= limit {
+                    table.blocks[block][(cp - base) as usize] = class;
+                    cp += 1;
+                }
+                range += 1;
+            }
+        }
+        page += 1;
+    }
+    table
+};
+
+// One load classifies ASCII controls and Latin-1 alike. Keep this derived
+// from the same ranges as the paged table, rather than branching per class
+// or making a dependent page lookup for these common codepoints.
+static LATIN1_CLASSES: [GraphemeClass; 256] = {
+    let mut classes = [GraphemeClass::Other; 256];
+    let mut range = 0;
+    while range < GRAPHEME_CLASS_RANGES.len() {
+        let (lo, hi, class) = GRAPHEME_CLASS_RANGES[range];
+        if lo > 255 {
+            break;
+        }
+        let mut cp = lo;
+        while cp <= hi && cp <= 255 {
+            classes[cp as usize] = class;
+            cp += 1;
+        }
+        range += 1;
+    }
+    classes
+};
+
+/// Class lookup through two compact tables covering every Unicode plane.
+#[inline]
 pub fn grapheme_class(c: char) -> GraphemeClass {
     let cp = c as u32;
-    match GRAPHEME_CLASS_RANGES.binary_search_by(|&(lo, hi, _)| {
-        if cp < lo {
-            core::cmp::Ordering::Greater
-        } else if cp > hi {
-            core::cmp::Ordering::Less
-        } else {
-            core::cmp::Ordering::Equal
-        }
-    }) {
-        Ok(i) => GRAPHEME_CLASS_RANGES[i].2,
-        Err(_) => GraphemeClass::Other,
+    if cp < 256 {
+        return LATIN1_CLASSES[cp as usize];
     }
+    let block = CLASS_TABLE.pages[(cp >> 8) as usize] as usize;
+    CLASS_TABLE.blocks[block][(cp & 255) as usize]
 }
 
 /// Emoji ZWJ sequence progress (GB11): `\p{ExtPic} Extend* ZWJ × \p{ExtPic}`.
@@ -138,7 +225,7 @@ impl BreakState {
     pub const COUNT: usize = 18;
 
     /// Pack into `0..COUNT` for table indexing.
-    pub fn pack(self) -> u8 {
+    pub const fn pack(self) -> u8 {
         let emoji = match self.emoji {
             EmojiSeq::None => 0u8,
             EmojiSeq::Emoji => 1,
@@ -153,7 +240,7 @@ impl BreakState {
     }
 
     /// Inverse of [`pack`](Self::pack).
-    pub fn unpack(value: u8) -> Option<Self> {
+    pub const fn unpack(value: u8) -> Option<Self> {
         if value as usize >= Self::COUNT {
             return None;
         }
@@ -173,13 +260,15 @@ impl BreakState {
     }
 
     /// State after the first codepoint of a sequence.
+    #[inline]
     pub fn start(first: GraphemeClass) -> Self {
         let mut state = Self::default();
         state.advance(first);
         state
     }
 
-    fn advance(&mut self, class: GraphemeClass) {
+    #[inline]
+    const fn advance(&mut self, class: GraphemeClass) {
         use GraphemeClass as G;
         self.emoji = match (self.emoji, class) {
             (_, G::ExtPic) => EmojiSeq::Emoji,
@@ -209,7 +298,8 @@ impl BreakState {
 // identical-bodied arms would make the machine harder to audit against
 // the standard for zero behavioral gain.
 #[allow(clippy::if_same_then_else)]
-pub fn is_break(
+#[inline]
+pub const fn is_break(
     prev: GraphemeClass,
     next: GraphemeClass,
     state: &mut BreakState,
@@ -217,7 +307,7 @@ pub fn is_break(
     use GraphemeClass as G;
     let decision = {
         // GB3: CR × LF.
-        if prev == G::CR && next == G::LF {
+        if matches!(prev, G::CR) && matches!(next, G::LF) {
             false
         // GB4 / GB5: controls break on both sides.
         } else if matches!(prev, G::Control | G::CR | G::LF)
@@ -225,29 +315,31 @@ pub fn is_break(
         {
             true
         // GB6-8: Hangul jamo.
-        } else if prev == G::L && matches!(next, G::L | G::V | G::LV | G::LVT) {
+        } else if matches!(prev, G::L) && matches!(next, G::L | G::V | G::LV | G::LVT) {
             false
         } else if matches!(prev, G::LV | G::V) && matches!(next, G::V | G::T) {
             false
-        } else if matches!(prev, G::LVT | G::T) && next == G::T {
+        } else if matches!(prev, G::LVT | G::T) && matches!(next, G::T) {
             false
         // GB9 / GB9a / GB9b: extenders, spacing marks, prepends.
         } else if matches!(next, G::Extend | G::ExtendIncb | G::Linker | G::Zwj) {
             false
-        } else if next == G::SpacingMark {
+        } else if matches!(next, G::SpacingMark) {
             false
-        } else if prev == G::Prepend {
+        } else if matches!(prev, G::Prepend) {
             false
         // GB9c: Indic conjuncts join across a linker chain.
-        } else if next == G::Consonant && state.incb == Incb::LinkerSeen {
+        } else if matches!(next, G::Consonant) && matches!(state.incb, Incb::LinkerSeen) {
             false
         // GB11: emoji ZWJ sequences.
-        } else if prev == G::Zwj && next == G::ExtPic && state.emoji == EmojiSeq::EmojiZwj
+        } else if matches!(prev, G::Zwj)
+            && matches!(next, G::ExtPic)
+            && matches!(state.emoji, EmojiSeq::EmojiZwj)
         {
             false
         // GB12/GB13: regional indicators pair up.
-        } else if prev == G::RegionalIndicator
-            && next == G::RegionalIndicator
+        } else if matches!(prev, G::RegionalIndicator)
+            && matches!(next, G::RegionalIndicator)
             && state.ri_odd
         {
             false
@@ -332,6 +424,26 @@ mod tests {
 
     fn clusters(s: &str) -> Vec<&str> {
         Graphemes::new(s).collect()
+    }
+
+    #[test]
+    fn page_index_matches_property_ranges_for_every_scalar() {
+        let mut range = 0;
+        for cp in 0..=0x10ffff {
+            let Some(c) = char::from_u32(cp) else {
+                continue;
+            };
+            while range < GRAPHEME_CLASS_RANGES.len()
+                && GRAPHEME_CLASS_RANGES[range].1 < cp
+            {
+                range += 1;
+            }
+            let expected = GRAPHEME_CLASS_RANGES
+                .get(range)
+                .filter(|&&(lo, _, _)| lo <= cp)
+                .map_or(GraphemeClass::Other, |&(_, _, class)| class);
+            assert_eq!(grapheme_class(c), expected, "U+{cp:04X}");
+        }
     }
 
     #[test]

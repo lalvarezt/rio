@@ -21,7 +21,7 @@ use crate::config::bindings::Bindings;
 use crate::config::defaults::*;
 use crate::config::hints::Hints;
 use crate::config::keyboard::Keyboard;
-use crate::config::layout::{Margin, Panel};
+use crate::config::layout::{Margin, Panel, PanelOverrides};
 use crate::config::navigation::Navigation;
 use crate::config::platform::{Platform, PlatformConfig};
 use crate::config::renderer::Renderer;
@@ -30,7 +30,7 @@ use crate::config::window::Window;
 use colors::Colors;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{default::Default, fs::File};
 #[cfg(feature = "renderer")]
 use sugarloaf::font::fonts::SugarloafFonts;
@@ -99,6 +99,8 @@ impl Default for Developer {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     #[serde(default)]
+    pub clipboard: crate::clipboard::ClipboardPolicy,
+    #[serde(default)]
     pub cursor: CursorConfig,
     #[serde(default = "Navigation::default")]
     pub navigation: Navigation,
@@ -140,8 +142,8 @@ pub struct Config {
     pub editor: Shell,
     #[serde(default = "default_margin", alias = "margin")]
     pub margin: Margin,
-    #[serde(default = "Panel::default")]
-    pub panel: Panel,
+    #[serde(default)]
+    pub panel: PanelOverrides,
     #[serde(default = "Vec::default", rename = "env-vars")]
     pub env_vars: Vec<String>,
     #[serde(default = "default_option_as_alt", rename = "option-as-alt")]
@@ -163,6 +165,8 @@ pub struct Config {
     pub ignore_selection_fg_color: bool,
     #[serde(default = "default_bool_true", rename = "confirm-before-quit")]
     pub confirm_before_quit: bool,
+    #[serde(default = "default_bool_true", rename = "confirm-before-close-tab")]
+    pub confirm_before_close_tab: bool,
     /// Unicode grapheme clusters as the unit of cell layout (presets
     /// DEC private mode 2027). A
     /// program's DECSET/DECRST still wins at runtime.
@@ -191,8 +195,40 @@ pub struct Config {
         rename = "scrollback-history-limit"
     )]
     pub scrollback_history_limit: usize,
+    /// Optional logical uncompressed history bytes; the line cap still applies.
+    /// Charges row metadata, cells, and shared style/extras payloads. Visible
+    /// rows, retained allocation capacity, allocator overhead and images are
+    /// separate. Zero disables history; omission preserves the line-only cap.
+    #[serde(default, rename = "scrollback-history-byte-limit")]
+    pub scrollback_history_byte_limit: Option<usize>,
     #[serde(default = "effects::Effects::default")]
     pub effects: effects::Effects,
+}
+
+#[cfg(test)]
+mod clipboard_policy_tests {
+    use super::Config;
+    use crate::clipboard::Access;
+
+    #[test]
+    fn partial_policy_preserves_defaults_and_accepts_zero_limit() {
+        let config: Config =
+            toml::from_str("[clipboard]\nwrite = 'deny'\nwrite-limit-bytes = 0\n")
+                .unwrap();
+        assert_eq!(config.clipboard.read, Access::Ask);
+        assert_eq!(config.clipboard.write, Access::Deny);
+        assert_eq!(config.clipboard.write_limit_bytes, 0);
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.clipboard, Default::default());
+    }
+
+    #[test]
+    fn rejects_unknown_access_and_negative_limit() {
+        assert!(toml::from_str::<Config>("[clipboard]\nread = 'yes'\n").is_err());
+        assert!(
+            toml::from_str::<Config>("[clipboard]\nwrite-limit-bytes = -1\n").is_err()
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -297,6 +333,10 @@ pub fn create_config_file(path: Option<PathBuf>) {
 }
 
 impl Config {
+    pub fn panel(&self) -> Panel {
+        self.panel.resolve(self.navigation.tab_style)
+    }
+
     #[cfg(test)]
     fn load_from_path(path: &PathBuf) -> Self {
         if path.exists() {
@@ -366,15 +406,10 @@ impl Config {
     }
 
     fn load_theme(path: &PathBuf) -> Result<Theme, String> {
-        if path.exists() {
-            let content = std::fs::read_to_string(path).unwrap();
-            match toml::from_str::<Theme>(&content) {
-                Ok(decoded) => Ok(decoded),
-                Err(err_message) => Err(format!("error parsing: {err_message:?}")),
-            }
-        } else {
-            Err(String::from("filepath does not exist"))
-        }
+        let content = std::fs::read_to_string(path)
+            .map_err(|error| format!("{}\n{error}", path.display()))?;
+        toml::from_str::<Theme>(&content)
+            .map_err(|error| format!("{}\n{error}", path.display()))
     }
 
     pub fn to_string(&self) -> Result<String, toml::ser::Error> {
@@ -415,14 +450,22 @@ impl Config {
         }
     }
 
-    pub fn try_load() -> Result<Self, ConfigError> {
-        let path = config_file_path();
+    /// Loads the config with a recoverable theme warning, or a file/parse error.
+    pub fn try_load() -> Result<(Self, Option<ConfigError>), ConfigError> {
+        Self::try_load_from(&config_dir_path())
+    }
+
+    fn try_load_from(
+        config_dir: &Path,
+    ) -> Result<(Self, Option<ConfigError>), ConfigError> {
+        let path = config_dir.join("config.toml");
         if path.exists() {
             match std::fs::read_to_string(path) {
                 Ok(content) => match toml::from_str::<Config>(&content) {
                     Ok(mut decoded) => {
+                        let mut theme_error = None;
                         let theme = &decoded.theme;
-                        let theme_path = config_dir_path().join("themes");
+                        let theme_path = config_dir.join("themes");
                         if !theme.is_empty() {
                             let path = theme_path.join(theme).with_extension("toml");
                             match Config::load_theme(&path) {
@@ -430,9 +473,8 @@ impl Config {
                                     decoded.colors = loaded_theme.colors;
                                 }
                                 Err(err_message) => {
-                                    return Err(ConfigError::ErrLoadingTheme(
-                                        err_message,
-                                    ));
+                                    theme_error =
+                                        Some(ConfigError::ErrLoadingTheme(err_message));
                                 }
                             }
                         }
@@ -453,9 +495,8 @@ impl Config {
                                 }
                                 Err(err_message) => {
                                     warn!("failed to load light theme: {}", light_theme);
-                                    return Err(ConfigError::ErrLoadingTheme(
-                                        err_message,
-                                    ));
+                                    theme_error =
+                                        Some(ConfigError::ErrLoadingTheme(err_message));
                                 }
                             }
 
@@ -467,9 +508,8 @@ impl Config {
                                 }
                                 Err(err_message) => {
                                     warn!("failed to load dark theme: {}", dark_theme);
-                                    return Err(ConfigError::ErrLoadingTheme(
-                                        err_message,
-                                    ));
+                                    theme_error =
+                                        Some(ConfigError::ErrLoadingTheme(err_message));
                                 }
                             }
 
@@ -480,7 +520,7 @@ impl Config {
                             }
                         }
 
-                        Ok(decoded)
+                        Ok((decoded, theme_error))
                     }
                     Err(err_message) => {
                         Err(ConfigError::ErrLoadingConfig(err_message.to_string()))
@@ -535,6 +575,12 @@ impl Config {
             if let Some(mode) = window_overwrite.mode {
                 self.window.mode = mode;
             }
+            if let Some(divider) = window_overwrite.divider {
+                self.window.divider = divider;
+            }
+            if let Some(width) = window_overwrite.divider_width {
+                self.window.divider_width = width;
+            }
             if let Some(opacity) = window_overwrite.opacity {
                 self.window.opacity = opacity;
             }
@@ -548,9 +594,7 @@ impl Config {
             if let Some(decorations) = window_overwrite.decorations {
                 self.window.decorations = decorations;
             }
-            if let Some(macos_unified) = window_overwrite.macos_use_unified_titlebar {
-                self.window.macos_use_unified_titlebar = macos_unified;
-            }
+
             if let Some(macos_shadow) = window_overwrite.macos_use_shadow {
                 self.window.macos_use_shadow = macos_shadow;
             }
@@ -579,21 +623,10 @@ impl Config {
 
         // Merge navigation fields individually
         if let Some(navigation_overwrite) = &platform_config.navigation {
-            if let Some(mode) = navigation_overwrite.mode {
-                self.navigation.mode = mode;
-            }
-            if let Some(color_automation) = &navigation_overwrite.color_automation {
-                self.navigation.color_automation = color_automation.clone();
-            }
-            if let Some(clickable) = navigation_overwrite.clickable {
-                self.navigation.clickable = clickable;
-            }
             if let Some(cwd) = navigation_overwrite.current_working_directory {
                 self.navigation.current_working_directory = cwd;
             }
-            if let Some(use_term_title) = navigation_overwrite.use_terminal_title {
-                self.navigation.use_terminal_title = use_term_title;
-            }
+
             if let Some(hide_if_single) = navigation_overwrite.hide_if_single {
                 self.navigation.hide_if_single = hide_if_single;
             }
@@ -613,6 +646,32 @@ impl Config {
             if let Some(max_tab_width) = navigation_overwrite.max_tab_width {
                 self.navigation.max_tab_width = max_tab_width;
             }
+            if let Some(min_tab_width) = navigation_overwrite.min_tab_width {
+                self.navigation.min_tab_width = min_tab_width;
+            }
+            if let Some(tab_icon_size) = navigation_overwrite.tab_icon_size {
+                self.navigation.tab_icon_size = tab_icon_size;
+            }
+            if let Some(style) = navigation_overwrite.tab_style {
+                self.navigation.tab_style = style;
+            }
+            self.navigation.tabs.merge(navigation_overwrite.tabs);
+            if let Some(intensity) = navigation_overwrite.tab_glass_intensity {
+                self.navigation.tab_glass_intensity = intensity;
+            }
+            if let Some(width) = navigation_overwrite.tab_status_width {
+                self.navigation.tab_status_width = width;
+            }
+            if let Some(animation) = navigation_overwrite.animation {
+                self.navigation.animation = animation;
+            }
+            if let Some(icons) = &navigation_overwrite.app_icons {
+                self.navigation.app_icons.extend(icons.clone());
+            }
+        }
+
+        if let Some(panel) = platform_config.panel {
+            self.panel.merge(panel);
         }
 
         // Clamp after platform merge so both the base and any override go
@@ -623,6 +682,20 @@ impl Config {
             );
         self.navigation.max_tab_width =
             crate::config::navigation::clamp_max_tab_width(self.navigation.max_tab_width);
+        self.navigation.min_tab_width = crate::config::navigation::clamp_min_tab_width(
+            self.navigation.min_tab_width,
+            self.navigation.max_tab_width,
+        );
+        self.navigation.tab_icon_size =
+            crate::config::navigation::clamp_tab_icon_size(self.navigation.tab_icon_size);
+        self.navigation.tab_glass_intensity =
+            crate::config::navigation::clamp_tab_glass_intensity(
+                self.navigation.tab_glass_intensity,
+            );
+        self.navigation.tab_status_width =
+            crate::config::navigation::clamp_tab_status_width(
+                self.navigation.tab_status_width,
+            );
 
         // Merge renderer fields individually
         if let Some(renderer_overwrite) = &platform_config.renderer {
@@ -659,6 +732,7 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            clipboard: Default::default(),
             cursor: CursorConfig::default(),
             editor: default_editor(),
             adaptive_theme: None,
@@ -677,7 +751,7 @@ impl Default for Config {
             navigation: Navigation::default(),
             option_as_alt: default_option_as_alt(),
             margin: default_margin(),
-            panel: Panel::default(),
+            panel: PanelOverrides::default(),
             renderer: Renderer::default(),
             shell: default_shell(),
             platform: Platform::default(),
@@ -688,6 +762,7 @@ impl Default for Config {
             working_dir: default_working_dir(),
             ignore_selection_fg_color: false,
             confirm_before_quit: true,
+            confirm_before_close_tab: true,
             grapheme_clustering: true,
             copy_on_select: false,
             hide_cursor_when_typing: false,
@@ -696,6 +771,7 @@ impl Default for Config {
             bell: Bell::default(),
             enable_scroll_bar: true,
             scrollback_history_limit: default_scrollback_history_limit(),
+            scrollback_history_byte_limit: None,
             effects: effects::Effects::default(),
         }
     }
@@ -710,6 +786,9 @@ impl Default for CursorConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod ui_tests;
 
 #[cfg(test)]
 mod tests {
@@ -737,6 +816,82 @@ mod tests {
         let file_name = tmp_dir().join(theme).with_extension("toml");
         let mut file = std::fs::File::create(file_name).unwrap();
         writeln!(file, "{toml_str}").unwrap();
+    }
+
+    fn try_load_fixture(
+        name: &str,
+        content: &str,
+    ) -> Result<(Config, Option<ConfigError>), ConfigError> {
+        let dir = tmp_dir().join(format!("rio-config-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("themes")).unwrap();
+        std::fs::write(dir.join("config.toml"), content).unwrap();
+        std::fs::write(
+            dir.join("themes/valid.toml"),
+            "[colors]\nbackground = '#123456'\n",
+        )
+        .unwrap();
+        let result = Config::try_load_from(&dir);
+        std::fs::remove_dir_all(dir).unwrap();
+        result
+    }
+
+    #[test]
+    fn missing_theme_diagnostic_identifies_the_file() {
+        let path = std::env::temp_dir()
+            .join(format!("rio-missing-theme-{}", std::process::id()))
+            .join("themes/missing.toml");
+        let message = Config::load_theme(&path).err().unwrap();
+        assert!(message.contains(path.to_str().unwrap()), "{message}");
+    }
+
+    #[test]
+    fn missing_theme_keeps_backend_and_bindings() {
+        let (config, warning) = try_load_fixture(
+            "missing-theme",
+            r#"
+            theme = "missing"
+            [renderer]
+            backend = "Webgpu"
+            [bindings]
+            keys = [{ key = "n", with = "Control", action = "CreateTab" }]
+        "#,
+        )
+        .unwrap();
+        assert_eq!(config.renderer.backend, renderer::Backend::Webgpu);
+        assert_eq!(config.bindings.keys.len(), 1);
+        assert!(matches!(warning, Some(ConfigError::ErrLoadingTheme(_))));
+    }
+
+    #[test]
+    fn missing_adaptive_theme_keeps_config_and_base_theme() {
+        for (name, light, dark) in [
+            ("missing-light", "missing", "valid"),
+            ("missing-dark", "valid", "missing"),
+        ] {
+            let content = format!(
+                r#"
+                theme = "valid"
+                [renderer]
+                backend = "Webgpu"
+                [adaptive-theme]
+                light = "{light}"
+                dark = "{dark}"
+            "#
+            );
+            let (config, warning) = try_load_fixture(name, &content).unwrap();
+            assert_eq!(config.renderer.backend, renderer::Backend::Webgpu);
+            assert_eq!(config.colors.background.1, hex_to_color_wgpu("#123456"));
+            assert!(config.adaptive_colors.is_none());
+            assert!(matches!(warning, Some(ConfigError::ErrLoadingTheme(_))));
+        }
+    }
+
+    #[test]
+    fn invalid_config_remains_a_load_error() {
+        assert!(matches!(
+            try_load_fixture("invalid", "[renderer"),
+            Err(ConfigError::ErrLoadingConfig(_))
+        ));
     }
 
     #[test]
@@ -1286,6 +1441,7 @@ mod tests {
 
     #[test]
     fn test_scrollback_history_limit_default() {
+        assert_eq!(Config::default().scrollback_history_byte_limit, None);
         let result = create_temporary_config(
             "scrollback-default",
             r#"
@@ -1298,6 +1454,12 @@ mod tests {
 
     #[test]
     fn test_scrollback_history_limit_custom() {
+        for bytes in [0, 1024, 50_000_000] {
+            let config: Config =
+                toml::from_str(&format!("scrollback-history-byte-limit = {bytes}"))
+                    .unwrap();
+            assert_eq!(config.scrollback_history_byte_limit, Some(bytes));
+        }
         let result = create_temporary_config(
             "scrollback-custom",
             r#"
@@ -1445,7 +1607,7 @@ mod tests {
 
         result.overwrite_based_on_platform();
 
-        // Mode should be overridden
+        // Preset should be overridden.
         assert_eq!(result.window.mode, window::WindowMode::Maximized);
         // But other fields should be preserved
         assert_eq!(result.window.width, 800);
@@ -1504,23 +1666,20 @@ mod tests {
             "platform-navigation-merge",
             r#"
             [navigation]
-            mode = "Tab"
-            clickable = true
+            preset = "pill"
+            hide-if-single = false
 
             [platform]
-            macos.navigation.mode = "NativeTab"
+            macos.navigation.preset = "square"
         "#,
         );
 
         result.overwrite_based_on_platform();
 
         // Mode should be overridden
-        assert_eq!(
-            result.navigation.mode,
-            navigation::NavigationMode::NativeTab
-        );
-        // Clickable should be preserved
-        assert!(result.navigation.clickable);
+        assert_eq!(result.navigation.tab_style, navigation::TabStyle::Square);
+        // Visibility should be preserved.
+        assert!(!result.navigation.hide_if_single);
     }
 
     #[test]
@@ -1562,8 +1721,8 @@ mod tests {
             disable-unfocused-render = false
 
             [navigation]
-            mode = "Tab"
-            clickable = false
+            preset = "pill"
+            hide-if-single = false
 
             shell = { program = "/bin/sh", args = ["-c"] }
 
@@ -1573,7 +1732,7 @@ mod tests {
             macos.window.opacity = 1.0
             macos.window.blur = true
             macos.renderer.performance = "High"
-            macos.navigation.clickable = true
+            macos.navigation.hide-if-single = true
             macos.shell = { program = "/bin/zsh", args = ["--login"] }
         "#,
         );
@@ -1596,9 +1755,9 @@ mod tests {
         // Renderer: performance overridden, disable_unfocused_render preserved
         assert!(!result.renderer.disable_unfocused_render);
 
-        // Navigation: clickable overridden, mode preserved
-        assert!(result.navigation.clickable);
-        assert_eq!(result.navigation.mode, navigation::NavigationMode::Tab);
+        // Navigation: visibility overridden, preset preserved.
+        assert!(result.navigation.hide_if_single);
+        assert_eq!(result.navigation.tab_style, navigation::TabStyle::Pill);
 
         // Shell: completely replaced
         assert_eq!(result.shell.program.as_deref(), Some("/bin/zsh"));

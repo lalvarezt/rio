@@ -87,6 +87,8 @@ pub enum RioEventType {
 pub enum Msg {
     /// Data that should be written to the PTY.
     Input(Cow<'static, [u8]>),
+    /// Clipboard data retaining its memory reservation until PTY delivery.
+    ClipboardInput(Arc<crate::clipboard::buffer::ResponseBuffer>),
 
     #[allow(dead_code)]
     Shutdown,
@@ -178,14 +180,10 @@ pub enum RioEvent {
     CreateWindow,
     ToggleQuake,
     CloseWindow,
-    CreateNativeTab(Option<String>),
     CreateConfigEditor,
-    SelectNativeTabByIndex(usize),
-    SelectNativeTabLast,
-    SelectNativeTabNext,
-    SelectNativeTabPrev,
 
     ReportToAssistant(RioError),
+    SshError(String),
 
     /// Grid has changed possibly requiring a mouse cursor shape change.
     MouseCursorDirty,
@@ -213,6 +211,17 @@ pub enum RioEvent {
 
     /// Request to store a text string in the clipboard.
     ClipboardStore(ClipboardType, String),
+    ClipboardReply(usize, Arc<crate::clipboard::buffer::ResponseBuffer>),
+    /// User paste for the search session that initiated the clipboard read.
+    ClipboardSearchPaste(
+        usize,
+        u64,
+        u64,
+        Arc<crate::clipboard::buffer::ResponseBuffer>,
+    ),
+
+    /// Permission/provider work for the terminal pane that originated OSC 5522.
+    KittyClipboardRequest(usize, Arc<crate::clipboard::kitty::Request>),
 
     /// Request to write the contents of the clipboard to the PTY.
     ///
@@ -259,6 +268,9 @@ pub enum RioEvent {
     /// Progress bar report from OSC 9;4 sequence
     ProgressReport(ProgressReport),
 
+    /// Program status or legacy progress changed in the identified pane.
+    ProgramStatusChanged(usize),
+
     /// Terminal bell ring, from the PTY identified by `route_id`.
     Bell(usize),
 
@@ -300,6 +312,15 @@ pub enum RioEvent {
 impl Debug for RioEvent {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            RioEvent::ClipboardReply(route, _) => {
+                write!(f, "ClipboardReply(route={route})")
+            }
+            RioEvent::ClipboardSearchPaste(route, _, _, _) => {
+                write!(f, "ClipboardSearchPaste(route={route})")
+            }
+            RioEvent::KittyClipboardRequest(route_id, _) => {
+                write!(f, "KittyClipboardRequest(route={route_id})")
+            }
             RioEvent::ClipboardStore(ty, text) => {
                 write!(f, "ClipboardStore({ty:?}, {text})")
             }
@@ -335,6 +356,9 @@ impl Debug for RioEvent {
             RioEvent::ProgressReport(report) => {
                 write!(f, "ProgressReport({:?})", report)
             }
+            RioEvent::ProgramStatusChanged(route_id) => {
+                write!(f, "ProgramStatusChanged route {route_id}")
+            }
             RioEvent::MouseCursorDirty => write!(f, "MouseCursorDirty"),
             RioEvent::ResetTitle => write!(f, "ResetTitle"),
             RioEvent::PrepareUpdateConfig => write!(f, "PrepareUpdateConfig"),
@@ -368,18 +392,12 @@ impl Debug for RioEvent {
             RioEvent::CreateWindow => write!(f, "CreateWindow"),
             RioEvent::ToggleQuake => write!(f, "ToggleQuake"),
             RioEvent::CloseWindow => write!(f, "CloseWindow"),
-            RioEvent::CreateNativeTab(_) => write!(f, "CreateNativeTab"),
-            RioEvent::SelectNativeTabByIndex(tab_index) => {
-                write!(f, "SelectNativeTabByIndex({tab_index})")
-            }
-            RioEvent::SelectNativeTabLast => write!(f, "SelectNativeTabLast"),
-            RioEvent::SelectNativeTabNext => write!(f, "SelectNativeTabNext"),
-            RioEvent::SelectNativeTabPrev => write!(f, "SelectNativeTabPrev"),
             RioEvent::CreateConfigEditor => write!(f, "CreateConfigEditor"),
             RioEvent::UpdateConfig => write!(f, "ReloadConfiguration"),
             RioEvent::ReportToAssistant(error_report) => {
                 write!(f, "ReportToAssistant({})", error_report.report)
             }
+            RioEvent::SshError(message) => write!(f, "SshError({message})"),
             RioEvent::ToggleFullScreen => write!(f, "FullScreen"),
             RioEvent::ToggleAppearanceTheme => write!(f, "ToggleAppearanceTheme"),
             RioEvent::BlinkCursor(timeout, route_id) => {
@@ -429,10 +447,6 @@ pub trait EventListener {
     fn send_event(&self, _event: RioEvent, _id: WindowId) {}
 
     fn send_event_with_high_priority(&self, _event: RioEvent, _id: WindowId) {}
-
-    fn send_redraw(&self, _id: WindowId) {}
-
-    fn send_global_event(&self, _event: RioEvent) {}
 }
 
 #[derive(Clone)]
@@ -500,6 +514,30 @@ pub struct SearchState {
 }
 
 impl SearchState {
+    /// Apply a keyboard edit or a whole paste before compiling and searching.
+    /// Returns whether the input contained an edit requiring a search update.
+    pub fn input(&mut self, chars: impl IntoIterator<Item = char>) -> bool {
+        let Some(index) = self.history_index else {
+            return false;
+        };
+        let mut edited = false;
+        for c in chars {
+            if self.history_index != Some(0) {
+                self.history[0] = self.history[index].clone();
+                self.history_index = Some(0);
+            }
+            match c {
+                '\x08' | '\x7f' => {
+                    self.history[0].pop();
+                }
+                ' '..='~' | '\u{a0}'..='\u{10ffff}' => self.history[0].push(c),
+                _ => continue,
+            }
+            edited = true;
+        }
+        edited
+    }
+
     /// Search regex text if a search is active.
     pub fn regex(&self) -> Option<&String> {
         self.history_index.and_then(|index| self.history.get(index))
@@ -548,6 +586,70 @@ impl Default for SearchState {
             origin: Default::default(),
             dfas: Default::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod search_input_tests {
+    use super::SearchState;
+
+    #[test]
+    #[ignore = "manual search paste measurement"]
+    fn measure_search_paste_compilation() {
+        use crate::crosswords::search::RegexSearch;
+        use std::time::Instant;
+        let text = "needle".repeat(80);
+        let start = Instant::now();
+        let mut state = SearchState::default();
+        state.history.push_front(String::new());
+        state.history_index = Some(0);
+        for c in text.chars() {
+            state.input([c]);
+            std::hint::black_box(RegexSearch::new(state.regex().unwrap()).unwrap());
+        }
+        let incremental = start.elapsed();
+        let start = Instant::now();
+        state.history[0].clear();
+        state.input(text.chars());
+        std::hint::black_box(RegexSearch::new(state.regex().unwrap()).unwrap());
+        println!(
+            "paste_chars={} incremental_us={} batched_us={}",
+            text.len(),
+            incremental.as_micros(),
+            start.elapsed().as_micros()
+        );
+    }
+
+    #[test]
+    fn paste_matches_keyboard_edits_and_preserves_history() {
+        let mut pasted = SearchState::default();
+        pasted.history = [String::new(), "previous 🦀".into()].into();
+        pasted.history_index = Some(1);
+        let mut typed = SearchState::default();
+        typed.history = pasted.history.clone();
+        typed.history_index = pasted.history_index;
+        let text = "\n\x08日\x7f本 café\t\r\x1b";
+        assert!(pasted.input(text.chars()));
+        for c in text.chars() {
+            typed.input([c]);
+        }
+        assert_eq!(pasted.regex(), Some(&"previous 本 café".to_string()));
+        assert_eq!(pasted.history, typed.history);
+        assert_eq!(pasted.history[1], "previous 🦀");
+        assert_eq!(pasted.history_index, Some(0));
+    }
+
+    #[test]
+    fn inactive_search_and_control_only_input_need_no_update() {
+        let mut state = SearchState::default();
+        assert!(!state.input("ignored".chars()));
+        assert!(state.history.is_empty());
+        state.history.push_front(String::new());
+        state.history_index = Some(0);
+        assert!(!state.input("\n\r\t\x1b".chars()));
+        assert!(!state.input("".chars()));
+        assert_eq!(state.regex().unwrap(), "");
+        assert!(state.input(['\x08']));
     }
 }
 

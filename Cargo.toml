@@ -16,8 +16,13 @@ members = [
     "librio",
     "librio-wasm",
     "libsugarloaf",
+    "vendor/swash",
 ]
 resolver = "2"
+
+[patch.crates-io]
+swash = { path = "vendor/swash" }
+smithay-clipboard = { path = "vendor/smithay-clipboard" }
 
 [workspace.package]
 version = "0.5.28"
@@ -109,3 +114,10 @@ split-debuginfo = "unpacked"
 lto = false
 opt-level = 0
 incremental = true
+
+# Keep text shaping responsive in debug builds.
+[profile.dev.package.swash]
+opt-level = 2
+
+[profile.dev.package.rio-grid]
+opt-level = 2

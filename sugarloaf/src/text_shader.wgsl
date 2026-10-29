@@ -82,6 +82,6 @@ fn text_fragment(in: TextVsOut) -> @location(0) vec4<f32> {
         let a = textureLoad(atlas_grayscale, ic, 0).r;
         return in.color * a;
     } else {
-        return textureLoad(atlas_color, ic, 0);
+        return textureLoad(atlas_color, ic, 0) * in.color;
     }
 }

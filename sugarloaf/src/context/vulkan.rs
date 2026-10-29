@@ -24,7 +24,7 @@ use raw_window_handle::{
     HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
 };
 use std::ffi::{c_char, CStr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Reference-counted owner of the raw Vulkan handles whose destruction
 /// must be sequenced last. Held as `Arc<VkShared>` by every struct
@@ -158,6 +158,9 @@ pub struct VulkanContext {
     /// effort) at startup and serialised back on `Drop`. Saves
     /// ~10–50ms of pipeline build time on subsequent launches.
     pipeline_cache: vk::PipelineCache,
+
+    pub(crate) grid_pipelines:
+        Mutex<rustc_hash::FxHashMap<vk::Format, Arc<crate::grid::vulkan::GridPipelines>>>,
 
     // Instance-level state — held last so it outlives everything above in
     // the Drop impl (drop order = declaration order).
@@ -301,6 +304,7 @@ impl VulkanContext {
             queue_family_index,
             shared,
             pipeline_cache,
+            grid_pipelines: Mutex::default(),
             surface,
             surface_loader,
             _debug_messenger,
@@ -1415,9 +1419,9 @@ fn create_swapchain(
             .get_physical_device_surface_formats(physical_device, surface)
             .expect("get_physical_device_surface_formats")
     };
-    // Prefer BGRA8_UNORM (linear) so blending stays in gamma space — the
-    // same choice Metal makes (`MTLPixelFormat::BGRA8Unorm` + DisplayP3
-    // tag). Fragment shaders will emit sRGB-encoded output. If the
+    // Prefer BGRA8_UNORM so blending stays in gamma space. Unlike Metal's
+    // Display-P3 drawable, this surface uses sRGB primaries: shaders must
+    // emit sRGB-encoded sRGB colors. If the
     // driver doesn't offer BGRA8_UNORM, fall back to whatever it gives
     // us — formats[0] is guaranteed present per the spec.
     let chosen_format = formats

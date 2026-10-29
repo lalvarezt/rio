@@ -44,6 +44,60 @@ impl fmt::Display for Utf8Error {
 
 impl std::error::Error for Utf8Error {}
 
+/// Decode the valid UTF-8 prefix into reusable UTF-32 storage. On error,
+/// `output` contains exactly the scalars before `valid_up_to`; the caller
+/// chooses replacement or buffering semantics for the remaining bytes.
+#[inline]
+pub fn decode_to_utf32(bytes: &[u8], output: &mut Vec<u32>) -> Result<(), Utf8Error> {
+    output.clear();
+    output.reserve(bytes.len());
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // SAFETY: at most one scalar is produced per input byte, and the
+        // vector has that many uninitialized slots available for the FFI.
+        let result = unsafe {
+            simdutf::convert_utf8_to_utf32_with_errors(
+                bytes.as_ptr(),
+                bytes.len(),
+                output.as_mut_ptr(),
+            )
+        };
+        if result.error == simdutf::ErrorCode::Success {
+            // SAFETY: simdutf initialized this many valid Unicode scalars.
+            unsafe { output.set_len(result.count) };
+            Ok(())
+        } else {
+            let valid_up_to = result.count;
+            let written = simdutf::count_utf8(&bytes[..valid_up_to]);
+            // SAFETY: simdutf initialized exactly the valid prefix.
+            unsafe { output.set_len(written) };
+            Err(Utf8Error {
+                valid_up_to,
+                error_len: compute_error_len(bytes, valid_up_to),
+            })
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => {
+                output.extend(text.chars().map(|c| c as u32));
+                Ok(())
+            }
+            Err(err) => {
+                // SAFETY: std validated precisely this prefix.
+                let text =
+                    unsafe { std::str::from_utf8_unchecked(&bytes[..err.valid_up_to()]) };
+                output.extend(text.chars().map(|c| c as u32));
+                Err(Utf8Error {
+                    valid_up_to: err.valid_up_to(),
+                    error_len: err.error_len(),
+                })
+            }
+        }
+    }
+}
+
 /// Validate `bytes` and return the corresponding `&str` on success.
 ///
 /// Single SIMD pass via `simdutf::validate_utf8_with_errors` — gives both
@@ -52,6 +106,14 @@ impl std::error::Error for Utf8Error {}
 #[cfg(not(target_arch = "wasm32"))]
 #[inline]
 pub fn validate(bytes: &[u8]) -> Result<&str, Utf8Error> {
+    // OSC fields and carried UTF-8 scalars are usually shorter than one
+    // SIMD block. Avoid the FFI dispatcher for these small validations.
+    if bytes.len() < 64 {
+        return std::str::from_utf8(bytes).map_err(|err| Utf8Error {
+            valid_up_to: err.valid_up_to(),
+            error_len: err.error_len(),
+        });
+    }
     let result = simdutf::validate_utf8_with_errors(bytes);
     if result.error == simdutf::ErrorCode::Success {
         // SAFETY: `simdutf` confirmed the entire byte slice is valid UTF-8.
@@ -82,63 +144,14 @@ pub fn validate(bytes: &[u8]) -> Result<&str, Utf8Error> {
 /// `None` for an unfinished sequence at end-of-input.
 #[cfg(not(target_arch = "wasm32"))]
 fn compute_error_len(bytes: &[u8], valid_up_to: usize) -> Option<usize> {
-    if valid_up_to >= bytes.len() {
-        return None;
-    }
-    let lead = bytes[valid_up_to];
-
-    // Determine the expected sequence length from the lead byte.
-    let expected_len = match lead {
-        0x00..=0x7F => return Some(1), // unreachable in practice
-        0x80..=0xBF => return Some(1), // unexpected continuation
-        0xC0..=0xC1 => return Some(1), // overlong 2-byte lead
-        0xC2..=0xDF => 2,
-        0xE0..=0xEF => 3,
-        0xF0..=0xF4 => 4,
-        0xF5..=0xFF => return Some(1), // out-of-range lead
-    };
-
-    let remaining = bytes.len() - valid_up_to;
-    if remaining < expected_len {
-        // Either truncated (None) or invalid continuation in the partial bytes.
-        let mut i = 1;
-        while i < remaining {
-            if bytes[valid_up_to + i] & 0xC0 != 0x80 {
-                return Some(i);
-            }
-            i += 1;
-        }
-        return None;
-    }
-
-    // Find the first non-continuation byte in the expected range.
-    let mut i = 1;
-    while i < expected_len {
-        if bytes[valid_up_to + i] & 0xC0 != 0x80 {
-            return Some(i);
-        }
-        i += 1;
-    }
-    // All continuation bytes look right but `simdutf` flagged the sequence —
-    // overlong, surrogate, or out-of-range codepoint.
-    Some(expected_len)
-}
-
-/// Compatibility shim — same as [`validate`].
-#[inline]
-pub fn from_utf8_fast(bytes: &[u8]) -> Result<&str, Utf8Error> {
-    validate(bytes)
-}
-
-/// Compatibility shim — same as [`validate`].
-#[inline]
-pub fn from_utf8_compat(bytes: &[u8]) -> Result<&str, Utf8Error> {
-    validate(bytes)
-}
-
-#[inline]
-pub fn from_utf8_to_string(bytes: &[u8]) -> Result<String, Utf8Error> {
-    validate(bytes).map(|s| s.to_string())
+    // SIMD identifies the first invalid sequence. Inspect at most one scalar
+    // to recover std's maximal-subpart error length, including E0/ED/F0/F4
+    // second-byte bounds. Merely counting continuation bytes can buffer an
+    // already-invalid prefix or swallow C1 controls across PTY read boundaries.
+    let suffix = bytes.get(valid_up_to..)?;
+    std::str::from_utf8(&suffix[..suffix.len().min(4)])
+        .err()
+        .and_then(|err| err.error_len())
 }
 
 /// Validate; on failure fall back to `String::from_utf8_lossy`.
@@ -155,16 +168,78 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decoded_prefix_and_error_match_std_for_every_byte_pair() {
+        let mut decoded = Vec::new();
+        for first in 0..=255u8 {
+            for second in 0..=255u8 {
+                let bytes = [b'x', 0xc3, 0xa9, first, second, 0x80, b'z'];
+                for len in 0..=bytes.len() {
+                    let input = &bytes[..len];
+                    let expected = std::str::from_utf8(input);
+                    let actual = decode_to_utf32(input, &mut decoded);
+                    let valid = match expected {
+                        Ok(text) => {
+                            assert!(actual.is_ok());
+                            text
+                        }
+                        Err(expected) => {
+                            let actual = actual.unwrap_err();
+                            assert_eq!(
+                                (actual.valid_up_to(), actual.error_len()),
+                                (expected.valid_up_to(), expected.error_len()),
+                                "{input:02x?}"
+                            );
+                            std::str::from_utf8(&input[..expected.valid_up_to()]).unwrap()
+                        }
+                    };
+                    assert!(
+                        decoded.iter().copied().eq(valid.chars().map(|c| c as u32)),
+                        "{input:02x?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn validation_errors_match_std_at_utf8_range_boundaries() {
+        // Invalid second-byte ranges must be rejected even before a complete
+        // sequence arrives. They are not valid prefixes to buffer for later.
+        for lead in 0_u8..=255 {
+            for second in 0_u8..=255 {
+                let bytes = [lead, second, 0x80, 0x80];
+                for len in 1..=bytes.len() {
+                    let input = &bytes[..len];
+                    let expected = std::str::from_utf8(input);
+                    let actual = validate(input);
+                    assert_eq!(
+                        actual.as_ref().ok(),
+                        expected.as_ref().ok(),
+                        "{input:02x?}"
+                    );
+                    if let (Err(actual), Err(expected)) = (actual, expected) {
+                        assert_eq!(
+                            (actual.valid_up_to(), actual.error_len()),
+                            (expected.valid_up_to(), expected.error_len()),
+                            "{input:02x?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_valid_utf8() {
         let bytes = b"Hello, \xE2\x9D\xA4\xEF\xB8\x8F UTF-8!";
-        let result = from_utf8_fast(bytes).unwrap();
+        let result = validate(bytes).unwrap();
         assert_eq!(result, "Hello, ❤️ UTF-8!");
     }
 
     #[test]
     fn test_invalid_utf8() {
         let bytes = b"Hello, \xFF invalid UTF-8!";
-        assert!(from_utf8_fast(bytes).is_err());
+        assert!(validate(bytes).is_err());
 
         let result = from_utf8_lossy_fast(bytes);
         assert!(result.contains("Hello"));
@@ -174,14 +249,14 @@ mod tests {
     #[test]
     fn test_ascii_fast_path() {
         let bytes = b"Pure ASCII text";
-        let result = from_utf8_fast(bytes).unwrap();
+        let result = validate(bytes).unwrap();
         assert_eq!(result, "Pure ASCII text");
     }
 
     #[test]
     fn test_compat_error_info() {
         let bytes = b"Valid\xFF\xFEInvalid";
-        let err = from_utf8_compat(bytes).unwrap_err();
+        let err = validate(bytes).unwrap_err();
         assert!(err.to_string().contains("invalid utf-8"));
         assert_eq!(err.valid_up_to(), 5);
         assert_eq!(err.error_len(), Some(1));
@@ -207,11 +282,11 @@ mod tests {
 
     #[test]
     fn complete_invalid_sequence_returns_some_len() {
-        // Surrogate codepoint encoded in UTF-8 (3 bytes) — valid bytes,
-        // invalid Unicode value.
+        // The surrogate range is invalid at its second byte, so the lead
+        // alone is the maximal subpart, matching std's error contract.
         let bytes = b"\xED\xA0\x80"; // U+D800, surrogate
         let err = validate(bytes).unwrap_err();
         assert_eq!(err.valid_up_to(), 0);
-        assert_eq!(err.error_len(), Some(3));
+        assert_eq!(err.error_len(), Some(1));
     }
 }

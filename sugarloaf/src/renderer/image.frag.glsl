@@ -28,25 +28,13 @@ vec3 linear_to_srgb(vec3 c) {
     return mix(lo, hi, greaterThan(c, vec3(0.0031308)));
 }
 
-vec3 rec2020_to_p3(vec3 linear_r2020) {
-    return vec3(
-        dot(linear_r2020, vec3( 1.34357825, -0.28217967, -0.06139858)),
-        dot(linear_r2020, vec3(-0.06529745,  1.08782226, -0.02252481)),
-        dot(linear_r2020, vec3( 0.00282179, -0.02598807,  1.02316628))
-    );
-}
-
 void main() {
     // R8G8B8A8_SRGB: HW decodes the byte → linear before handing it
     // to the shader. Alpha is linear by convention regardless of
-    // format. After optional Rec.2020 → P3 gamut conversion, encode
-    // back to gamma-sRGB for the framebuffer.
+    // format. Images use sRGB independently of the terminal's configured
+    // input colorspace. Encode back to gamma-sRGB for the sRGB surface.
     vec4 rgba = texture(image_texture, in_tex_coord);
-    vec3 lin = rgba.rgb;
-    if (globals.input_colorspace == 2u) {
-        lin = rec2020_to_p3(lin);
-    }
-    vec3 enc = linear_to_srgb(lin);
+    vec3 enc = linear_to_srgb(rgba.rgb);
     // Premultiply alpha — pipeline blend factors are ONE / ONE_MINUS_SRC_ALPHA.
     out_color = vec4(enc * rgba.a, rgba.a);
 }

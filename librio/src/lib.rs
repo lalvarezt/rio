@@ -8,6 +8,7 @@ pub use key::{
     encode as encode_key, EncodeContext, Key, KeyAction, KeyEvent, KittyFlags, Modifiers,
 };
 pub use render_state::{RenderState, ViewportSelection};
+use rio_vt::clipboard::encode_paste;
 pub use rio_vt::clipboard::ClipboardType;
 pub use rio_vt::config::colors::term::TermColors;
 pub use rio_vt::config::colors::{AnsiColor, ColorRgb, NamedColor};
@@ -365,9 +366,9 @@ pub struct Surface {
     )>,
 }
 
-/// Encode one mouse report. SGR (`CSI < b ; x ; y M`) when the program
-/// asked for it, else the original X10 form, whose coordinates are
-/// offset by 32 and cannot exceed 223 without the UTF-8 extension.
+/// Encode one mouse report using SGR or the legacy X10 form.
+/// Returns an empty vector when a legacy coordinate is outside its encoding
+/// range: zero-based 222 normally or 2014 with the UTF-8 extension.
 fn mouse_report(
     button: u8,
     col: u16,
@@ -376,12 +377,16 @@ fn mouse_report(
     sgr: bool,
     utf8: bool,
 ) -> Vec<u8> {
-    let x = col.saturating_add(1);
-    let y = row.saturating_add(1);
+    let x = u32::from(col) + 1;
+    let y = u32::from(row) + 1;
     if sgr {
         // SGR keeps the real button and marks a release with lowercase `m`.
         let end = if pressed { 'M' } else { 'm' };
         return format!("\x1b[<{button};{x};{y}{end}").into_bytes();
+    }
+    let limit = if utf8 { 2015 } else { 223 };
+    if u32::from(col) >= limit || u32::from(row) >= limit {
+        return Vec::new();
     }
     // The X10/normal form has no release code: the button field collapses to
     // 3, but the modifier/motion bits (bit 3 and up) are kept, matching xterm.
@@ -390,23 +395,14 @@ fn mouse_report(
     for value in [x, y] {
         if utf8 && value >= 95 {
             // Two-byte UTF-8 for the extended range.
-            let encoded = char::from_u32(32 + value as u32).unwrap_or('\u{20}');
+            let encoded = char::from_u32(32 + value).expect("bounded mouse coordinate");
             let mut buffer = [0u8; 4];
             out.extend_from_slice(encoded.encode_utf8(&mut buffer).as_bytes());
         } else {
-            out.push(32u8.saturating_add(value.min(223) as u8));
+            out.push(32 + value as u8);
         }
     }
     out
-}
-
-fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
-    if bracketed {
-        let filtered = text.replace(['\x1b', '\x03', '\u{9b}'], "");
-        format!("\x1b[200~{filtered}\x1b[201~").into_bytes()
-    } else {
-        text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
-    }
 }
 
 impl Surface {
@@ -711,9 +707,13 @@ impl Surface {
             if mods.contains(Modifiers::CTRL) {
                 button += 16;
             }
+            let report = mouse_report(button, col, row, true, sgr, utf8);
+            if report.is_empty() {
+                return false;
+            }
             let mut out = Vec::new();
             for _ in 0..lines.abs() {
-                out.extend_from_slice(&mouse_report(button, col, row, true, sgr, utf8));
+                out.extend_from_slice(&report);
             }
             self.write(out);
             return true;
@@ -742,9 +742,7 @@ impl Surface {
     /// Report a mouse button press/release to the program when it asked for
     /// mouse events (DEC 1000/1002/1003, or X10/9). `button` is 0=left,
     /// 1=middle, 2=right. Returns true when a report was written, so the host
-    /// should not start a local selection. Returns false when no program
-    /// is grabbing the mouse, or shift is held to force a local selection
-    /// (shift-to-bypass).
+    /// should not start a local selection.
     pub fn mouse_button(
         &self,
         col: u16,
@@ -762,7 +760,7 @@ impl Surface {
                 mode.contains(Mode::UTF8_MOUSE),
             )
         };
-        if !mouse_mode || mods.contains(Modifiers::SHIFT) {
+        if !mouse_mode || mods.contains(Modifiers::SHIFT) || button > 2 {
             return false;
         }
         // X10 (mode 9) reports only presses of the three main buttons, with
@@ -779,7 +777,11 @@ impl Surface {
                 encoded += 16;
             }
         }
-        self.write(mouse_report(encoded, col, row, pressed, sgr, utf8));
+        let report = mouse_report(encoded, col, row, pressed, sgr, utf8);
+        if report.is_empty() {
+            return false;
+        }
+        self.write(report);
         true
     }
 
@@ -797,7 +799,7 @@ impl Surface {
                 mode.contains(Mode::UTF8_MOUSE),
             )
         };
-        if mods.contains(Modifiers::SHIFT) {
+        if mods.contains(Modifiers::SHIFT) || button > 3 {
             return false;
         }
         // 1002 reports motion only while a button is down; 1003 reports all.
@@ -813,7 +815,11 @@ impl Surface {
         if mods.contains(Modifiers::CTRL) {
             encoded += 16;
         }
-        self.write(mouse_report(encoded, col, row, true, sgr, utf8));
+        let report = mouse_report(encoded, col, row, true, sgr, utf8);
+        if report.is_empty() {
+            return false;
+        }
+        self.write(report);
         true
     }
 
@@ -1375,6 +1381,71 @@ mod tests {
             mouse_report(16, 0, 0, false, false, false),
             vec![0x1b, b'[', b'M', 32 + 19, 33, 33]
         );
+    }
+
+    #[test]
+    fn mouse_sgr_release_preserves_button_and_modifier_bits() {
+        for (button, expected) in [
+            (0, "\x1b[<0;5;6m"),
+            (1, "\x1b[<1;5;6m"),
+            (2, "\x1b[<2;5;6m"),
+            (26, "\x1b[<26;5;6m"),
+        ] {
+            assert_eq!(
+                mouse_report(button, 4, 5, false, true, false),
+                expected.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn mouse_x10_rejects_unrepresentable_coordinates() {
+        assert_eq!(
+            mouse_report(0, 222, 222, true, false, false),
+            [0x1b, b'[', b'M', 32, 255, 255]
+        );
+        assert!(mouse_report(0, 223, 0, true, false, false).is_empty());
+        assert!(mouse_report(0, 0, 223, true, false, false).is_empty());
+        assert!(mouse_report(0, u16::MAX, u16::MAX, true, false, false).is_empty());
+    }
+
+    #[test]
+    fn mouse_utf8_coordinates_use_the_extended_two_byte_range() {
+        assert_eq!(
+            mouse_report(0, 300, 400, true, false, true),
+            "\x1b[M \u{14d}\u{1b1}".as_bytes()
+        );
+        assert_eq!(
+            mouse_report(0, 2014, 0, true, false, true),
+            "\x1b[M \u{7ff}!".as_bytes()
+        );
+        assert!(mouse_report(0, 2015, 0, true, false, true).is_empty());
+        assert!(mouse_report(0, 0, 2015, true, false, true).is_empty());
+    }
+
+    #[test]
+    fn mouse_sgr_one_based_coordinates_do_not_saturate() {
+        assert_eq!(
+            mouse_report(0, u16::MAX, u16::MAX, true, true, false),
+            b"\x1b[<0;65536;65536M"
+        );
+    }
+
+    #[test]
+    fn mouse_modes_ignore_invalid_buttons_and_unencodable_positions() {
+        let engine = Engine::new(Arc::new(CountingDelegate {
+            wakeups: AtomicUsize::new(0),
+        }));
+        let surface = engine.create_surface(&SurfaceDesc::default()).unwrap();
+        surface.inject_output(b"\x1b[?1000h");
+        assert!(!surface.mouse_button(0, 0, 255, true, Modifiers::CTRL | Modifiers::ALT));
+        assert!(!surface.mouse_button(223, 0, 0, true, Modifiers::empty()));
+        assert!(!surface.scroll_wheel(1, 223, 0, Modifiers::empty()));
+        surface.inject_output(b"\x1b[?1003h");
+        assert!(!surface.mouse_motion(0, 0, 255, Modifiers::CTRL | Modifiers::ALT));
+        assert!(!surface.mouse_motion(223, 0, 0, Modifiers::empty()));
+        surface.inject_output(b"\x1b[?1006h");
+        assert!(surface.mouse_button(223, 0, 0, true, Modifiers::empty()));
     }
 
     // Clicks and drags report only when the program asked; shift bypasses to

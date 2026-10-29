@@ -19,11 +19,11 @@ use conpty::Conpty as Backend;
 use pipes::{EventedAnonRead as ReadPipe, EventedAnonWrite as WritePipe};
 
 pub struct Pty {
-    // Backend is required to be the first field, to ensure correct drop order. Dropping
-    // `conout` before `backend` will cause a deadlock (with Conpty).
-    backend: Backend,
+    // Close pipe workers before ClosePseudoConsole: on older Windows it waits
+    // for output drainage, which cannot progress if our bounded queue is full.
     conout: ReadPipe,
     conin: WritePipe,
+    backend: Backend,
     read_token: corcovado::Token,
     write_token: corcovado::Token,
     child_event_token: corcovado::Token,
@@ -218,8 +218,7 @@ impl ProcessReadWrite for Pty {
         winsize_builder: WinsizeBuilder,
     ) -> Result<(), std::io::Error> {
         let winsize: Winsize = winsize_builder.build();
-        self.backend.on_resize(winsize);
-        Ok(())
+        self.backend.on_resize(winsize)
     }
 }
 

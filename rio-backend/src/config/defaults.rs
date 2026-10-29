@@ -27,16 +27,12 @@ pub fn default_title_placeholder() -> Option<String> {
 
 #[inline]
 pub fn default_title_content() -> String {
-    #[cfg(unix)]
-    return String::from("{{ TITLE || RELATIVE_PATH }}");
-
-    #[cfg(not(unix))]
-    return String::from("{{ TITLE || PROGRAM }}");
+    String::from("{{ RELATIVE_PATH || TITLE || PROGRAM }}")
 }
 
 #[inline]
 pub fn default_margin() -> crate::config::layout::Margin {
-    crate::config::layout::Margin::all(2.0)
+    crate::config::layout::Margin::all(4.0)
 }
 
 #[inline]
@@ -94,11 +90,6 @@ pub fn default_log_level() -> String {
 #[inline]
 pub fn default_cursor() -> CursorShape {
     CursorShape::default()
-}
-
-#[inline]
-pub fn default_theme() -> String {
-    String::from("")
 }
 
 #[inline]

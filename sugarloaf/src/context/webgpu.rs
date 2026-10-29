@@ -1,5 +1,6 @@
 use crate::sugarloaf::{Colorspace, SugarloafWindow, SugarloafWindowSize};
 use crate::SugarloafRenderer;
+use std::sync::{Arc, Mutex};
 
 pub struct WgpuContext<'a> {
     pub device: wgpu::Device,
@@ -14,6 +15,12 @@ pub struct WgpuContext<'a> {
     pub supports_f16: bool,
     pub colorspace: Colorspace,
     pub max_texture_dimension_2d: u32,
+    pub(crate) grid_pipelines: Mutex<
+        rustc_hash::FxHashMap<
+            wgpu::TextureFormat,
+            Arc<crate::grid::webgpu::GridPipelines>,
+        >,
+    >,
 }
 
 impl<'a> WgpuContext<'a> {
@@ -31,20 +38,47 @@ impl<'a> WgpuContext<'a> {
         // - `vulkan`
         // - `metal`
         // - `dx12`
-        // - `dx11`
         // - `gl`
         // - `webgpu`
-        // - `primary`
         let backend = wgpu::Backends::from_env().unwrap_or(wgpu_backend);
         let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
         instance_desc.backends = backend;
-        let instance = wgpu::Instance::new(instance_desc);
+        let instance = {
+            let _timing =
+                tracing::debug_span!(target: "rio_profile", "gpu.instance").entered();
+            #[cfg(not(target_arch = "wasm32"))]
+            let instance = {
+                use std::collections::HashMap;
+                use std::sync::{Mutex, OnceLock};
+
+                // Backends and instance options are process-wide on desktop.
+                // Keep adapter selection per surface, but initialize each
+                // requested set of graphics backends only once.
+                static INSTANCES: OnceLock<
+                    Mutex<HashMap<wgpu::Backends, wgpu::Instance>>,
+                > = OnceLock::new();
+                let mut instances = INSTANCES
+                    .get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock()
+                    .unwrap();
+                instances
+                    .entry(backend)
+                    .or_insert_with(|| wgpu::Instance::new(instance_desc))
+                    .clone()
+            };
+            #[cfg(target_arch = "wasm32")]
+            let instance = wgpu::Instance::new(instance_desc);
+            instance
+        };
 
         tracing::info!("selected instance: {instance:?}");
         tracing::info!("initializing the surface");
 
-        let surface: wgpu::Surface<'a> =
-            instance.create_surface(sugarloaf_window).unwrap();
+        let surface: wgpu::Surface<'a> = {
+            let _timing =
+                tracing::debug_span!(target: "rio_profile", "gpu.surface").entered();
+            instance.create_surface(sugarloaf_window).unwrap()
+        };
 
         // A translucent window needs an adapter whose surface offers an
         // alpha-carrying composite mode. On Windows that decides whether
@@ -110,6 +144,8 @@ impl<'a> WgpuContext<'a> {
         let alpha_capable_adapter: Option<wgpu::Adapter> = None;
 
         let default_adapter = |surface: &wgpu::Surface| {
+            let _timing =
+                tracing::debug_span!(target: "rio_profile", "gpu.adapter").entered();
             futures::executor::block_on(instance.request_adapter(
                 &wgpu::RequestAdapterOptions {
                     // Hard-coded — sugarloaf used to expose a
@@ -126,6 +162,8 @@ impl<'a> WgpuContext<'a> {
             .expect("Request adapter")
         };
         let request_device = |adapter: &wgpu::Adapter| {
+            let _timing =
+                tracing::debug_span!(target: "rio_profile", "gpu.device").entered();
             if let Ok(result) = futures::executor::block_on(
                 adapter.request_device(&wgpu::DeviceDescriptor::default()),
             ) {
@@ -202,39 +240,12 @@ impl<'a> WgpuContext<'a> {
             wgpu::CompositeAlphaMode::Auto
         };
 
-        // Configure view formats for wide color gamut support
-        let view_formats = match renderer_config.colorspace {
-            Colorspace::DisplayP3 | Colorspace::Rec2020 => {
-                // For wide color gamut, we may want to support additional view formats
-                // This allows the surface to be viewed in different formats
-                vec![format]
-            }
-            Colorspace::Srgb => {
-                vec![]
-            }
-        };
-
-        surface.configure(
-            &device,
-            &wgpu::SurfaceConfiguration {
-                usage: Self::get_texture_usage(&surface_caps),
-                format,
-                width: size.width as u32,
-                height: size.height as u32,
-                view_formats,
-                alpha_mode,
-                color_space: wgpu::SurfaceColorSpace::Auto,
-                present_mode: wgpu::PresentMode::Fifo,
-                desired_maximum_frame_latency: 2,
-            },
-        );
-
         let max_texture_dimension_2d = device.limits().max_texture_dimension_2d;
 
         tracing::info!("Configured colorspace: {:?}", renderer_config.colorspace);
         tracing::info!("Surface format: {:?}", format);
 
-        WgpuContext {
+        let mut context = WgpuContext {
             device,
             queue,
             surface,
@@ -251,7 +262,13 @@ impl<'a> WgpuContext<'a> {
             supports_f16: false,
             colorspace: renderer_config.colorspace,
             max_texture_dimension_2d,
-        }
+            grid_pipelines: Mutex::default(),
+        };
+        let configure_timing =
+            tracing::debug_span!(target: "rio_profile", "gpu.configure").entered();
+        context.resize(size.width as u32, size.height as u32);
+        drop(configure_timing);
+        context
     }
 
     fn get_texture_usage(caps: &wgpu::SurfaceCapabilities) -> wgpu::TextureUsages {
@@ -301,7 +318,17 @@ impl<'a> WgpuContext<'a> {
                 view_formats,
                 alpha_mode: self.alpha_mode,
                 color_space: wgpu::SurfaceColorSpace::Auto,
-                present_mode: wgpu::PresentMode::Fifo,
+                // Animation must not queue stale terminal frames ahead of input.
+                present_mode: if cfg!(target_os = "windows")
+                    && self
+                        .surface_caps
+                        .present_modes
+                        .contains(&wgpu::PresentMode::Mailbox)
+                {
+                    wgpu::PresentMode::Mailbox
+                } else {
+                    wgpu::PresentMode::Fifo
+                },
                 desired_maximum_frame_latency: 2,
             },
         );

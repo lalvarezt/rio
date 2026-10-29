@@ -10,17 +10,18 @@
 //! `CellText`, grayscale glyph atlas, instanced quad draws.
 
 use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
 use super::atlas::{AtlasSlot, GlyphKey, RasterizedGlyph};
 use super::cell::{CellBg, CellText, GridUniforms};
 use crate::context::webgpu::WgpuContext;
 use crate::renderer::image_cache::atlas::AtlasAllocator;
 
-const FRAMES_IN_FLIGHT: usize = 3;
 const CURSOR_ROW_SLOTS: usize = 2;
 const ATLAS_SIZE: u32 = 2048;
 
 pub struct WgpuGlyphAtlas {
+    device: wgpu::Device,
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     allocator: AtlasAllocator,
@@ -37,9 +38,12 @@ impl WgpuGlyphAtlas {
             wgpu::TextureFormat::R8Unorm,
             1,
             "grid.atlas_grayscale",
+            ATLAS_SIZE,
         )
     }
 
+    /// A single texel satisfies the binding until a nonempty color glyph needs
+    /// the full atlas. Existing bind groups keep the old texture alive.
     pub fn new_color(device: &wgpu::Device, queue: wgpu::Queue) -> Self {
         Self::new_with_format(
             device,
@@ -47,6 +51,7 @@ impl WgpuGlyphAtlas {
             wgpu::TextureFormat::Rgba8Unorm,
             4,
             "grid.atlas_color",
+            1,
         )
     }
 
@@ -56,12 +61,32 @@ impl WgpuGlyphAtlas {
         format: wgpu::TextureFormat,
         bytes_per_pixel: u32,
         label: &'static str,
+        size: u32,
     ) -> Self {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
+        let texture = Self::create_texture(device, format, label, size);
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        Self {
+            device: device.clone(),
+            texture,
+            view,
+            allocator: AtlasAllocator::new(ATLAS_SIZE as u16, ATLAS_SIZE as u16),
+            slots: FxHashMap::default(),
+            queue,
+            bytes_per_pixel,
+        }
+    }
+
+    fn create_texture(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        label: &'static str,
+        size: u32,
+    ) -> wgpu::Texture {
+        device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
             size: wgpu::Extent3d {
-                width: ATLAS_SIZE,
-                height: ATLAS_SIZE,
+                width: size,
+                height: size,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -70,16 +95,7 @@ impl WgpuGlyphAtlas {
             format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        Self {
-            texture,
-            view,
-            allocator: AtlasAllocator::new(ATLAS_SIZE as u16, ATLAS_SIZE as u16),
-            slots: FxHashMap::default(),
-            queue,
-            bytes_per_pixel,
-        }
+        })
     }
 
     #[inline]
@@ -92,6 +108,13 @@ impl WgpuGlyphAtlas {
         key: GlyphKey,
         glyph: RasterizedGlyph<'_>,
     ) -> Option<AtlasSlot> {
+        let slot = self.upload(glyph)?;
+        self.slots.insert(key, slot);
+        Some(slot)
+    }
+
+    /// Upload pixels without adding a font-glyph cache entry.
+    pub(crate) fn upload(&mut self, glyph: RasterizedGlyph<'_>) -> Option<AtlasSlot> {
         if glyph.width == 0 || glyph.height == 0 {
             let slot = AtlasSlot {
                 x: 0,
@@ -102,11 +125,19 @@ impl WgpuGlyphAtlas {
                 bearing_y: glyph.bearing_y,
                 page: 0,
             };
-            self.slots.insert(key, slot);
             return Some(slot);
         }
 
         let (x, y) = self.allocator.allocate(glyph.width, glyph.height)?;
+        if self.texture.width() != ATLAS_SIZE {
+            self.texture = Self::create_texture(
+                &self.device,
+                self.texture.format(),
+                "grid.atlas_color",
+                ATLAS_SIZE,
+            );
+            self.view = self.texture.create_view(&Default::default());
+        }
         let slot = AtlasSlot {
             x,
             y,
@@ -116,8 +147,6 @@ impl WgpuGlyphAtlas {
             bearing_y: glyph.bearing_y,
             page: 0,
         };
-        self.slots.insert(key, slot);
-
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.texture,
@@ -153,6 +182,46 @@ impl WgpuGlyphAtlas {
     pub fn view(&self) -> &wgpu::TextureView {
         &self.view
     }
+
+    pub(crate) fn size(&self) -> u32 {
+        self.texture.width()
+    }
+}
+
+/// Share compiled pipelines across panes; uniforms and atlases stay per grid so
+/// resizing or clearing one pane cannot invalidate another pane's frame.
+pub(crate) struct GridPipelines {
+    bg_layout: wgpu::BindGroupLayout,
+    bg: wgpu::RenderPipeline,
+    text_uniform_layout: wgpu::BindGroupLayout,
+    text_atlas_layout: wgpu::BindGroupLayout,
+    text: wgpu::RenderPipeline,
+}
+
+impl GridPipelines {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let bg_layout = create_bg_bind_group_layout(device);
+        let text_uniform_layout = create_text_uniform_bgl(device);
+        let text_atlas_layout = create_text_atlas_bgl(device);
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("grid.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/grid.wgsl").into()),
+        });
+        let bg = build_bg_pipeline(device, format, &bg_layout, &shader);
+        let text = build_text_pipeline(
+            device,
+            format,
+            &[Some(&text_uniform_layout), Some(&text_atlas_layout)],
+            &shader,
+        );
+        Self {
+            bg_layout,
+            bg,
+            text_uniform_layout,
+            text_atlas_layout,
+            text,
+        }
+    }
 }
 
 pub struct WgpuGridRenderer {
@@ -162,43 +231,34 @@ pub struct WgpuGridRenderer {
     cols: u32,
     rows: u32,
 
-    bg_cpu: [Vec<CellBg>; FRAMES_IN_FLIGHT],
-    bg_buffers: [wgpu::Buffer; FRAMES_IN_FLIGHT],
+    bg_cpu: Vec<CellBg>,
+    bg_buffer: wgpu::Buffer,
+    bg_visible_rows: usize,
 
     fg_rows: Vec<Vec<CellText>>,
-    fg_buffers: [wgpu::Buffer; FRAMES_IN_FLIGHT],
-    fg_capacity: [usize; FRAMES_IN_FLIGHT],
+    fg_buffer: wgpu::Buffer,
+    fg_capacity: usize,
     fg_staging: Vec<CellText>,
 
-    /// GPU-resident instance count in `fg_buffers[0]` from the last
+    /// GPU-resident instance count in `fg_buffer` from the last
     /// flush. Reused on Noop/CursorOnly frames to skip the concat
     /// and `write_buffer` call. Same pattern as `MetalGridRenderer`.
     fg_live_count: u32,
     /// Any row-level write since the last flush.
-    fg_dirty: bool,
-    /// `bg_cpu` changed since the last `write_buffer`.
-    bg_dirty: bool,
-
-    #[allow(dead_code)]
-    frame: usize,
+    fg_dirty: std::ops::Range<usize>,
+    /// Cell range changed since the last background upload.
+    bg_dirty: std::ops::Range<usize>,
 
     uniform_buffer: wgpu::Buffer,
+    last_uniforms: Option<GridUniforms>,
 
-    // bg pipeline
-    bg_bind_group_layout: wgpu::BindGroupLayout,
+    pipelines: Arc<GridPipelines>,
     bg_bind_group: wgpu::BindGroup,
-    bg_pipeline: wgpu::RenderPipeline,
 
-    // text pipeline. The bind-group-layout fields are retained for
-    // Phase 2 (recreating the atlas bind group when we grow/rotate
-    // the atlas texture); hence `#[allow(dead_code)]` for now.
-    #[allow(dead_code)]
-    text_uniform_bgl: wgpu::BindGroupLayout,
+    // Text uniforms and atlas textures use separate bind groups, so allocating
+    // the first color glyph can replace its texture without touching uniforms.
     text_uniform_bg: wgpu::BindGroup,
-    #[allow(dead_code)]
-    text_atlas_bgl: wgpu::BindGroupLayout,
     text_atlas_bg: wgpu::BindGroup,
-    text_pipeline: wgpu::RenderPipeline,
 
     atlas_grayscale: WgpuGlyphAtlas,
     atlas_color: WgpuGlyphAtlas,
@@ -206,20 +266,28 @@ pub struct WgpuGridRenderer {
     /// Mirror of `MetalGridRenderer::needs_full_rebuild`. Set on
     /// `new` / `resize`, cleared via `mark_full_rebuild_done`.
     needs_full_rebuild: bool,
+    retained_scratch: Vec<CellText>,
+    atlas_generation: u64,
 }
 
 impl WgpuGridRenderer {
     pub fn new(ctx: &WgpuContext<'_>, cols: u32, rows: u32) -> Self {
         let device = ctx.device.clone();
         let queue = ctx.queue.clone();
+        let pipelines = ctx
+            .grid_pipelines
+            .lock()
+            .unwrap()
+            .entry(ctx.format)
+            .or_insert_with(|| Arc::new(GridPipelines::new(&device, ctx.format)))
+            .clone();
 
         let bg_len = (cols as usize) * (rows as usize);
-        let bg_cpu = std::array::from_fn(|_| vec![CellBg::TRANSPARENT; bg_len]);
-        let bg_buffers = std::array::from_fn(|_| alloc_bg_buffer(&device, cols, rows));
+        let bg_cpu = vec![CellBg::TRANSPARENT; bg_len];
+        let bg_buffer = alloc_bg_buffer(&device, cols, rows);
 
-        let initial_fg_capacity = bg_len.max(1);
-        let fg_buffers =
-            std::array::from_fn(|_| alloc_fg_buffer(&device, initial_fg_capacity));
+        let initial_fg_capacity = bg_len.saturating_add(CURSOR_ROW_SLOTS);
+        let fg_buffer = alloc_fg_buffer(&device, initial_fg_capacity);
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("grid.uniforms"),
@@ -229,40 +297,26 @@ impl WgpuGridRenderer {
         });
 
         // bg pipeline — uniforms + storage buffer.
-        let bg_bind_group_layout = create_bg_bind_group_layout(&device);
         let bg_bind_group = create_bg_bind_group(
             &device,
-            &bg_bind_group_layout,
+            &pipelines.bg_layout,
             &uniform_buffer,
-            &bg_buffers[0],
+            &bg_buffer,
         );
 
         // text pipeline — uniforms in group(0), atlas textures in group(1).
         let atlas_grayscale = WgpuGlyphAtlas::new_grayscale(&device, queue.clone());
         let atlas_color = WgpuGlyphAtlas::new_color(&device, queue.clone());
-        let text_uniform_bgl = create_text_uniform_bgl(&device);
-        let text_uniform_bg =
-            create_text_uniform_bg(&device, &text_uniform_bgl, &uniform_buffer);
-        let text_atlas_bgl = create_text_atlas_bgl(&device);
+        let text_uniform_bg = create_text_uniform_bg(
+            &device,
+            &pipelines.text_uniform_layout,
+            &uniform_buffer,
+        );
         let text_atlas_bg = create_text_atlas_bg(
             &device,
-            &text_atlas_bgl,
+            &pipelines.text_atlas_layout,
             atlas_grayscale.view(),
             atlas_color.view(),
-        );
-
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("grid.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/grid.wgsl").into()),
-        });
-
-        let bg_pipeline =
-            build_bg_pipeline(&device, ctx.format, &bg_bind_group_layout, &shader);
-        let text_pipeline = build_text_pipeline(
-            &device,
-            ctx.format,
-            &[Some(&text_uniform_bgl), Some(&text_atlas_bgl)],
-            &shader,
         );
 
         Self {
@@ -271,33 +325,36 @@ impl WgpuGridRenderer {
             cols,
             rows,
             bg_cpu,
-            bg_buffers,
+            bg_buffer,
+            bg_visible_rows: 0,
             fg_rows: init_fg_rows(rows),
-            fg_buffers,
-            fg_capacity: [initial_fg_capacity; FRAMES_IN_FLIGHT],
+            fg_buffer,
+            fg_capacity: initial_fg_capacity,
             fg_staging: Vec::new(),
             fg_live_count: 0,
-            fg_dirty: true,
-            bg_dirty: true,
-            frame: 0,
+            fg_dirty: 0..rows as usize + CURSOR_ROW_SLOTS,
+            bg_dirty: 0..(cols as usize * rows as usize),
             uniform_buffer,
-            bg_bind_group_layout,
+            last_uniforms: None,
+            pipelines,
             bg_bind_group,
-            bg_pipeline,
-            text_uniform_bgl,
             text_uniform_bg,
-            text_atlas_bgl,
             text_atlas_bg,
-            text_pipeline,
             atlas_grayscale,
             atlas_color,
             needs_full_rebuild: true,
+            retained_scratch: Vec::new(),
+            atlas_generation: super::next_atlas_generation(),
         }
     }
 
     #[inline]
     pub fn needs_full_rebuild(&self) -> bool {
         self.needs_full_rebuild
+    }
+
+    pub fn atlas_generation(&self) -> u64 {
+        self.atlas_generation
     }
 
     #[inline]
@@ -317,87 +374,102 @@ impl WgpuGridRenderer {
         self.cols = cols;
         self.rows = rows;
         let bg_len = (cols as usize) * (rows as usize);
-        self.bg_cpu = std::array::from_fn(|_| vec![CellBg::TRANSPARENT; bg_len]);
-        self.bg_buffers =
-            std::array::from_fn(|_| alloc_bg_buffer(&self.device, cols, rows));
+        self.bg_cpu = vec![CellBg::TRANSPARENT; bg_len];
+        self.bg_visible_rows = 0;
+        self.bg_buffer = alloc_bg_buffer(&self.device, cols, rows);
         self.fg_rows = init_fg_rows(rows);
-        let initial_fg_capacity = bg_len.max(1);
-        self.fg_buffers =
-            std::array::from_fn(|_| alloc_fg_buffer(&self.device, initial_fg_capacity));
-        self.fg_capacity = [initial_fg_capacity; FRAMES_IN_FLIGHT];
+        let initial_fg_capacity = bg_len.saturating_add(CURSOR_ROW_SLOTS);
+        self.fg_buffer = alloc_fg_buffer(&self.device, initial_fg_capacity);
+        self.fg_capacity = initial_fg_capacity;
         self.needs_full_rebuild = true;
-        self.fg_dirty = true;
-        self.bg_dirty = true;
+        self.fg_dirty = 0..self.fg_rows.len();
+        self.bg_dirty = 0..bg_len;
+        self.fg_staging.clear();
         self.fg_live_count = 0;
         self.bg_bind_group = create_bg_bind_group(
             &self.device,
-            &self.bg_bind_group_layout,
+            &self.pipelines.bg_layout,
             &self.uniform_buffer,
-            &self.bg_buffers[0],
+            &self.bg_buffer,
         );
     }
 
-    pub fn write_row(&mut self, row: u32, bg: &[CellBg], fg: &[CellText]) {
-        let idx = (row as usize) + 1;
-        if let Some(slot) = self.fg_rows.get_mut(idx) {
-            slot.clear();
-            slot.extend_from_slice(fg);
-            self.fg_dirty = true;
-        }
+    pub fn write_retained_row(&mut self, row: u32, bg: &[CellBg], fg: &[CellText]) {
+        let mut cells = std::mem::take(&mut self.retained_scratch);
+        cells.clear();
+        cells.extend(fg.iter().map(|cell| {
+            let mut cell = *cell;
+            cell.grid_pos[1] = row as u16;
+            cell
+        }));
+        self.write_row(row, bg, &cells);
+        self.retained_scratch = cells;
+    }
 
+    pub fn write_row(&mut self, row: u32, bg: &[CellBg], fg: &[CellText]) {
+        self.write_fg_row(row as usize + 1, fg);
+        self.write_bg_row(row, bg);
+    }
+
+    pub fn clear_row(&mut self, row: u32) {
+        self.write_fg_row(row as usize + 1, &[]);
+        self.write_bg_row(row, &[]);
+    }
+
+    fn write_bg_row(&mut self, row: u32, bg: &[CellBg]) {
         if row >= self.rows {
             return;
         }
         let row_start = (row as usize) * (self.cols as usize);
         let row_len = (self.cols as usize).min(bg.len());
-        let cpu = &mut self.bg_cpu[0];
-        cpu[row_start..row_start + row_len].copy_from_slice(&bg[..row_len]);
-        for slot in &mut cpu[row_start + row_len..row_start + self.cols as usize] {
-            *slot = CellBg::TRANSPARENT;
+        let cpu = &mut self.bg_cpu[row_start..row_start + self.cols as usize];
+        // Packed comparison skips unchanged uploads; clear the tail when a row shrinks.
+        if bytemuck::cast_slice::<_, u8>(&cpu[..row_len])
+            != bytemuck::cast_slice(&bg[..row_len])
+            || cpu[row_len..]
+                .iter()
+                .any(|cell| *cell != CellBg::TRANSPARENT)
+        {
+            let was_visible = cpu.iter().any(|cell| *cell != CellBg::TRANSPARENT);
+            cpu[..row_len].copy_from_slice(&bg[..row_len]);
+            cpu[row_len..].fill(CellBg::TRANSPARENT);
+            let is_visible = cpu.iter().any(|cell| *cell != CellBg::TRANSPARENT);
+            self.bg_visible_rows =
+                self.bg_visible_rows + is_visible as usize - was_visible as usize;
+            extend_damage(
+                &mut self.bg_dirty,
+                row_start..row_start + self.cols as usize,
+            );
         }
-        self.bg_dirty = true;
     }
 
-    pub fn clear_row(&mut self, row: u32) {
-        let idx = (row as usize) + 1;
-        if let Some(slot) = self.fg_rows.get_mut(idx) {
-            if !slot.is_empty() {
-                self.fg_dirty = true;
-            }
-            slot.clear();
-        }
-        if row >= self.rows {
+    fn write_fg_row(&mut self, idx: usize, cells: &[CellText]) {
+        let row_count = self.fg_rows.len();
+        let Some(slot) = self.fg_rows.get_mut(idx) else {
+            return;
+        };
+        if bytemuck::cast_slice::<_, u8>(slot.as_slice()) == bytemuck::cast_slice(cells) {
             return;
         }
-        let row_start = (row as usize) * (self.cols as usize);
-        let cpu = &mut self.bg_cpu[0];
-        for slot in &mut cpu[row_start..row_start + self.cols as usize] {
-            *slot = CellBg::TRANSPARENT;
-        }
-        self.bg_dirty = true;
+        // A length change shifts every subsequent row in the packed GPU stream.
+        let end = if slot.len() == cells.len() {
+            idx + 1
+        } else {
+            row_count
+        };
+        slot.clear();
+        slot.extend_from_slice(cells);
+        extend_damage(&mut self.fg_dirty, idx..end);
     }
 
     pub fn set_cursor(&mut self, block: &[CellText], non_block: &[CellText]) {
-        let mut changed = false;
-        if let Some(slot) = self.fg_rows.first_mut() {
-            if slot.as_slice() != block {
-                slot.clear();
-                slot.extend_from_slice(block);
-                changed = true;
-            }
-        }
+        // A zero-area instance keeps text offsets stable while the block blinks.
+        let hidden = [CellText::default()];
+        let block = if block.is_empty() { &hidden } else { block };
+        self.write_fg_row(0, block);
         let last = self.fg_rows.len().saturating_sub(1);
         if last > 0 {
-            if let Some(slot) = self.fg_rows.get_mut(last) {
-                if slot.as_slice() != non_block {
-                    slot.clear();
-                    slot.extend_from_slice(non_block);
-                    changed = true;
-                }
-            }
-        }
-        if changed {
-            self.fg_dirty = true;
+            self.write_fg_row(last, non_block);
         }
     }
 
@@ -412,11 +484,12 @@ impl WgpuGridRenderer {
     /// Drop every cached glyph and force a full rebuild. Called when
     /// the font library is swapped, since the new library reuses font ids.
     pub fn clear_atlas(&mut self) {
+        self.atlas_generation = super::next_atlas_generation();
         self.atlas_grayscale.clear();
         self.atlas_color.clear();
         self.needs_full_rebuild = true;
-        self.fg_dirty = true;
-        self.bg_dirty = true;
+        self.fg_dirty = 0..self.fg_rows.len();
+        self.bg_dirty = 0..self.bg_cpu.len();
     }
 
     /// The wgpu atlas is fixed-size (no grow yet), so on atlas-full
@@ -426,12 +499,17 @@ impl WgpuGridRenderer {
         key: GlyphKey,
         glyph: RasterizedGlyph<'_>,
     ) -> Option<AtlasSlot> {
+        if self.atlas_grayscale.lookup(key).is_some() {
+            self.atlas_generation = super::next_atlas_generation();
+            self.needs_full_rebuild = true;
+        }
         if let Some(slot) = self.atlas_grayscale.insert(key, glyph) {
             return Some(slot);
         }
         self.atlas_grayscale.clear();
         self.needs_full_rebuild = true;
-        self.fg_dirty = true;
+        self.atlas_generation = super::next_atlas_generation();
+        self.fg_dirty = 0..self.fg_rows.len();
         self.atlas_grayscale.insert(key, glyph)
     }
 
@@ -440,84 +518,138 @@ impl WgpuGridRenderer {
         key: GlyphKey,
         glyph: RasterizedGlyph<'_>,
     ) -> Option<AtlasSlot> {
-        if let Some(slot) = self.atlas_color.insert(key, glyph) {
-            return Some(slot);
+        if self.atlas_color.lookup(key).is_some() {
+            self.atlas_generation = super::next_atlas_generation();
+            self.needs_full_rebuild = true;
         }
-        self.atlas_color.clear();
-        self.needs_full_rebuild = true;
-        self.fg_dirty = true;
-        self.atlas_color.insert(key, glyph)
+        let deferred = self.atlas_color.texture.width() != ATLAS_SIZE;
+        let slot = if let Some(slot) = self.atlas_color.insert(key, glyph) {
+            Some(slot)
+        } else {
+            self.atlas_color.clear();
+            self.needs_full_rebuild = true;
+            self.atlas_generation = super::next_atlas_generation();
+            self.fg_dirty = 0..self.fg_rows.len();
+            self.atlas_color.insert(key, glyph)
+        };
+        if deferred && self.atlas_color.texture.width() == ATLAS_SIZE {
+            self.text_atlas_bg = create_text_atlas_bg(
+                &self.device,
+                &self.pipelines.text_atlas_layout,
+                self.atlas_grayscale.view(),
+                self.atlas_color.view(),
+            );
+        }
+        slot
     }
 
-    /// Record the cell-bg pass. Uploads the uniform buffer (cheap; the
-    /// bg path always runs first per frame so this is the right place
-    /// for it) and the bg cell storage buffer if it changed since the
-    /// last flush. Pair with `render_text`, with any
+    /// Record the cell-bg pass, uploading changed uniforms and background cells.
+    /// Pair with `render_text`, with any
     /// `kitty_below_text` images composited in between.
     pub fn render_bg(
         &mut self,
         render_pass: &mut wgpu::RenderPass<'_>,
         uniforms: &GridUniforms,
     ) {
-        self.queue
-            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
-
-        if self.bg_dirty {
+        // UI-only redraws still record grid passes; resident uniforms need no queue write.
+        // Keep this before the transparent-background early return: the text pass
+        // shares the buffer and still needs cursor, geometry, and color changes.
+        if self
+            .last_uniforms
+            .as_ref()
+            .is_none_or(|last| bytemuck::bytes_of(last) != bytemuck::bytes_of(uniforms))
+        {
             self.queue.write_buffer(
-                &self.bg_buffers[0],
+                &self.uniform_buffer,
                 0,
-                bytemuck::cast_slice(&self.bg_cpu[0]),
+                bytemuck::bytes_of(uniforms),
             );
-            self.bg_dirty = false;
+            self.last_uniforms = Some(*uniforms);
         }
 
-        render_pass.set_pipeline(&self.bg_pipeline);
+        if !self.bg_dirty.is_empty() {
+            self.queue.write_buffer(
+                &self.bg_buffer,
+                (self.bg_dirty.start * std::mem::size_of::<CellBg>()) as u64,
+                bytemuck::cast_slice(&self.bg_cpu[self.bg_dirty.clone()]),
+            );
+            self.bg_dirty = 0..0;
+        }
+
+        if self.bg_visible_rows == 0 && uniforms.cursor_bg_color[3] == 0.0 {
+            return;
+        }
+        render_pass.set_pipeline(&self.pipelines.bg);
         render_pass.set_bind_group(0, &self.bg_bind_group, &[]);
         render_pass.draw(0..3, 0..1);
     }
 
-    /// Record the cell-text pass. Lazily flushes per-row CPU vecs to
-    /// `fg_buffers[0]` only when `fg_dirty` — saves ~(rows × cols ×
-    /// 32 B) of memcpy on Noop/CursorOnly damage frames.
+    /// Record the cell-text pass, flushing only changed packed rows.
     pub fn render_text(
         &mut self,
         render_pass: &mut wgpu::RenderPass<'_>,
         _uniforms: &GridUniforms,
     ) {
-        if self.fg_dirty {
-            self.fg_staging.clear();
-            for row in &self.fg_rows {
-                self.fg_staging.extend_from_slice(row);
+        if !self.fg_dirty.is_empty() {
+            let start = self.fg_rows[..self.fg_dirty.start]
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>();
+            let rows = &self.fg_rows[self.fg_dirty.clone()];
+            let end = start + rows.iter().map(Vec::len).sum::<usize>();
+            if self.fg_dirty.end == self.fg_rows.len() {
+                self.fg_staging.resize(end, CellText::default());
             }
+            let mut offset = start;
+            for row in rows {
+                let end = offset + row.len();
+                self.fg_staging[offset..end].copy_from_slice(row);
+                offset = end;
+            }
+            let mut dirty = start..end;
 
-            if self.fg_staging.len() > self.fg_capacity[0] {
+            if self.fg_staging.len() > self.fg_capacity {
                 let new_cap = self.fg_staging.len().next_power_of_two();
-                self.fg_buffers[0] = alloc_fg_buffer(&self.device, new_cap);
-                self.fg_capacity[0] = new_cap;
+                self.fg_buffer = alloc_fg_buffer(&self.device, new_cap);
+                self.fg_capacity = new_cap;
+                dirty = 0..self.fg_staging.len();
             }
-            self.queue.write_buffer(
-                &self.fg_buffers[0],
-                0,
-                bytemuck::cast_slice(&self.fg_staging),
-            );
+            if !dirty.is_empty() {
+                self.queue.write_buffer(
+                    &self.fg_buffer,
+                    (dirty.start * std::mem::size_of::<CellText>()) as u64,
+                    bytemuck::cast_slice(&self.fg_staging[dirty]),
+                );
+            }
             self.fg_live_count = self.fg_staging.len() as u32;
-            self.fg_dirty = false;
+            self.fg_dirty = 0..0;
         }
 
         let instance_count = self.fg_live_count as usize;
-        if instance_count == 0 {
+        if instance_count == 0
+            || (instance_count == 1 && self.fg_rows[0][0].glyph_size == [0, 0])
+        {
             return;
         }
 
-        render_pass.set_pipeline(&self.text_pipeline);
+        render_pass.set_pipeline(&self.pipelines.text);
         render_pass.set_bind_group(0, &self.text_uniform_bg, &[]);
         render_pass.set_bind_group(1, &self.text_atlas_bg, &[]);
-        render_pass.set_vertex_buffer(0, self.fg_buffers[0].slice(..));
+        render_pass.set_vertex_buffer(0, self.fg_buffer.slice(..));
         render_pass.draw(0..4, 0..instance_count as u32);
     }
 }
 
 // ---------- buffer / layout / pipeline helpers ----------
+
+fn extend_damage(damage: &mut std::ops::Range<usize>, range: std::ops::Range<usize>) {
+    if damage.start >= damage.end {
+        *damage = range;
+    } else {
+        damage.start = damage.start.min(range.start);
+        damage.end = damage.end.max(range.end);
+    }
+}
 
 fn alloc_bg_buffer(device: &wgpu::Device, cols: u32, rows: u32) -> wgpu::Buffer {
     let size = (cols as u64)
@@ -546,7 +678,13 @@ fn alloc_fg_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
 
 fn init_fg_rows(rows: u32) -> Vec<Vec<CellText>> {
     (0..(rows as usize + CURSOR_ROW_SLOTS))
-        .map(|_| Vec::new())
+        .map(|index| {
+            if index == 0 {
+                vec![CellText::default()]
+            } else {
+                Vec::new()
+            }
+        })
         .collect()
 }
 

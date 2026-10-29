@@ -4,6 +4,8 @@
 // (softbuffer's other presenters ignore it), so every store must keep
 // the premultiplied invariant, each color channel <= alpha.
 
+use wide::u32x4;
+
 #[inline(always)]
 pub(crate) fn pack_premul(r: u8, g: u8, b: u8, a: u8) -> u32 {
     ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
@@ -31,25 +33,292 @@ pub(crate) fn blend_premul_over(src: [u8; 4], dst: u32) -> u32 {
         return pack_opaque(src[0], src[1], src[2]);
     }
     let inv = 255 - sa;
-    let dr = (dst >> 16) & 0xff;
-    let dg = (dst >> 8) & 0xff;
-    let db = dst & 0xff;
-    let da = (dst >> 24) & 0xff;
-    let or = src[0] as u32 + (dr * inv + 127) / 255;
-    let og = src[1] as u32 + (dg * inv + 127) / 255;
-    let ob = src[2] as u32 + (db * inv + 127) / 255;
-    let oa = sa + (da * inv + 127) / 255;
-    pack_premul(
-        or.min(255) as u8,
-        og.min(255) as u8,
-        ob.min(255) as u8,
-        oa.min(255) as u8,
-    )
+    let source = pack_premul(src[0], src[1], src[2], src[3]);
+    // Two independent 16-bit lanes hold R+B or A+G. Each product fits
+    // in its lane, including the bias for exact rounded division by 255.
+    let pair = |source: u32, destination: u32| {
+        let product = destination * inv + 0x0080_0080;
+        let scaled = ((product + ((product >> 8) & 0x00ff_00ff)) >> 8) & 0x00ff_00ff;
+        let sum = source + scaled;
+        // Keep the scalar helper's saturation even for non-premultiplied input.
+        let overflow = sum & 0x0100_0100;
+        (sum | (overflow - (overflow >> 8))) & 0x00ff_00ff
+    };
+    pair(source & 0x00ff_00ff, dst & 0x00ff_00ff)
+        | (pair((source >> 8) & 0x00ff_00ff, (dst >> 8) & 0x00ff_00ff) << 8)
+}
+
+/// Composite a grayscale atlas glyph into the framebuffer. Clip both surfaces
+/// once so the inner loop only visits valid source and destination pixels.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn blit_mask(
+    buf: &mut [u32],
+    buf_w: i32,
+    buf_h: i32,
+    glyph_x: i32,
+    glyph_y: i32,
+    gw: i32,
+    gh: i32,
+    atlas: &[u8],
+    atlas_side: usize,
+    ax: usize,
+    ay: usize,
+    color: [u8; 4],
+) {
+    if color[3] == 0 {
+        return;
+    }
+    let x_start = glyph_x.max(0);
+    let y_start = glyph_y.max(0);
+    let x_end = (glyph_x + gw).min(buf_w);
+    let y_end = (glyph_y + gh).min(buf_h);
+    if x_end <= x_start || y_end <= y_start {
+        return;
+    }
+    let sx = (x_start - glyph_x) as usize + ax;
+    let sy = (y_start - glyph_y) as usize + ay;
+    if sx >= atlas_side || sy >= atlas_side {
+        return;
+    }
+    let width = ((x_end - x_start) as usize).min(atlas_side - sx);
+    let height = ((y_end - y_start) as usize).min(atlas_side - sy);
+    let stride = buf_w as usize;
+    let [r, g, b, ca] = color.map(u32::from);
+    let pair_mask = u32x4::splat(0x00ff_00ff);
+    let bias = u32x4::splat(0x0080_0080);
+    let source_rb = u32x4::splat((r << 16) | b);
+    let source_ag = u32x4::splat((255 << 16) | g);
+    let text_alpha = u32x4::splat(ca);
+    let round_pair = |product: u32x4| -> u32x4 {
+        let biased = product + bias;
+        ((biased + ((biased >> 8) & pair_mask)) >> 8) & pair_mask
+    };
+    let vector_width = width / 4 * 4;
+    for row in 0..height {
+        let source = (sy + row) * atlas_side + sx;
+        let dest = (y_start as usize + row) * stride + x_start as usize;
+        let mask = &atlas[source..source + width];
+        let pixels = &mut buf[dest..dest + width];
+        for (coverage, dst) in mask[..vector_width]
+            .chunks_exact(4)
+            .zip(pixels[..vector_width].chunks_exact_mut(4))
+        {
+            if coverage == [0; 4] {
+                continue;
+            }
+            let coverage = u32x4::new([
+                u32::from(coverage[0]),
+                u32::from(coverage[1]),
+                u32::from(coverage[2]),
+                u32::from(coverage[3]),
+            ]);
+            let biased = coverage * text_alpha + u32x4::splat(128);
+            let alpha: u32x4 = (biased + (biased >> 8)) >> 8;
+            let inv = u32x4::splat(255) - alpha;
+            let dest = u32x4::new([dst[0], dst[1], dst[2], dst[3]]);
+            let rb = round_pair(source_rb * alpha) + round_pair((dest & pair_mask) * inv);
+            let ag = round_pair(source_ag * alpha)
+                + round_pair(((dest >> 8) & pair_mask) * inv);
+            // Each premultiplied source channel is <= alpha, so adding the
+            // attenuated destination cannot overflow either byte lane.
+            let out: u32x4 = rb | (ag << 8);
+            dst.copy_from_slice(&out.to_array());
+        }
+        for (&m, dst) in mask[vector_width..].iter().zip(&mut pixels[vector_width..]) {
+            let a = (u32::from(m) * ca + 127) / 255;
+            if a == 0 {
+                continue;
+            }
+            let src = [
+                ((r * a + 127) / 255) as u8,
+                ((g * a + 127) / 255) as u8,
+                ((b * a + 127) / 255) as u8,
+                a as u8,
+            ];
+            *dst = blend_premul_over(src, *dst);
+        }
+    }
+}
+
+/// Composite an untinted premultiplied RGBA atlas glyph.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn blit_color(
+    buf: &mut [u32],
+    buf_w: i32,
+    buf_h: i32,
+    glyph_x: i32,
+    glyph_y: i32,
+    gw: i32,
+    gh: i32,
+    atlas: &[u8],
+    atlas_side: usize,
+    ax: usize,
+    ay: usize,
+) {
+    let x_start = glyph_x.max(0);
+    let y_start = glyph_y.max(0);
+    let x_end = (glyph_x + gw).min(buf_w);
+    let y_end = (glyph_y + gh).min(buf_h);
+    if x_end <= x_start || y_end <= y_start {
+        return;
+    }
+    let sx = (x_start - glyph_x) as usize + ax;
+    let sy = (y_start - glyph_y) as usize + ay;
+    if sx >= atlas_side || sy >= atlas_side {
+        return;
+    }
+    let width = ((x_end - x_start) as usize).min(atlas_side - sx);
+    let height = ((y_end - y_start) as usize).min(atlas_side - sy);
+    let stride = buf_w as usize;
+    let vector_width = width / 4 * 4;
+    for row in 0..height {
+        let source = ((sy + row) * atlas_side + sx) * 4;
+        let dest = (y_start as usize + row) * stride + x_start as usize;
+        let rgba = &atlas[source..source + width * 4];
+        let pixels = &mut buf[dest..dest + width];
+        for (src, dst) in rgba[..vector_width * 4]
+            .chunks_exact(16)
+            .zip(pixels[..vector_width].chunks_exact_mut(4))
+        {
+            let rgba = u32x4::new([
+                u32::from_le_bytes(src[..4].try_into().unwrap()),
+                u32::from_le_bytes(src[4..8].try_into().unwrap()),
+                u32::from_le_bytes(src[8..12].try_into().unwrap()),
+                u32::from_le_bytes(src[12..16].try_into().unwrap()),
+            ]);
+            let source = (rgba & u32x4::splat(0xff00_ff00))
+                | ((rgba & u32x4::splat(0xff)) << 16)
+                | ((rgba >> 16) & u32x4::splat(0xff));
+            let dest = u32x4::new([dst[0], dst[1], dst[2], dst[3]]);
+            dst.copy_from_slice(&blend_premul_over_x4(source, dest).to_array());
+        }
+        for (src, dst) in rgba[vector_width * 4..]
+            .chunks_exact(4)
+            .zip(&mut pixels[vector_width..])
+        {
+            *dst = blend_premul_over(src.try_into().unwrap(), *dst);
+        }
+    }
+}
+
+#[inline]
+fn blend_premul_over_x4(source: u32x4, dest: u32x4) -> u32x4 {
+    let alpha: u32x4 = source >> 24;
+    let inv = u32x4::splat(255) - alpha;
+    // Preserve transparent-source identity even for non-premultiplied input.
+    let active: u32x4 = u32x4::splat(0) - ((alpha + u32x4::splat(255)) >> 8);
+    let source = source & active;
+    let mask = u32x4::splat(0x00ff_00ff);
+    let pair = |src: u32x4, dst: u32x4| -> u32x4 {
+        let product = dst * inv + u32x4::splat(0x0080_0080);
+        let scaled = ((product + ((product >> 8) & mask)) >> 8) & mask;
+        let sum = src + scaled;
+        let overflow = sum & u32x4::splat(0x0100_0100);
+        (sum | (overflow - (overflow >> 8))) & mask
+    };
+    pair(source & mask, dest & mask)
+        | (pair((source >> 8) & mask, (dest >> 8) & mask) << 8)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn color_blit_matches_every_alpha_and_channel_with_scalar_tail() {
+        for alpha in 0..=255u8 {
+            let atlas: Vec<_> = (0..259u32)
+                .flat_map(|c| {
+                    [c as u8, (255 - c.min(255)) as u8, (c ^ 0x9b) as u8, alpha]
+                })
+                .collect();
+            let mut actual: Vec<_> =
+                (0..259u32).map(|i| i.wrapping_mul(0x7123_459b)).collect();
+            let expected: Vec<_> = atlas
+                .chunks_exact(4)
+                .zip(&actual)
+                .map(|(src, &dst)| blend_premul_over(src.try_into().unwrap(), dst))
+                .collect();
+            blit_color(&mut actual, 259, 1, 0, 0, 259, 1, &atlas, 259, 0, 0);
+            assert_eq!(actual, expected, "alpha={alpha}");
+        }
+    }
+
+    #[test]
+    fn mask_blit_matches_all_mask_and_text_alpha_pairs() {
+        // A full mask ramp plus a three-pixel tail exercises SIMD and scalar
+        // paths with every effective alpha, including transparent pixels.
+        let atlas: Vec<_> = (0..259).map(|i| i as u8).collect();
+        for alpha in 0..=255u8 {
+            for rgb in [[0, 0, 0], [255, 255, 255], [37, 180, 91]] {
+                let mut actual: Vec<_> =
+                    (0..259u32).map(|i| i.wrapping_mul(0x7123_459b)).collect();
+                let expected: Vec<_> = atlas
+                    .iter()
+                    .zip(&actual)
+                    .map(|(&m, &dst)| {
+                        let a = (u32::from(m) * u32::from(alpha) + 127) / 255;
+                        let channel = |c: u8| ((u32::from(c) * a + 127) / 255) as u8;
+                        blend_premul_over(
+                            [channel(rgb[0]), channel(rgb[1]), channel(rgb[2]), a as u8],
+                            dst,
+                        )
+                    })
+                    .collect();
+                blit_mask(
+                    &mut actual,
+                    259,
+                    1,
+                    0,
+                    0,
+                    259,
+                    1,
+                    &atlas,
+                    259,
+                    0,
+                    0,
+                    [rgb[0], rgb[1], rgb[2], alpha],
+                );
+                assert_eq!(actual, expected, "alpha={alpha} rgb={rgb:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn blend_matches_scalar_rounding_and_saturation() {
+        for alpha in 0..=255u32 {
+            for channel in 0..=255u32 {
+                let dst = pack_premul(
+                    channel as u8,
+                    (255 - channel) as u8,
+                    channel as u8,
+                    channel as u8,
+                );
+                for value in [0, alpha / 2, alpha, 255] {
+                    let src = [value as u8, (value / 2) as u8, value as u8, alpha as u8];
+                    let expected = if alpha == 0 {
+                        dst
+                    } else {
+                        let blend = |src: u8, dst: u32| {
+                            (src as u32 + (dst * (255 - alpha) + 127) / 255).min(255)
+                                as u8
+                        };
+                        pack_premul(
+                            blend(src[0], channel),
+                            blend(src[1], 255 - channel),
+                            blend(src[2], channel),
+                            blend(src[3], channel),
+                        )
+                    };
+                    assert_eq!(
+                        blend_premul_over(src, dst),
+                        expected,
+                        "src={src:?} dst={dst:08x}"
+                    );
+                }
+            }
+        }
+    }
 
     /// Opaque destinations stay opaque and transparent sources are
     /// identity, alpha byte included: the invariants `window.opacity`

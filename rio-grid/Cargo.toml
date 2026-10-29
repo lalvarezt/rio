@@ -16,5 +16,7 @@ path = "src/lib.rs"
 rio-backend = { workspace = true }
 rio-unicode = { workspace = true }
 rustc-hash = { workspace = true }
-smallvec = { workspace = true }
 rapidhash = { version = "4.4.1", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rio-window = { workspace = true, features = ["x11"] }

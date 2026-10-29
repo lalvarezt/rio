@@ -383,20 +383,10 @@ impl VulkanRenderer {
         }
     }
 
-    /// Draw a batch of image overlays (kitty / sixel placements) for
-    /// one layer (BelowText or AboveText). Each `(descriptor_set,
-    /// instance)` pair is one image placement — caller has resolved
-    /// the per-image descriptor set ahead of time. Writes all
-    /// instances into the per-slot ring buffer in order, then issues
-    /// one `cmd_draw(4, 1, ...)` per placement, binding the buffer
-    /// at the matching byte offset.
-    ///
-    /// Pre-binds the uniform set + image pipeline once, then loops
-    /// per-image just to update the texture descriptor + vertex
-    /// buffer offset.
-    pub fn render_image_overlays(
+    /// Upload all image layers before recording any draws. Reusing an instance
+    /// range for another layer would overwrite data referenced by earlier draws.
+    pub fn prepare_image_overlays(
         &mut self,
-        cmd: vk::CommandBuffer,
         slot: usize,
         viewport: [f32; 2],
         draws: &[(vk::DescriptorSet, ImageInstance)],
@@ -423,7 +413,6 @@ impl VulkanRenderer {
         // Grow the per-slot kitty/sixel instance buffer if needed.
         let count = draws.len();
         let stride = std::mem::size_of::<ImageInstance>();
-        let needed_bytes = count * stride;
         if count > self.image_instance_capacity[slot] {
             let new_cap = count.next_power_of_two().max(16);
             self.image_instance_buffers[slot] = Some(allocate_host_visible_buffer_raw(
@@ -441,6 +430,23 @@ impl VulkanRenderer {
                 std::ptr::write(dst.add(i), *inst);
             }
         }
+    }
+
+    /// Draw a layer using its range in the prepared per-slot instance buffer.
+    /// `first_instance` must match the layer's start in prepare_image_overlays.
+    pub fn render_image_overlays(
+        &mut self,
+        cmd: vk::CommandBuffer,
+        slot: usize,
+        draws: &[(vk::DescriptorSet, ImageInstance)],
+        first_instance: usize,
+    ) {
+        if draws.is_empty() {
+            return;
+        }
+        let stride = std::mem::size_of::<ImageInstance>();
+        debug_assert!(first_instance + draws.len() <= self.image_instance_capacity[slot]);
+        let buf = self.image_instance_buffers[slot].as_ref().unwrap();
 
         unsafe {
             self.shared.cmd_bind_pipeline(
@@ -467,14 +473,13 @@ impl VulkanRenderer {
                     &[*texture_set],
                     &[],
                 );
-                let byte_offset = (i * stride) as u64;
+                let byte_offset = ((first_instance + i) * stride) as u64;
                 self.shared.cmd_bind_vertex_buffers(
                     cmd,
                     0,
                     &[buf.handle()],
                     &[byte_offset],
                 );
-                let _ = needed_bytes; // shut up unused warning
                 self.shared.cmd_draw(cmd, 4, 1, 0, 0);
             }
         }
@@ -1509,6 +1514,10 @@ impl VulkanImageTexture {
 impl Drop for VulkanImageTexture {
     fn drop(&mut self) {
         unsafe {
+            // A removal event can arrive while the previous frame still
+            // references this descriptor set and image. Complete that work
+            // before destroying either resource.
+            let _ = self.shared.device_wait_idle();
             // Pool destruction frees the descriptor set; image drops
             // itself.
             self.shared

@@ -371,14 +371,22 @@ fn encode_legacy(
             }
             vec![b'\t']
         }
-        Key::Backspace => vec![0x7f],
+        Key::Backspace => vec![if ctrl { 0x08 } else { 0x7f }],
         Key::Escape => vec![0x1b],
         Key::Char(c) => {
             if ctrl {
                 // ctrl+key that has no control byte sends nothing legacy can
                 // express; `modifyOtherKeys` or kitty mode is how a program
                 // asks to see it.
-                vec![ctrl_byte(c)?]
+                let control = ctrl_byte(c).or_else(|| {
+                    let mut chars = text?.chars();
+                    let shifted = chars.next()?;
+                    if chars.next().is_some() {
+                        return None;
+                    }
+                    ctrl_byte(shifted)
+                })?;
+                vec![control]
             } else if let Some(text) = text.filter(|t| !t.is_empty()) {
                 // Prefer what the platform produced: it already accounts for
                 // shift, the layout, and any dead key.
@@ -422,15 +430,15 @@ fn encode_legacy(
     Some(base)
 }
 
-/// Whether the legacy form of this key loses information the terminal asked to
-/// see: ctrl or alt combined with a key whose control byte is ambiguous or
-/// absent, and Escape, which is indistinguishable from the start of any
-/// sequence.
+/// Whether the legacy form loses information requested by the terminal.
+/// This includes Ctrl or Alt combinations, Escape, and modified Enter, Tab,
+/// or Backspace.
 fn needs_disambiguation(key: Key, mods: Modifiers) -> bool {
     if mods.contains(Modifiers::CTRL) || mods.contains(Modifiers::ALT) {
         return true;
     }
     matches!(key, Key::Escape)
+        || (!mods.is_empty() && matches!(key, Key::Enter | Key::Tab | Key::Backspace))
 }
 
 pub fn encode(event: &KeyEvent, ctx: &EncodeContext) -> Option<Vec<u8>> {
@@ -443,7 +451,7 @@ pub fn encode(event: &KeyEvent, ctx: &EncodeContext) -> Option<Vec<u8>> {
     // composition. The composed text goes to the program as-is; there is
     // no keystroke to encode.
     let Some(key) = event.key else {
-        if event.action != KeyAction::Press {
+        if event.action == KeyAction::Release {
             return None;
         }
         return event
@@ -474,6 +482,19 @@ pub fn encode(event: &KeyEvent, ctx: &EncodeContext) -> Option<Vec<u8>> {
     // modifier the program should see.
     let mods = event.mods.difference(event.consumed_mods);
     let text = event.text.as_deref();
+
+    // A dead key can commit printable text through Enter, Backspace, or
+    // Escape. The committed text wins over the control key's usual byte.
+    if event.action != KeyAction::Release
+        && matches!(key, Key::Enter | Key::Backspace | Key::Escape)
+        && (!mods.contains(Modifiers::SUPER) || !ctx.kitty.is_empty())
+    {
+        if let Some(text) =
+            text.filter(|text| !text.is_empty() && text.chars().all(|c| !c.is_control()))
+        {
+            return Some(text.as_bytes().to_vec());
+        }
+    }
 
     let kitty_active = !ctx.kitty.is_empty();
     if kitty_active {
@@ -794,5 +815,182 @@ mod tests {
         );
         let shifted = with_mods(Key::F(1), Modifiers::SHIFT);
         assert_eq!(encode(&shifted, &legacy()), Some(b"\x1b[1;2P".to_vec()));
+    }
+
+    // Cases adapted from Ghostty's src/input/key_encode.zig using Rio's public
+    // key-event fields.
+    #[test]
+    fn kitty_disambiguates_shifted_control_keys() {
+        let ctx = kitty(KittyFlags::DISAMBIGUATE);
+        for (key, expected) in [
+            (Key::Enter, "\x1b[13;2u"),
+            (Key::Tab, "\x1b[9;2u"),
+            (Key::Backspace, "\x1b[127;2u"),
+        ] {
+            assert_eq!(
+                encode(&with_mods(key, Modifiers::SHIFT), &ctx),
+                Some(expected.as_bytes().to_vec()),
+                "{key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn control_backspace_is_distinct_from_plain_backspace() {
+        for (mods, expected) in [
+            (Modifiers::empty(), &b"\x7f"[..]),
+            (Modifiers::SHIFT, &b"\x7f"[..]),
+            (Modifiers::CTRL, &b"\x08"[..]),
+            (Modifiers::CTRL | Modifiers::SHIFT, &b"\x08"[..]),
+            (Modifiers::ALT, &b"\x1b\x7f"[..]),
+            (Modifiers::CTRL | Modifiers::ALT, &b"\x1b\x08"[..]),
+        ] {
+            assert_eq!(
+                encode(&with_mods(Key::Backspace, mods), &legacy()),
+                Some(expected.to_vec()),
+                "{mods:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dead_key_text_is_not_replaced_by_a_control_key() {
+        for key in [Key::Enter, Key::Backspace, Key::Escape] {
+            for flags in [
+                KittyFlags::empty(),
+                KittyFlags::DISAMBIGUATE,
+                KittyFlags::REPORT_ALL_AS_ESC,
+            ] {
+                let event = KeyEvent {
+                    text: Some("é".into()),
+                    ..press(key)
+                };
+                assert_eq!(
+                    encode(&event, &kitty(flags)),
+                    Some("é".as_bytes().to_vec()),
+                    "{key:?} {flags:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn control_key_control_text_still_uses_the_requested_protocol() {
+        let ctx = kitty(KittyFlags::REPORT_ALL_AS_ESC);
+        for (key, text, expected) in [
+            (Key::Enter, "\r", "\x1b[13u"),
+            (Key::Backspace, "\x7f", "\x1b[127u"),
+            (Key::Escape, "\x1b", "\x1b[27u"),
+        ] {
+            let event = KeyEvent {
+                text: Some(text.into()),
+                ..press(key)
+            };
+            assert_eq!(encode(&event, &ctx), Some(expected.as_bytes().to_vec()));
+        }
+    }
+
+    #[test]
+    fn text_only_repeats_are_sent_but_releases_are_not() {
+        for flags in [
+            KittyFlags::empty(),
+            KittyFlags::REPORT_ALL_AS_ESC | KittyFlags::REPORT_EVENT_TYPES,
+        ] {
+            let mut event = KeyEvent {
+                text: Some("!".into()),
+                action: KeyAction::Repeat,
+                ..Default::default()
+            };
+            assert_eq!(encode(&event, &kitty(flags)), Some(b"!".to_vec()));
+            event.action = KeyAction::Release;
+            assert_eq!(encode(&event, &kitty(flags)), None);
+            event.action = KeyAction::Press;
+            event.text = Some(String::new());
+            assert_eq!(encode(&event, &kitty(flags)), None);
+        }
+    }
+
+    #[test]
+    fn kitty_modifier_combinations_use_the_protocol_bit_order() {
+        let ctx = kitty(KittyFlags::REPORT_ALL_AS_ESC);
+        for (mods, expected) in [
+            (Modifiers::empty(), "\x1b[D"),
+            (Modifiers::SHIFT, "\x1b[1;2D"),
+            (Modifiers::ALT, "\x1b[1;3D"),
+            (Modifiers::SHIFT | Modifiers::ALT, "\x1b[1;4D"),
+            (Modifiers::CTRL, "\x1b[1;5D"),
+            (Modifiers::CTRL | Modifiers::SHIFT, "\x1b[1;6D"),
+            (Modifiers::CTRL | Modifiers::ALT, "\x1b[1;7D"),
+            (
+                Modifiers::CTRL | Modifiers::ALT | Modifiers::SHIFT,
+                "\x1b[1;8D",
+            ),
+            (Modifiers::SUPER, "\x1b[1;9D"),
+            (Modifiers::SUPER | Modifiers::SHIFT, "\x1b[1;10D"),
+            (Modifiers::SUPER | Modifiers::ALT, "\x1b[1;11D"),
+            (
+                Modifiers::SUPER | Modifiers::ALT | Modifiers::SHIFT,
+                "\x1b[1;12D",
+            ),
+            (Modifiers::SUPER | Modifiers::CTRL, "\x1b[1;13D"),
+            (
+                Modifiers::SUPER | Modifiers::CTRL | Modifiers::SHIFT,
+                "\x1b[1;14D",
+            ),
+            (
+                Modifiers::SUPER | Modifiers::CTRL | Modifiers::ALT,
+                "\x1b[1;15D",
+            ),
+            (Modifiers::all(), "\x1b[1;16D"),
+        ] {
+            assert_eq!(
+                encode(&with_mods(Key::Left, mods), &ctx),
+                Some(expected.as_bytes().to_vec()),
+                "{mods:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn kitty_functional_key_event_types_keep_their_sequence_shapes() {
+        let ctx = kitty(KittyFlags::REPORT_ALL_AS_ESC | KittyFlags::REPORT_EVENT_TYPES);
+        for (key, action, expected) in [
+            (Key::Delete, KeyAction::Release, "\x1b[3;5:3~"),
+            (Key::F(1), KeyAction::Repeat, "\x1b[1;5:2P"),
+            (Key::Up, KeyAction::Release, "\x1b[1;5:3A"),
+            (Key::Char('c'), KeyAction::Release, "\x1b[99;5:3u"),
+        ] {
+            let event = KeyEvent {
+                action,
+                text: Some("c".into()),
+                ..with_mods(key, Modifiers::CTRL)
+            };
+            assert_eq!(encode(&event, &ctx), Some(expected.as_bytes().to_vec()));
+        }
+    }
+
+    #[test]
+    fn alt_unicode_text_respects_consumed_modifiers() {
+        let mut event = KeyEvent {
+            text: Some("ф".into()),
+            ..with_mods(Key::Char('ф'), Modifiers::ALT)
+        };
+        assert_eq!(encode(&event, &legacy()), Some("\x1bф".as_bytes().to_vec()));
+        event.consumed_mods = Modifiers::ALT;
+        assert_eq!(encode(&event, &legacy()), Some("ф".as_bytes().to_vec()));
+        let ctx = EncodeContext {
+            modify_other_keys: Some(2),
+            ..legacy()
+        };
+        assert_eq!(encode(&event, &ctx), Some("ф".as_bytes().to_vec()));
+    }
+
+    #[test]
+    fn shifted_punctuation_can_supply_its_control_character() {
+        let event = KeyEvent {
+            text: Some("_".into()),
+            ..with_mods(Key::Char('-'), Modifiers::CTRL | Modifiers::SHIFT)
+        };
+        assert_eq!(encode(&event, &legacy()), Some(vec![0x1f]));
     }
 }

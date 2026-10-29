@@ -36,7 +36,12 @@ struct Uniforms {
     float    min_contrast;     //       144
     uint     flags;            //       148
     uint     padding_extend;   //       152
-    uint     input_colorspace; //       156 → total 160
+    uint     input_colorspace; //       156
+    float4   panel_rect;       //       160
+    float    panel_radius;     //       176
+    float    _pad_panel0;
+    float    _pad_panel1;
+    float    _pad_panel2;
 };
 
 //-------------------------------------------------------------------
@@ -138,6 +143,15 @@ fragment float4 grid_bg_fragment(
     constant Uniforms&   uniforms [[buffer(0)]],
     constant uchar4*     cells    [[buffer(1)]]
 ) {
+    float coverage = 1.0;
+    if (all(uniforms.panel_rect.zw > float2(0.0))) {
+        float2 half_size = uniforms.panel_rect.zw * 0.5;
+        float radius = min(uniforms.panel_radius, min(half_size.x, half_size.y));
+        float2 q = abs(in.position.xy - uniforms.panel_rect.xy - half_size) - half_size + radius;
+        float distance = length(max(q, float2(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+        coverage = clamp(0.5 - distance, 0.0, 1.0);
+        if (coverage == 0.0) { discard_fragment(); }
+    }
  // `in.position.xy` is the pixel's center in framebuffer pixels.
  // `grid_padding` is (top, right, bottom, left) — we only need
  // left (.w) and top (.x) to locate the grid origin.
@@ -190,7 +204,7 @@ fragment float4 grid_bg_fragment(
         float4 c = uniforms.cursor_bg_color;
         c.rgb = grid_prepare_output_rgb(c.rgb, uniforms.input_colorspace);
         c.rgb *= c.a;
-        return c;
+        return c * coverage;
     }
 
  // Load the cell and convert to normalized premultiplied color.
@@ -199,7 +213,7 @@ fragment float4 grid_bg_fragment(
     color.rgb = grid_prepare_output_rgb(color.rgb, uniforms.input_colorspace);
     color.rgb *= color.a;
 
-    return color;
+    return color * coverage;
 }
 
 //-------------------------------------------------------------------

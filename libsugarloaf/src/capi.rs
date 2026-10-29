@@ -197,7 +197,6 @@ pub unsafe extern "C" fn sl_new(
         };
         let renderer = SugarloafRenderer {
             backend: default_backend(),
-            font_features: None,
             colorspace: colorspace_from_u32(colorspace),
             ..Default::default()
         };
@@ -1344,6 +1343,9 @@ pub unsafe extern "C" fn sl_render_surface(
             flags: 0,
             padding_extend: sl.padding_extend,
             input_colorspace,
+            panel_rect: [0.0; 4],
+            panel_radius: 0.0,
+            _pad_panel: [0.0; 3],
         };
 
         // IME preedit: draw the composition string in an inverted box at the
@@ -1375,10 +1377,9 @@ pub unsafe extern "C" fn sl_render_surface(
                     x = (grid_right - text_w).max(0.0);
                 }
                 let y = pad_top_l + cursor_line as f32 * cell_h_l;
-                sl.rect(None, x, y, text_w, cell_h_l, fg_col, 0.0, 0);
+                sl.rect(x, y, text_w, cell_h_l, fg_col, 0.0, 0);
                 let underline_h = (cell_h_l * 0.09).max(1.0);
                 sl.rect(
-                    None,
                     x,
                     y + cell_h_l - underline_h,
                     text_w,

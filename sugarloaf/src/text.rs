@@ -4,7 +4,17 @@
 // LICENSE file in the root directory of this source tree.
 
 use crate::font::FontLibrary;
+
 use rustc_hash::FxHashMap;
+
+#[cfg(all(test, feature = "wgpu", not(target_os = "macos")))]
+mod wgpu_tests;
+use std::collections::VecDeque;
+use std::sync::{Arc, OnceLock};
+
+const MAX_SHAPED_RUNS: usize = 2048;
+// Bound glyph payload as well as entry count; a few long titles can dwarf the cache.
+const MAX_SHAPED_BYTES: usize = 4 * 1024 * 1024;
 
 // `pos` is **pixel-space top-left** of the glyph's text bounding box.
 // `bearings.x` shifts it right to the glyph bitmap's left edge;
@@ -21,9 +31,9 @@ pub struct TextInstance {
     // `0` = grayscale atlas; `1` = color atlas.
     pub atlas: u8,
     // Index of the atlas page this glyph lives in. Used host-side by
-    // the Vulkan overlay to bucket instances per (kind, page) and
-    // bind the right page's descriptor set per draw; other backends
-    // use a single texture and leave this at 0.
+    // the Vulkan overlay to bind the right descriptor set per draw
+    // and by CPU text to select the pixel page. Other backends use
+    // a single texture and leave this at 0.
     pub page: u8,
     pub _pad: [u8; 2],
 }
@@ -56,18 +66,16 @@ impl Default for DrawOpts {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-#[allow(unused)]
+#[derive(Clone, Debug)]
 struct ShapedGlyph {
     id: u16,
     x: f32,
     y: f32,
     advance: f32,
-    cluster: u32,
+    slot: OnceLock<(crate::grid::atlas::AtlasSlot, bool)>,
 }
 
 #[derive(Clone, Debug)]
-#[allow(unused)]
 struct ShapedRun {
     font_id: u32,
     size_u16: u16,
@@ -80,7 +88,15 @@ struct ShapedRun {
     #[cfg(not(target_os = "macos"))]
     wght_variation: Option<f32>,
     ascent_px: i16,
+    width_px: f32,
     glyphs: Vec<ShapedGlyph>,
+}
+
+impl ShapedRun {
+    fn cache_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.glyphs.capacity() * std::mem::size_of::<ShapedGlyph>()
+    }
 }
 
 #[inline]
@@ -115,8 +131,8 @@ struct TextWgpuState {
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
     atlas_bind_group: wgpu::BindGroup,
-    #[allow(dead_code)] // retained for future atlas-bind-group recreation on atlas grow
     atlas_bind_group_layout: wgpu::BindGroupLayout,
+    bound_color_atlas_size: u32,
     pipeline: wgpu::RenderPipeline,
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
@@ -138,6 +154,10 @@ struct TextVulkanState {
     instance_buffers: [Option<crate::context::vulkan::VulkanBuffer>;
         crate::context::vulkan::FRAMES_IN_FLIGHT],
     instance_capacity: [usize; crate::context::vulkan::FRAMES_IN_FLIGHT],
+    previous_instances: Vec<TextInstance>,
+    instance_groups: Vec<((u8, u8), Vec<TextInstance>)>,
+    instance_buckets: Vec<((u8, u8), u32, u32)>,
+    instance_dirty: [bool; crate::context::vulkan::FRAMES_IN_FLIGHT],
     descriptor_pool: ash::vk::DescriptorPool,
     uniform_descriptor_set_layout: ash::vk::DescriptorSetLayout,
     atlas_descriptor_set_layout: ash::vk::DescriptorSetLayout,
@@ -157,7 +177,11 @@ pub struct Text {
     #[cfg(not(target_os = "macos"))]
     wght_variation_cache: FxHashMap<u32, Option<f32>>,
     ascent_cache: FxHashMap<(u32, u16), i16>,
-    shape_cache: FxHashMap<u64, ShapedRun>,
+    // Measurement and drawing share immutable runs instead of cloning glyph vectors.
+    shape_cache: FxHashMap<u64, Arc<ShapedRun>>,
+    shape_cache_order: VecDeque<u64>,
+    shape_cache_bytes: usize,
+    icons: FxHashMap<(&'static str, u16), Option<crate::grid::atlas::AtlasSlot>>,
 
     #[cfg(target_os = "macos")]
     handle_cache: FxHashMap<u32, crate::font::macos::FontHandle>,
@@ -189,6 +213,9 @@ impl Text {
             wght_variation_cache: FxHashMap::default(),
             ascent_cache: FxHashMap::default(),
             shape_cache: FxHashMap::default(),
+            shape_cache_order: VecDeque::new(),
+            shape_cache_bytes: 0,
+            icons: FxHashMap::default(),
             #[cfg(target_os = "macos")]
             handle_cache: FxHashMap::default(),
             #[cfg(target_os = "macos")]
@@ -213,6 +240,7 @@ impl Text {
         if self.cpu.is_some() {
             return;
         }
+        self.clear_atlas_cache();
         self.cpu = Some(TextCpuState {
             atlas_grayscale: crate::grid::cpu::CpuGridAtlas::new_grayscale(),
             atlas_color: crate::grid::cpu::CpuGridAtlas::new_color(),
@@ -224,6 +252,13 @@ impl Text {
     #[inline]
     pub fn set_scale_factor(&mut self, scale: f32) {
         self.scale_factor = scale.max(1.0);
+    }
+
+    fn clear_atlas_cache(&mut self) {
+        self.icons.clear();
+        self.shape_cache.clear();
+        self.shape_cache_order.clear();
+        self.shape_cache_bytes = 0;
     }
 
     #[inline]
@@ -250,9 +285,107 @@ impl Text {
         let Some(shaped) = self.shape_for(text, opts) else {
             return 0.0;
         };
-        let width_px = shaped_width(&shaped);
         self.emit_instances(x, y, &shaped, opts);
-        width_px / self.scale_factor
+        shaped.width_px / self.scale_factor
+    }
+
+    /// Draw a cached icon centered at logical `(cx, cy)`, using the UI color
+    /// atlas. `key` identifies immutable artwork. Rasterization runs only on
+    /// a cache miss and returns square premultiplied RGBA pixels at `size`.
+    pub fn draw_icon(
+        &mut self,
+        key: &'static str,
+        cx: f32,
+        cy: f32,
+        size: f32,
+        color: [u8; 4],
+        rasterize: impl FnOnce(u16) -> Vec<u8>,
+    ) -> bool {
+        let scale = self.scale_factor;
+        let size = (size * scale).round().clamp(1.0, 256.0) as u16;
+        let key = (key, size);
+        let slot = if let Some(slot) = self.icons.get(&key) {
+            *slot
+        } else {
+            let bytes = {
+                let _timing =
+                    tracing::debug_span!(target: "rio_profile", "ui.icon_raster")
+                        .entered();
+                rasterize(size)
+            };
+            if bytes.len() != size as usize * size as usize * 4 {
+                self.icons.insert(key, None);
+                return false;
+            }
+            let raster = crate::grid::RasterizedGlyph {
+                width: size,
+                height: size,
+                bearing_x: 0,
+                bearing_y: 0,
+                bytes: &bytes,
+            };
+            let _timing =
+                tracing::debug_span!(target: "rio_profile", "ui.icon_upload").entered();
+            let slot = self.upload_color(raster);
+            // A full atlas cannot accept this immutable artwork on a later
+            // frame either. Atlas initialization clears successful and failed
+            // entries together.
+            self.icons.insert(key, slot);
+            slot
+        };
+        let Some(slot) = slot else { return false };
+        self.instances.push(TextInstance {
+            pos: [
+                (cx * scale - size as f32 / 2.0).round(),
+                (cy * scale - size as f32 / 2.0).round(),
+            ],
+            glyph_pos: [slot.x as u32, slot.y as u32],
+            glyph_size: [slot.w as u32, slot.h as u32],
+            color,
+            atlas: 1,
+            page: slot.page,
+            ..TextInstance::default()
+        });
+        true
+    }
+
+    /// Exclude a logical horizontal interval from glyphs recorded since `first`.
+    /// Crop the atlas rectangles so a moving overlay can cover part of a label
+    /// without hiding the whole run or requiring a separate text render pass.
+    pub fn exclude_horizontal_range_since(&mut self, first: usize, range: [f32; 2]) {
+        let [left, right] = range.map(|x| x * self.scale_factor);
+        if left >= right || first >= self.instances.len() {
+            return;
+        }
+        let mut write = first;
+        let mut fragments = Vec::new();
+        for read in first..self.instances.len() {
+            let instance = self.instances[read];
+            let x = instance.pos[0] + instance.bearings[0] as f32;
+            let width = instance.glyph_size[0];
+            let keep_left = (left - x).floor().clamp(0.0, width as f32) as u32;
+            let skip_right = (right - x).ceil().clamp(0.0, width as f32) as u32;
+            if keep_left > 0 {
+                let mut visible = instance;
+                visible.glyph_size[0] = keep_left;
+                self.instances[write] = visible;
+                write += 1;
+            }
+            if skip_right < width {
+                let mut visible = instance;
+                visible.pos[0] += skip_right as f32;
+                visible.glyph_pos[0] += skip_right;
+                visible.glyph_size[0] -= skip_right;
+                if keep_left > 0 {
+                    fragments.push(visible);
+                } else {
+                    self.instances[write] = visible;
+                    write += 1;
+                }
+            }
+        }
+        self.instances.truncate(write);
+        self.instances.extend(fragments);
     }
 
     /// Measure `text` under `opts` without recording a draw. Returns
@@ -262,11 +395,64 @@ impl Text {
             return 0.0;
         }
         self.shape_for(text, opts)
-            .map(|r| shaped_width(&r) / self.scale_factor)
+            .map(|r| r.width_px / self.scale_factor)
             .unwrap_or(0.0)
     }
 
-    fn shape_for(&mut self, text: &str, opts: &DrawOpts) -> Option<ShapedRun> {
+    fn upload_color(
+        &mut self,
+        raster: crate::grid::RasterizedGlyph<'_>,
+    ) -> Option<crate::grid::atlas::AtlasSlot> {
+        if let Some(cpu) = self.cpu.as_mut() {
+            return cpu.atlas_color.upload(raster).or_else(|| {
+                cpu.atlas_color
+                    .grow()
+                    .then(|| cpu.atlas_color.upload(raster))
+                    .flatten()
+            });
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(metal) = self.metal.as_mut() {
+            return metal.atlas_color.upload(raster).or_else(|| {
+                metal
+                    .atlas_color
+                    .grow(&metal.device, &metal.command_queue)
+                    .then(|| metal.atlas_color.upload(raster))
+                    .flatten()
+            });
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(vulkan) = self.vulkan.as_mut() {
+            return vulkan.atlas_color.upload(raster);
+        }
+        #[cfg(all(feature = "wgpu", not(target_os = "macos")))]
+        if let Some(wgpu) = self.wgpu.as_mut() {
+            return wgpu.atlas_color.upload(raster);
+        }
+        None
+    }
+
+    /// Visible glyph top and height, relative to `draw`'s logical y origin.
+    pub fn vertical_bounds(&mut self, text: &str, opts: &DrawOpts) -> Option<(f32, f32)> {
+        let run = self.shape_for(text, opts)?;
+        let mut top = f32::INFINITY;
+        let mut bottom = f32::NEG_INFINITY;
+        for glyph in &run.glyphs {
+            let Some((slot, _)) = self.rasterize_slot(&run, glyph) else {
+                continue;
+            };
+            if slot.w == 0 || slot.h == 0 {
+                continue;
+            }
+            let y = glyph.y.max(0.0) + slot.bearing_y as f32;
+            top = top.min(y);
+            bottom = bottom.max(y + slot.h as f32);
+        }
+        top.is_finite()
+            .then_some((top / self.scale_factor, (bottom - top) / self.scale_factor))
+    }
+
+    fn shape_for(&mut self, text: &str, opts: &DrawOpts) -> Option<Arc<ShapedRun>> {
         use crate::{Attributes, SpanStyle, Stretch, Style as FontStyle, Weight};
 
         let scaled = opts.font_size * self.scale_factor;
@@ -276,30 +462,36 @@ impl Text {
             (if opts.bold { 1u8 } else { 0 }) | (if opts.italic { 2u8 } else { 0 });
 
         let first_ch = text.chars().next()?;
-        let (font_id, _is_emoji) = match self.font_resolve.entry((first_ch, style_flags))
-        {
-            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                let mut ss = SpanStyle::default();
-                let weight = if opts.bold {
-                    Weight::BOLD
-                } else {
-                    Weight::NORMAL
-                };
-                let fstyle = if opts.italic {
-                    FontStyle::Italic
-                } else {
-                    FontStyle::Normal
-                };
-                ss.font_attrs = Attributes::new(Stretch::NORMAL, weight, fstyle);
-                let resolved =
-                    self.font_library.resolve_font_for_char(first_ch, &ss, None);
-                let v = (resolved.0 as u32, resolved.1);
-                e.insert(v);
-                v
+        let font_id = if let Some(id) = opts.font_id {
+            id as u32
+        } else {
+            match self.font_resolve.entry((first_ch, style_flags)) {
+                std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let _timing =
+                        tracing::debug_span!(target: "rio_profile", "ui.font_fallback")
+                            .entered();
+                    let mut ss = SpanStyle::default();
+                    let weight = if opts.bold {
+                        Weight::BOLD
+                    } else {
+                        Weight::NORMAL
+                    };
+                    let fstyle = if opts.italic {
+                        FontStyle::Italic
+                    } else {
+                        FontStyle::Normal
+                    };
+                    ss.font_attrs = Attributes::new(Stretch::NORMAL, weight, fstyle);
+                    let resolved =
+                        self.font_library.resolve_font_for_char(first_ch, &ss, None);
+                    let v = (resolved.0 as u32, resolved.1);
+                    e.insert(v);
+                    v
+                }
             }
+            .0
         };
-        let font_id = opts.font_id.map(|id| id as u32).unwrap_or(font_id);
 
         let hash = shape_hash(font_id, size_bucket, style_flags, text);
         if let Some(entry) = self.shape_cache.get(&hash) {
@@ -342,7 +534,7 @@ impl Text {
                     x: g.x,
                     y: g.y,
                     advance: g.advance,
-                    cluster: g.cluster,
+                    slot: OnceLock::new(),
                 })
                 .collect();
             (glyphs, ascent_px)
@@ -401,8 +593,7 @@ impl Text {
                     m.ascent.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16
                 });
 
-            // Shape with swash. Flatten clusters to a Vec<ShapedGlyph>
-            // with UTF-8 byte offset as `cluster`.
+            // Flatten swash clusters to drawable glyph offsets and advances.
             let mut shaper = self
                 .shape_ctx
                 .builder(font_ref)
@@ -412,21 +603,20 @@ impl Text {
             shaper.add_str(text);
             let mut glyphs: Vec<ShapedGlyph> = Vec::new();
             shaper.shape_with(|cluster| {
-                let byte_offset = cluster.source.start;
                 for g in cluster.glyphs {
                     glyphs.push(ShapedGlyph {
                         id: g.id,
                         x: g.x,
                         y: g.y,
                         advance: g.advance,
-                        cluster: byte_offset,
+                        slot: OnceLock::new(),
                     });
                 }
             });
             (glyphs, ascent_px, wght)
         };
 
-        let run = ShapedRun {
+        let run = Arc::new(ShapedRun {
             font_id,
             size_u16,
             size_bucket,
@@ -435,8 +625,26 @@ impl Text {
             #[cfg(not(target_os = "macos"))]
             wght_variation,
             ascent_px,
+            width_px: glyphs.iter().map(|g| g.advance).sum(),
             glyphs,
-        };
+        });
+        let bytes = run.cache_bytes();
+        // An oversized label can still be drawn, without evicting the useful
+        // working set or keeping its large allocation in the cache.
+        if bytes > MAX_SHAPED_BYTES {
+            return Some(run);
+        }
+        // FIFO eviction bounds changing titles without maintaining an LRU list
+        // on every measurement and draw. Hits share the same immutable run.
+        while self.shape_cache_order.len() == MAX_SHAPED_RUNS
+            || self.shape_cache_bytes + bytes > MAX_SHAPED_BYTES
+        {
+            let oldest = self.shape_cache_order.pop_front().unwrap();
+            let old = self.shape_cache.remove(&oldest).unwrap();
+            self.shape_cache_bytes -= old.cache_bytes();
+        }
+        self.shape_cache_bytes += bytes;
+        self.shape_cache_order.push_back(hash);
         self.shape_cache.insert(hash, run.clone());
         Some(run)
     }
@@ -447,10 +655,12 @@ impl Text {
         let scale = self.scale_factor;
         let mut pen_x = x * scale;
         let py = y * scale;
+        // Most glyphs share the run baseline; snap that origin once.
+        let rounded_y = py.round();
         let color = opts.color;
 
         for glyph in &run.glyphs {
-            let Some((slot, is_color)) = self.rasterize_slot(run, glyph.id) else {
+            let Some((slot, is_color)) = self.rasterize_slot(run, glyph) else {
                 continue;
             };
             if slot.w == 0 || slot.h == 0 {
@@ -466,7 +676,18 @@ impl Text {
             };
 
             self.instances.push(TextInstance {
-                pos: [pen_x + glyph.x, py + glyph.y.max(0.0)],
+                // Atlas bitmaps use nearest sampling. Fractional physical
+                // origins can repeat an edge texel and drop the opposite row
+                // or column. Keep fractional advances, but place each bitmap
+                // on the pixel grid for every renderer.
+                pos: [
+                    (pen_x + glyph.x).round(),
+                    if glyph.y.max(0.0) == 0.0 {
+                        rounded_y
+                    } else {
+                        (py + glyph.y).round()
+                    },
+                ],
                 glyph_pos: [slot.x as u32, slot.y as u32],
                 glyph_size: [slot.w as u32, slot.h as u32],
                 bearings: [slot.bearing_x, slot.bearing_y],
@@ -480,11 +701,27 @@ impl Text {
         }
     }
 
+    /// Atlas slots survive growth; atlas initialization discards shaped runs.
+    #[inline(always)]
+    fn rasterize_slot(
+        &mut self,
+        run: &ShapedRun,
+        glyph: &ShapedGlyph,
+    ) -> Option<(crate::grid::atlas::AtlasSlot, bool)> {
+        if let Some(slot) = glyph.slot.get() {
+            return Some(*slot);
+        }
+        let slot = self.rasterize_slot_uncached(run, glyph.id)?;
+        let _ = glyph.slot.set(slot);
+        Some(slot)
+    }
+
     /// Lookup or rasterize-and-insert a glyph. Returns
     /// `(x, y, w, h, bearing_x, bearing_y, is_color)` from the atlas
     /// slot. Per-OS rasterize path; shared slot shape.
+    #[inline(never)]
     #[allow(clippy::type_complexity)]
-    fn rasterize_slot(
+    fn rasterize_slot_uncached(
         &mut self,
         run: &ShapedRun,
         glyph_id: u16,
@@ -671,6 +908,7 @@ impl Text {
     /// `None` when shaping caches haven't been primed for this
     /// font_id (shouldn't happen — `shape()` always runs first) or
     /// when the atlas is at `ATLAS_MAX_SIZE` and the glyph won't fit.
+    #[inline(always)]
     #[allow(clippy::type_complexity)]
     fn rasterize_slot_cpu(
         &mut self,
@@ -797,6 +1035,15 @@ impl Text {
             let ay = inst.glyph_pos[1] as usize;
 
             if inst.atlas == 1 {
+                let (color_atlas, color_side) = if inst.page == 0 {
+                    (color_atlas, color_side)
+                } else {
+                    let Some(pixels) = state.atlas_color.page_pixels(inst.page) else {
+                        continue;
+                    };
+                    let side = state.atlas_color.page_side(inst.page).unwrap() as usize;
+                    (pixels, side)
+                };
                 blit_text_color(
                     buf,
                     buf_w_i,
@@ -809,8 +1056,20 @@ impl Text {
                     color_side,
                     ax,
                     ay,
+                    inst.color,
                 );
             } else {
+                let (mask, mask_side) = if inst.page == 0 {
+                    (mask, mask_side)
+                } else {
+                    let Some(pixels) = state.atlas_grayscale.page_pixels(inst.page)
+                    else {
+                        continue;
+                    };
+                    let side =
+                        state.atlas_grayscale.page_side(inst.page).unwrap() as usize;
+                    (pixels, side)
+                };
                 blit_text_mask(
                     buf, buf_w_i, buf_h_i, glyph_x, glyph_y, gw, gh, mask, mask_side, ax,
                     ay, inst.color,
@@ -836,6 +1095,7 @@ impl Text {
         let instance_buffers = (0..frames)
             .map(|_| alloc_instance_buffer_metal(device, instance_capacity))
             .collect();
+        self.clear_atlas_cache();
         self.metal = Some(TextMetalState {
             device: device.to_owned(),
             command_queue: command_queue.to_owned(),
@@ -957,6 +1217,7 @@ impl Text {
         let instance_capacity: usize = 256;
         let instance_buffer = alloc_instance_buffer_wgpu(device, instance_capacity);
 
+        let bound_color_atlas_size = atlas_color.size();
         self.wgpu = Some(TextWgpuState {
             device: device.to_owned(),
             queue: queue.to_owned(),
@@ -966,10 +1227,12 @@ impl Text {
             uniform_bind_group,
             atlas_bind_group,
             atlas_bind_group_layout: atlas_bgl,
+            bound_color_atlas_size,
             pipeline,
             instance_buffer,
             instance_capacity,
         });
+        self.clear_atlas_cache();
     }
 
     /// Record the UI text pass into `render_pass`. No-op if wgpu state
@@ -987,6 +1250,18 @@ impl Text {
         let Some(state) = self.wgpu.as_mut() else {
             return;
         };
+
+        // Both font glyphs and SVG icons can promote the deferred color atlas
+        // while building this frame. Bind its current view before drawing either.
+        if state.bound_color_atlas_size != state.atlas_color.size() {
+            state.atlas_bind_group = create_text_atlas_bg_wgpu(
+                &state.device,
+                &state.atlas_bind_group_layout,
+                state.atlas_grayscale.view(),
+                state.atlas_color.view(),
+            );
+            state.bound_color_atlas_size = state.atlas_color.size();
+        }
 
         // Upload uniforms (viewport + 8 bytes pad).
         let uniforms: [f32; 4] = [viewport[0], viewport[1], 0.0, 0.0];
@@ -1025,6 +1300,7 @@ impl Text {
             return;
         }
         let state = build_text_vulkan_state(ctx);
+        self.clear_atlas_cache();
         self.vulkan = Some(state);
     }
 
@@ -1079,26 +1355,50 @@ impl Text {
         // mismatched instances can't share a draw. Typical overlay:
         // 1–2 buckets (a few glyphs on page 0, both kinds at most),
         // so the linear-search grouping is cheap.
-        let mut groups: Vec<((u8, u8), Vec<TextInstance>)> = Vec::with_capacity(4);
-        for inst in &self.instances {
-            let key = (inst.atlas, inst.page);
-            match groups.iter_mut().find(|(k, _)| *k == key) {
-                Some(g) => g.1.push(*inst),
-                None => groups.push((key, vec![*inst])),
+        if bytemuck_instances(&state.previous_instances)
+            != bytemuck_instances(&self.instances)
+        {
+            state.previous_instances.clear();
+            state.previous_instances.extend_from_slice(&self.instances);
+            for (_, instances) in &mut state.instance_groups {
+                instances.clear();
             }
-        }
-        let mut bucketed: Vec<TextInstance> = Vec::with_capacity(self.instances.len());
-        let mut buckets: Vec<((u8, u8), u32, u32)> = Vec::with_capacity(groups.len());
-        for ((kind, page), insts) in groups.into_iter() {
-            let start = bucketed.len() as u32;
-            let count = insts.len() as u32;
-            bucketed.extend_from_slice(&insts);
-            buckets.push(((kind, page), start, count));
+            let mut used = 0;
+            for inst in &self.instances {
+                let key = (inst.atlas, inst.page);
+                let group = match state.instance_groups[..used]
+                    .iter()
+                    .position(|(k, _)| *k == key)
+                {
+                    Some(index) => index,
+                    None => {
+                        if used == state.instance_groups.len() {
+                            state.instance_groups.push((key, Vec::new()));
+                        } else {
+                            state.instance_groups[used].0 = key;
+                        }
+                        used += 1;
+                        used - 1
+                    }
+                };
+                state.instance_groups[group].1.push(*inst);
+            }
+            state.instance_buckets.clear();
+            let mut start = 0;
+            for (key, instances) in &state.instance_groups[..used] {
+                let count = instances.len() as u32;
+                if count != 0 {
+                    state.instance_buckets.push((*key, start, count));
+                    start += count;
+                }
+            }
+            // Frame slots own separate buffers. Each must receive the new
+            // layout once, even if the next frame reuses identical UI instances.
+            state.instance_dirty.fill(true);
         }
 
         // Grow per-slot instance buffer if needed.
-        let instance_count = bucketed.len();
-        let needed_bytes = instance_count * std::mem::size_of::<TextInstance>();
+        let instance_count = self.instances.len();
         if instance_count > state.instance_capacity[slot] {
             let new_cap = instance_count.next_power_of_two().max(256);
             state.instance_buffers[slot] =
@@ -1110,12 +1410,19 @@ impl Text {
             state.instance_capacity[slot] = new_cap;
         }
         let instance_buf = state.instance_buffers[slot].as_ref().unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bucketed.as_ptr() as *const u8,
-                instance_buf.as_mut_ptr(),
-                needed_bytes,
-            );
+        if state.instance_dirty[slot] {
+            let mut dst = instance_buf.as_mut_ptr() as *mut TextInstance;
+            for (_, instances) in &state.instance_groups {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        instances.as_ptr(),
+                        dst,
+                        instances.len(),
+                    );
+                    dst = dst.add(instances.len());
+                }
+            }
+            state.instance_dirty[slot] = false;
         }
 
         unsafe {
@@ -1138,7 +1445,7 @@ impl Text {
                 .cmd_bind_vertex_buffers(cmd, 0, &[instance_buf.handle()], &[0]);
 
             // One draw per (kind, page) bucket.
-            for &((kind, page), start, count) in &buckets {
+            for &((kind, page), start, count) in &state.instance_buckets {
                 let set = if kind == 1 {
                     state.atlas_color.page_descriptor_set(page)
                 } else {
@@ -1169,11 +1476,7 @@ impl Text {
 //  Helpers
 
 #[inline]
-fn shaped_width(run: &ShapedRun) -> f32 {
-    run.glyphs.iter().map(|g| g.advance).sum()
-}
-
-#[cfg(all(feature = "wgpu", not(target_os = "macos")))]
+#[cfg(any(target_os = "linux", all(feature = "wgpu", not(target_os = "macos"))))]
 fn bytemuck_instances(insts: &[TextInstance]) -> &[u8] {
     // Safety: TextInstance is repr(C) with all-primitive fields (no
     // padding surprises thanks to 4-byte alignment + explicit _pad).
@@ -1701,6 +2004,10 @@ fn build_text_vulkan_state(
         uniform_buffers,
         instance_buffers: std::array::from_fn(|_| None),
         instance_capacity: [0; FRAMES_IN_FLIGHT],
+        previous_instances: Vec::new(),
+        instance_groups: Vec::new(),
+        instance_buckets: Vec::new(),
+        instance_dirty: [true; FRAMES_IN_FLIGHT],
         descriptor_pool,
         uniform_descriptor_set_layout,
         atlas_descriptor_set_layout,
@@ -1899,68 +2206,7 @@ impl Drop for TextVulkanState {
 
 //  CPU blit path for `Text::render_cpu`: premultiplied source-over into
 //  the shared `0xAARRGGBB` framebuffer (see `crate::premul`).
-use crate::premul::blend_premul_over;
-
-#[allow(clippy::too_many_arguments)]
-fn blit_text_mask(
-    buf: &mut [u32],
-    buf_w: i32,
-    buf_h: i32,
-    glyph_x: i32,
-    glyph_y: i32,
-    gw: i32,
-    gh: i32,
-    atlas: &[u8],
-    atlas_side: usize,
-    ax: usize,
-    ay: usize,
-    color: [u8; 4],
-) {
-    if color[3] == 0 {
-        return;
-    }
-    let stride = buf_w as usize;
-    let x_start = glyph_x.max(0);
-    let y_start = glyph_y.max(0);
-    let x_end = (glyph_x + gw).min(buf_w);
-    let y_end = (glyph_y + gh).min(buf_h);
-    if x_end <= x_start || y_end <= y_start {
-        return;
-    }
-    let r = color[0] as u32;
-    let g = color[1] as u32;
-    let b = color[2] as u32;
-    let ca = color[3] as u32;
-
-    for dst_y in y_start..y_end {
-        let src_y = (dst_y - glyph_y) as usize + ay;
-        if src_y >= atlas_side {
-            continue;
-        }
-        let atlas_row = src_y * atlas_side;
-        let buf_row = (dst_y as usize) * stride;
-        for dst_x in x_start..x_end {
-            let src_x = (dst_x - glyph_x) as usize + ax;
-            if src_x >= atlas_side {
-                continue;
-            }
-            let m = atlas[atlas_row + src_x] as u32;
-            if m == 0 {
-                continue;
-            }
-            let a = (m * ca + 127) / 255;
-            if a == 0 {
-                continue;
-            }
-            let pr = (r * a + 127) / 255;
-            let pg = (g * a + 127) / 255;
-            let pb = (b * a + 127) / 255;
-            let src = [pr as u8, pg as u8, pb as u8, a as u8];
-            let idx = buf_row + (dst_x as usize);
-            buf[idx] = blend_premul_over(src, buf[idx]);
-        }
-    }
-}
+use crate::premul::{blend_premul_over, blit_mask as blit_text_mask};
 
 #[allow(clippy::too_many_arguments)]
 fn blit_text_color(
@@ -1975,7 +2221,14 @@ fn blit_text_color(
     atlas_side: usize,
     ax: usize,
     ay: usize,
+    color: [u8; 4],
 ) {
+    if color == [255; 4] {
+        crate::premul::blit_color(
+            buf, buf_w, buf_h, glyph_x, glyph_y, gw, gh, atlas, atlas_side, ax, ay,
+        );
+        return;
+    }
     let stride = buf_w as usize;
     let x_start = glyph_x.max(0);
     let y_start = glyph_y.max(0);
@@ -2004,9 +2257,72 @@ fn blit_text_color(
             if a == 0 {
                 continue;
             }
-            let src = [r, g, b, a];
+            let alpha = color[3] as u32;
+            let tint = |value: u8, channel: u8| {
+                ((value as u32 * channel as u32 * alpha + 32_512) / 65_025) as u8
+            };
+            let src = [
+                tint(r, color[0]),
+                tint(g, color[1]),
+                tint(b, color[2]),
+                ((a as u32 * alpha + 127) / 255) as u8,
+            ];
             let idx = buf_row + (dst_x as usize);
             buf[idx] = blend_premul_over(src, buf[idx]);
         }
+    }
+}
+
+#[cfg(test)]
+mod cpu_page_tests {
+    use super::*;
+    use crate::grid::RasterizedGlyph;
+
+    #[test]
+    fn ui_text_samples_later_mask_and_color_pages() {
+        let mut text = Text::new(&FontLibrary::default());
+        text.init_cpu();
+        let state = text.cpu.as_mut().unwrap();
+        for (kind, atlas, bpp, pixel) in [
+            (0, &mut state.atlas_grayscale, 1, [255; 4]),
+            (1, &mut state.atlas_color, 4, [10, 20, 30, 255]),
+        ] {
+            let empty = vec![0; 1023 * 1023 * bpp];
+            atlas
+                .upload(RasterizedGlyph {
+                    width: 1023,
+                    height: 1023,
+                    bearing_x: 0,
+                    bearing_y: 0,
+                    bytes: &empty,
+                })
+                .unwrap();
+            let slot = atlas
+                .upload(RasterizedGlyph {
+                    width: 1,
+                    height: 1,
+                    bearing_x: 0,
+                    bearing_y: 0,
+                    bytes: &pixel[..bpp],
+                })
+                .unwrap();
+            assert_eq!(slot.page, 1);
+            text.instances.push(TextInstance {
+                pos: [kind as f32, 0.0],
+                glyph_pos: [slot.x as u32, slot.y as u32],
+                glyph_size: [1, 1],
+                color: if kind == 0 {
+                    [200, 100, 50, 255]
+                } else {
+                    [255; 4]
+                },
+                atlas: kind,
+                page: slot.page,
+                ..TextInstance::default()
+            });
+        }
+        let mut pixels = [0; 2];
+        text.render_cpu(&mut pixels, 2, 1);
+        assert_eq!(pixels, [0xffc86432, 0xff0a141e]);
     }
 }

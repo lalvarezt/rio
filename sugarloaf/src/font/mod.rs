@@ -2210,6 +2210,37 @@ fn find_font(
     slot: Slot,
     evictable: bool,
 ) -> FindResult {
+    #[cfg(target_os = "windows")]
+    {
+        let bundled: Option<&'static [u8]> = match (font_spec.family.as_str(), slot) {
+            ("JetBrainsMono Nerd Font Mono", _) => Some(include_bytes!(
+                "../../../vendor/fonts/JetBrainsMonoNerdFontMono-Regular.ttf"
+            )),
+            ("Maple Mono", Slot::Italic) => {
+                Some(include_bytes!("../../../vendor/fonts/MapleMono-Italic.ttf"))
+            }
+            ("Maple Mono", Slot::BoldItalic) => Some(include_bytes!(
+                "../../../vendor/fonts/MapleMono-BoldItalic.ttf"
+            )),
+            ("Symbols Nerd Font Mono", _) => Some(include_bytes!(
+                "../../../vendor/fonts/SymbolsNerdFontMono-Regular.ttf"
+            )),
+            _ => None,
+        };
+        if let Some(bytes) = bundled {
+            return match FontData::from_data(
+                SharedData::from_static(bytes),
+                PathBuf::from(&font_spec.family),
+                false,
+                slot,
+                &font_spec,
+                0,
+            ) {
+                Ok(data) => FindResult::Found(data),
+                Err(_) => FindResult::NotFound(font_spec),
+            };
+        }
+    }
     if !font_spec.is_default_family() {
         let family = font_spec.family.to_string();
         let mut query = crate::font::loader::Query {
@@ -2600,29 +2631,6 @@ mod alias_tests {
         let from_alias = lib.get_font_metrics(&1, 14.0).expect("alias metrics");
         assert_eq!(from_regular, from_alias);
     }
-}
-
-#[allow(dead_code)]
-fn find_font_path(
-    db: &crate::font::loader::Database,
-    font_family: String,
-) -> Option<PathBuf> {
-    info!("Font path search: family '{font_family}'");
-
-    let query = crate::font::loader::Query {
-        families: &[crate::font::loader::Family::Name(&font_family)],
-        ..crate::font::loader::Query::default()
-    };
-
-    if let Some(id) = db.query(&query) {
-        if let Some((crate::font::loader::Source::File(ref path), _index)) =
-            db.face_source(id)
-        {
-            return Some(path.to_path_buf());
-        }
-    }
-
-    None
 }
 
 #[cfg(not(target_arch = "wasm32"))]

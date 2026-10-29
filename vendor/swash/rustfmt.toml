@@ -1,0 +1,2 @@
+# Keep the vendored source in upstream's default formatting style.
+max_width = 100

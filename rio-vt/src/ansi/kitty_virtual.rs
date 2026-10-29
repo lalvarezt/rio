@@ -410,11 +410,13 @@ pub fn decode_placeholder(s: &str) -> Option<(u32, u32, Option<u8>)> {
 /// bits of the image (or placement) id. The encoding depends on color mode:
 /// - `Indexed(n)`: id = n (0..=255). 256-color slot maps to itself.
 /// - `Spec(rgb)`: id = (R << 16) | (G << 8) | B (full 24 bits).
-/// - `Named(_)`: id = 0 (no encoding possible — caller treats as "no id").
+/// - `Named` ANSI colors: id = palette index. Default foreground and other
+///   special colors carry no id.
 fn color_to_id(color: AnsiColor) -> u32 {
     match color {
         AnsiColor::Indexed(n) => n as u32,
         AnsiColor::Spec(rgb) => rgb_to_id(rgb),
+        AnsiColor::Named(named) if (named as u32) < 256 => named as u32,
         AnsiColor::Named(_) => 0,
     }
 }
@@ -552,6 +554,8 @@ pub struct RunGeometry {
 /// `origin_x`/`origin_y` are the top-left of the terminal grid in
 /// physical pixels. `screen_line` is the visible-rows index of the run.
 /// `start_screen_col` is the run's leftmost cell on screen.
+/// Destination offsets and sizes, and source positions and extents, round
+/// independently to image pixels. Virtual placeholders ignore source crop keys.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_run_geometry(
     run: &PlaceholderRun,
@@ -559,7 +563,7 @@ pub fn compute_run_geometry(
     placement_rows: u32,
     image_width_px: u32,
     image_height_px: u32,
-    source_rect_px: (u32, u32, u32, u32),
+    _source_rect_px: (u32, u32, u32, u32),
     cell_width: f32,
     cell_height: f32,
     origin_x: f32,
@@ -567,86 +571,113 @@ pub fn compute_run_geometry(
     screen_line: usize,
     start_screen_col: usize,
 ) -> Option<RunGeometry> {
-    let img_w = image_width_px as f32;
-    let img_h = image_height_px as f32;
-
-    // Resolve the placement's raw source rectangle against the
-    // image's current dimensions; what gets fitted into the
-    // placement box is the crop, not the whole image. A full-image
-    // crop (the common case) leaves the math identical.
-    let (crop_x, crop_y, crop_w, crop_h) = crate::ansi::graphics::resolve_source_rect(
-        source_rect_px.0,
-        source_rect_px.1,
-        source_rect_px.2,
-        source_rect_px.3,
-        image_width_px as usize,
-        image_height_px as usize,
-    )?;
-    let crop_x = crop_x as f32;
-    let crop_y = crop_y as f32;
-    let crop_w = crop_w as f32;
-    let crop_h = crop_h as f32;
-
-    // 1. Placement box in pixels. `c=`/`r=` are optional on virtual
-    // placements (yazi's kgp driver omits both); any missing side is
-    // implied from the crop's pixel size rounded up to whole cells,
-    // so the image keeps its native cell footprint.
-    let p_cols = if placement_cols > 0 {
-        placement_cols as f32
-    } else {
-        (crop_w / cell_width).ceil().max(1.0)
-    };
-    let p_rows = if placement_rows > 0 {
-        placement_rows as f32
-    } else {
-        (crop_h / cell_height).ceil().max(1.0)
-    };
-    let p_cols_px = p_cols * cell_width;
-    let p_rows_px = p_rows * cell_height;
-
-    // 2. Aspect-fit + centering.
-    let scale = (p_cols_px / crop_w).min(p_rows_px / crop_h);
-    let fit_w = crop_w * scale;
-    let fit_h = crop_h * scale;
-    let pad_x = (p_cols_px - fit_w) * 0.5;
-    let pad_y = (p_rows_px - fit_h) * 0.5;
-
-    // 3. Run rect inside the placement box.
-    let run_box_x = run.col as f32 * cell_width;
-    let run_box_y = run.row as f32 * cell_height;
-    let run_box_w = run.width as f32 * cell_width;
-    let run_box_h = cell_height;
-
-    // 4. Intersect with image fitted rect.
-    let img_box_x0 = pad_x;
-    let img_box_y0 = pad_y;
-    let img_box_x1 = pad_x + fit_w;
-    let img_box_y1 = pad_y + fit_h;
-
-    let vis_x0 = run_box_x.max(img_box_x0);
-    let vis_y0 = run_box_y.max(img_box_y0);
-    let vis_x1 = (run_box_x + run_box_w).min(img_box_x1);
-    let vis_y1 = (run_box_y + run_box_h).min(img_box_y1);
-    if vis_x1 <= vis_x0 || vis_y1 <= vis_y0 {
+    if image_width_px == 0
+        || image_height_px == 0
+        || !cell_width.is_finite()
+        || !cell_height.is_finite()
+        || cell_width <= 0.0
+        || cell_height <= 0.0
+    {
         return None;
     }
+    // Ghostty's graphics_unicode.zig fits the whole image. The source
+    // rectangle keys on a virtual placement do not crop its placeholders.
+    let img_w = f64::from(image_width_px);
+    let img_h = f64::from(image_height_px);
+    let cell_w = f64::from(cell_width);
+    let cell_h = f64::from(cell_height);
+    let cols = if placement_cols == 0 {
+        (img_w / cell_w).ceil()
+    } else {
+        f64::from(placement_cols)
+    };
+    let rows = if placement_rows == 0 {
+        (img_h / cell_h).ceil()
+    } else {
+        f64::from(placement_rows)
+    };
+    let box_w = cols * cell_w;
+    let box_h = rows * cell_h;
+    let (scale, pad_x, pad_y) = if img_w * box_h > img_h * box_w {
+        let scale = box_w / img_w;
+        (scale, 0.0, (box_h - img_h * scale) / 2.0 / scale)
+    } else {
+        let scale = box_h / img_h;
+        (scale, (box_w - img_w * scale) / 2.0 / scale, 0.0)
+    };
+    let padded_w = img_w + pad_x * 2.0;
+    let padded_h = img_h + pad_y * 2.0;
 
-    // 5. Source rect (normalised) and screen position. The fitted
-    // fractions live in crop space; map them into full-image texture
-    // coordinates.
-    let src_u0 = (crop_x + (vis_x0 - img_box_x0) / fit_w * crop_w) / img_w;
-    let src_v0 = (crop_y + (vis_y0 - img_box_y0) / fit_h * crop_h) / img_h;
-    let src_u1 = (crop_x + (vis_x1 - img_box_x0) / fit_w * crop_w) / img_w;
-    let src_v1 = (crop_y + (vis_y1 - img_box_y0) / fit_h * crop_h) / img_h;
+    // Work in image pixels until the final conversion. Rounding source
+    // position and extent separately matches Ghostty even for a slice
+    // smaller than one image pixel.
+    fn axis(
+        mut source: f64,
+        mut length: f64,
+        image: f64,
+        padded: f64,
+        padding: f64,
+        scale: f64,
+        mut destination: f64,
+    ) -> (f64, f64, f64, f64) {
+        let mut offset = 0.0;
+        if source < padding {
+            let shift = padding - source;
+            length -= shift;
+            offset = shift * scale;
+            destination -= shift * scale;
+            source = 0.0;
+            if length > image {
+                length = image;
+                destination = image * scale;
+            }
+        } else if source + length > padded - padding {
+            source -= padding;
+            length = padded - padding - source;
+            length -= padding;
+            destination = length * scale;
+        } else {
+            source -= padding;
+        }
+        (source, length, offset, destination)
+    }
 
-    let intra_x = vis_x0 - run_box_x;
-    let intra_y = vis_y0 - run_box_y;
+    let (sx, sw, dx, width) = axis(
+        padded_w * (f64::from(run.col) / cols),
+        padded_w * (f64::from(run.width) / cols),
+        img_w,
+        padded_w,
+        pad_x,
+        scale,
+        f64::from(run.width) * cell_w,
+    );
+    let (sy, sh, dy, height) = axis(
+        padded_h * (f64::from(run.row) / rows),
+        padded_h * (1.0 / rows),
+        img_h,
+        padded_h,
+        pad_y,
+        scale,
+        cell_h,
+    );
+    if sw <= 0.0 || sh <= 0.0 {
+        return None;
+    }
+    let sx = sx.round();
+    let sy = sy.round();
+    let sw = sw.round();
+    let sh = sh.round();
     Some(RunGeometry {
-        x: origin_x + start_screen_col as f32 * cell_width + intra_x,
-        y: origin_y + screen_line as f32 * cell_height + intra_y,
-        width: vis_x1 - vis_x0,
-        height: vis_y1 - vis_y0,
-        source_rect: [src_u0, src_v0, src_u1, src_v1],
+        x: origin_x + start_screen_col as f32 * cell_width + dx.round() as f32,
+        y: origin_y + screen_line as f32 * cell_height + dy.round() as f32,
+        width: width.round() as f32,
+        height: height.round() as f32,
+        source_rect: [
+            (sx / img_w) as f32,
+            (sy / img_h) as f32,
+            ((sx + sw) / img_w) as f32,
+            ((sy + sh) / img_h) as f32,
+        ],
     })
 }
 
@@ -664,20 +695,15 @@ pub fn compute_run_geometry(
 ///
 /// A non-zero id must match exactly, as in kitty (`graphics.c`,
 /// `grman_put_cell_image`). For id 0 kitty takes the first virtual
-/// placement its hash table happens to yield; the spec allows any, so
-/// the placement with the lowest id is chosen here instead, so the
-/// result never depends on iteration order (an explicit `p=0`
-/// placement therefore still wins).
+/// placement its hash table happens to yield. Match Ghostty's stable
+/// preference: explicit IDs precede internal ones, then lower IDs win.
 pub fn resolve_virtual_placement(
-    placements: &FxHashMap<(u32, u32), VirtualPlacement>,
+    placements: &FxHashMap<(u32, u64), VirtualPlacement>,
     image_id: u32,
     placement_id: u32,
 ) -> Option<&VirtualPlacement> {
     if placement_id != 0 {
-        return placements.get(&(image_id, placement_id));
-    }
-    if let Some(vp) = placements.get(&(image_id, 0)) {
-        return Some(vp);
+        return placements.get(&(image_id, u64::from(placement_id)));
     }
     placements
         .iter()
@@ -690,7 +716,7 @@ pub fn resolve_virtual_placement(
 mod tests {
     use super::*;
 
-    fn vp(image_id: u32, placement_id: u32) -> VirtualPlacement {
+    fn vp(image_id: u32, placement_id: u64) -> VirtualPlacement {
         VirtualPlacement {
             image_id,
             placement_id,
@@ -717,21 +743,35 @@ mod tests {
 
     #[test]
     fn resolve_zero_placement_id_prefers_lowest_id() {
+        let mut allocator = crate::ansi::graphics::Graphics::default();
+        let first = allocator.allocate_internal_placement_id();
+        let second = allocator.allocate_internal_placement_id();
         let mut m = FxHashMap::default();
         m.insert((7, 11), vp(7, 11));
-        m.insert((7, 0), vp(7, 0));
+        m.insert((7, first), vp(7, first));
+        m.insert((7, second), vp(7, second));
         m.insert((7, 5), vp(7, 5));
         let got = resolve_virtual_placement(&m, 7, 0).unwrap();
-        assert_eq!(got.placement_id, 0);
-        m.remove(&(7, 0));
-        assert_eq!(resolve_virtual_placement(&m, 7, 0).unwrap().placement_id, 5);
+        assert_eq!(got.placement_id, 5);
+        m.remove(&(7, 5));
+        assert_eq!(
+            resolve_virtual_placement(&m, 7, 0).unwrap().placement_id,
+            11
+        );
+        m.remove(&(7, 11));
+        assert_eq!(
+            resolve_virtual_placement(&m, 7, 0).unwrap().placement_id,
+            first
+        );
     }
 
     #[test]
     fn resolve_nonzero_placement_id_must_match_exactly() {
+        let mut allocator = crate::ansi::graphics::Graphics::default();
+        let internal = allocator.allocate_internal_placement_id();
         let mut m = FxHashMap::default();
         m.insert((7, 11), vp(7, 11));
-        m.insert((7, 0), vp(7, 0));
+        m.insert((7, internal), vp(7, internal));
         assert_eq!(
             resolve_virtual_placement(&m, 7, 11).unwrap().placement_id,
             11
@@ -865,7 +905,7 @@ mod tests {
     }
 
     #[test]
-    fn from_cell_named_fg_yields_zero_id() {
+    fn from_cell_default_fg_yields_zero_id() {
         let combining = [DIACRITICS[0], DIACRITICS[0]];
         let p = IncompletePlacement::from_cell(
             AnsiColor::Named(NamedColor::Foreground),
@@ -873,6 +913,18 @@ mod tests {
             &combining,
         );
         assert_eq!(p.image_id_low, 0);
+    }
+
+    #[test]
+    fn from_cell_ansi_named_colors_encode_palette_ids() {
+        for (color, id) in [(NamedColor::Red, 1), (NamedColor::LightBlack, 8)] {
+            let p = IncompletePlacement::from_cell(
+                AnsiColor::Named(color),
+                None,
+                &[DIACRITICS[0], DIACRITICS[0]],
+            );
+            assert_eq!(p.image_id_low, id);
+        }
     }
 
     fn p(row: Option<u32>, col: Option<u32>) -> IncompletePlacement {
@@ -963,6 +1015,54 @@ mod tests {
             row,
             col,
             width,
+        }
+    }
+
+    #[test]
+    fn virtual_slices_round_destination_and_source_rectangles_to_pixels() {
+        // Ghostty graphics_unicode.zig rounds each field independently.
+        for (row, y, source_y) in [(0, 11.0, 0.0), (1, 20.0, 2.0)] {
+            let g = compute_run_geometry(
+                &run(row, 0, 4),
+                4,
+                2,
+                7,
+                3,
+                (0, 0, 0, 0),
+                10.0,
+                20.0,
+                0.0,
+                0.0,
+                row as usize,
+                0,
+            )
+            .unwrap();
+            assert_eq!((g.x, g.y, g.width, g.height), (0.0, y, 40.0, 9.0));
+            approx(g.source_rect[1] * 3.0, source_y);
+            approx((g.source_rect[3] - g.source_rect[1]) * 3.0, 2.0);
+        }
+    }
+
+    #[test]
+    fn virtual_placeholders_ignore_source_crop_keys() {
+        for crop in [(0, 0, 0, 0), (1, 1, 2, 2), (99, 99, 1, 1)] {
+            let g = compute_run_geometry(
+                &run(0, 0, 4),
+                4,
+                2,
+                7,
+                3,
+                crop,
+                10.0,
+                20.0,
+                0.0,
+                0.0,
+                0,
+                0,
+            )
+            .unwrap();
+            assert_eq!((g.x, g.y, g.width, g.height), (0.0, 11.0, 40.0, 9.0));
+            assert_eq!(g.source_rect, [0.0, 0.0, 1.0, 2.0 / 3.0]);
         }
     }
 
@@ -1287,7 +1387,7 @@ mod tests {
         .expect("visible");
         approx(g.y, 20.0);
         approx(g.width, 100.0);
-        approx(g.height, 300.0 / 19.0);
+        approx(g.height, 16.0);
         approx(g.source_rect[1], 0.5);
         approx(g.source_rect[3], 1.0);
 
@@ -1348,9 +1448,9 @@ mod tests {
         )
         .expect("visible");
         approx(g.x, 0.0);
-        approx(g.y, 12.5);
+        approx(g.y, 13.0);
         approx(g.width, 50.0);
-        approx(g.height, 7.5);
+        approx(g.height, 8.0);
         approx(g.source_rect[1], 0.0);
         approx(g.source_rect[2], 1.0);
         approx(g.source_rect[3], 0.3);

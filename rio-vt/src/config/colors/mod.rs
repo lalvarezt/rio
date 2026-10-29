@@ -7,6 +7,7 @@ use serde::Serialize;
 use serde::{de, Deserialize};
 use std::num::ParseIntError;
 use std::ops::Mul;
+use std::sync::LazyLock;
 
 // `ColorWGPU` is the legacy name; `rio_graphics::Color` is the actual
 // type now (mirrors `wgpu::Color`'s shape, but doesn't drag wgpu
@@ -515,17 +516,18 @@ impl ColorBuilder {
     }
 
     pub fn from_hex(mut hex: String, conversion_type: Format) -> Result<Self, String> {
+        static NON_HEX_CHARS: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"(?i)[^#a-f\d]").unwrap());
+        static VALID_HEX_SIZE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"(?i)^#?[a-f\d]{6}([a-f\d]{2})?$").unwrap());
+
         let mut alpha: f64 = 1.0;
-        let non_hex_chars = Regex::new(r"(?i)[^#a-f\d]").unwrap();
 
-        // match valid 6 or 8 hex characters
-        let valid_hex_size = Regex::new(r"(?i)^#?[a-f\d]{6}([a-f\d]{2})?$").unwrap();
-
-        if non_hex_chars.is_match(&hex) {
+        if NON_HEX_CHARS.is_match(&hex) {
             return Err(String::from("Error: Character is not valid"));
         }
 
-        if !valid_hex_size.is_match(&hex) {
+        if !VALID_HEX_SIZE.is_match(&hex) {
             return Err(String::from("Error: Hex String size is not valid"));
         }
 

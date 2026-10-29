@@ -1,6 +1,5 @@
 pub mod graphics;
 pub mod primitives;
-pub mod state;
 
 use crate::components::core::image::Handle;
 #[cfg(feature = "wgpu")]
@@ -9,7 +8,7 @@ use crate::font::{fonts::SugarloafFont, FontLibrary};
 use crate::font_cache::{compute_advance, resolve_with, FontCache, ResolvedGlyph};
 use crate::layout::RootStyle;
 use crate::renderer::Renderer;
-use crate::sugarloaf::graphics::{image_key_route, GraphicDataEntry, Graphics};
+use crate::sugarloaf::graphics::{image_key_route, GraphicDataEntry};
 use swash::Attributes;
 
 use crate::context::Context;
@@ -18,7 +17,6 @@ use primitives::ImageProperties;
 use raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, WindowHandle,
 };
-use state::SugarState;
 
 pub struct Sugarloaf<'a> {
     // NOTE: field order is load-bearing for the Vulkan backend. Rust
@@ -27,7 +25,8 @@ pub struct Sugarloaf<'a> {
     // BEFORE `ctx` — destroying handles after the device has been
     // torn down would crash the driver. `ctx` is therefore last.
     renderer: Renderer,
-    state: state::SugarState,
+    style: RootStyle,
+    fonts: FontLibrary,
     /// Input colorspace configured at construction. Exposed via
     /// `input_colorspace()` so the grid renderer can feed the same
     /// value into its own uniform — keeps grid + quad-fill pipelines
@@ -35,7 +34,6 @@ pub struct Sugarloaf<'a> {
     colorspace: Colorspace,
     pub background_color: Option<Color>,
     pub background_image: Option<ImageProperties>,
-    pub graphics: Graphics,
     #[cfg(feature = "wgpu")]
     filters_brush: Option<FiltersBrush>,
     /// One-shot notice that active filters defeat `window.opacity`.
@@ -53,11 +51,7 @@ pub struct Sugarloaf<'a> {
     /// width (for the grid) and unscaled glyph advance (for
     /// proportional UI via `char_advance`).
     font_cache: FontCache,
-    /// Immediate-mode UI-text recorder. Overlays (tab titles, search
-    /// overlay, command palette, etc.) drive this instead of the
-    /// `Content`/`BuilderState` pipeline. See `sugarloaf::text` and
-    /// `memory/project_sugarloaf_content_drop.md`. Phase 1a: scaffold
-    /// only — holds no atlases or GPU state yet.
+    /// Immediate-mode UI text and its glyph atlases.
     text: crate::text::Text,
     /// Per-panel (rich_text_id) image overlays. Driven by the kitty
     /// graphics frontend path; read by the renderer's image pass.
@@ -127,7 +121,6 @@ pub use rio_graphics::Color;
 
 pub struct SugarloafRenderer {
     pub backend: SugarloafBackend,
-    pub font_features: Option<Vec<String>>,
     pub colorspace: Colorspace,
     /// The window wants per-pixel alpha (`window.opacity < 1`). On wgpu
     /// this prefers an adapter whose surface offers an alpha-carrying
@@ -190,7 +183,6 @@ impl Default for SugarloafRenderer {
 
         SugarloafRenderer {
             backend: default_backend,
-            font_features: None,
             colorspace: Colorspace::default(),
             prefer_alpha_capable_adapter: false,
         }
@@ -231,29 +223,40 @@ impl Sugarloaf<'_> {
         font_library: &FontLibrary,
         layout: RootStyle,
     ) -> Result<Sugarloaf<'a>, Box<SugarloafWithErrors<'a>>> {
-        let font_features = renderer.font_features.to_owned();
         let colorspace = renderer.colorspace;
-        let ctx = Context::new(window, renderer);
+        let ctx = {
+            let _timing =
+                tracing::debug_span!(target: "rio_profile", "gpu.context").entered();
+            Context::new(window, renderer)
+        };
 
-        let renderer = Renderer::new(&ctx, colorspace);
-        let state = SugarState::new(layout, font_library, &font_features);
-
+        let renderer = {
+            let _timing =
+                tracing::debug_span!(target: "rio_profile", "gpu.pipelines").entered();
+            Renderer::new(&ctx, colorspace)
+        };
         let font_cache = FontCache::new();
 
         let mut text = crate::text::Text::new(font_library);
-        text.set_scale_factor(state.style.scale_factor);
+        text.set_scale_factor(layout.scale_factor);
         if matches!(ctx.inner, crate::context::ContextType::Cpu(_)) {
             text.init_cpu();
         }
+        #[cfg(all(feature = "wgpu", not(target_os = "macos")))]
+        if let crate::context::ContextType::Wgpu(ctx) = &ctx.inner {
+            // UI drawing uploads icons and resolves glyph slots before the render
+            // pass. Initializing there would discard the first frame's atlas cache.
+            text.init_wgpu(&ctx.device, &ctx.queue, ctx.format);
+        }
 
         let instance = Sugarloaf {
-            state,
+            style: layout,
+            fonts: font_library.clone(),
             ctx,
             colorspace,
             background_color: Some(Color::BLACK),
             background_image: None,
             renderer,
-            graphics: Graphics::default(),
             #[cfg(feature = "wgpu")]
             filters_brush: None,
             #[cfg(feature = "wgpu")]
@@ -287,15 +290,13 @@ impl Sugarloaf<'_> {
         // Clear the global font data cache to ensure fonts are reloaded
         crate::font::clear_font_data_cache();
 
-        // Clear the atlas to remove old font glyphs
-        self.renderer.clear_atlas();
-        // Cached tinted glyphs alias the old atlas coordinates — drop them.
+        self.renderer.reset();
+        // Force the CPU rasterizer to present the changed fonts.
         self.cpu_cache.clear();
         // Glyph resolutions point at the old font ids — drop them.
         self.font_cache.clear();
 
-        self.state.reset();
-        self.state.set_fonts(font_library, &mut self.renderer);
+        self.fonts = font_library.clone();
     }
 
     /// Look up a single glyph in the font cache without performing
@@ -314,7 +315,7 @@ impl Sugarloaf<'_> {
         if let Some(cached) = self.font_cache.get(&(ch, attrs)) {
             return *cached;
         }
-        let font_lib = self.state.fonts.clone();
+        let font_lib = self.fonts.clone();
         resolve_with(&mut self.font_cache, &font_lib, ch, attrs)
     }
 
@@ -351,7 +352,7 @@ impl Sugarloaf<'_> {
         }
 
         let computed = {
-            let font_ctx = self.state.fonts.inner.read();
+            let font_ctx = self.fonts.inner.read();
             compute_advance(&font_ctx, resolved.font_id, ch)
         };
         // Cache both hits AND misses — misses become a zero-advance
@@ -371,7 +372,7 @@ impl Sugarloaf<'_> {
     /// set changes rarely, and the one-off cost of walking the library
     /// is fine for a human-triggered lookup.
     pub fn font_family_names(&self) -> Vec<String> {
-        self.state.fonts.family_names()
+        self.fonts.family_names()
     }
 
     /// Borrow the font library. Used by the grid emission path to
@@ -379,7 +380,7 @@ impl Sugarloaf<'_> {
     /// own atlas.
     #[inline]
     pub fn font_library(&self) -> &crate::font::FontLibrary {
-        &self.state.fonts
+        &self.fonts
     }
 
     /// Stateless cell-metrics computation. Callers (rioterm's
@@ -396,7 +397,7 @@ impl Sugarloaf<'_> {
         scale_factor: f32,
     ) -> (crate::layout::TextDimensions, crate::layout::CellMetrics) {
         crate::layout::compute_cell_metrics(
-            &self.state.fonts,
+            &self.fonts,
             font_size,
             line_height,
             scale_factor,
@@ -415,7 +416,7 @@ impl Sugarloaf<'_> {
         if queries.is_empty() {
             return Vec::new();
         }
-        let font_lib = self.state.fonts.clone();
+        let font_lib = self.fonts.clone();
         let mut out = Vec::with_capacity(queries.len());
         for &(ch, attrs) in queries {
             out.push(resolve_with(&mut self.font_cache, &font_lib, ch, attrs));
@@ -435,12 +436,12 @@ impl Sugarloaf<'_> {
 
     #[inline]
     pub fn style(&self) -> RootStyle {
-        self.state.style
+        self.style
     }
 
     #[inline]
     pub fn style_mut(&mut self) -> &mut RootStyle {
-        &mut self.state.style
+        &mut self.style
     }
 
     #[inline]
@@ -556,15 +557,11 @@ impl Sugarloaf<'_> {
         self.background_image = None;
     }
 
-    /// Add a rectangle to content system
-    /// - `id: None` - not cached, rendered immediately
-    /// - `id: Some(n)` - cached with id n, overwrites existing content
-    /// - `order` - draw order (higher values render on top)
+    /// Draw a rectangle. Higher `order` values render on top.
     #[inline]
     #[allow(clippy::too_many_arguments)]
     pub fn rect(
         &mut self,
-        _id: Option<usize>,
         x: f32,
         y: f32,
         width: f32,
@@ -573,13 +570,10 @@ impl Sugarloaf<'_> {
         depth: f32,
         order: u8,
     ) {
-        let scaled_x = x * self.state.style.scale_factor;
-        let scaled_y = y * self.state.style.scale_factor;
-        let scaled_width = width * self.state.style.scale_factor;
-        let scaled_height = height * self.state.style.scale_factor;
-        // The `Some(id)` cached arm has no rio caller — every
-        // ephemeral rect goes through `Renderer.batches`. Argument
-        // kept for API stability with the other primitive helpers.
+        let scaled_x = x * self.style.scale_factor;
+        let scaled_y = y * self.style.scale_factor;
+        let scaled_width = width * self.style.scale_factor;
+        let scaled_height = height * self.style.scale_factor;
         self.renderer.rect(
             scaled_x,
             scaled_y,
@@ -591,12 +585,20 @@ impl Sugarloaf<'_> {
         );
     }
 
-    /// Add a rounded rectangle. Always immediate-mode now — see `rect`.
+    /// Clip shapes recorded by `draw` to a rectangle in logical pixels.
+    /// UI text uses its own clipping and is not affected by this scope.
+    pub fn with_shape_clip(&mut self, clip: [f32; 4], draw: impl FnOnce(&mut Self)) {
+        let scale = self.scale_factor();
+        let previous = self.renderer.set_shape_clip(clip.map(|v| v * scale));
+        draw(self);
+        self.renderer.set_shape_clip(previous);
+    }
+
+    /// Draw a rounded rectangle.
     #[inline]
     #[allow(clippy::too_many_arguments)]
     pub fn rounded_rect(
         &mut self,
-        _id: Option<usize>,
         x: f32,
         y: f32,
         width: f32,
@@ -606,11 +608,11 @@ impl Sugarloaf<'_> {
         border_radius: f32,
         order: u8,
     ) {
-        let scaled_x = x * self.state.style.scale_factor;
-        let scaled_y = y * self.state.style.scale_factor;
-        let scaled_width = width * self.state.style.scale_factor;
-        let scaled_height = height * self.state.style.scale_factor;
-        let scaled_border_radius = border_radius * self.state.style.scale_factor;
+        let scaled_x = x * self.style.scale_factor;
+        let scaled_y = y * self.style.scale_factor;
+        let scaled_width = width * self.style.scale_factor;
+        let scaled_height = height * self.style.scale_factor;
+        let scaled_border_radius = border_radius * self.style.scale_factor;
         self.renderer.rounded_rect(
             scaled_x,
             scaled_y,
@@ -623,14 +625,11 @@ impl Sugarloaf<'_> {
         );
     }
 
-    /// Add a quad with per-corner radii and per-edge border widths
-    /// - `id: None` - not cached, rendered immediately
-    /// - `id: Some(n)` - cached with id n, overwrites existing content
+    /// Draw a quad with per-corner radii.
     #[inline]
     #[allow(clippy::too_many_arguments)]
     pub fn quad(
         &mut self,
-        _id: Option<usize>,
         x: f32,
         y: f32,
         width: f32,
@@ -640,7 +639,7 @@ impl Sugarloaf<'_> {
         depth: f32,
         order: u8,
     ) {
-        let scale = self.state.style.scale_factor;
+        let scale = self.style.scale_factor;
         let scaled_x = x * scale;
         let scaled_y = y * scale;
         let scaled_width = width * scale;
@@ -652,7 +651,6 @@ impl Sugarloaf<'_> {
             corner_radii[3] * scale,
         ];
 
-        // For now, quad is always rendered immediately (no caching support yet)
         self.renderer.quad(
             scaled_x,
             scaled_y,
@@ -665,43 +663,11 @@ impl Sugarloaf<'_> {
         );
     }
 
-    /// Add an image rectangle. Always immediate-mode now — see `rect`.
-    #[inline]
-    #[allow(clippy::too_many_arguments)]
-    pub fn image_rect(
-        &mut self,
-        _id: Option<usize>,
-        x: f32,
-        y: f32,
-        width: f32,
-        height: f32,
-        color: [f32; 4],
-        coords: [f32; 4],
-        depth: f32,
-        atlas_layer: i32,
-    ) {
-        let scaled_x = x * self.state.style.scale_factor;
-        let scaled_y = y * self.state.style.scale_factor;
-        let scaled_width = width * self.state.style.scale_factor;
-        let scaled_height = height * self.state.style.scale_factor;
-
-        self.renderer.add_image_rect(
-            scaled_x,
-            scaled_y,
-            scaled_width,
-            scaled_height,
-            color,
-            coords,
-            depth,
-            atlas_layer,
-        );
-    }
-
     /// Draw an anti-aliased polygon from a list of points.
     /// Coordinates are in logical pixels (scaled internally).
     #[inline]
     pub fn polygon(&mut self, points: &[(f32, f32)], depth: f32, color: [f32; 4]) {
-        let scale = self.state.style.scale_factor;
+        let scale = self.style.scale_factor;
         let scaled: Vec<(f32, f32)> =
             points.iter().map(|(x, y)| (x * scale, y * scale)).collect();
         self.renderer.polygon(&scaled, depth, color);
@@ -722,7 +688,7 @@ impl Sugarloaf<'_> {
         depth: f32,
         color: [f32; 4],
     ) {
-        let s = self.state.style.scale_factor;
+        let s = self.style.scale_factor;
         self.renderer.triangle(
             x1 * s,
             y1 * s,
@@ -750,7 +716,7 @@ impl Sugarloaf<'_> {
         color: [f32; 4],
         order: u8,
     ) {
-        let s = self.state.style.scale_factor;
+        let s = self.style.scale_factor;
         self.renderer.line(
             x1 * s,
             y1 * s,
@@ -778,7 +744,7 @@ impl Sugarloaf<'_> {
         depth: f32,
         color: [f32; 4],
     ) {
-        let s = self.state.style.scale_factor;
+        let s = self.style.scale_factor;
         self.renderer.arc(
             center_x * s,
             center_y * s,
@@ -825,18 +791,13 @@ impl Sugarloaf<'_> {
     }
 
     #[inline]
-    pub fn clear(&mut self) {
-        self.state.clean_screen();
-    }
-
-    #[inline]
     pub fn window_size(&self) -> SugarloafWindowSize {
         self.ctx.size()
     }
 
     #[inline]
     pub fn scale_factor(&self) -> f32 {
-        self.state.style.scale_factor
+        self.style.scale_factor
     }
 
     #[inline]
@@ -850,16 +811,12 @@ impl Sugarloaf<'_> {
     #[inline]
     pub fn rescale(&mut self, scale: f32) {
         self.ctx.set_scale(scale);
-        self.state.compute_layout_rescale(scale);
+        self.style.scale_factor = scale;
         self.text.set_scale_factor(scale);
     }
 
     #[inline]
-    pub fn add_layers(&mut self, _quantity: usize) {}
-
-    #[inline]
     pub fn reset(&mut self) {
-        self.state.reset();
         // Drop this frame's UI text instances — overlays re-record
         // next frame (immediate mode).
         self.text.clear();
@@ -892,7 +849,6 @@ impl Sugarloaf<'_> {
     #[inline]
     pub fn discard_frame(&mut self) {
         self.renderer.discard_frame_batches();
-        self.state.reset();
         self.text.clear();
     }
 
@@ -921,14 +877,8 @@ impl Sugarloaf<'_> {
         &mut self,
         grids: &mut [(&mut crate::grid::GridRenderer, crate::grid::GridUniforms)],
     ) {
-        self.state.compute_dimensions();
-        self.state.compute_updates(
-            &mut self.renderer,
-            &mut self.ctx,
-            &mut self.graphics,
-            &mut self.image_data,
-            &self.image_overlays,
-        );
+        self.renderer
+            .prepare(&mut self.ctx, &mut self.image_data, &self.image_overlays);
 
         match self.ctx.inner {
             #[cfg(feature = "wgpu")]
@@ -1002,17 +952,15 @@ impl Sugarloaf<'_> {
         self.reset();
     }
 
-    /// Drive a native Vulkan frame. Drives the entire frame from the
-    /// outside so grid passes, the optional bootstrap rect, and (later)
-    /// rich-text / images / UI text overlays all share one
-    /// dynamic-rendering pass and one swapchain present.
+    /// Drive a native Vulkan frame with grids, images and UI overlays sharing
+    /// one dynamic-rendering pass and one swapchain present.
     ///
     /// Order of operations inside the pass:
     ///   1. swapchain image barrier `UNDEFINED → COLOR_ATTACHMENT_OPTIMAL`
     ///   2. `cmd_begin_rendering` with `LOAD_OP_CLEAR(bg)`
     ///   3. set viewport + scissor
-    ///   4. per-panel `GridRenderer::render_vulkan` (Phase 3+)
-    ///   5. `VulkanRenderer::draw_bootstrap` (debug rect, gated by env)
+    ///   4. image layers interleaved with grid backgrounds and text, then UI chrome
+    ///   5. UI text overlays
     ///   6. `cmd_end_rendering`
     ///   7. swapchain image barrier `COLOR_ATTACHMENT_OPTIMAL → PRESENT_SRC_KHR`
     ///   8. `present_frame` (queue submit + present)
@@ -1092,21 +1040,9 @@ impl Sugarloaf<'_> {
             device.cmd_set_scissor(cmd, 0, &[scissor]);
         }
 
-        // Per-panel grid passes — draw cell backgrounds + grid text
-        // underneath everything else. Vulkan doesn't yet interleave
-        // kitty image layers around the bg/text split — same as the
-        // wgpu path; follow-up.
-        for (grid, uniforms) in grids.iter_mut() {
-            grid.render_bg_vulkan(ctx, cmd, frame.slot, uniforms);
-            grid.render_text_vulkan(ctx, cmd, frame.slot, uniforms);
-        }
-
-        // Rich-text quad pass — `Sugarloaf::quad()` / `rect()` calls
-        // (command palette background, search overlay panel,
-        // assistant frame, etc.). Drawn AFTER grid so panel chrome
-        // covers cells underneath, BEFORE the text overlay so labels
-        // sit on top.
-        self.renderer.render_vulkan(cmd, &frame);
+        // Interleave Kitty's three image layers around grid backgrounds and
+        // glyphs, then draw UI chrome above the completed terminal contents.
+        self.renderer.render_vulkan(cmd, &frame, ctx, grids);
 
         // UI text overlay (tab titles, search overlay labels,
         // command palette items, etc.). Drawn last so labels sit on
@@ -1138,6 +1074,8 @@ impl Sugarloaf<'_> {
             _ => return,
         };
 
+        let acquire_timing =
+            tracing::debug_span!(target: "rio_profile", "gpu.acquire").entered();
         let frame = match ctx.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -1146,6 +1084,7 @@ impl Sugarloaf<'_> {
                 return;
             }
         };
+        drop(acquire_timing);
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -1230,7 +1169,6 @@ impl Sugarloaf<'_> {
             // Metal branch).
             #[cfg(not(target_os = "macos"))]
             {
-                self.text.init_wgpu(&ctx.device, &ctx.queue, ctx.format);
                 self.text
                     .render_wgpu(&mut rpass, [ctx.size.width, ctx.size.height]);
             }
@@ -1252,8 +1190,16 @@ impl Sugarloaf<'_> {
             }
             filters_brush.render(ctx, &mut encoder, &frame.texture, &frame.texture);
         }
-        ctx.queue.submit(Some(encoder.finish()));
-        ctx.queue.present(frame);
+        {
+            let _timing =
+                tracing::debug_span!(target: "rio_profile", "gpu.submit").entered();
+            ctx.queue.submit(Some(encoder.finish()));
+        }
+        {
+            let _timing =
+                tracing::debug_span!(target: "rio_profile", "gpu.present").entered();
+            ctx.queue.present(frame);
+        }
         self.reset();
     }
 }

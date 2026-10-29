@@ -1,7 +1,7 @@
 //! Typed parsing helpers for OSC (Operating System Command) sequences.
 //!
-//! The Williams parser hands the dispatcher a `&[&[u8]]` of separator-split
-//! parameter slices. Each helper here takes those raw slices and returns a
+//! The Williams parser hands the dispatcher a `&[&[u8]]` of parameter slices,
+//! preserving the payload tails of OSC 7, OSC 8 and OSC 9;9. Each helper returns a
 //! typed result for the corresponding OSC command, leaving the dispatcher in
 //! `handler.rs` as a thin glue layer.
 
@@ -74,7 +74,7 @@ pub(super) fn parse_semantic_prompt(
 pub(super) fn parse_set_user_var(params: &[&[u8]]) -> Option<(String, String)> {
     let payload = params.get(1)?.strip_prefix(b"SetUserVar=")?;
     let mut parts = payload.splitn(2, |byte| *byte == b'=');
-    let name = simd_utf8::from_utf8_fast(parts.next()?).ok()?;
+    let name = simd_utf8::validate(parts.next()?).ok()?;
     if name.is_empty() {
         return None;
     }
@@ -97,7 +97,7 @@ pub(super) fn xparse_color(color: &[u8]) -> Option<ColorRgb> {
 
 /// Parse colors in `rgb:r(rrr)/g(ggg)/b(bbb)` format.
 fn parse_rgb_color(color: &[u8]) -> Option<ColorRgb> {
-    let colors = simd_utf8::from_utf8_fast(color)
+    let colors = simd_utf8::validate(color)
         .ok()?
         .split('/')
         .collect::<Vec<_>>();
@@ -130,8 +130,7 @@ fn parse_legacy_color(color: &[u8]) -> Option<ColorRgb> {
 
     // Truncate/Fill to two byte precision.
     let color_from_slice = |slice: &[u8]| {
-        let col =
-            usize::from_str_radix(simd_utf8::from_utf8_fast(slice).ok()?, 16).ok()? << 4;
+        let col = usize::from_str_radix(simd_utf8::validate(slice).ok()?, 16).ok()? << 4;
         Some((col >> (4 * slice.len().saturating_sub(1))) as u8)
     };
 
@@ -168,11 +167,9 @@ pub(super) fn parse_title(params: &[&[u8]]) -> Option<String> {
     Some(
         params[1..]
             .iter()
-            .flat_map(|x| simd_utf8::from_utf8_fast(x))
+            .flat_map(|x| simd_utf8::validate(x))
             .collect::<Vec<&str>>()
-            .join(";")
-            .trim()
-            .to_owned(),
+            .join(";"),
     )
 }
 
@@ -219,7 +216,30 @@ fn strip_scheme<'a>(s: &'a str, scheme: &str) -> Option<&'a str> {
 /// far side of an ssh session, so a directory that belongs to another machine is
 /// refused rather than reported as ours.
 pub(super) fn parse_current_directory(param: &[u8]) -> Option<String> {
-    let s = simd_utf8::from_utf8_fast(param).ok()?;
+    let (host, path) = parse_directory(param)?;
+    host_is_local(&host).then_some(path)
+}
+
+pub(super) fn parse_remote_directory(param: &[u8]) -> Option<(String, String)> {
+    let (host, path) = parse_directory(param)?;
+    // A Windows drive path has a URI slash even when the receiving terminal
+    // runs on Unix. Preserve the leading slash on remote POSIX paths.
+    let bytes = path.as_bytes();
+    let path = if bytes.len() >= 4
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+        && matches!(bytes[3], b'/' | b'\\')
+    {
+        path[1..].to_owned()
+    } else {
+        path
+    };
+    (!host_is_local(&host)).then_some((host, path))
+}
+
+fn parse_directory(param: &[u8]) -> Option<(String, String)> {
+    let s = simd_utf8::validate(param).ok()?;
 
     let (after_scheme, percent_encoded) = match strip_scheme(s, FILE_SCHEME) {
         Some(rest) => (rest, true),
@@ -232,26 +252,25 @@ pub(super) fn parse_current_directory(param: &[u8]) -> Option<String> {
     let host = &after_scheme[..path_start];
     let path = &after_scheme[path_start..];
 
-    if !host_is_local(host) {
-        tracing::warn!("ignoring OSC 7 for non-local host {host:?}");
-        return None;
-    }
-
     // Windows paths arrive as `/C:/...` in both flavors; drop the
     // leading slash.
     #[cfg(windows)]
-    let path = path.strip_prefix('/').unwrap_or(path);
+    let path = if host_is_local(host) {
+        path.strip_prefix('/').unwrap_or(path)
+    } else {
+        path
+    };
 
     if !percent_encoded {
         // The kitty flavor is the path verbatim: `?`, `#` and `%` are
         // path bytes, not URL syntax.
-        return Some(path.to_string());
+        return Some((host.to_string(), path.to_string()));
     }
 
     // A query or fragment is not part of the path.
     let path = &path[..path.find(['?', '#']).unwrap_or(path.len())];
 
-    percent_decode(path)
+    Some((host.to_string(), percent_decode(path)?))
 }
 
 /// Whether an OSC 7 host names this machine.
@@ -301,7 +320,26 @@ fn read_hostname() -> Option<String> {
         .map(str::to_owned)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn read_hostname() -> Option<String> {
+    use windows_sys::Win32::System::SystemInformation::{
+        ComputerNameDnsHostname, GetComputerNameExW,
+    };
+    let mut buffer = [0_u16; 256];
+    let mut length = buffer.len() as u32;
+    // SAFETY: the buffer contains `length` writable UTF-16 code units.
+    if unsafe {
+        GetComputerNameExW(ComputerNameDnsHostname, buffer.as_mut_ptr(), &mut length)
+    } == 0
+    {
+        return None;
+    }
+    String::from_utf16(&buffer[..length as usize])
+        .ok()
+        .filter(|hostname| !hostname.is_empty())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn read_hostname() -> Option<String> {
     // No lookup here, so `host_is_local` falls back to accepting the payload,
     // which is what rio did on every platform before.
@@ -350,17 +388,19 @@ pub(super) fn parse_hyperlink_id(link_params: &[u8]) -> Option<&str> {
     link_params
         .split(|&b| b == b':')
         .find_map(|kv| kv.strip_prefix(b"id="))
-        .and_then(|kv| simd_utf8::from_utf8_fast(kv).ok())
+        .and_then(|kv| simd_utf8::validate(kv).ok())
 }
 
 /// Construct a [`Hyperlink`] from the link params + URI bytes. Returns
 /// `None` for an empty URI (caller should clear the active hyperlink).
+/// Malformed UTF-8 is replaced because hyperlink targets are stored as strings.
 pub(super) fn parse_hyperlink(link_params: &[u8], uri_param: &[u8]) -> Option<Hyperlink> {
-    let uri = simd_utf8::from_utf8_fast(uri_param).unwrap_or_default();
+    let uri = String::from_utf8_lossy(uri_param);
     if uri.is_empty() {
         return None;
     }
-    Some(Hyperlink::new(parse_hyperlink_id(link_params), uri))
+    let id = parse_hyperlink_id(link_params).filter(|id| !id.is_empty());
+    Some(Hyperlink::new(id, &*uri))
 }
 
 /// OSC 9;4 — ConEmu/Windows-Terminal progress reporting.
@@ -385,23 +425,10 @@ pub(super) fn parse_progress_report(params: &[&[u8]]) -> Option<ProgressReport> 
     Some(ProgressReport { state, progress })
 }
 
-/// Rejoin `params[from..]` with the `;` the OSC parser split on, so a
-/// payload defined as verbatim text survives a `;` inside it.
-pub(super) fn join_params(params: &[&[u8]], from: usize) -> Option<String> {
-    Some(
-        params
-            .get(from..)?
-            .iter()
-            .map(|param| simd_utf8::from_utf8_fast(param).ok())
-            .collect::<Option<Vec<_>>>()?
-            .join(";"),
-    )
-}
-
 /// OSC 9;9: ConEmu/Windows-Terminal working directory report, the
 /// Windows counterpart of OSC 7. Format: `9;9;<path>`, with the path
 /// optionally wrapped in double quotes and travelling verbatim (no URL
-/// encoding), so everything after `9;9;` is rejoined.
+/// encoding). The parser retains everything after `9;9;` as one parameter.
 ///
 /// The sequence carries no host field, so unlike OSC 7 a remote shell
 /// cannot be told apart from a local one (ConEmu and Windows Terminal
@@ -411,11 +438,11 @@ pub(super) fn parse_conemu_working_directory(params: &[&[u8]]) -> Option<String>
     if params.len() < 3 || params[1] != b"9" {
         return None;
     }
-    let path = join_params(params, 2)?;
+    let path = simd_utf8::validate(params[2]).ok()?;
     let path = path
         .strip_prefix('"')
         .and_then(|p| p.strip_suffix('"'))
-        .unwrap_or(&path);
+        .unwrap_or(path);
     if !is_absolute_path(path) {
         return None;
     }
@@ -595,8 +622,7 @@ mod tests {
             parse(&[b"9", b"9", b"\"C:\\Program Files\""]),
             Some("C:\\Program Files".into())
         );
-        // A `;` in the path arrives as extra params and is rejoined.
-        assert_eq!(parse(&[b"9", b"9", b"C:\\a", b"b"]), Some("C:\\a;b".into()));
+        assert_eq!(parse(&[b"9", b"9", b"C:\\a;b"]), Some("C:\\a;b".into()));
 
         // Progress reports and notifications are not directories.
         assert_eq!(parse(&[b"9", b"4", b"1", b"50"]), None);
@@ -616,13 +642,23 @@ mod tests {
     }
 
     #[test]
-    fn join_params_restores_split_semicolons() {
+    fn hyperlink_identity_and_closure() {
+        let uri = b"https://example.com/a;b;";
+        assert!(parse_hyperlink(b"id=one", b"").is_none());
+        let first = parse_hyperlink(b"id=", uri).unwrap();
+        let second = parse_hyperlink(b"id=", uri).unwrap();
+        assert_ne!(first.id(), second.id());
+        assert_eq!(first.uri(), "https://example.com/a;b;");
+        assert_eq!(parse_hyperlink(b"id=one:id=two", uri).unwrap().id(), "one");
         assert_eq!(
-            join_params(&[b"7", b"kitty-shell-cwd://h/tmp/a", b"b"], 1),
-            Some("kitty-shell-cwd://h/tmp/a;b".into())
+            parse_hyperlink(b"other=value:id=two", uri).unwrap().id(),
+            "two"
         );
-        assert_eq!(join_params(&[b"7", b"x"], 1), Some("x".into()));
-        assert_eq!(join_params(&[b"7"], 1), Some(String::new()));
+        assert_eq!(parse_hyperlink(b"id=\xff", uri).unwrap().uri(), first.uri());
+        assert_eq!(
+            parse_hyperlink(b"", b"file:///caf\xe9").unwrap().uri(),
+            "file:///caf\u{fffd}"
+        );
     }
 
     #[cfg(not(windows))]
@@ -645,10 +681,8 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn kitty_shell_cwd_keeps_semicolons_after_rejoin() {
-        // The handler rejoins split params before calling the parser.
-        let payload = join_params(&[b"7", b"kitty-shell-cwd:///tmp/a", b"b"], 1).unwrap();
-        assert_eq!(cwd(&payload), Some("/tmp/a;b".into()));
+    fn kitty_shell_cwd_keeps_semicolons() {
+        assert_eq!(cwd("kitty-shell-cwd:///tmp/a;b"), Some("/tmp/a;b".into()));
     }
 
     #[cfg(not(windows))]
@@ -679,12 +713,61 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn remote_windows_directory_strips_uri_slash_on_any_client() {
+        for (payload, expected) in [
+            (
+                "kitty-shell-cwd://remote.invalid/C:\\Users\\a b",
+                "C:\\Users\\a b",
+            ),
+            ("file://remote.invalid/C:/Users/a%20b", "C:/Users/a b"),
+            ("file://remote.invalid/home/user", "/home/user"),
+        ] {
+            assert_eq!(
+                parse_remote_directory(payload.as_bytes()),
+                Some(("remote.invalid".into(), expected.into()))
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
     #[test]
     fn kitty_shell_cwd_rejects_remote_hosts() {
         assert_eq!(
             cwd("kitty-shell-cwd://other-machine.example/home/user"),
             None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_current_directory_keeps_remote_posix_paths_separate() {
+        use crate::ansi::CursorShape;
+        use crate::crosswords::{Crosswords, CrosswordsSize};
+        use crate::event::{VoidListener, WindowId};
+        use crate::performer::handler::Processor;
+        let mut term = Crosswords::new(
+            CrosswordsSize::new(20, 5),
+            CursorShape::Block,
+            VoidListener,
+            WindowId::from(0),
+            0,
+            10,
+        );
+        let mut processor = Processor::default();
+        processor.advance(&mut term, b"\x1b]7;file:///C:/Windows\x07");
+        processor.advance(
+            &mut term,
+            b"\x1b]7;kitty-shell-cwd://other-machine.invalid/tmp\x07",
+        );
+        assert_eq!(
+            term.current_directory.as_deref(),
+            Some(std::path::Path::new("C:/Windows"))
+        );
+        assert_eq!(
+            term.remote_directory,
+            Some(("other-machine.invalid".into(), "/tmp".into()))
         );
     }
 
@@ -767,5 +850,11 @@ mod tests {
             term.current_directory.as_deref(),
             Some(std::path::Path::new("/home/My Files"))
         );
+        assert_eq!(
+            term.remote_directory,
+            Some(("not-this-machine.invalid".into(), "/tmp".into()))
+        );
+        processor.advance(&mut term, b"\x1b]7;file:///home/back\x1b\\");
+        assert!(term.remote_directory.is_none());
     }
 }

@@ -2,16 +2,21 @@
 // https://github.com/alacritty/alacritty/blob/e35e5ad14fce8456afdd89f2b392b9924bb27471/alacritty_terminal/src/grid/resize.rs
 // which is licensed under Apache 2.0 license.
 
-use crate::crosswords::grid::{Dimensions, Grid, ReflowRemap};
-use crate::crosswords::pos::{Boundary, Column, Line};
+use crate::crosswords::grid::{
+    Dimensions, Grid, GridSquare, ReflowRemap, ViewportAnchor,
+};
+use crate::crosswords::pos::{Column, Line};
 use crate::crosswords::square::{Square, Wide};
 use crate::crosswords::Row;
-use std::cmp::{max, min, Ordering};
+use std::cmp::{min, Ordering};
 use std::mem;
 
 impl Grid<Square> {
     /// Resize the grid's width and/or height.
     pub fn resize(&mut self, reflow: bool, lines: usize, columns: usize) {
+        let was_pending = self.cursor.should_wrap;
+        let mut cursor_lost = false;
+        self.apply_history_byte_limit(columns);
         // Use empty template cell for resetting cells due to resize.
         let template = mem::take(&mut self.cursor.template);
 
@@ -19,41 +24,85 @@ impl Grid<Square> {
         // one from an earlier resize must not leak through.
         self.reflow_remap = None;
 
+        if !reflow && columns != self.columns {
+            self.resize_columns_without_reflow(columns);
+        }
+
+        // Wider columns must unwrap before changing the viewport height.
+        let grow_columns_first = reflow && columns > self.columns;
+        if grow_columns_first {
+            self.grow_columns(reflow, columns);
+        }
         match self.lines.cmp(&lines) {
-            Ordering::Less => self.grow_lines(lines),
-            Ordering::Greater => self.shrink_lines(lines),
+            Ordering::Less => self.grow_lines(lines, columns >= self.columns),
+            Ordering::Greater => cursor_lost = self.shrink_lines(lines),
             Ordering::Equal => (),
         }
 
         match self.columns.cmp(&columns) {
-            Ordering::Less => self.grow_columns(reflow, columns),
+            Ordering::Less if !grow_columns_first => self.grow_columns(reflow, columns),
             Ordering::Greater => self.shrink_columns(reflow, columns),
-            Ordering::Equal => (),
+            _ => (),
         }
 
         // Restore template cell.
         self.cursor.template = template;
+        if cursor_lost && was_pending {
+            self.cursor.pos.col = Column(1.min(columns - 1));
+            self.cursor.should_wrap = columns == 1;
+        }
+        self.apply_history_byte_limit(columns);
+        self.display_anchor = match self.display_anchor {
+            ViewportAnchor::Top => {
+                self.display_offset = self.history_size();
+                ViewportAnchor::Top
+            }
+            ViewportAnchor::Cell(col) if self.display_offset != 0 => {
+                ViewportAnchor::Cell(col.min(columns - 1))
+            }
+            _ => {
+                self.display_offset = 0;
+                ViewportAnchor::Active
+            }
+        };
     }
 
     /// Add lines to the visible area.
     ///
-    /// Rio keeps the cursor at the bottom of the terminal as long as there
-    /// is scrollback available. Once scrollback is exhausted, new lines are
-    /// simply added to the bottom of the screen.
-    fn grow_lines(&mut self, target: usize) {
+    /// Pull history only when the cursor is at the old bottom. Otherwise
+    /// append blanks so growth preserves its row, as Ghostty does.
+    fn grow_lines(&mut self, target: usize, pull_scrollback: bool) {
         let lines_added = target - self.lines;
+        // Ghostty's intermediate row resize can absorb a cell pin into
+        // the active area before a subsequent column shrink reflows it.
+        if matches!(self.display_anchor, ViewportAnchor::Cell(_))
+            && !pull_scrollback
+            && self.display_offset <= lines_added
+        {
+            self.display_offset = 0;
+            self.display_anchor = ViewportAnchor::Active;
+        }
+        let pull_history =
+            pull_scrollback && self.cursor.pos.row.0 as usize == self.lines - 1;
 
         // Need to resize before updating buffer.
         self.raw.grow_visible_lines(target);
         self.lines = target;
 
         let history_size = self.history_size();
-        let from_history = min(history_size, lines_added);
+        let from_history = if pull_history {
+            min(history_size, lines_added)
+        } else {
+            0
+        };
 
         // Move existing lines up for every line that couldn't be pulled from history.
         if from_history != lines_added {
             let delta = lines_added - from_history;
-            self.scroll_up(&(Line(0)..Line(target as i32)), delta);
+            // Append without scrolling: no history may be evicted merely
+            // because the window grew, even when the history is full.
+            self.raw.rotate(-(delta as isize));
+            self.reset_rows(Line((target - delta) as i32)..Line(target as i32));
         }
 
         // Move cursor down for every line pulled from history.
@@ -65,500 +114,414 @@ impl Grid<Square> {
         // the reflow paths do: an offset past the remaining history makes
         // `visible_line_bounds` request rows the storage doesn't have.
         self.display_offset = self.display_offset.saturating_sub(from_history);
-        self.decrease_scroll_limit(lines_added);
+        self.decrease_scroll_limit(from_history);
         self.display_offset = min(self.display_offset, self.history_size());
     }
 
     /// Remove lines from the visible area.
     ///
-    /// The behavior in Terminal.app and iTerm.app is to keep the cursor at the
-    /// bottom of the screen. This is achieved by pushing history "out the top"
-    /// of the terminal window.
-    ///
-    /// Rio takes the same approach.
-    fn shrink_lines(&mut self, target: usize) {
-        // Scroll up to keep content inside the window.
-        let required_scrolling =
-            (self.cursor.pos.row.0 as usize + 1).saturating_sub(target);
+    /// Trim trailing text-free rows where possible, preserving cursor and
+    /// image pins. Move the remaining excess rows into history.
+    fn shrink_lines(&mut self, target: usize) -> bool {
+        let shrinkage = self.lines - target;
+        let mut trimmed = 0;
+        let active_top = self.lines_evicted() as i64 + self.history_size() as i64;
+        for row in (target..self.lines).rev() {
+            if self.cursor.pos.row.0 as usize == row
+                || self.saved_cursor.pos.row.0 as usize == row
+                || self
+                    .reflow_protected_rows
+                    .contains(&(active_top + row as i64))
+                || self[Line(row as i32)].inner.iter().any(|cell| {
+                    !cell.is_bg_only()
+                        && !matches!(cell.c(), '\0' | '\t')
+                        && !matches!(cell.wide(), Wide::Spacer | Wide::LeadingSpacer)
+                })
+            {
+                break;
+            }
+            trimmed += 1;
+        }
+        let required_scrolling = shrinkage - trimmed;
+        let cursor_lost = self.cursor.pos.row.0 < required_scrolling as i32;
         if required_scrolling > 0 {
             self.scroll_up(&(Line(0)..Line(self.lines as i32)), required_scrolling);
-
-            // Clamp cursors to the new viewport size.
-            self.cursor.pos.row = min(self.cursor.pos.row, Line(target as i32 - 1));
+            if self.cursor.pos.row.0 < required_scrolling as i32 {
+                self.cursor.pos.row = Line(0);
+                self.cursor.pos.col = Column(0);
+                self.cursor.should_wrap = false;
+            } else {
+                self.cursor.pos.row -= required_scrolling;
+            }
         }
 
-        // Clamp saved cursor, since only primary cursor is scrolled into viewport.
-        self.saved_cursor.pos.row =
-            min(self.saved_cursor.pos.row, Line(target as i32 - 1));
+        // Keep the saved cursor attached to the same cell when rows move into
+        // history. If that cell leaves the active viewport, reset its position
+        // like Ghostty's saved-cursor pin fallback.
+        let saved_row = self.saved_cursor.pos.row - required_scrolling;
+        if saved_row.0 >= 0 && saved_row.0 < target as i32 {
+            self.saved_cursor.pos.row = saved_row;
+        } else {
+            self.saved_cursor.pos.row = Line(0);
+            self.saved_cursor.pos.col = Column(0);
+            self.saved_cursor.should_wrap = false;
+        }
 
-        self.raw.rotate((self.lines - target) as isize);
+        self.raw.rotate(shrinkage as isize);
         self.raw.shrink_visible_lines(target);
         self.lines = target;
         // Rows moved into history above; same defensive clamp as
         // `grow_lines` and the column reflows.
         self.display_offset = min(self.display_offset, self.history_size());
+        cursor_lost
     }
 
-    /// Grow number of columns in each row, reflowing if necessary.
+    /// Resize columns without rebuilding rows when no cells need reflow.
     fn grow_columns(&mut self, reflow: bool, columns: usize) {
-        // Check if a row needs to be wrapped.
-        let should_reflow = |row: &Row<Square>| -> bool {
-            let len = Column(row.len());
-            reflow && len.0 > 0 && len < columns && row[len - 1].wrapline()
-        };
-
-        // Fast path: when no row is soft-wrapped into the next there is
-        // nothing to rejoin, so growing is a per-row blank extension with no
-        // content movement. The full reflow loop below would, in that case,
-        // re-push every row unchanged and grow it to `columns`, so this is
-        // equivalent while skipping `take_all` and the two temporary buffers.
-        // Skipped when tracking image placements, since the full path also
-        // builds their row remap.
-        if !self.track_reflow_remap && !self.raw.rows().any(should_reflow) {
+        if !reflow {
+            self.resize_columns_without_reflow(columns);
+        } else if !self.track_reflow_remap
+            && self
+                .raw
+                .rows()
+                .all(|row| !row[Column(row.len() - 1)].wrapline())
+        {
             self.columns = columns;
-            // Undo the linewrap special case exactly as the full path does.
-            if self.cursor.should_wrap && reflow {
-                self.cursor.should_wrap = false;
-                self.cursor.pos.col += 1;
-            }
             self.raw.grow_all_rows(columns);
-            return;
-        }
-
-        self.columns = columns;
-
-        let mut reversed: Vec<Row<Square>> = Vec::with_capacity(self.raw.len());
-        let mut cursor_line_delta = 0;
-
-        // Remove the linewrap special case, by moving the cursor outside of the grid.
-        if self.cursor.should_wrap && reflow {
-            self.cursor.should_wrap = false;
-            self.cursor.pos.col += 1;
-        }
-
-        let mut rows = self.raw.take_all();
-        let old_len = rows.len();
-        // Exact row tracking for image placements: rows are walked
-        // oldest-first, and a row's absolute index is `base_abs +
-        // oldest-first position` on both sides of the reflow.
-        let mut remap = self.track_reflow_remap.then(|| ReflowRemap {
-            base_abs: self.lines_evicted(),
-            new_pos: vec![-1; old_len],
-        });
-
-        for (i, mut row) in rows.drain(..).enumerate().rev() {
-            // Index of the merge target while `last_row` holds the
-            // mutable borrow below.
-            let merge_target = reversed.len().wrapping_sub(1);
-
-            // Check if reflowing should be performed.
-            let last_row = match reversed.last_mut() {
-                Some(last_row) if should_reflow(last_row) => last_row,
-                _ => {
-                    reversed.push(row);
-                    if let Some(r) = remap.as_mut() {
-                        r.new_pos[old_len - 1 - i] = (reversed.len() - 1) as i64;
-                    }
-                    continue;
+            for cursor in [&mut self.cursor, &mut self.saved_cursor] {
+                if cursor.should_wrap {
+                    cursor.should_wrap = false;
+                    cursor.pos.col += 1;
                 }
-            };
-
-            // Remove wrap flag before appending additional cells.
-            if let Some(cell) = last_row.last_mut() {
-                cell.set_wrapline(false);
             }
+        } else {
+            self.reflow_columns(columns);
+        }
+    }
 
-            // Remove leading spacers when reflowing wide char to the previous line.
-            let mut last_len = last_row.len();
-            if last_len >= 1
-                && matches!(last_row[Column(last_len - 1)].wide(), Wide::LeadingSpacer)
-            {
-                last_row.shrink(last_len - 1);
-                last_len -= 1;
-            }
+    fn shrink_columns(&mut self, reflow: bool, columns: usize) {
+        if !reflow {
+            self.resize_columns_without_reflow(columns);
+        } else if !self.track_reflow_remap
+            && self.cursor.pos.col.0 < columns
+            && self.saved_cursor.pos.col.0 < columns
+            && self
+                .raw
+                .rows()
+                .all(|row| row.inner[columns..].iter().all(GridSquare::is_empty))
+        {
+            self.columns = columns;
+            self.raw.shrink_all_rows(columns);
+        } else {
+            self.reflow_columns(columns);
+        }
+    }
 
-            // Don't try to pull more cells from the next line than available.
-            let mut num_wrapped = columns - last_len;
-            let len = min(row.len(), num_wrapped);
-
-            // Move the wrapped cells from the front of `row` onto the end of
-            // `last_row`, in place (no per-row temporary allocation).
-            let mut first_cell_moved = true;
-            if matches!(row[Column(len - 1)].wide(), Wide::Wide) {
-                num_wrapped -= 1;
-
-                // With a single free column, only the spacer is
-                // appended and the wide char stays on this row.
-                first_cell_moved = len > 1;
-
-                last_row.append_front_of(&mut row, len - 1);
-
-                let mut spacer = Square::default();
-                spacer.set_wide(Wide::LeadingSpacer);
-                last_row.inner.push(spacer);
-                last_row.occ += 1;
+    fn resize_columns_without_reflow(&mut self, columns: usize) {
+        // Spare storage rows must not retain an obsolete width and later
+        // reappear when the viewport grows.
+        self.raw.truncate();
+        let old_columns = self.columns;
+        if self.track_reflow_remap {
+            self.reflow_remap = Some(ReflowRemap {
+                base_abs: self.lines_evicted(),
+                new_pos: (0..self.raw.len()).map(|row| row as i64).collect(),
+                cells: self
+                    .reflow_protected_cells
+                    .iter()
+                    .map(|&(row, col)| ((row, col), (row, col.min(columns - 1))))
+                    .collect(),
+            });
+        }
+        for line in self.topmost_line().0..self.lines as i32 {
+            let row = &mut self.raw[Line(line)];
+            let wrap = row[Column(old_columns - 1)].wrapline();
+            row[Column(old_columns - 1)].set_wrapline(false);
+            if columns > old_columns {
+                row.grow(columns);
+                row.wrap_continuation = false;
             } else {
-                last_row.append_front_of(&mut row, len);
+                if row[Column(columns - 1)].wide() == Wide::Wide {
+                    row[Column(columns - 1)] = Square::default();
+                }
+                row.truncate_columns(columns);
             }
-
-            // The old row's first cell just landed at the end of the
-            // merge target, unless the wide-char spacer case kept it
-            // on this row; then it lands with the push below (the
-            // dropped-as-clear paths are unreachable while the row
-            // still holds the wide char).
-            if first_cell_moved {
-                if let Some(r) = remap.as_mut() {
-                    r.new_pos[old_len - 1 - i] = merge_target as i64;
-                }
+            row[Column(columns - 1)].set_wrapline(wrap && columns < old_columns);
+        }
+        self.columns = columns;
+        for cursor in [&mut self.cursor, &mut self.saved_cursor] {
+            cursor.pos.col = min(cursor.pos.col, Column(columns - 1));
+            if cursor.should_wrap && cursor.pos.col.0 != columns - 1 {
+                cursor.should_wrap = false;
+                cursor.pos.col += 1;
             }
+        }
+    }
 
-            let cursor_buffer_line = self.lines - self.cursor.pos.row.0 as usize - 1;
-
-            if i == cursor_buffer_line && reflow {
-                // Resize cursor's line and reflow the cursor if necessary.
-                let mut target = self.cursor.pos.sub(self, Boundary::Cursor, num_wrapped);
-
-                // Clamp to the last column, if no content was reflown with the cursor.
-                if target.col.0 == 0 && row.is_clear() {
-                    self.cursor.should_wrap = true;
-                    target = target.sub(self, Boundary::Cursor, 1);
+    /// Reflow oldest-first, retaining the actual cell under each cursor.
+    /// Empty hard lines are deferred so trailing blanks can be replaced by
+    /// the new viewport padding. This follows Ghostty's ReflowCursor policy.
+    fn reflow_columns(&mut self, columns: usize) {
+        let old_columns = self.columns;
+        let cursor_row = self.history_size() + self.cursor.pos.row.0 as usize;
+        let saved_row = self.history_size() + self.saved_cursor.pos.row.0 as usize;
+        let cursor_col = self.cursor.pos.col.0;
+        let mut saved_col = self.saved_cursor.pos.col.0;
+        let remaining = self.lines - self.cursor.pos.row.0 as usize - 1;
+        let old_top = self.history_size();
+        let was_scrolled = self.display_anchor != ViewportAnchor::Active;
+        let (viewport_row, mut viewport_col) = match self.display_anchor {
+            ViewportAnchor::Cell(col) => (Some(old_top - self.display_offset), col),
+            _ => (None, 0),
+        };
+        let mut viewport_location = None;
+        let base_abs = self.lines_evicted();
+        let mut source = self.raw.take_all();
+        source.reverse();
+        let old_wrapped = (old_top..=cursor_row)
+            .filter(|&row| source[row].wrap_continuation)
+            .count();
+        let mut remap = self.track_reflow_remap.then(|| ReflowRemap {
+            base_abs,
+            new_pos: vec![-1; source.len()],
+            cells: std::collections::HashMap::new(),
+        });
+        let mut output = vec![Row::<Square>::new(columns)];
+        let mut col = 0;
+        let mut deferred = 0;
+        let mut cursor_location = None;
+        let mut saved_location = None;
+        for (old_row, row) in source.iter().enumerate() {
+            let wrapped = row[Column(old_columns - 1)].wrapline();
+            let mut len = if wrapped {
+                old_columns
+            } else {
+                row.inner
+                    .iter()
+                    .rposition(|cell| !cell.is_empty())
+                    .map_or(0, |i| i + 1)
+            };
+            if row.semantic_prompt != super::row::SemanticPrompt::None {
+                len = len.max(1);
+            }
+            let start = if deferred != 0 || col == columns {
+                0
+            } else {
+                col
+            };
+            if old_row == saved_row {
+                if saved_col >= len {
+                    saved_col = saved_col.min(columns - 1 - start);
                 }
-                self.cursor.pos.col = target.col;
-
-                // Get required cursor line changes. Since `num_wrapped` is smaller than `columns`
-                // this will always be either `0` or `1`.
-                let line_delta = self.cursor.pos.row - target.row;
-
-                if line_delta != 0 && row.is_clear() {
-                    continue;
+                len = len.max(saved_col + 1);
+            }
+            let abs_row = base_abs as i64 + old_row as i64;
+            let pins: Vec<_> = self
+                .reflow_protected_cells
+                .iter()
+                .filter_map(|&(row, col)| {
+                    if row != abs_row {
+                        return None;
+                    }
+                    let x = if col >= len {
+                        col.min(columns - 1 - start)
+                    } else {
+                        col
+                    };
+                    len = len.max(x + 1);
+                    Some(((row, col), x))
+                })
+                .collect();
+            if old_row == cursor_row {
+                len = len.max(cursor_col + 1);
+            }
+            if Some(old_row) == viewport_row {
+                if viewport_col >= len {
+                    viewport_col = viewport_col.min(columns - 1 - start);
                 }
-
-                cursor_line_delta += line_delta.0 as usize;
-            } else if row.is_clear() {
-                if i < self.display_offset {
-                    // Since we removed a line, rotate down the viewport.
-                    self.display_offset = self.display_offset.saturating_sub(1);
+                len = len.max(viewport_col + 1);
+            }
+            let protected = self.reflow_protected_rows.iter().any(|&pin| {
+                u64::try_from(pin).ok() == base_abs.checked_add(old_row as u64)
+            });
+            if protected {
+                len = len.max(1);
+            }
+            if len == 0 {
+                if !row.wrap_continuation {
+                    deferred += 1;
                 }
-
-                // Rotate cursor down if content below them was pulled from history.
-                if i < cursor_buffer_line {
-                    self.cursor.pos.row += 1;
-                }
-
-                // Don't push line into the new buffer.
                 continue;
             }
-
-            if let Some(cell) = last_row.last_mut() {
-                // Set wrap flag if next line still has cells.
-                cell.set_wrapline(true);
+            if deferred != 0 {
+                output.resize_with(output.len() + deferred, || Row::new(columns));
+                col = 0;
+                deferred = 0;
             }
-
-            reversed.push(row);
-            if !first_cell_moved {
-                if let Some(r) = remap.as_mut() {
-                    r.new_pos[old_len - 1 - i] = (reversed.len() - 1) as i64;
+            output.last_mut().unwrap().semantic_prompt = row.semantic_prompt;
+            let mut x = 0;
+            while x < len {
+                if col == columns {
+                    output.last_mut().unwrap()[Column(columns - 1)].set_wrapline(true);
+                    let mut next = Row::new(columns);
+                    next.semantic_prompt = row.semantic_prompt;
+                    next.wrap_continuation = true;
+                    output.push(next);
+                    col = 0;
                 }
-            }
-        }
-
-        // Make sure we have at least the viewport filled.
-        if reversed.len() < self.lines {
-            let delta = (self.lines - reversed.len()) as i32;
-            self.cursor.pos.row = max(self.cursor.pos.row - delta, Line(0));
-            reversed.resize_with(self.lines, || Row::new(columns));
-        }
-
-        // Pull content down to put cursor in correct position, or move cursor up if there's no
-        // more lines to delete below the cursor.
-        if cursor_line_delta != 0 {
-            let cursor_buffer_line = self.lines - self.cursor.pos.row.0 as usize - 1;
-            let available = min(cursor_buffer_line, reversed.len() - self.lines);
-            let overflow = cursor_line_delta.saturating_sub(available);
-            reversed.truncate(reversed.len() + overflow - cursor_line_delta);
-            self.cursor.pos.row = max(self.cursor.pos.row - overflow, Line(0));
-        }
-
-        // Restore oldest-first order in place and fill all rows that are
-        // still too short. Reusing `reversed` avoids allocating a second
-        // full row buffer, which matters when reflowing a long scrollback.
-        reversed.reverse();
-        for row in reversed.iter_mut() {
-            if row.len() < columns {
-                row.grow(columns);
-            }
-        }
-
-        self.raw.replace_inner(reversed);
-
-        // Clamp display offset in case lines above it got merged.
-        self.display_offset = min(self.display_offset, self.history_size());
-
-        self.reflow_remap = remap;
-    }
-
-    /// Shrink number of columns in each row, reflowing if necessary.
-    fn shrink_columns(&mut self, reflow: bool, columns: usize) {
-        // Fast path: if no row has occupied content beyond `columns` there is
-        // nothing to wrap down, so shrinking is a per-row truncation of
-        // trailing blank cells. Wrapped rows are full width, so `occ <=
-        // columns` also rules them out. Requires the cursor to fit (otherwise
-        // the full path wraps it onto a new line, which is not a plain
-        // truncation) and no image-placement tracking (whose remap the full
-        // path builds).
-        let effective_cursor_col =
-            self.cursor.pos.col.0 + usize::from(self.cursor.should_wrap && reflow);
-        if !self.track_reflow_remap
-            && (!reflow || effective_cursor_col <= columns)
-            && self.raw.rows().all(|row| row.occ <= columns)
-        {
-            self.columns = columns;
-            if self.cursor.should_wrap && reflow {
-                self.cursor.should_wrap = false;
-                self.cursor.pos.col += 1;
-            }
-            self.raw.shrink_all_rows(columns);
-
-            // Clamp the cursor to the new width, mirroring the full path's tail.
-            if !reflow {
-                self.cursor.pos.col = min(self.cursor.pos.col, Column(columns - 1));
-            } else if self.cursor.pos.col == columns
-                && !self[self.cursor.pos.row][Column(columns - 1)].wrapline()
-            {
-                self.cursor.should_wrap = true;
-                self.cursor.pos.col -= 1;
-            } else {
-                self.cursor.pos = self.cursor.pos.grid_clamp(self, Boundary::Cursor);
-            }
-            self.saved_cursor.pos.col =
-                min(self.saved_cursor.pos.col, Column(columns - 1));
-            return;
-        }
-
-        self.columns = columns;
-
-        // Remove the linewrap special case, by moving the cursor outside of the grid.
-        if self.cursor.should_wrap && reflow {
-            self.cursor.should_wrap = false;
-            self.cursor.pos.col += 1;
-        }
-
-        let mut new_raw = Vec::with_capacity(self.raw.len());
-        let mut buffered: Option<Vec<Square>> = None;
-
-        let mut rows = self.raw.take_all();
-        let old_len = rows.len();
-        // See `grow_columns`; `base_abs + position` also survives the
-        // cap truncation below because dropping the N oldest rows
-        // advances the eviction base by the same N.
-        let mut remap = self.track_reflow_remap.then(|| ReflowRemap {
-            base_abs: self.lines_evicted(),
-            new_pos: vec![-1; old_len],
-        });
-
-        // Each old row's first cell, as (old position, offset from the
-        // head of the not-yet-pushed cell stream). Recorded at the
-        // push that consumes the cell. Offsets survive across old-row
-        // iterations because a displaced wide char can travel in the
-        // buffered tail into the next iteration's first push.
-        let mut trackers: Vec<(usize, i64)> = Vec::new();
-
-        for (i, mut row) in rows.drain(..).enumerate().rev() {
-            if remap.is_some() {
-                let own_first = buffered.as_ref().map_or(0, |b| b.len()) as i64;
-                trackers.push((old_len - 1 - i, own_first));
-            }
-
-            // Append lines left over from the previous row.
-            if let Some(buffered) = buffered.take() {
-                // Add a column for every cell added before the cursor, if it goes beyond the new
-                // width it is then later reflown.
-                let cursor_buffer_line = self.lines - self.cursor.pos.row.0 as usize - 1;
-                if i == cursor_buffer_line {
-                    self.cursor.pos.col += buffered.len();
+                let position = (output.len() - 1, col);
+                if old_row == cursor_row && x == cursor_col && cursor_location.is_none() {
+                    cursor_location = Some(position);
                 }
-
-                row.append_front(buffered);
-            }
-
-            loop {
-                // Remove all cells which require reflowing.
-                let mut wrapped = match row.shrink(columns) {
-                    Some(wrapped) if reflow => wrapped,
-                    _ => {
-                        let cursor_buffer_line =
-                            self.lines - self.cursor.pos.row.0 as usize - 1;
-                        if reflow
-                            && i == cursor_buffer_line
-                            && self.cursor.pos.col > columns
-                        {
-                            // If there are empty cells before the cursor, we assume it is explicit
-                            // whitespace and need to wrap it like normal content.
-                            Vec::new()
-                        } else {
-                            // Since it fits, just push the existing line without any reflow.
-                            new_raw.push(row);
-                            if let Some(r) = remap.as_mut() {
-                                for (p, _) in trackers.drain(..) {
-                                    r.new_pos[p] = (new_raw.len() - 1) as i64;
-                                }
-                            }
-                            break;
-                        }
-                    }
-                };
-
-                // Insert spacer if a wide char would be wrapped into the last column.
-                let mut displaced = 0i64;
-                if row.len() >= columns
-                    && matches!(row[Column(columns - 1)].wide(), Wide::Wide)
+                if old_row == saved_row && x == saved_col && saved_location.is_none() {
+                    saved_location = Some(position);
+                }
+                if Some(old_row) == viewport_row
+                    && x == viewport_col
+                    && viewport_location.is_none()
                 {
-                    if columns < 2 {
-                        // Displacing the char into the next row would never
-                        // terminate here: column 0 is also the last column,
-                        // so it would be displaced again every iteration
-                        // while `new_raw` grew without bound. Destroy the
-                        // wide char and leave a blank narrow cell, and drop the
-                        // Spacer that followed it so it cannot claim a row
-                        // of its own.
-                        row[Column(columns - 1)] = Square::default();
-                        while matches!(
-                            wrapped.first().map(|cell| cell.wide()),
-                            Some(Wide::Spacer)
-                        ) {
-                            wrapped.remove(0);
+                    viewport_location = Some(position);
+                }
+                if let Some(remap) = remap.as_mut() {
+                    for &(key, pin_x) in &pins {
+                        if pin_x == x {
+                            remap.cells.entry(key).or_insert((
+                                base_abs as i64 + position.0 as i64,
+                                position.1,
+                            ));
                         }
-                    } else {
-                        let mut spacer = Square::default();
-                        spacer.set_wide(Wide::LeadingSpacer);
-
-                        let wide_char =
-                            mem::replace(&mut row[Column(columns - 1)], spacer);
-                        wrapped.insert(0, wide_char);
-                        displaced = 1;
+                    }
+                    if remap.new_pos[old_row] == -1 {
+                        remap.new_pos[old_row] = position.0 as i64;
                     }
                 }
-
-                // Remove wide char spacer before shrinking.
-                let len = wrapped.len();
-                if len > 0 && matches!(wrapped[len - 1].wide(), Wide::LeadingSpacer) {
-                    if len == 1 {
-                        row[Column(columns - 1)].set_wrapline(true);
-                        new_raw.push(row);
-                        if let Some(r) = remap.as_mut() {
-                            for (p, _) in trackers.drain(..) {
-                                r.new_pos[p] = (new_raw.len() - 1) as i64;
+                let mut cell = row.inner.get(x).copied().unwrap_or_default();
+                cell.set_wrapline(false);
+                if cell.wide() == Wide::LeadingSpacer {
+                    x += 1;
+                    continue;
+                }
+                if cell.wide() == Wide::Wide && columns > 1 && col == columns - 1 {
+                    let mut spacer = Square::default();
+                    spacer.set_wide(Wide::LeadingSpacer);
+                    output.last_mut().unwrap()[Column(col)] = spacer;
+                    col += 1;
+                    continue;
+                }
+                let skip_tail = cell.wide() == Wide::Wide && columns == 1;
+                if columns == 1 && matches!(cell.wide(), Wide::Wide | Wide::Spacer) {
+                    cell = Square::default();
+                }
+                let target = output.last_mut().unwrap();
+                target[Column(col)] = cell;
+                target.has_extras |= cell.extras_id().is_some();
+                target.has_styles |= cell.carries_style();
+                target.kitty_virtual_placeholder |=
+                    cell.c() == crate::ansi::kitty_virtual::PLACEHOLDER;
+                col += 1;
+                if skip_tail {
+                    if let Some(remap) = remap.as_mut() {
+                        for &(key, pin_x) in &pins {
+                            if pin_x == x + 1 {
+                                remap.cells.entry(key).or_insert((
+                                    base_abs as i64 + output.len() as i64 - 1,
+                                    col.min(columns - 1),
+                                ));
                             }
                         }
-                        break;
-                    } else {
-                        // Remove the leading spacer from the end of the wrapped row.
-                        wrapped[len - 2].set_wrapline(true);
-                        wrapped.truncate(len - 1);
                     }
-                }
-
-                new_raw.push(row);
-                if let Some(r) = remap.as_mut() {
-                    // This push consumed `columns` cells of the
-                    // stream, minus a wide char the spacer displaced
-                    // into the next row.
-                    let consumed = columns as i64 - displaced;
-                    trackers.retain(|&(p, off)| {
-                        if off < consumed {
-                            r.new_pos[p] = (new_raw.len() - 1) as i64;
-                            false
-                        } else {
-                            true
-                        }
-                    });
-                    for t in trackers.iter_mut() {
-                        t.1 -= consumed;
+                    if old_row == cursor_row && x + 1 == cursor_col {
+                        cursor_location = Some((output.len() - 1, col.min(columns - 1)));
                     }
-                }
-
-                // Set line as wrapped if cells got removed.
-                if let Some(cell) = new_raw.last_mut().and_then(|r| r.last_mut()) {
-                    cell.set_wrapline(true);
-                }
-
-                if wrapped
-                    .last()
-                    .map(|c| c.wrapline() && i >= 1)
-                    .unwrap_or(false)
-                    && wrapped.len() < columns
-                {
-                    // Make sure previous wrap flag doesn't linger around.
-                    if let Some(cell) = wrapped.last_mut() {
-                        cell.set_wrapline(false);
+                    if old_row == saved_row && x + 1 == saved_col {
+                        saved_location = Some((output.len() - 1, col.min(columns - 1)));
                     }
-
-                    // Add removed cells to start of next row.
-                    buffered = Some(wrapped);
-                    break;
+                    if Some(old_row) == viewport_row && x + 1 == viewport_col {
+                        viewport_location =
+                            Some((output.len() - 1, col.min(columns - 1)));
+                    }
+                    x += 2;
                 } else {
-                    // Reflow cursor if a line below it is deleted.
-                    let cursor_buffer_line =
-                        self.lines - self.cursor.pos.row.0 as usize - 1;
-                    if (i == cursor_buffer_line && self.cursor.pos.col < columns)
-                        || i < cursor_buffer_line
-                    {
-                        self.cursor.pos.row = max(self.cursor.pos.row - 1, Line(0));
-                    }
-
-                    // Reflow the cursor if it is on this line beyond the width.
-                    if i == cursor_buffer_line && self.cursor.pos.col >= columns {
-                        // Since only a single new line is created, we subtract only `columns`
-                        // from the cursor instead of reflowing it completely.
-                        self.cursor.pos.col -= columns;
-                    }
-
-                    // Make sure new row is at least as long as new width.
-                    let occ = wrapped.len();
-                    if occ < columns {
-                        wrapped.resize_with(columns, Square::default);
-                    }
-                    row = Row::from_vec(wrapped, occ);
-
-                    if i < self.display_offset {
-                        // Since we added a new line, rotate up the viewport.
-                        self.display_offset += 1;
-                    }
+                    x += 1;
+                }
+            }
+            if !wrapped {
+                deferred += 1;
+            }
+        }
+        output.resize_with(output.len().max(self.lines), || Row::new(columns));
+        if let Some((row, _)) = cursor_location {
+            let top = output.len().saturating_sub(self.lines);
+            if row >= top {
+                let new_wrapped = (top..=row)
+                    .filter(|&row| output[row].wrap_continuation)
+                    .count();
+                let wanted =
+                    remaining.saturating_sub(new_wrapped.saturating_sub(old_wrapped));
+                let current = output.len() - row - 1;
+                if wanted > current {
+                    output.resize_with(output.len() + wanted - current, || {
+                        Row::new(columns)
+                    });
                 }
             }
         }
-
-        // Restore oldest-first order in place and reuse the buffer as the new
-        // grid storage, avoiding a second full row-buffer allocation.
-        new_raw.reverse();
-        let mut reversed = new_raw;
-        // Reflow can overflow the scrollback cap; the oldest lines
-        // fall off the ring and must advance the absolute row base.
-        let cap = self.max_scroll_limit + self.lines;
-        if reversed.len() > cap {
-            self.total_lines_scrolled += (reversed.len() - cap) as u64;
+        let top = output.len().saturating_sub(self.lines);
+        let map_cursor = |location: Option<(usize, usize)>, pending: bool| {
+            let Some((row, mut col)) = location.filter(|&(row, _)| row >= top) else {
+                return (crate::crosswords::pos::Pos::new(Line(0), Column(0)), false);
+            };
+            let pending = pending && col == columns - 1;
+            col = col.min(columns - 1);
+            (
+                crate::crosswords::pos::Pos::new(Line((row - top) as i32), Column(col)),
+                pending,
+            )
+        };
+        let live_pending = self.cursor.should_wrap;
+        let saved_pending = self.saved_cursor.should_wrap;
+        let (mut live, live_wrap) = map_cursor(cursor_location, live_pending);
+        let (mut saved, saved_wrap) = map_cursor(saved_location, saved_pending);
+        if live_pending && !live_wrap {
+            live.col = Column((live.col.0 + 1).min(columns - 1));
         }
-        reversed.truncate(cap);
-        self.raw.replace_inner(reversed);
-
-        // Clamp display offset in case some lines went off.
-        self.display_offset = min(self.display_offset, self.history_size());
-
-        // Reflow the primary cursor, or clamp it if reflow is disabled.
-        if !reflow {
-            self.cursor.pos.col = min(self.cursor.pos.col, Column(columns - 1));
-        } else if self.cursor.pos.col == columns
-            && !self[self.cursor.pos.row][Column(columns - 1)].wrapline()
+        if saved_pending
+            && !saved_wrap
+            && saved_location.is_some_and(|(row, _)| row >= top)
         {
-            self.cursor.should_wrap = true;
-            self.cursor.pos.col -= 1;
-        } else {
-            self.cursor.pos = self.cursor.pos.grid_clamp(self, Boundary::Cursor);
+            saved.col = Column((saved.col.0 + 1).min(columns - 1));
         }
-
-        // Clamp the saved cursor to the grid.
-        self.saved_cursor.pos.col = min(self.saved_cursor.pos.col, Column(columns - 1));
-
+        self.columns = columns;
+        self.cursor.pos = live;
+        self.cursor.should_wrap = live_wrap;
+        self.saved_cursor.pos = saved;
+        self.saved_cursor.should_wrap = saved_wrap;
+        let cap = self.max_scroll_limit + self.lines;
+        let dropped = output.len().saturating_sub(cap);
+        if output.len() > cap {
+            self.total_lines_scrolled += (output.len() - cap) as u64;
+        }
+        output.reverse();
+        output.truncate(cap);
+        self.raw.replace_inner(output);
+        if !was_scrolled {
+            self.display_offset = 0;
+            self.display_anchor = ViewportAnchor::Active;
+        } else if let Some((row, col)) =
+            viewport_location.filter(|&(row, _)| row >= dropped)
+        {
+            self.display_offset = top.saturating_sub(row).min(self.history_size());
+            self.display_anchor = if self.display_offset == 0 {
+                ViewportAnchor::Active
+            } else {
+                ViewportAnchor::Cell(col)
+            };
+        } else {
+            // A top-pinned viewport follows the oldest retained row. The
+            // same fallback applies when history pruning evicts a cell pin.
+            self.display_offset = self.history_size();
+            self.display_anchor = ViewportAnchor::Top;
+        }
         self.reflow_remap = remap;
     }
 }

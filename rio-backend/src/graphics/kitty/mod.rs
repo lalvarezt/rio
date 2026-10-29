@@ -416,6 +416,7 @@ fn test_cursor_movement_default() {
 
     // Place with cursor_movement=0 (move cursor to after image)
     let placement = kitty_graphics_protocol::PlacementRequest {
+        relative: None,
         image_id: 1,
         placement_id: 0,
         x: 0,
@@ -499,6 +500,7 @@ fn test_cursor_movement_no_move() {
 
     // Place with cursor_movement=1 (don't move cursor)
     let placement = kitty_graphics_protocol::PlacementRequest {
+        relative: None,
         image_id: 2,
         placement_id: 0,
         x: 0,
@@ -517,8 +519,18 @@ fn test_cursor_movement_no_move() {
 
     term.place_graphic(placement);
 
-    // With cursor_movement=1, cursor behavior depends on placement x,y
-    // This test verifies the no-move code path executes without panic
+    assert_eq!(term.grid.cursor.pos.row.0, 5);
+    assert_eq!(term.grid.cursor.pos.col.0, 10);
+    assert_eq!(term.graphics.kitty_placements.len(), 1);
+    assert_eq!(
+        term.graphics
+            .kitty_placements
+            .values()
+            .next()
+            .unwrap()
+            .dest_row,
+        5
+    );
 }
 
 #[test]
@@ -606,6 +618,7 @@ fn test_image_row_occupation_exact_fit() {
 
     // Place it with rows=2 (should occupy exactly 2 rows)
     let placement = kitty_graphics_protocol::PlacementRequest {
+        relative: None,
         image_id: 1,
         placement_id: 0,
         x: 0,
@@ -626,7 +639,6 @@ fn test_image_row_occupation_exact_fit() {
 
     let final_cursor_row = term.grid.cursor.pos.row.0;
 
-    // With fix: cursor stays ON last row of image (row 1)
     assert_eq!(
         final_cursor_row, 1,
         "Cursor should be at row 1 (last row of image) after placing a 2-row image, but got row {}",
@@ -668,6 +680,7 @@ fn test_subcell_offset_forwarded_and_clamped() {
 
     // In-range `X=`/`Y=` flows through to the stored placement.
     let placement = kitty_graphics_protocol::PlacementRequest {
+        relative: None,
         image_id: 1,
         placement_id: 7,
         x: 0,
@@ -697,6 +710,7 @@ fn test_subcell_offset_forwarded_and_clamped() {
     // The stored value stays raw (re-clamped at read time so cell
     // size changes don't lose it); span derivation uses the clamp.
     let placement = kitty_graphics_protocol::PlacementRequest {
+        relative: None,
         image_id: 1,
         placement_id: 8,
         x: 0,
@@ -763,6 +777,7 @@ fn test_subcell_offset_extends_row_occupation() {
     // into a third row: ceil((40 + 15) / 20) = 3. Cursor movement and
     // occupation must cover that extra row.
     let placement = kitty_graphics_protocol::PlacementRequest {
+        relative: None,
         image_id: 1,
         placement_id: 7,
         x: 0,
@@ -837,6 +852,7 @@ fn test_image_row_occupation_single_row() {
     term.store_graphic(graphic);
 
     let placement = kitty_graphics_protocol::PlacementRequest {
+        relative: None,
         image_id: 2,
         placement_id: 0,
         x: 0,
@@ -857,7 +873,6 @@ fn test_image_row_occupation_single_row() {
 
     let final_cursor_row = term.grid.cursor.pos.row.0;
 
-    // With fix: cursor stays ON last row of image (row 0)
     assert_eq!(
         final_cursor_row, 0,
         "Cursor should be at row 0 (last row of image) after placing a 1-row image, but got row {}",
@@ -906,6 +921,7 @@ fn test_image_row_occupation_three_rows() {
     term.store_graphic(graphic);
 
     let placement = kitty_graphics_protocol::PlacementRequest {
+        relative: None,
         image_id: 3,
         placement_id: 0,
         x: 0,
@@ -926,7 +942,6 @@ fn test_image_row_occupation_three_rows() {
 
     let final_cursor_row = term.grid.cursor.pos.row.0;
 
-    // With fix: cursor stays ON last row of image (row 2)
     assert_eq!(
         final_cursor_row, 2,
         "Cursor should be at row 2 (last row of image) after placing a 3-row image, but got row {}. \
@@ -980,6 +995,7 @@ fn test_image_row_occupation_from_middle() {
     term.store_graphic(graphic);
 
     let placement = kitty_graphics_protocol::PlacementRequest {
+        relative: None,
         image_id: 4,
         placement_id: 0,
         x: 0,
@@ -1000,47 +1016,12 @@ fn test_image_row_occupation_from_middle() {
 
     let final_cursor_row = term.grid.cursor.pos.row.0;
 
-    // With fix: cursor stays ON last row of image (row 6)
     assert_eq!(
         final_cursor_row, 6,
         "Cursor should be at row 6 (last row of image) after placing a 2-row image from row 5, but got row {}",
         final_cursor_row
     );
 }
-
-// Delete Tests
-
-#[test]
-fn test_delete_all() {
-    let event_listener = TestEventListener;
-    let window_id = WindowId::from(0);
-
-    let mut term: Crosswords<TestEventListener> = Crosswords::new(
-        crate::crosswords::CrosswordsSize::new(80, 24),
-        crate::ansi::CursorShape::Block,
-        event_listener,
-        window_id,
-        0,
-        10_000,
-    );
-
-    // Delete all graphics (d=a)
-    let delete = DeleteRequest {
-        action: b'a',
-        image_id: 0,
-        image_number: 0,
-        placement_id: 0,
-        x: 0,
-        y: 0,
-        z_index: 0,
-        delete_data: false,
-    };
-
-    // Should not panic
-    term.delete_graphics(delete);
-}
-
-// Placement Management Tests
 
 #[test]
 fn test_store_graphic() {
@@ -1094,6 +1075,7 @@ fn test_place_nonexistent_graphic() {
     );
 
     let placement = kitty_graphics_protocol::PlacementRequest {
+        relative: None,
         image_id: 999, // Doesn't exist
         placement_id: 0,
         x: 5,
@@ -1110,14 +1092,12 @@ fn test_place_nonexistent_graphic() {
         cell_y_offset: 0,
     };
 
-    // Should not panic, just warn
+    let cursor_before = term.grid.cursor.pos;
     term.place_graphic(placement);
+    assert_eq!(term.grid.cursor.pos, cursor_before);
+    assert!(term.graphics.kitty_placements.is_empty());
+    assert!(term.graphics.get_kitty_image(999).is_none());
 }
-
-// test_delete_by_kitty_image_id and test_delete_by_image_id_does_not_delete_wrong_id
-// were removed: kitty images no longer go into grid cells (overlay path only).
-// Equivalent tests exist as test_delete_by_image_id_removes_all_placements_for_image
-// and test_delete_by_specific_placement_id.
 
 #[test]
 fn test_recount_releases_key_exactly_once() {
@@ -1264,6 +1244,8 @@ fn test_kitty_placement_insert_and_delete() {
     let mut graphics = Graphics::default();
 
     let placement = KittyPlacement {
+        expired: false,
+        relative: None,
         image_id: 1,
         placement_id: 0,
         source_x: 0,
@@ -1299,6 +1281,8 @@ fn test_kitty_placement_delete_by_z_index() {
     let mut graphics = Graphics::default();
 
     let make_placement = |image_id: u32, z: i32| KittyPlacement {
+        expired: false,
+        relative: None,
         image_id,
         placement_id: 0,
         source_x: 0,
@@ -1343,6 +1327,8 @@ fn test_collect_active_ids_includes_overlay_placements() {
     let mut graphics = Graphics::default();
 
     let placement = KittyPlacement {
+        expired: false,
+        relative: None,
         image_id: 42,
         placement_id: 0,
         source_x: 0,
@@ -1400,6 +1386,8 @@ fn test_eviction_removes_dangling_placements() {
 
     // Add an overlay placement referencing this graphic
     let placement = KittyPlacement {
+        expired: false,
+        relative: None,
         image_id: 1,
         placement_id: 0,
         source_x: 0,
@@ -1443,8 +1431,10 @@ fn make_test_placement(
     z_index: i32,
 ) -> KittyPlacement {
     KittyPlacement {
+        expired: false,
+        relative: None,
         image_id,
-        placement_id,
+        placement_id: u64::from(placement_id),
         source_x: 0,
         source_y: 0,
         source_width: 0,
@@ -2461,41 +2451,33 @@ fn test_aspect_ratio_with_only_rows() {
 // Format conversion tests
 
 #[test]
-fn test_grayscale_format_conversion() {
-    // Test: gray (1 bpp) to RGBA conversion
+fn test_grayscale_wire_format_is_rejected() {
     let mut state = KittyGraphicsState::default();
     // 2x1 grayscale: 2 bytes, base64 of [128, 255] = "gP8="
     let params: Vec<&[u8]> = vec![b"G", b"a=t,f=8,s=2,v=1,i=1", b"gP8="];
     let resp = kitty_graphics_protocol::parse(&params, &mut state);
     assert!(resp.is_some());
-    let data = resp.unwrap().graphic_data.unwrap();
-    assert_eq!(data.pixels.len(), 8); // 2 pixels * 4 bytes RGBA
-                                      // First pixel: gray=128 → [128, 128, 128, 255]
-    assert_eq!(data.pixels[0], 128);
-    assert_eq!(data.pixels[1], 128);
-    assert_eq!(data.pixels[2], 128);
-    assert_eq!(data.pixels[3], 255);
-    // Second pixel: gray=255 → [255, 255, 255, 255]
-    assert_eq!(data.pixels[4], 255);
-    assert_eq!(data.pixels[7], 255);
+    let response = resp.unwrap();
+    assert!(response.graphic_data.is_none());
+    assert_eq!(
+        response.response.unwrap(),
+        "\x1b_Gi=1;EINVAL: unsupported format\x1b\\"
+    );
 }
 
 #[test]
-fn test_gray_alpha_format_conversion() {
-    // Test: gray+alpha (2 bpp) to RGBA conversion
+fn test_gray_alpha_wire_format_is_rejected() {
     let mut state = KittyGraphicsState::default();
     // 1x1 gray+alpha: 2 bytes [128, 200], base64 = "gMg="
     let params: Vec<&[u8]> = vec![b"G", b"a=t,f=16,s=1,v=1,i=1", b"gMg="];
     let resp = kitty_graphics_protocol::parse(&params, &mut state);
     assert!(resp.is_some());
-    let data = resp.unwrap().graphic_data.unwrap();
-    assert_eq!(data.pixels.len(), 4); // 1 pixel * 4 bytes RGBA
-                                      // gray=128, alpha=200 → [128, 128, 128, 200]
-    assert_eq!(data.pixels[0], 128);
-    assert_eq!(data.pixels[1], 128);
-    assert_eq!(data.pixels[2], 128);
-    assert_eq!(data.pixels[3], 200);
-    assert!(!data.is_opaque); // alpha != 255
+    let response = resp.unwrap();
+    assert!(response.graphic_data.is_none());
+    assert_eq!(
+        response.response.unwrap(),
+        "\x1b_Gi=1;EINVAL: unsupported format\x1b\\"
+    );
 }
 
 // Free-data deletion bug regression tests.
@@ -2561,7 +2543,7 @@ fn test_delete_uppercase_i_actually_frees_image_data() {
 }
 
 #[test]
-fn test_delete_uppercase_a_clears_all_image_data() {
+fn test_delete_uppercase_a_preserves_unplaced_image_data() {
     let mut term = make_test_term();
     store_red_pixel(&mut term, 1);
     store_red_pixel(&mut term, 2);
@@ -2569,6 +2551,7 @@ fn test_delete_uppercase_a_clears_all_image_data() {
     assert_eq!(term.graphics.kitty_images.len(), 3);
 
     let delete = DeleteRequest {
+        frame_number: 0,
         action: b'a',
         image_id: 0,
         image_number: 0,
@@ -2581,8 +2564,8 @@ fn test_delete_uppercase_a_clears_all_image_data() {
     term.delete_graphics(delete);
 
     assert!(
-        term.graphics.kitty_images.is_empty(),
-        "d=A must clear all image data, not just placements"
+        term.graphics.kitty_images.len() == 3,
+        "d=A selects visible placements; it must preserve unrelated unplaced images"
     );
     assert!(term.graphics.kitty_image_numbers.is_empty());
 }
@@ -2595,6 +2578,7 @@ fn test_delete_lowercase_a_keeps_image_data() {
     store_red_pixel(&mut term, 1);
 
     let delete = DeleteRequest {
+        frame_number: 0,
         action: b'a',
         image_id: 0,
         image_number: 0,
@@ -2636,6 +2620,7 @@ fn test_delete_uppercase_n_frees_image_via_number() {
     // d=N with image_id=9 (the parser stores the image *number* into
     // image_id for the d=n/N case via the `i=` key per spec).
     let delete = DeleteRequest {
+        frame_number: 0,
         action: b'n',
         image_id: 0,
         image_number: 9, // canonical: I= for d=n
@@ -2665,6 +2650,7 @@ fn test_delete_uppercase_r_frees_image_range() {
     // d=R with x=range_start, y=range_end (inclusive). Source x/y carry
     // these values per the parser's field reuse.
     let delete = DeleteRequest {
+        frame_number: 0,
         action: b'r',
         image_id: 0,
         image_number: 0,
@@ -2731,11 +2717,11 @@ fn test_swap_alt_isolates_kitty_images() {
         "Alt-screen image 3 must not leak into main screen"
     );
 
-    // Swap back to alt — image 3 should be there again.
+    // A new 1049 entry clears alternate-screen contents and unused images.
     term.swap_alt();
     assert!(
-        term.graphics.get_kitty_image(3).is_some(),
-        "Alt-screen image 3 must be preserved across screen swaps"
+        term.graphics.get_kitty_image(3).is_none(),
+        "A fresh alternate-screen entry reclaims its unplaced image"
     );
 }
 
@@ -2749,6 +2735,7 @@ fn test_swap_alt_isolates_placements() {
 
     store_red_pixel(&mut term, 1);
     let placement = kitty_graphics_protocol::PlacementRequest {
+        relative: None,
         image_id: 1,
         placement_id: 0,
         x: 0,
@@ -2896,6 +2883,7 @@ fn test_eviction_prefers_inactive_screen_images() {
     graphics.kitty_inactive_screen.kitty_images.insert(
         2,
         StoredImage {
+            image_generation: 0,
             data: inactive_data,
             transmission_time: std::time::Instant::now()
                 - std::time::Duration::from_secs(60),
@@ -2962,6 +2950,7 @@ fn test_eviction_keeps_active_used_image_when_inactive_available() {
     graphics.kitty_inactive_screen.kitty_images.insert(
         2,
         StoredImage {
+            image_generation: 0,
             data: inactive,
             transmission_time: std::time::Instant::now(),
         },
@@ -3050,12 +3039,9 @@ fn test_kitten_icat_two_invocations_without_explicit_id_keep_both_images() {
 }
 
 #[test]
-fn test_kitten_icat_two_invocations_with_same_explicit_id_each_get_unique_placement() {
-    // Even when icat reuses the same `i=N` (which kitty itself allows
-    // and uses for re-transmission), the *placements* should still be
-    // distinct so both copies render. The image data is shared (the
-    // second transmission overwrites it per spec) but each placement
-    // gets its own internal placement_id.
+fn test_kitten_icat_retransmission_retires_previous_placements() {
+    // Reusing an explicit image ID starts a replacement transmission and
+    // retires the old image's placements before adding the new placement.
     let mut term = make_test_term();
     term.graphics.cell_width = 10.0;
     term.graphics.cell_height = 20.0;
@@ -3065,13 +3051,10 @@ fn test_kitten_icat_two_invocations_with_same_explicit_id_each_get_unique_placem
 
     // One image (re-transmissions overwrite at same id per spec).
     assert_eq!(term.graphics.kitty_images.len(), 1);
-    // Two placements (each `a=T` with implicit p=0 must get its own
-    // internal placement_id so the prior placement isn't overwritten).
     assert_eq!(
         term.graphics.kitty_placements.len(),
-        2,
-        "Two `a=T` calls with the same image_id must produce two \
-         placements, not collapse into one"
+        1,
+        "Only the replacement transmission's placement survives"
     );
 }
 
@@ -3210,6 +3193,7 @@ fn test_resize_widen_unwraps_command_image_follows() {
 
     store_red_pixel(&mut term, 1);
     let placement = kitty_graphics_protocol::PlacementRequest {
+        relative: None,
         image_id: 1,
         placement_id: 0,
         x: 0,
@@ -3290,6 +3274,7 @@ fn test_resize_narrow_wraps_command_image_follows() {
 
     store_red_pixel(&mut term, 1);
     let placement = kitty_graphics_protocol::PlacementRequest {
+        relative: None,
         image_id: 1,
         placement_id: 0,
         x: 0,
@@ -3341,172 +3326,9 @@ fn test_resize_narrow_wraps_command_image_follows() {
     );
 }
 
-/// Print the visible grid contents for debugging.
-fn dump_grid(term: &Crosswords<TestEventListener>, label: &str) {
-    use crate::crosswords::grid::Dimensions;
-    eprintln!("=== {label} ===");
-    eprintln!(
-        "  cursor.row={}, history={}, columns={}, screen_lines={}",
-        term.grid.cursor.pos.row.0,
-        term.history_size(),
-        Dimensions::columns(&term.grid),
-        Dimensions::screen_lines(&term.grid),
-    );
-    for placement in term.graphics.kitty_placements.values() {
-        eprintln!(
-            "  placement: image_id={}, dest_row={}, dest_col={}, columns={}, rows={}",
-            placement.image_id,
-            placement.dest_row,
-            placement.dest_col,
-            placement.columns,
-            placement.rows,
-        );
-    }
-    use crate::crosswords::pos::{Column, Line};
-    let lines = Dimensions::screen_lines(&term.grid);
-    let cols = Dimensions::columns(&term.grid);
-    for r in 0..lines {
-        let line = Line(r as i32);
-        let mut s = String::new();
-        for c in 0..cols {
-            let cell = &term.grid[line][Column(c)];
-            let ch = cell.c();
-            if ch == '\0' || ch == ' ' {
-                s.push('.');
-            } else {
-                s.push(ch);
-            }
-        }
-        eprintln!("  row {:>2}: |{}|", r, s.trim_end_matches('.'));
-    }
-}
-
-#[test]
-fn test_debug_widen_visible_layout() {
-    // Mirror of test_debug_narrow_visible_layout: starts NARROW with the
-    // command wrapped onto 2 rows, then widens.
-    use crate::performer::handler::Handler;
-    let event_listener = TestEventListener;
-    let window_id = WindowId::from(0);
-    let mut term: Crosswords<TestEventListener> = Crosswords::new(
-        crate::crosswords::CrosswordsSize::new(20, 24),
-        crate::ansi::CursorShape::Block,
-        event_listener,
-        window_id,
-        0,
-        10_000,
-    );
-    term.graphics.cell_width = 10.0;
-    term.graphics.cell_height = 20.0;
-
-    for _ in 0..18 {
-        term.linefeed();
-    }
-    term.carriage_return();
-
-    type_text(&mut term, "$ kitten icat /path/to/image.png");
-    term.linefeed();
-    term.carriage_return();
-
-    store_red_pixel(&mut term, 1);
-    let placement = kitty_graphics_protocol::PlacementRequest {
-        image_id: 1,
-        placement_id: 0,
-        x: 0,
-        y: 0,
-        width: 0,
-        height: 0,
-        columns: 1,
-        rows: 1,
-        z_index: 0,
-        virtual_placement: false,
-        unicode_placeholder: 0,
-        cursor_movement: 0,
-        cell_x_offset: 0,
-        cell_y_offset: 0,
-    };
-    term.place_graphic(placement);
-
-    term.linefeed();
-    term.carriage_return();
-    type_text(&mut term, "$ ");
-
-    dump_grid(&term, "BEFORE widen");
-
-    term.resize(ReflowDim {
-        columns: 50,
-        lines: 24,
-    });
-
-    dump_grid(&term, "AFTER widen");
-}
-
-#[test]
-fn test_debug_narrow_visible_layout() {
-    // Print visible layout before/after narrowing to understand what
-    // shrink_columns actually does to cursor and content positioning.
-    use crate::performer::handler::Handler;
-    let event_listener = TestEventListener;
-    let window_id = WindowId::from(0);
-    let mut term: Crosswords<TestEventListener> = Crosswords::new(
-        crate::crosswords::CrosswordsSize::new(50, 24),
-        crate::ansi::CursorShape::Block,
-        event_listener,
-        window_id,
-        0,
-        10_000,
-    );
-    term.graphics.cell_width = 10.0;
-    term.graphics.cell_height = 20.0;
-
-    for _ in 0..20 {
-        term.linefeed();
-    }
-    term.carriage_return();
-
-    type_text(&mut term, "$ kitten icat /path/to/image.png");
-    term.linefeed();
-    term.carriage_return();
-
-    store_red_pixel(&mut term, 1);
-    let placement = kitty_graphics_protocol::PlacementRequest {
-        image_id: 1,
-        placement_id: 0,
-        x: 0,
-        y: 0,
-        width: 0,
-        height: 0,
-        columns: 1,
-        rows: 1,
-        z_index: 0,
-        virtual_placement: false,
-        unicode_placeholder: 0,
-        cursor_movement: 0,
-        cell_x_offset: 0,
-        cell_y_offset: 0,
-    };
-    term.place_graphic(placement);
-
-    term.linefeed();
-    term.carriage_return();
-    type_text(&mut term, "$ ");
-
-    dump_grid(&term, "BEFORE narrow");
-
-    term.resize(ReflowDim {
-        columns: 20,
-        lines: 24,
-    });
-
-    dump_grid(&term, "AFTER narrow");
-}
-
 #[test]
 fn test_resize_narrow_combined_col_and_row_change() {
-    // Real window resize: user drags the corner, both columns and
-    // lines change in the same Crosswords::resize call. Both
-    // grow_columns/shrink_columns AND grow_lines/shrink_lines fire.
-    // Cursor delta accumulates from both.
+    // Resizing both dimensions keeps the image directly above the prompt.
     use crate::performer::handler::Handler;
     let event_listener = TestEventListener;
     let window_id = WindowId::from(0);
@@ -3532,6 +3354,7 @@ fn test_resize_narrow_combined_col_and_row_change() {
 
     store_red_pixel(&mut term, 1);
     let placement = kitty_graphics_protocol::PlacementRequest {
+        relative: None,
         image_id: 1,
         placement_id: 0,
         x: 0,
@@ -3561,11 +3384,10 @@ fn test_resize_narrow_combined_col_and_row_change() {
         .unwrap()
         .dest_row;
 
-    eprintln!(
-        "BEFORE combined: cursor.row={}, history={}, dest_row={}",
-        term.grid.cursor.pos.row.0,
-        term.history_size(),
-        initial_dest_row,
+    assert_eq!(initial_dest_row, 11);
+    assert_eq!(
+        term.history_size() as i64 + term.grid.cursor.pos.row.0 as i64,
+        initial_dest_row + 1
     );
 
     // Narrow + shorten at the same time.
@@ -3582,20 +3404,12 @@ fn test_resize_narrow_combined_col_and_row_change() {
         .unwrap()
         .dest_row;
 
-    eprintln!(
-        "AFTER combined : cursor.row={}, history={}, dest_row={}, delta={}",
-        term.grid.cursor.pos.row.0,
-        term.history_size(),
-        final_dest_row,
-        final_dest_row - initial_dest_row,
+    assert_eq!(final_dest_row, initial_dest_row + 1);
+    assert_eq!(
+        term.history_size() as i64 + term.grid.cursor.pos.row.0 as i64,
+        final_dest_row + 1,
+        "the image must remain directly above the prompt after reflow"
     );
-
-    // The image should still follow the wrap regardless of the
-    // simultaneous row count change.
-    // Cursor delta should be (history_grew_by_wrap) +
-    // (cursor_row_change_from_shrink_lines + wrap_above_cursor).
-    // The exact number depends on how shrink_lines + shrink_columns
-    // interact, but the image should track the cursor.
 }
 
 #[test]
@@ -3631,6 +3445,7 @@ fn test_resize_narrow_with_multi_row_image() {
 
     store_red_pixel(&mut term, 1);
     let placement = kitty_graphics_protocol::PlacementRequest {
+        relative: None,
         image_id: 1,
         placement_id: 0,
         x: 0,
@@ -3745,6 +3560,7 @@ fn test_resize_narrow_with_cursor_at_bottom_of_screen() {
 
     store_red_pixel(&mut term, 1);
     let placement = kitty_graphics_protocol::PlacementRequest {
+        relative: None,
         image_id: 1,
         placement_id: 0,
         x: 0,
@@ -3847,6 +3663,7 @@ fn test_resize_narrow_with_prompt_after_image() {
     let placement_row = term.grid.cursor.pos.row.0;
     store_red_pixel(&mut term, 1);
     let placement = kitty_graphics_protocol::PlacementRequest {
+        relative: None,
         image_id: 1,
         placement_id: 0,
         x: 0,
@@ -4072,6 +3889,7 @@ fn test_resize_widen_kitty_above_wrap_change_stays_put() {
 
     store_red_pixel(&mut term, 1);
     let placement = kitty_graphics_protocol::PlacementRequest {
+        relative: None,
         image_id: 1,
         placement_id: 0,
         x: 0,
@@ -4120,13 +3938,11 @@ fn test_resize_widen_kitty_above_wrap_change_stays_put() {
     );
 }
 
-// Animation actions surface EINVAL (regression).
+// Invalid animation payloads surface addressed decode errors.
 
 #[test]
-fn test_animation_action_surfaces_unsupported_response() {
-    // Going through the full Crosswords path: a=f should produce a
-    // response that the terminal can forward back to the client. Pre-fix
-    // this returned None and the client got nothing.
+fn test_animation_frame_decode_errors_are_addressed() {
+    // Three decoded bytes cannot supply a 1x1 RGBA patch.
     let mut state = KittyGraphicsState::default();
     let params = vec![
         b"G".as_ref(),
@@ -4138,9 +3954,8 @@ fn test_animation_action_surfaces_unsupported_response() {
         .expect("animation actions must produce a response");
     let body = resp
         .response
-        .expect("response body must contain EINVAL marker");
-    assert!(body.contains("EINVAL:unsupported action"));
-    assert!(body.contains("i=1"));
+        .expect("response body must contain the decode error");
+    assert_eq!(body, "\x1b_Gi=1;ENODATA: insufficient data\x1b\\");
 }
 
 // Placement geometry tests
@@ -4175,6 +3990,7 @@ fn geometry_test_term() -> Crosswords<TestEventListener> {
 
 fn placement_request(placement_id: u32) -> PlacementRequest {
     PlacementRequest {
+        relative: None,
         image_id: 1,
         placement_id,
         x: 0,
@@ -4253,8 +4069,8 @@ fn test_source_crop_clamped_and_degenerate_invisible() {
     assert_eq!(geometry.width, 10.0, "clamped to image width");
     assert_eq!(geometry.source_rect, [0.9, 0.0, 1.0, 1.0]);
 
-    // A crop fully outside the image is stored (kitty answers OK) but
-    // renders nothing and occupies no cells.
+    // An empty source axis renders no natural-size quad, while the other
+    // axis retains its footprint and cursor movement.
     let mut placement = placement_request(7);
     placement.y = 100;
     placement.cursor_movement = 0;
@@ -4265,16 +4081,14 @@ fn test_source_crop_clamped_and_degenerate_invisible() {
         .kitty_placements
         .get(&(1, 7))
         .expect("degenerate placement still stored");
-    assert_eq!(stored.columns, 0, "no cell footprint");
+    assert_eq!(stored.columns, 10, "nonempty width retains its footprint");
     assert_eq!(stored.rows, 0);
     assert!(
         kitty_overlay_geometry(stored, 100, 100, &viewport).is_none(),
         "degenerate crop renders nothing"
     );
-    assert_eq!(
-        term.grid.cursor.pos, cursor_before,
-        "invisible placement leaves the cursor untouched"
-    );
+    assert_eq!(term.grid.cursor.pos.row, cursor_before.row);
+    assert_eq!(term.grid.cursor.pos.col, cursor_before.col + 10);
 }
 
 #[test]
@@ -4305,6 +4119,8 @@ fn test_overlay_geometry_scroll_and_pixel_position() {
     use crate::ansi::graphics::{kitty_overlay_geometry, OverlayViewport};
 
     let placement = KittyPlacement {
+        expired: false,
+        relative: None,
         image_id: 1,
         placement_id: 1,
         source_x: 50,
@@ -4367,6 +4183,8 @@ fn test_overlay_geometry_partial_visibility_and_full_source() {
     use crate::ansi::graphics::{kitty_overlay_geometry, OverlayViewport};
 
     let placement = KittyPlacement {
+        expired: false,
+        relative: None,
         image_id: 1,
         placement_id: 1,
         source_x: 0,
@@ -4413,6 +4231,8 @@ fn test_rescale_keeps_native_size_and_tracks_cell_span() {
 
     // Native-size placement: 25x45 crop, 10x20 cells.
     let mut native = KittyPlacement {
+        expired: false,
+        relative: None,
         image_id: 1,
         placement_id: 1,
         source_x: 0,
@@ -4443,6 +4263,8 @@ fn test_rescale_keeps_native_size_and_tracks_cell_span() {
 
     // Cell-sized placement (c=4, r=2) tracks the grid instead.
     let mut cell_sized = KittyPlacement {
+        expired: false,
+        relative: None,
         requested_columns: 4,
         requested_rows: 2,
         columns: 4,
@@ -4505,6 +4327,8 @@ fn test_overlay_geometry_clamps_raw_offsets() {
     // Raw offsets larger than the current cell box clamp at read
     // time; the stored value survives cell size changes.
     let placement = KittyPlacement {
+        expired: false,
+        relative: None,
         image_id: 1,
         placement_id: 1,
         source_x: 0,
@@ -4565,9 +4389,8 @@ fn test_retransmit_reclamps_crop_and_updates_footprint() {
     assert_eq!(geometry.height, 50.0);
     assert_eq!(geometry.source_rect, [0.0, 0.5, 1.0, 1.0]);
 
-    // Retransmit the same id as 100x60: the crop re-resolves against
-    // the new dimensions instead of showing a stale region, and the
-    // grid footprint follows.
+    // A replacement retires the old placement. Re-placing the crop uses
+    // the new image dimensions.
     term.graphics.kitty_graphics_dirty = false;
     let graphic = GraphicData {
         id: GraphicId::new(1),
@@ -4583,6 +4406,10 @@ fn test_retransmit_reclamps_crop_and_updates_footprint() {
     };
     term.store_graphic(graphic);
 
+    assert!(!term.graphics.kitty_placements.contains_key(&(1, 11)));
+    let mut replacement = placement_request(11);
+    replacement.y = 50;
+    term.place_graphic(replacement);
     let stored = term.graphics.kitty_placements.get(&(1, 11)).unwrap();
     assert_eq!(stored.pixel_height, 10, "60 - 50 remaining below the crop");
     assert_eq!(stored.rows, 1);
@@ -4592,14 +4419,12 @@ fn test_retransmit_reclamps_crop_and_updates_footprint() {
     assert!((v0 - 50.0 / 60.0).abs() < 1e-6);
     assert_eq!(v1, 1.0);
 
-    // The new pixels were dispatched for upload without a re-place
-    // (send_graphics_updates drains the queue into an event, so the
-    // dirty flag is the observable side).
+    // Re-placing queues the replacement pixels for upload.
     assert!(term.graphics.kitty_graphics_dirty);
 }
 
 #[test]
-fn test_retransmit_can_make_degenerate_placement_visible() {
+fn test_replacing_a_degenerate_crop_requires_a_new_placement() {
     let mut term = geometry_test_term();
 
     // Fully outside the 100x100 image: invisible, zero footprint.
@@ -4611,7 +4436,7 @@ fn test_retransmit_can_make_degenerate_placement_visible() {
         0
     );
 
-    // Retransmit taller: the placement comes alive.
+    // The taller replacement has room for the crop, but needs a new placement.
     let graphic = GraphicData {
         id: GraphicId::new(1),
         width: 100,
@@ -4626,6 +4451,10 @@ fn test_retransmit_can_make_degenerate_placement_visible() {
     };
     term.store_graphic(graphic);
 
+    assert!(!term.graphics.kitty_placements.contains_key(&(1, 12)));
+    let mut replacement = placement_request(12);
+    replacement.y = 100;
+    term.place_graphic(replacement);
     let stored = term.graphics.kitty_placements.get(&(1, 12)).unwrap();
     assert_eq!(stored.pixel_height, 100, "rows 100..200 of the new image");
     assert_eq!(stored.rows, 5, "ceil(100 / 20)");
@@ -4646,83 +4475,47 @@ fn test_cursor_movement_scrolls_at_screen_bottom() {
     placement.cursor_movement = 0;
     term.place_graphic(placement);
 
-    // The image scrolled into view (5 linefeeds at the bottom) and the
+    // The image scrolls four rows, one less than its five-row span, and the
     // cursor sits on its last row, first column after it.
-    assert_eq!(term.grid.cursor.pos.row.0, 22);
+    assert_eq!(term.grid.cursor.pos.row.0, 23);
     assert_eq!(term.grid.cursor.pos.col.0, 10);
-    assert_eq!(term.history_size(), 5, "five rows scrolled into history");
+    assert_eq!(term.history_size(), 4, "four rows scrolled into history");
 }
 
 #[test]
-fn test_virtual_run_geometry_honors_source_crop() {
+fn test_virtual_run_geometry_ignores_source_crop() {
     use crate::ansi::kitty_virtual::{compute_run_geometry, PlaceholderRun};
 
-    let run = PlaceholderRun {
+    let top = PlaceholderRun {
         image_id: 1,
         placement_id: 1,
         row: 0,
         col: 0,
         width: 5,
     };
-
-    // Right half of a 100x50 image (crop 50x50) into a 5x5 cell
-    // placement at 10x10 cells: the crop fits the 50x50 box exactly.
-    let g = compute_run_geometry(
-        &run,
-        5,
-        5,
-        100,
-        50,
-        (50, 0, 50, 50),
-        10.0,
-        10.0,
-        0.0,
-        0.0,
-        0,
-        0,
-    )
-    .expect("visible run");
-    assert_eq!(g.width, 50.0);
-    assert_eq!(g.height, 10.0, "one cell row");
-    // u spans the right half of the image; v the top fifth of the crop.
-    assert_eq!(g.source_rect, [0.5, 0.0, 1.0, 0.2]);
-
-    // Without a crop the full image aspect-fits with letterboxing;
-    // the top run sits entirely in the padding, while the second row
-    // maps to the full-image left edge.
-    assert!(compute_run_geometry(
-        &run,
-        5,
-        5,
-        100,
-        50,
-        (0, 0, 0, 0),
-        10.0,
-        10.0,
-        0.0,
-        0.0,
-        0,
-        0,
-    )
-    .is_none());
-    let second_row = PlaceholderRun { row: 1, ..run };
-    let g = compute_run_geometry(
-        &second_row,
-        5,
-        5,
-        100,
-        50,
-        (0, 0, 0, 0),
-        10.0,
-        10.0,
-        0.0,
-        0.0,
-        1,
-        0,
-    )
-    .expect("visible run");
-    assert_eq!(g.source_rect[0], 0.0, "full-image left edge");
-    assert_eq!(g.source_rect[1], 0.0, "crop origin maps to image top");
+    let geometry = |run: &PlaceholderRun, crop, screen_row| {
+        compute_run_geometry(
+            run, 5, 5, 100, 50, crop, 10.0, 10.0, 0.0, 0.0, screen_row, 0,
+        )
+    };
+    // Both requests aspect-fit the full image, leaving the top row in padding.
+    assert!(geometry(&top, (50, 0, 50, 50), 0).is_none());
+    assert!(geometry(&top, (0, 0, 0, 0), 0).is_none());
+    let second = PlaceholderRun { row: 1, ..top };
+    let cropped = geometry(&second, (50, 0, 50, 50), 1).unwrap();
+    let full = geometry(&second, (0, 0, 0, 0), 1).unwrap();
+    assert_eq!(
+        (
+            cropped.x,
+            cropped.y,
+            cropped.width,
+            cropped.height,
+            cropped.source_rect
+        ),
+        (full.x, full.y, full.width, full.height, full.source_rect)
+    );
+    assert_eq!(cropped.source_rect[0], 0.0);
+    assert_eq!(cropped.source_rect[1], 0.0);
 }
 
 #[test]
@@ -4746,7 +4539,7 @@ fn test_cursor_movement_clears_pending_wrap() {
 }
 
 #[test]
-fn test_transmit_and_display_refreshes_sibling_placements() {
+fn test_transmit_and_display_retires_sibling_placements() {
     let mut term = geometry_test_term();
 
     // Direct placement of the 100x100 image: 5 rows at 20px cells.
@@ -4758,9 +4551,8 @@ fn test_transmit_and_display_refreshes_sibling_placements() {
         5
     );
 
-    // a=T retransmit of the same id (new 100x200 pixels + a second
-    // placement): the first placement's footprint must follow the new
-    // dimensions like the a=t path.
+    // The replacement transmission retires the first placement and creates
+    // a new placement against the taller image.
     let graphic = GraphicData {
         id: GraphicId::new(1),
         width: 100,
@@ -4777,11 +4569,7 @@ fn test_transmit_and_display_refreshes_sibling_placements() {
     second.cursor_movement = 1;
     term.kitty_transmit_and_display(graphic, second);
 
-    assert_eq!(
-        term.graphics.kitty_placements.get(&(1, 15)).unwrap().rows,
-        10,
-        "sibling placement footprint follows the retransmit"
-    );
+    assert!(!term.graphics.kitty_placements.contains_key(&(1, 15)));
     assert_eq!(
         term.graphics.kitty_placements.get(&(1, 16)).unwrap().rows,
         10
@@ -4958,41 +4746,32 @@ fn test_kitty_placement_glued_across_ring_saturation_and_expiry() {
     assert_eq!(term.history_size(), 3);
     assert_eq!(term.lines_evicted(), 0);
 
-    // One more line: the ring is at cap, the oldest row (the image's
-    // first) is evicted.
-    term.linefeed();
-    assert_eq!(term.lines_evicted(), 1);
-    let stored = term
-        .graphics
-        .kitty_placements
-        .get(&(1, 20))
-        .expect("placement survives while a row remains in the ring");
-
-    // Scrolled fully back: the image's second row is the topmost
-    // retained line, so the placement renders one row above the
-    // viewport top (negative y, partially visible). Without the
-    // absolute base it would drift a full row down.
+    // The anchor remains attached while its own row is retained.
+    let stored = term.graphics.kitty_placements.get(&(1, 20)).unwrap();
     let viewport = OverlayViewport {
         cell_width: 10.0,
         cell_height: 20.0,
         origin_x: 0.0,
         origin_y: 0.0,
-        history_size: (term.lines_evicted() + term.history_size() as u64) as i64,
+        history_size: term.history_size() as i64,
         display_offset: term.history_size() as i64,
         screen_lines: 4,
     };
-    let geometry =
-        kitty_overlay_geometry(stored, 30, 40, &viewport).expect("partially visible");
-    assert_eq!(geometry.y, -20.0, "glued: first image row evicted");
+    let geometry = kitty_overlay_geometry(stored, 30, 40, &viewport).unwrap();
+    assert_eq!(geometry.y, 0.0);
 
-    // One more eviction takes the image's last row off the ring: the
-    // placement expires like kitty's do.
+    // Evicting the anchor hides the whole placement even though its second
+    // row remains retained. The expired storage reference keeps its bitmap.
+    term.linefeed();
+    assert_eq!(term.lines_evicted(), 1);
+    let expired = &term.graphics.kitty_placements[&(1, 20)];
+    assert!(expired.expired);
+    assert!(kitty_overlay_geometry(expired, 30, 40, &viewport).is_none());
+    assert!(term.graphics.resolved_kitty_placements().is_empty());
+    assert!(term.graphics.get_kitty_image(1).is_some());
     term.linefeed();
     assert_eq!(term.lines_evicted(), 2);
-    assert!(
-        !term.graphics.kitty_placements.contains_key(&(1, 20)),
-        "placement expires with its content"
-    );
+    assert!(term.graphics.resolved_kitty_placements().is_empty());
 }
 
 #[test]
@@ -5055,8 +4834,8 @@ fn test_atlas_overlay_geometry_scaling_and_scroll() {
     assert_eq!(g.x, 100.0 + 4.0 * 12.0);
     assert_eq!(g.y, 50.0 + 5.0 * 24.0);
     // Live cells grew 10x20 -> 12x24: display scales with the font.
-    assert_eq!(g.width, 30.0 * 1.2);
-    assert_eq!(g.height, 20.0 * 1.2);
+    assert!((g.width - 30.0 * 1.2).abs() < 1e-5);
+    assert!((g.height - 20.0 * 1.2).abs() < 1e-5);
     // Bottom half of the display space.
     assert_eq!(g.source_rect, [0.0, 0.5, 1.0, 1.0]);
 
@@ -5329,8 +5108,8 @@ fn test_narrowing_terminal_keeps_image_span_and_clips_at_edge() {
         image_id: 1,
         x: geometry.x,
         y: geometry.y,
-        width: geometry.width,
-        height: geometry.height,
+        width: geometry.width as f32,
+        height: geometry.height as f32,
         z_index: 0,
         source_rect: geometry.source_rect,
     };

@@ -14,7 +14,7 @@
 // come in already sRGB-encoded from the CPU).
 //
 // Bindings:
-// @group(0) @binding(0) Uniforms (140+4 = 144 bytes)
+// @group(0) @binding(0) Uniforms (192 bytes)
 // @group(0) @binding(1) CellBg[] (cols * rows entries)
 //
 // Must match `WgpuGridRenderer`'s bind group layout in
@@ -32,51 +32,17 @@ struct Uniforms {
     min_contrast:     f32,           //       144
     flags:            u32,           //       148
     padding_extend:   u32,           //       152
-    input_colorspace: u32,           //       156
+    input_colorspace: u32,           //       156 (native backend ABI; unused by wgpu)
+    panel_rect: vec4<f32>,           //       160
+    panel_radius: f32,               //       176
+    _pad_panel0: f32,
+    _pad_panel1: f32,
+    _pad_panel2: f32,
 };
 
-// Color space / transfer curve helpers. Matrices match the Metal
-// peer (`grid.metal`) and `sugarloaf/src/renderer/renderer.metal`,
-// so grid + quad pipelines produce byte-identical framebuffer values.
-// WGSL has no `select` with a `bool3` mask returning vec3, so we use
-// the scalar `select` per-component via a helper.
-fn grid_srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
-    let lo = c / 12.92;
-    let hi = pow((c + vec3<f32>(0.055)) / vec3<f32>(1.055), vec3<f32>(2.4));
-    return select(lo, hi, c > vec3<f32>(0.04045));
-}
-
-fn grid_linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
-    let lo = c * 12.92;
-    let hi = pow(c, vec3<f32>(1.0 / 2.4)) * vec3<f32>(1.055) - vec3<f32>(0.055);
-    return select(lo, hi, c > vec3<f32>(0.0031308));
-}
-
-fn grid_srgb_to_p3(linear_srgb: vec3<f32>) -> vec3<f32> {
-    return vec3<f32>(
-        dot(linear_srgb, vec3<f32>(0.82246197, 0.17753803, 0.0)),
-        dot(linear_srgb, vec3<f32>(0.03319420, 0.96680580, 0.0)),
-        dot(linear_srgb, vec3<f32>(0.01708263, 0.07239744, 0.91051993))
-    );
-}
-
-fn grid_rec2020_to_p3(linear_r2020: vec3<f32>) -> vec3<f32> {
-    return vec3<f32>(
-        dot(linear_r2020, vec3<f32>( 1.34357825, -0.28217967, -0.06139858)),
-        dot(linear_r2020, vec3<f32>(-0.06529745,  1.08782226, -0.02252481)),
-        dot(linear_r2020, vec3<f32>( 0.00282179, -0.02598807,  1.02316628))
-    );
-}
-
-fn grid_prepare_output_rgb(srgb: vec3<f32>, input_colorspace: u32) -> vec3<f32> {
-    var lin = grid_srgb_to_linear(srgb);
-    if (input_colorspace == 0u) {
-        lin = grid_srgb_to_p3(lin);
-    } else if (input_colorspace == 2u) {
-        lin = grid_rec2020_to_p3(lin);
-    }
-    return grid_linear_to_srgb(lin);
-}
+// Match the wgpu UI and clear passes, which use the configured color
+// bytes directly. Metal's conversion to its Display-P3 drawable does
+// not apply here; converting only the grid creates seams against UI.
 
 const PAD_EXTEND_LEFT:  u32 = 1u;
 const PAD_EXTEND_RIGHT: u32 = 2u;
@@ -124,6 +90,15 @@ fn load_cell_bg(idx: u32) -> vec4<f32> {
 
 @fragment
 fn grid_bg_fragment(in: VsOut) -> @location(0) vec4<f32> {
+    var coverage = 1.0;
+    if (all(uniforms.panel_rect.zw > vec2<f32>(0.0))) {
+        let half_size = uniforms.panel_rect.zw * 0.5;
+        let radius = min(uniforms.panel_radius, min(half_size.x, half_size.y));
+        let q = abs(in.position.xy - uniforms.panel_rect.xy - half_size) - half_size + vec2<f32>(radius);
+        let distance = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+        coverage = clamp(0.5 - distance, 0.0, 1.0);
+        if (coverage == 0.0) { discard; }
+    }
  // `grid_padding` is (top, right, bottom, left).
  // Use .w (left) + .x (top) to find the grid origin, same as Metal port.
     let cell_fx = (in.position.xy - vec2<f32>(uniforms.grid_padding.w, uniforms.grid_padding.x))
@@ -169,26 +144,24 @@ fn grid_bg_fragment(in: VsOut) -> @location(0) vec4<f32> {
     if (uniforms.cursor_bg_color.a > 0.0
         && orig_grid_pos.x == i32(uniforms.cursor_pos.x)
         && orig_grid_pos.y == i32(uniforms.cursor_pos.y)) {
-        let rgb = grid_prepare_output_rgb(
-            uniforms.cursor_bg_color.rgb,
-            uniforms.input_colorspace,
-        );
+        let rgb = uniforms.cursor_bg_color.rgb;
         let a = uniforms.cursor_bg_color.a;
-        return vec4<f32>(rgb * a, a);
+        return vec4<f32>(rgb * a, a) * coverage;
     }
 
- // Load cell, convert to output color space, then premultiply.
- // Same pipeline as the quad fill in `sugarloaf/src/renderer/renderer.metal`
- // so the grid and window-fill paths produce identical framebuffer
- // values.
+ // Load cell and premultiply, matching the wgpu UI color path.
     let idx = u32(grid_pos.y) * uniforms.grid_size.x + u32(grid_pos.x);
     let word = cells[idx];
+    // Transparent cells contribute nothing; skip their color decoding.
+    // Keep this after the cursor overlay, which can cover a transparent cell.
+    if ((word >> 24u) == 0u) {
+        return vec4<f32>(0.0);
+    }
     let r = f32((word >>  0u) & 0xFFu) / 255.0;
     let g = f32((word >>  8u) & 0xFFu) / 255.0;
     let b = f32((word >> 16u) & 0xFFu) / 255.0;
     let a = f32((word >> 24u) & 0xFFu) / 255.0;
-    let rgb = grid_prepare_output_rgb(vec3<f32>(r, g, b), uniforms.input_colorspace);
-    return vec4<f32>(rgb * a, a);
+    return vec4<f32>(vec3<f32>(r, g, b) * a, a) * coverage;
 }
 
 // -------------------------------------------------------------------
@@ -270,14 +243,8 @@ fn grid_text_vertex(
     out.atlas = in.atlas;
 
  // Foreground color — `in.color` arrives normalized via UNorm8x4.
- // Convert to output color space first, then premultiply. Same
- // pipeline as `grid_bg_fragment` and the quad fill so glyph/cell
- // bg/window bg agree.
-    var color = in.color;
-    color = vec4<f32>(
-        grid_prepare_output_rgb(color.rgb, uniforms.input_colorspace) * color.a,
-        color.a,
-    );
+ // Premultiply in the same color encoding as the wgpu UI and backgrounds.
+    var color = vec4<f32>(in.color.rgb * in.color.a, in.color.a);
 
  // Cursor-pos fg swap. Skip when cursor_color.a == 0 — that's the
  // hollow / unfocused path where text colour stays untouched.
@@ -287,10 +254,7 @@ fn grid_text_vertex(
         && is_cursor_pos
         && uniforms.cursor_color.a > 0.0) {
         let c = uniforms.cursor_color;
-        color = vec4<f32>(
-            grid_prepare_output_rgb(c.rgb, uniforms.input_colorspace) * c.a,
-            c.a,
-        );
+        color = vec4<f32>(c.rgb * c.a, c.a);
     }
 
     out.color = color;

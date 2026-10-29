@@ -6,8 +6,15 @@ pub mod control;
 pub mod glyph_protocol;
 pub mod graphics;
 pub mod iterm2_image_protocol;
+pub mod kitty_animation;
 pub mod kitty_graphics_protocol;
 pub mod kitty_virtual;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtectionMode {
+    Dec,
+    Iso,
+}
 pub mod mode;
 pub mod sixel;
 
@@ -56,6 +63,8 @@ pub enum ClearMode {
     Above,
     /// Clear entire terminal.
     All,
+    /// Move visible content into scrollback and clear the display.
+    Scroll,
     /// Clear 'saved' lines (scrollback).
     Saved,
 }

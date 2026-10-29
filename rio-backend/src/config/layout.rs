@@ -1,8 +1,28 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
-// Panel configuration for split layouts
+/// A hidden border contributes no stroke inset; pane margin and padding remain.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BorderVisibility {
+    #[default]
+    Always,
+    WhenSplit,
+    Never,
+}
+
+impl BorderVisibility {
+    pub fn is_visible(self, pane_count: usize) -> bool {
+        self == Self::Always || (self == Self::WhenSplit && pane_count > 1)
+    }
+}
+
+// Pane box model: root margin -> panel margin -> border -> padding -> cells.
+// Margins, padding, gaps, and radius are logical pixels. Border width stays in
+// physical pixels to match the shared chrome stroke renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Panel {
+    #[serde(default)]
+    pub border: BorderVisibility,
     #[serde(default = "default_panel_margin")]
     pub margin: Margin,
     #[serde(default = "default_panel_padding")]
@@ -20,6 +40,7 @@ pub struct Panel {
 impl Default for Panel {
     fn default() -> Self {
         Self {
+            border: BorderVisibility::Always,
             margin: default_panel_margin(),
             padding: default_panel_padding(),
             row_gap: default_row_gap(),
@@ -30,14 +51,78 @@ impl Default for Panel {
     }
 }
 
+/// Input values are optional so a preset supplies only unspecified fields.
+/// `Panel` is the resolved layout configuration.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct PanelOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub border: Option<BorderVisibility>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub margin: Option<Margin>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub padding: Option<Margin>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row_gap: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column_gap: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub border_width: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub border_radius: Option<f32>,
+}
+
+impl PanelOverrides {
+    pub fn resolve(self, preset: super::navigation::TabStyle) -> Panel {
+        use super::navigation::{
+            tabs::{margin, spacing},
+            TabStyle,
+        };
+        let mut base = Panel::default();
+        if preset == TabStyle::Square {
+            base.margin = Margin::all(0.0);
+            base.border_width = 1.0;
+            base.border_radius = 0.0;
+        }
+        Panel {
+            border: self.border.unwrap_or(base.border),
+            margin: margin(self.margin.unwrap_or(base.margin), base.margin),
+            padding: margin(self.padding.unwrap_or(base.padding), base.padding),
+            row_gap: spacing(self.row_gap.unwrap_or(base.row_gap), base.row_gap),
+            column_gap: spacing(
+                self.column_gap.unwrap_or(base.column_gap),
+                base.column_gap,
+            ),
+            border_width: spacing(
+                self.border_width.unwrap_or(base.border_width),
+                base.border_width,
+            ),
+            border_radius: spacing(
+                self.border_radius.unwrap_or(base.border_radius),
+                base.border_radius,
+            ),
+        }
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.border = other.border.or(self.border);
+        self.margin = other.margin.or(self.margin);
+        self.padding = other.padding.or(self.padding);
+        self.row_gap = other.row_gap.or(self.row_gap);
+        self.column_gap = other.column_gap.or(self.column_gap);
+        self.border_width = other.border_width.or(self.border_width);
+        self.border_radius = other.border_radius.or(self.border_radius);
+    }
+}
+
 #[inline]
 fn default_panel_margin() -> Margin {
-    Margin::all(2.0)
+    Margin::all(4.0)
 }
 
 #[inline]
 fn default_panel_padding() -> Margin {
-    Margin::all(5.0)
+    Margin::all(8.0)
 }
 
 #[inline]
@@ -57,16 +142,23 @@ fn default_border_width() -> f32 {
 
 #[inline]
 fn default_border_radius() -> f32 {
-    0.0
+    8.0
 }
 
 // CSS-like margin structure
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Margin {
     pub top: f32,
     pub right: f32,
     pub bottom: f32,
     pub left: f32,
+}
+
+impl Serialize for Margin {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // The deserializer accepts CSS arrays, so map serialization cannot round-trip.
+        [self.top, self.right, self.bottom, self.left].serialize(serializer)
+    }
 }
 
 impl Margin {
@@ -229,11 +321,11 @@ mod tests {
     #[test]
     fn test_panel_default() {
         let panel = Panel::default();
-        assert_eq!(panel.margin, Margin::all(2.0));
+        assert_eq!(panel.margin, Margin::all(4.0));
         assert_eq!(panel.row_gap, 0.0);
         assert_eq!(panel.column_gap, 0.0);
         assert_eq!(panel.border_width, 2.0);
-        assert_eq!(panel.border_radius, 0.0);
+        assert_eq!(panel.border_radius, 8.0);
     }
 
     #[test]

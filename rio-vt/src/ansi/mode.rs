@@ -59,6 +59,7 @@ impl PrivateMode {
             9 => Self::Named(NamedPrivateMode::ReportX10MouseClicks),
             12 => Self::Named(NamedPrivateMode::BlinkingCursor),
             25 => Self::Named(NamedPrivateMode::ShowCursor),
+            47 => Self::Named(NamedPrivateMode::SwapScreen),
             1000 => Self::Named(NamedPrivateMode::ReportMouseClicks),
             1002 => Self::Named(NamedPrivateMode::ReportCellMouseMotion),
             1003 => Self::Named(NamedPrivateMode::ReportAllMouseMotion),
@@ -67,10 +68,13 @@ impl PrivateMode {
             1006 => Self::Named(NamedPrivateMode::SgrMouse),
             1007 => Self::Named(NamedPrivateMode::AlternateScroll),
             1042 => Self::Named(NamedPrivateMode::UrgencyHints),
+            1047 => Self::Named(NamedPrivateMode::SwapScreenAndClear),
+            1048 => Self::Named(NamedPrivateMode::SaveRestoreCursor),
             1049 => Self::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor),
             2004 => Self::Named(NamedPrivateMode::BracketedPaste),
             2026 => Self::Named(NamedPrivateMode::SyncUpdate),
             2027 => Self::Named(NamedPrivateMode::GraphemeCluster),
+            5522 => Self::Named(NamedPrivateMode::KittyPasteEvents),
             _ => Self::Unknown(mode),
         }
     }
@@ -116,6 +120,7 @@ pub enum NamedPrivateMode {
     ReportX10MouseClicks = 9,
     BlinkingCursor = 12,
     ShowCursor = 25,
+    SwapScreen = 47,
     ReportMouseClicks = 1000,
     ReportCellMouseMotion = 1002,
     ReportAllMouseMotion = 1003,
@@ -124,6 +129,8 @@ pub enum NamedPrivateMode {
     SgrMouse = 1006,
     AlternateScroll = 1007,
     UrgencyHints = 1042,
+    SwapScreenAndClear = 1047,
+    SaveRestoreCursor = 1048,
     SwapScreenAndSetRestoreCursor = 1049,
     BracketedPaste = 2004,
     /// The mode is handled automatically by [`Processor`].
@@ -136,6 +143,7 @@ pub enum NamedPrivateMode {
     /// width-bearing codepoint. Queryable via DECRQM, which is how
     /// applications detect support. Default: reset.
     GraphemeCluster = 2027,
+    KittyPasteEvents = 5522,
 }
 
 /// Mode for clearing line.

@@ -20,6 +20,7 @@ bitflags = { workspace = true }
 rustc-hash = { workspace = true }
 regex = { workspace = true }
 image_rs = { workspace = true, optional = true }
+png = { version = "0.18.1", optional = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 rio-graphics = { workspace = true }
@@ -34,6 +35,7 @@ flate2 = { workspace = true }
 # Native-only: SIMD UTF-8/base64 (scalar fallbacks on wasm), the PTY stack,
 # and the system clipboard.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+getrandom = "0.3.4"
 corcovado = { workspace = true, optional = true }
 raw-window-handle = { workspace = true, optional = true }
 copypasta = { version = "0.10.2", default-features = false, optional = true }
@@ -49,12 +51,15 @@ rio-window = { workspace = true, optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+smithay-clipboard = { version = "0.7.3", optional = true }
+
 # `Instant` backed by performance.now(); std's panics on wasm32-unknown-unknown.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-time = "1.1.0"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_System_Memory", "Win32_Foundation"] }
+windows-sys = { version = "0.61.2", features = ["Win32_System_Memory", "Win32_Foundation", "Win32_System_SystemInformation", "Win32_Storage_FileSystem"] }
 
 [features]
 # PTY driver on by default; no renderer, no windowing.
@@ -74,14 +79,10 @@ clipboard = ["dep:copypasta", "dep:raw-window-handle"]
 # Image (sixel/kitty/iTerm2) and glyph protocol decoding. Pulls the `image`
 # crate and a font-outline parser. Headless embedders that only parse and
 # snapshot never decode images or glyphs, so this stays off by default.
-graphics = ["dep:image_rs", "rio-graphics/image", "rio-graphics/glyph"]
-x11 = ["clipboard", "copypasta/x11"]
-wayland = ["clipboard", "copypasta/wayland"]
+graphics = ["dep:image_rs", "dep:png", "rio-graphics/image", "rio-graphics/glyph"]
+x11 = ["clipboard", "copypasta/x11", "rio-window?/x11"]
+wayland = ["clipboard", "dep:smithay-clipboard", "rio-window?/wayland"]
 wgpu = ["renderer", "dep:sugarloaf", "sugarloaf/wgpu"]
 
 [dev-dependencies]
 criterion = { workspace = true }
-
-[[bench]]
-name = "vt_input"
-harness = false

@@ -92,7 +92,7 @@ impl std::fmt::Display for RioErrorType {
                 write!(f, "Found an issue loading the configuration file:\n\n{message}\n\nRio will proceed with the default configuration")
             }
             RioErrorType::InvalidConfigurationTheme(message) => {
-                write!(f, "Found an issue in the configured theme:\n\n{message}")
+                write!(f, "Could not load the configured theme:\n\n{message}\n\nUsing fallback colors.")
             }
             RioErrorType::BackgroundImageLoadFailure(message) => {
                 write!(

@@ -26,10 +26,9 @@ pub enum SemanticPrompt {
 pub struct Row<T> {
     pub inner: Vec<T>,
 
-    /// Maximum number of occupied entries.
-    ///
-    /// This is the upper bound on the number of elements in the row, which have been modified
-    /// since the last reset. All cells after this point are guaranteed to be equal.
+    /// Conservative end of the modified prefix. Plain tails contain the last
+    /// reset's fill, optionally followed by defaults appended during growth.
+    /// Arbitrary appended data carries `has_extras` and uses full snapshots.
     pub(crate) occ: usize,
 
     /// Set when at least one cell in the row contains a kitty Unicode
@@ -53,6 +52,10 @@ pub struct Row<T> {
     /// scrollback; cleared when the row is recycled.
     pub semantic_prompt: SemanticPrompt,
 
+    /// This row continues a soft-wrapped line. Kept separately from the
+    /// previous row's wrap flag because line insertion can break the link.
+    pub wrap_continuation: bool,
+
     /// Per-row dirty bit set on every write through `IndexMut` /
     /// `last_mut` / `iter_mut` / `reset` / `append*` / `front_split_off`.
     /// Read + cleared by the renderer's snapshot path so it can copy
@@ -71,6 +74,7 @@ impl<T> Default for Row<T> {
             has_extras: false,
             has_styles: false,
             semantic_prompt: SemanticPrompt::None,
+            wrap_continuation: false,
             dirty: true,
         }
     }
@@ -111,6 +115,7 @@ impl<T: Clone + Default> Row<T> {
             has_extras: false,
             has_styles: false,
             semantic_prompt: SemanticPrompt::None,
+            wrap_continuation: false,
             dirty: true,
         }
     }
@@ -124,11 +129,48 @@ impl<T: Clone + Default> Row<T> {
     #[inline]
     pub fn copy_from(&mut self, src: &Self) {
         self.inner.clone_from(&src.inner);
+        self.copy_metadata_from(src);
+    }
+
+    /// Copy a renderer snapshot, retaining an equal plain fill tail. Managed
+    /// rows and changed dimensions or fill values keep the full-copy path.
+    #[inline]
+    pub(crate) fn copy_snapshot_from(&mut self, src: &Self)
+    where
+        T: PartialEq,
+    {
+        let prefix = self.occ.max(src.occ);
+        let len = src.inner.len();
+        if self.inner.len() == len
+            && prefix < len
+            && !self.has_styles
+            && !self.has_extras
+            && !src.has_styles
+            && !src.has_extras
+            && self.inner[len - 1] == src.inner[len - 1]
+            && self.inner[prefix] == self.inner[len - 1]
+            && src.inner[prefix] == src.inner[len - 1]
+        {
+            // Plain rows retain equal fill tails across output frames. Include
+            // the old occupied prefix so shorter lines erase previous text.
+            // Matching both ends excludes a reset-fill/default transition
+            // inside either tail after column growth.
+            // Managed/from_vec rows keep the complete-copy path.
+            self.inner[..prefix].clone_from_slice(&src.inner[..prefix]);
+        } else {
+            self.inner.clone_from(&src.inner);
+        }
+        self.copy_metadata_from(src);
+    }
+
+    #[inline]
+    fn copy_metadata_from(&mut self, src: &Self) {
         self.occ = src.occ;
         self.kitty_virtual_placeholder = src.kitty_virtual_placeholder;
         self.has_extras = src.has_extras;
         self.has_styles = src.has_styles;
         self.semantic_prompt = src.semantic_prompt;
+        self.wrap_continuation = src.wrap_continuation;
     }
 
     /// Reset a recycled row back to a blank `columns`-wide row, reusing the
@@ -146,6 +188,7 @@ impl<T: Clone + Default> Row<T> {
         self.has_extras = false;
         self.has_styles = false;
         self.semantic_prompt = SemanticPrompt::None;
+        self.wrap_continuation = false;
         self.dirty = true;
     }
 
@@ -180,27 +223,43 @@ impl<T: Clone + Default> Row<T> {
             return None;
         }
 
-        // Split off cells for a new row.
-        let mut new_row = self.inner.split_off(columns);
-        let index = new_row
+        // Inspect the tail before allocating it. A mixed grid can need
+        // reflow overall while many individual rows only lose blank cells.
+        let index = self.inner[columns..]
             .iter()
             .rposition(|c| !c.is_empty())
             .map_or(0, |i| i + 1);
-        new_row.truncate(index);
+
+        let new_row = if index == 0 {
+            self.inner.truncate(columns);
+            None
+        } else {
+            let mut tail = self.inner.split_off(columns);
+            tail.truncate(index);
+            Some(tail)
+        };
 
         self.occ = min(self.occ, columns);
         self.dirty = true;
 
-        if new_row.is_empty() {
-            None
-        } else {
-            Some(new_row)
-        }
+        new_row
     }
 
-    /// Reset all cells in the row to the `template` cell.
+    /// Reset the row using the template's background and default text attributes.
     #[inline]
-    pub fn reset(&mut self, template: &T)
+    pub fn reset(&mut self, template: &T, styles: &mut crate::crosswords::style::StyleSet)
+    where
+        T: GridSquare + PartialEq,
+    {
+        let mut proto = T::default();
+        proto.reset(template, styles);
+        self.reset_to(proto);
+    }
+
+    /// Reset to a cell whose text attributes and extras are already erased.
+    /// Region clears share this value instead of resolving the same template
+    /// background through the style table separately for every row.
+    pub(super) fn reset_to(&mut self, proto: T)
     where
         T: GridSquare + PartialEq,
     {
@@ -211,27 +270,16 @@ impl<T: Clone + Default> Row<T> {
         // ends match what this reset writes, only the prefix needs work.
         let len = self.inner.len();
         let mut occ = self.occ;
-        if occ < len {
-            let mut probe = self.inner[occ].clone();
-            probe.reset(template);
-            if probe != self.inner[occ] || probe != self.inner[len - 1] {
-                occ = len;
-            }
+        if occ < len && (proto != self.inner[occ] || proto != self.inner[len - 1]) {
+            occ = len;
         }
-        if occ == len {
-            let mut proto = T::default();
-            proto.reset(template);
-            self.inner.fill(proto);
-        } else {
-            for item in &mut self.inner[0..occ] {
-                item.reset(template);
-            }
-        }
+        self.has_styles = proto.carries_style();
+        self.inner[..occ].fill(proto);
         self.occ = 0;
         self.kitty_virtual_placeholder = false;
         self.has_extras = false;
-        self.has_styles = template.carries_style();
         self.semantic_prompt = SemanticPrompt::None;
+        self.wrap_continuation = false;
         self.dirty = true;
     }
 }
@@ -251,6 +299,7 @@ impl<T> Row<T> {
             has_extras: true,
             has_styles,
             semantic_prompt: SemanticPrompt::None,
+            wrap_continuation: false,
             dirty: true,
         }
     }
@@ -296,10 +345,15 @@ impl<T> Row<T> {
         T: Copy + GridSquare,
     {
         self.inner.extend_from_slice(&src.inner[..count]);
-        self.occ += count;
+        self.occ = self.inner.len();
         self.dirty = true;
-        self.has_extras = true;
-        self.has_styles |= src.inner[..count].iter().any(GridSquare::carries_style);
+        // Reflow moves cells between rows, so their conservative hints must
+        // follow them too. A false source hint also avoids scanning plain rows.
+        self.has_extras |= src.has_extras;
+        self.kitty_virtual_placeholder |= src.kitty_virtual_placeholder;
+        if !self.has_styles && src.has_styles {
+            self.has_styles = src.inner[..count].iter().any(GridSquare::carries_style);
+        }
 
         src.inner.drain(..count);
         src.occ = src.occ.saturating_sub(count);
@@ -463,7 +517,7 @@ impl<T> Index<RangeToInclusive<Column>> for Row<T> {
 impl<T> IndexMut<RangeToInclusive<Column>> for Row<T> {
     #[inline]
     fn index_mut(&mut self, index: RangeToInclusive<Column>) -> &mut [T] {
-        self.occ = max(self.occ, *index.end);
+        self.occ = max(self.occ, *index.end + 1);
         self.dirty = true;
         &mut self.inner[..=(index.end.0)]
     }

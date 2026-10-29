@@ -19,7 +19,9 @@ pub const DEFAULT_HINTS_ALPHABET: &str = "jfkdls;ahgurieowpq";
 ///    contain a dotted filename segment.
 /// 3. **Bare relative paths** — `word/.../name.ext`. A dotted segment is
 ///    required, and lookbehinds prevent matching mid-word starts.
-pub const DEFAULT_URL_REGEX: &str = concat!(
+macro_rules! url_regex {
+    ($($suffix:literal),* $(,)?) => {
+        concat!(
  // schemed URLs
     "(?:https?://|mailto:|ftp://|file:|ssh:|git://|ssh://|tel:|magnet:|ipfs://|ipns://|gemini://|gopher://|news:)",
     "(?:",
@@ -53,6 +55,22 @@ pub const DEFAULT_URL_REGEX: &str = concat!(
     r"[\w\-.~:/?#@!$&*+;=%]+",
     r"(?<!:)",
     r"(?: +(?= *$))?",
+            $($suffix),*
+        )
+    };
+}
+
+#[cfg(not(windows))]
+pub const DEFAULT_URL_REGEX: &str = url_regex!();
+#[cfg(windows)]
+pub const DEFAULT_URL_REGEX: &str = WINDOWS_URL_REGEX;
+
+#[cfg(any(windows, test))]
+const WINDOWS_URL_REGEX: &str = url_regex!(
+    // Conservative file-like drive and UNC paths, including spaces and parentheses.
+    r"|(?<![A-Za-z0-9])[A-Za-z]:[\\/](?:[\w\-. ()]+[\\/])*[\w\-. ()]*\.[A-Za-z0-9]+(?![\w.\\/-])",
+    r"|\\\\[\w\-. ()]+(?:\\[\w\-. ()]+)*\\[\w\-. ()]*\.[A-Za-z0-9]+(?![\w.\\/-])",
+    r"|(?<![\w~/])//[\w\-. ()]+(?:/[\w\-. ()]+)*/[\w\-. ()]*\.[A-Za-z0-9]+(?![\w.\\/-])",
 );
 
 /// Hints configuration
@@ -371,6 +389,47 @@ mod tests {
     #[test]
     fn test_default_regex_compiles() {
         onig::Regex::new(DEFAULT_URL_REGEX).expect("default regex must compile");
+    }
+
+    #[test]
+    fn windows_hint_regex_matches_complete_paths() {
+        let regex = onig::Regex::new(WINDOWS_URL_REGEX).unwrap();
+        for path in [
+            r"C:\Users\feng\notes.txt",
+            "C:/Users/feng/notes.txt",
+            r"C:\Program Files (x86)\app\readme.md",
+            r"\\server\share\doc.pdf",
+            "//server/share/doc.pdf",
+            "/c/Users/feng/notes.txt",
+            "/cygdrive/c/Users/feng/notes.txt",
+            "/mnt/c/Users/feng/notes.txt",
+        ] {
+            let text = format!("see {path} end");
+            let matches: Vec<_> = regex
+                .find_iter(&text)
+                .map(|(start, end)| &text[start..end])
+                .collect();
+            assert_eq!(matches, vec![path], "{path}");
+        }
+        for prose in ["option C: drive", "v1.2.3 at 12:34:56"] {
+            assert!(!regex.is_match(prose), "{prose}");
+        }
+    }
+
+    #[test]
+    fn windows_hint_regex_does_not_match_a_file_prefix() {
+        let regex = onig::Regex::new(WINDOWS_URL_REGEX).unwrap();
+        for path in [
+            r"C:\repo\.git\info\directory",
+            r"\\server\share\.git\info\directory",
+            r"C:\repo\report.txt-backup",
+            r"\\server\share\report.txt-backup",
+        ] {
+            assert!(
+                regex.find_iter(path).next().is_none(),
+                "partial file match in {path}"
+            );
+        }
     }
 
     /// Given input text, return every leftmost non-overlapping match produced

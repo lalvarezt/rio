@@ -10,7 +10,7 @@
 // cell itself is 8 bytes.
 
 use crate::crosswords::grid::GridSquare;
-use crate::crosswords::style::{StyleId, DEFAULT_STYLE_ID};
+use crate::crosswords::style::{Style, StyleId, StyleSet, DEFAULT_STYLE_ID};
 use crate::crosswords::Column;
 use crate::crosswords::Row;
 use bitflags::bitflags;
@@ -142,6 +142,8 @@ bitflags! {
         const HYPERLINK        = 1 << 2;
  /// Cell carries multi-codepoint grapheme cluster. Lookup via extras_id.
         const GRAPHEME         = 1 << 3;
+ /// Cell survives selective erasure, or ordinary erasure in ISO protection mode.
+        const PROTECTED        = 1 << 4;
     }
 }
 
@@ -206,6 +208,22 @@ pub struct Extras {
 }
 
 impl Extras {
+    /// Charge each interned payload once. Distinct extras containing the same
+    /// shared hyperlink conservatively each include its logical string bytes.
+    pub(crate) fn logical_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.zerowidth
+                    .len()
+                    .saturating_mul(std::mem::size_of::<char>()),
+            )
+            .saturating_add(
+                self.hyperlink
+                    .as_ref()
+                    .map_or(0, |link| link.id().len().saturating_add(link.uri().len())),
+            )
+    }
+
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.zerowidth.is_empty() && self.hyperlink.is_none()
@@ -224,6 +242,14 @@ impl Default for Square {
 }
 
 impl Square {
+    /// Packed tag/style/extras bits, excluding glyph and presentation flags.
+    /// Equal metadata permits reusing row dependencies, but their table values
+    /// must still be refreshed because IDs can be recycled.
+    #[inline]
+    pub(crate) fn snapshot_metadata(self) -> u64 {
+        self.0 >> CONTENT_TAG_SHIFT
+    }
+
     /// Create a cell with the given codepoint and the default style/extras.
     #[inline]
     pub fn from_char(c: char) -> Self {
@@ -284,6 +310,18 @@ impl Square {
     #[inline]
     pub fn needs_wide_cleanup(self) -> bool {
         matches!(self.wide(), Wide::Wide | Wide::Spacer)
+    }
+
+    /// Whether any cell in a print span needs wide-character neighbour cleanup.
+    #[inline]
+    pub(crate) fn any_needs_wide_cleanup(cells: &[Self]) -> bool {
+        // Wide (01) and Spacer (10) have unequal wide bits; Narrow (00)
+        // and LeadingSpacer (11) do not. Reduce those bits before converting
+        // to bool, avoiding per-cell comparisons and lane shuffles in SIMD.
+        let bits = cells
+            .iter()
+            .fold(0, |bits, cell| bits | (cell.0 ^ (cell.0 >> 1)));
+        bits & (1 << WIDE_SHIFT) != 0
     }
 
     #[inline]
@@ -445,12 +483,52 @@ impl Square {
         *self = Square(0);
     }
 
-    /// Reset the cell using a template. Preserves the template's style id;
-    /// drops any extras the cell currently has (caller must free the slot).
+    /// Erased cells retain only the background, never text attributes.
     #[inline]
-    pub fn reset(&mut self, template: Square) {
-        let new = Square(0).with_style_id(template.style_id());
-        *self = new;
+    pub(crate) fn blank_with_bg(
+        bg: crate::config::colors::AnsiColor,
+        intern: impl FnOnce(Style) -> StyleId,
+    ) -> Self {
+        use crate::config::colors::{AnsiColor, NamedColor};
+
+        let mut cell = Square::default();
+        match bg {
+            // Default background → fully default cell, no encoding needed.
+            AnsiColor::Named(NamedColor::Background) => return cell,
+
+            // Palette index → bg-only cell, inline encoding.
+            AnsiColor::Indexed(idx) => {
+                cell.set_bg_palette(idx);
+                return cell;
+            }
+
+            // RGB spec → bg-only cell, inline encoding.
+            AnsiColor::Spec(rgb) => {
+                cell.set_bg_rgb(rgb.r, rgb.g, rgb.b);
+                return cell;
+            }
+
+            // Named palette colors 0..15 → encode as palette index.
+            AnsiColor::Named(named) => {
+                let n = named as u16;
+                if n < 16 {
+                    cell.set_bg_palette(n as u8);
+                    return cell;
+                }
+                // Special named colors (Foreground, Cursor, Dim*, Light*)
+                // fall through to the style table because their meaning
+                // depends on the active palette and would require lookup
+                // anyway.
+            }
+        }
+
+        // Fallback: intern a regular style. Should be rare in practice.
+        let style = Style {
+            bg,
+            ..Style::default()
+        };
+        let id = intern(style);
+        Square::default().with_style_id(id)
     }
 
     /// Builder helper for tests.
@@ -534,9 +612,18 @@ impl GridSquare for Square {
     }
 
     #[inline]
-    fn reset(&mut self, template: &Self) {
-        let style_id = template.style_id();
-        *self = Square(0).with_style_id(style_id);
+    fn reset(&mut self, template: &Self, styles: &mut StyleSet) {
+        use crate::config::colors::{AnsiColor, ColorRgb};
+        let bg = match template.content_tag() {
+            ContentTag::Codepoint => styles.get(template.style_id()).bg,
+            ContentTag::BgPalette => AnsiColor::Indexed(template.bg_palette_index()),
+            ContentTag::BgRgb => {
+                let (r, g, b) = template.bg_rgb();
+                AnsiColor::Spec(ColorRgb { r, g, b })
+            }
+        };
+        // Foreground-only blanks must remain empty during column reflow.
+        *self = Self::blank_with_bg(bg, |style| styles.intern(style));
     }
 }
 
@@ -593,6 +680,38 @@ mod tests {
 
     use crate::crosswords::grid::row::Row;
     use crate::crosswords::pos::Column;
+
+    #[test]
+    fn bulk_wide_cleanup_matches_individual_cells() {
+        assert!(!Square::any_needs_wide_cleanup(&[]));
+        for payload in [0, !WIDE_MASK, 0x1234_5678_9abc_def0 & !WIDE_MASK] {
+            for pattern in 0..256u64 {
+                let cells: Vec<_> = (0..4)
+                    .map(|i| Square(payload | (((pattern >> (i * 2)) & 3) << WIDE_SHIFT)))
+                    .collect();
+                assert_eq!(
+                    Square::any_needs_wide_cleanup(&cells),
+                    cells.iter().any(|cell| cell.needs_wide_cleanup()),
+                    "payload {payload:x}, pattern {pattern:x}"
+                );
+            }
+        }
+        for len in 1..=65 {
+            let mut cells = vec![Square::default(); len];
+            for position in 0..len {
+                for wide in [Wide::Narrow, Wide::Wide, Wide::Spacer, Wide::LeadingSpacer]
+                {
+                    cells[position].set_wide(wide);
+                    assert_eq!(
+                        Square::any_needs_wide_cleanup(&cells),
+                        cells.iter().any(|cell| cell.needs_wide_cleanup()),
+                        "length {len}, position {position}, wide {wide:?}"
+                    );
+                }
+                cells[position] = Square::default();
+            }
+        }
+    }
 
     #[test]
     fn line_length_ignores_bg_only_cells_regardless_of_color() {

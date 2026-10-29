@@ -19,6 +19,7 @@ pub mod formatter;
 pub mod grid;
 pub mod pos;
 pub mod search;
+pub mod snapshot;
 pub mod square;
 pub mod style;
 pub mod vi_mode;
@@ -46,7 +47,6 @@ use crate::performer::parser::Params;
 use crate::selection::{Selection, SelectionRange, SelectionType};
 use crate::simd_utf8;
 use attr::*;
-use base64::{engine::general_purpose, Engine as _};
 use bitflags::bitflags;
 use grid::row::Row;
 use pos::{
@@ -102,6 +102,7 @@ bitflags! {
         /// across main/alt screens (the mode lives on the terminal,
         /// not the grid), matching contour.
         const GRAPHEME_CLUSTER        = 1 << 24;
+        const KITTY_PASTE_EVENTS       = 1 << 25;
         const MOUSE_MODE = Self::MOUSE_REPORT_CLICK.bits() | Self::MOUSE_MOTION.bits() | Self::MOUSE_DRAG.bits() | Self::MOUSE_REPORT_X10.bits();
         const KITTY_KEYBOARD_PROTOCOL = Self::DISAMBIGUATE_ESC_CODES.bits()
                                       | Self::REPORT_EVENT_TYPES.bits()
@@ -260,6 +261,8 @@ struct TermDamageState {
 
     /// Information about damage on terminal lines.
     lines: Vec<LineDamage>,
+    /// Bounds of marked lines; len..0 is the empty sentinel.
+    dirty_lines: Range<usize>,
 
     /// Old terminal cursor point.
     last_cursor: Pos,
@@ -277,6 +280,7 @@ impl TermDamageState {
         Self {
             full: true,
             lines,
+            dirty_lines: num_lines..0,
             last_cursor: Default::default(),
             last_vi_cursor_point: Default::default(),
             last_selection: Default::default(),
@@ -292,16 +296,18 @@ impl TermDamageState {
         self.full = true;
 
         self.lines.clear();
-        self.lines.reserve(num_lines);
-        for line in 0..num_lines {
-            self.lines.push(LineDamage::undamaged(line));
-        }
+        self.dirty_lines = num_lines..0;
+        // The exact-size iterator lets Vec reserve once and initialize
+        // the whole range without a capacity check and length write per row.
+        self.lines.extend((0..num_lines).map(LineDamage::undamaged));
     }
 
     /// Damage a line
     #[inline]
     fn damage_line(&mut self, line: usize) {
         self.lines[line].mark_damaged();
+        self.dirty_lines.start = self.dirty_lines.start.min(line);
+        self.dirty_lines.end = self.dirty_lines.end.max(line + 1);
     }
 
     fn damage_selection(&mut self, selection: SelectionRange, display_offset: usize) {
@@ -325,7 +331,12 @@ impl TermDamageState {
     /// Reset information about terminal damage.
     fn reset(&mut self) {
         self.full = false;
-        self.lines.iter_mut().for_each(|line| line.reset());
+        if !self.dirty_lines.is_empty() {
+            self.lines[self.dirty_lines.clone()]
+                .iter_mut()
+                .for_each(|line| line.reset());
+        }
+        self.dirty_lines = self.lines.len()..0;
     }
 }
 
@@ -423,12 +434,25 @@ const TITLE_STACK_MAX_DEPTH: usize = 4096;
 // Max size of the keyboard modes.
 const KEYBOARD_MODE_STACK_MAX_DEPTH: usize = 8;
 
+/// Metadata read by window chrome independently of terminal parsing.
+#[derive(Debug, Default)]
+pub struct TerminalMetadata {
+    pub title: String,
+    pub app: Option<String>,
+    pub remote: bool,
+    pub status: Option<crate::program_status::ProgramStatusRecord>,
+    pub status_revision: u64,
+}
+
 #[derive(Debug)]
 pub struct Crosswords<U>
 where
     U: EventListener,
 {
     active_charset: CharsetIndex,
+    single_shift: Option<CharsetIndex>,
+    /// Independent DECRQM latches for modes 47, 1047, 1048 and 1049.
+    screen_mode_state: [bool; 4],
     mode: Mode,
     pub vi_mode_cursor: ViModeCursor,
     semantic_escape_chars: String,
@@ -440,6 +464,8 @@ where
     pub selection: Option<Selection>,
     pub colors: TermColors,
     pub title: String,
+    pub program_status: crate::program_status::ProgramStatusStore,
+    pub metadata: Arc<parking_lot::Mutex<TerminalMetadata>>,
     damage: TermDamageState,
     pub graphics: Graphics,
     /// Per-session registry of glyphs registered over Glyph Protocol
@@ -459,6 +485,7 @@ where
     pub route_id: usize,
     title_stack: Vec<String>,
     pub current_directory: Option<std::path::PathBuf>,
+    pub remote_directory: Option<(String, std::path::PathBuf)>,
     /// Shell state from `OSC 1337 ; SetUserVar` (iTerm2 style).
     pub user_vars: rustc_hash::FxHashMap<String, String>,
 
@@ -475,6 +502,8 @@ where
 
     // The stack for the keyboard modes.
     modify_other_keys: u8,
+    kitty_clipboard_session: crate::clipboard::kitty::Session,
+    clipboard_policy: crate::clipboard::ClipboardPolicy,
     keyboard_mode_stack: [u8; KEYBOARD_MODE_STACK_MAX_DEPTH],
     keyboard_mode_idx: usize,
     inactive_keyboard_mode_stack: [u8; KEYBOARD_MODE_STACK_MAX_DEPTH],
@@ -482,6 +511,22 @@ where
 }
 
 impl<U: EventListener> Crosswords<U> {
+    /// Configure primary-screen retention. The alternate screen keeps no history.
+    pub fn set_scrollback_limits(&mut self, lines: usize, bytes: Option<usize>) {
+        if lines == 0 || bytes == Some(0) {
+            self.clear_kitty_history_placements(self.mode.contains(Mode::ALT_SCREEN));
+        }
+        let primary = if self.mode.contains(Mode::ALT_SCREEN) {
+            &mut self.inactive_grid
+        } else {
+            &mut self.grid
+        };
+        primary.update_history(lines);
+        primary.set_history_byte_limit(bytes);
+        self.expire_kitty_placements();
+        self.mark_fully_damaged();
+    }
+
     pub fn new<D: Dimensions>(
         dimensions: D,
         cursor_shape: CursorShape,
@@ -509,10 +554,14 @@ impl<U: EventListener> Crosswords<U> {
             grid,
             inactive_grid: alt,
             active_charset: CharsetIndex::default(),
+            single_shift: None,
+            screen_mode_state: [false; 4],
             scroll_region,
             event_proxy,
             colors: term_colors,
             title: String::from(""),
+            program_status: Default::default(),
+            metadata: Default::default(),
             tabs: TabStops::new(cols),
             mode: Mode::SHOW_CURSOR
                 | Mode::LINE_WRAP
@@ -531,9 +580,12 @@ impl<U: EventListener> Crosswords<U> {
             route_id,
             title_stack: Default::default(),
             current_directory: None,
+            remote_directory: None,
             user_vars: rustc_hash::FxHashMap::default(),
             damage_event_in_flight: false,
             modify_other_keys: 0,
+            kitty_clipboard_session: Default::default(),
+            clipboard_policy: Default::default(),
             keyboard_mode_stack: Default::default(),
             keyboard_mode_idx: 0,
             inactive_keyboard_mode_stack: Default::default(),
@@ -624,7 +676,7 @@ impl<U: EventListener> Crosswords<U> {
     pub fn peek_damage_event(&self) -> Option<TerminalDamage> {
         if self.damage.full {
             Some(TerminalDamage::Full)
-        } else if self.damage.lines.iter().any(|line| line.is_damaged()) {
+        } else if !self.damage.dirty_lines.is_empty() {
             Some(TerminalDamage::Partial)
         } else if self.damage.last_cursor != self.grid.cursor.pos {
             Some(TerminalDamage::CursorOnly)
@@ -736,8 +788,12 @@ impl<U: EventListener> Crosswords<U> {
 
     #[inline]
     pub fn send_graphics_updates(&mut self) {
+        if self.graphics.coalesce_updates && self.graphics.update_in_flight {
+            return;
+        }
         if self.graphics.has_pending_updates() {
             if let Some(queues) = self.graphics.take_queues() {
+                self.graphics.update_in_flight = self.graphics.coalesce_updates;
                 self.event_proxy.send_event(
                     RioEvent::UpdateGraphics {
                         route_id: self.route_id,
@@ -754,8 +810,34 @@ impl<U: EventListener> Crosswords<U> {
     where
         U: EventListener,
     {
+        self.end_program_activity();
         self.event_proxy
             .send_event(RioEvent::CloseTerminal(self.route_id), self.window_id);
+    }
+
+    /// Desktop consumers enable coalescing and acknowledge each delivered
+    /// batch. At most one batch then owns pixels outside the terminal queue.
+    pub fn acknowledge_graphics_update(&mut self) {
+        self.graphics.update_in_flight = false;
+        self.send_graphics_updates();
+    }
+
+    fn program_status_changed(&self) {
+        {
+            let mut metadata = self.metadata.lock();
+            metadata.status = self.program_status.display_status();
+            metadata.status_revision = self.program_status.revision();
+        }
+        self.event_proxy.send_event(
+            RioEvent::ProgramStatusChanged(self.route_id),
+            self.window_id,
+        );
+    }
+
+    fn end_program_activity(&mut self) {
+        if self.program_status.end_activity() {
+            self.program_status_changed();
+        }
     }
 
     pub fn resize<S: Dimensions>(&mut self, size: S) {
@@ -823,13 +905,9 @@ impl<U: EventListener> Crosswords<U> {
         delta = std::cmp::min(std::cmp::max(delta, min_delta), history_size as i32);
         self.vi_mode_cursor.pos.row += delta;
 
-        // Image placements (kitty and sixel/iTerm2) anchor at absolute
-        // rows. A column reflow moves content to different rows, so ask
-        // each grid to record an exact old-row to new-row mapping while
-        // it reflows, but only when that grid's screen actually has
-        // placements; tracking costs a Vec sized to the ring. Vertical
-        // resizes never move content in absolute row space and produce
-        // no remap.
+        // Track Kitty anchor cells and atlas anchor rows through column
+        // reflow. Only screens with placements need these mappings.
+        // Height changes preserve anchors in absolute row space.
         let active_has_placements = !self.graphics.kitty_placements.is_empty()
             || !self.graphics.atlas_placements.is_empty();
         let inactive_has_placements = !self
@@ -846,8 +924,53 @@ impl<U: EventListener> Crosswords<U> {
         let is_alt = self.mode.contains(Mode::ALT_SCREEN);
         self.grid.track_reflow_remap = active_has_placements;
         self.inactive_grid.track_reflow_remap = inactive_has_placements;
-        self.grid.resize(!is_alt, num_lines, num_cols);
-        self.inactive_grid.resize(is_alt, num_lines, num_cols);
+        self.grid.reflow_protected_rows.extend(
+            self.graphics
+                .kitty_placements
+                .values()
+                .filter(|p| p.relative.is_none())
+                .map(|p| p.dest_row)
+                .chain(self.graphics.atlas_placements.iter().map(|p| p.abs_row)),
+        );
+        self.inactive_grid.reflow_protected_rows.extend(
+            self.graphics
+                .kitty_inactive_screen
+                .kitty_placements
+                .values()
+                .filter(|p| p.relative.is_none())
+                .map(|p| p.dest_row)
+                .chain(
+                    self.graphics
+                        .kitty_inactive_screen
+                        .atlas_placements
+                        .iter()
+                        .map(|p| p.abs_row),
+                ),
+        );
+        self.grid.reflow_protected_cells.extend(
+            self.graphics
+                .kitty_placements
+                .values()
+                .filter(|p| p.relative.is_none())
+                .map(|p| (p.dest_row, p.dest_col)),
+        );
+        self.inactive_grid.reflow_protected_cells.extend(
+            self.graphics
+                .kitty_inactive_screen
+                .kitty_placements
+                .values()
+                .filter(|p| p.relative.is_none())
+                .map(|p| (p.dest_row, p.dest_col)),
+        );
+        let reflow_primary = self.mode.contains(Mode::LINE_WRAP);
+        self.grid
+            .resize(!is_alt && reflow_primary, num_lines, num_cols);
+        self.inactive_grid
+            .resize(is_alt && reflow_primary, num_lines, num_cols);
+        self.grid.reflow_protected_rows.clear();
+        self.inactive_grid.reflow_protected_rows.clear();
+        self.grid.reflow_protected_cells.clear();
+        self.inactive_grid.reflow_protected_cells.clear();
         self.grid.track_reflow_remap = false;
         self.inactive_grid.track_reflow_remap = false;
         let active_remap = self.grid.reflow_remap.take();
@@ -916,18 +1039,16 @@ impl<U: EventListener> Crosswords<U> {
             }
         }
 
-        // Re-anchor placements through the exact reflow row mapping:
-        // each one moves to wherever its anchor row's content landed.
-        // Kitty placements on a dropped row stay put (they float and
-        // get culled off screen); sixel/iTerm2 placements are grid
-        // content and are destroyed, along with any that a truncation
-        // pushed past the ring end.
+        // Kitty uses the mapped anchor cell; atlas images follow their
+        // row's content. Dropped atlas regions are destroyed, while Kitty
+        // placement expiry follows the history lifetime.
         if let Some(remap) = &active_remap {
             let max_abs =
                 self.grid.lines_evicted() as i64 + self.grid.total_lines() as i64;
             for p in self.graphics.kitty_placements.values_mut() {
-                if let Some(abs) = remap.remap_abs(p.dest_row) {
-                    p.dest_row = abs;
+                if let Some((row, col)) = remap.remap_cell(p.dest_row, p.dest_col) {
+                    p.dest_row = row;
+                    p.dest_col = col;
                 }
             }
             let before = self.graphics.atlas_placements.len();
@@ -950,8 +1071,9 @@ impl<U: EventListener> Crosswords<U> {
                 + self.inactive_grid.total_lines() as i64;
             let inactive = &mut self.graphics.kitty_inactive_screen;
             for p in inactive.kitty_placements.values_mut() {
-                if let Some(abs) = remap.remap_abs(p.dest_row) {
-                    p.dest_row = abs;
+                if let Some((row, col)) = remap.remap_cell(p.dest_row, p.dest_col) {
+                    p.dest_row = row;
+                    p.dest_col = col;
                 }
             }
             let before = inactive.atlas_placements.len();
@@ -976,6 +1098,7 @@ impl<U: EventListener> Crosswords<U> {
         if active_has_placements || inactive_has_placements {
             self.graphics.kitty_graphics_dirty = true;
         }
+        self.expire_kitty_placements();
         self.expire_atlas_placements();
     }
 
@@ -1117,6 +1240,8 @@ impl<U: EventListener> Crosswords<U> {
         }
 
         self.grid.cursor.pos.col = Column(0);
+        let row = self.grid.cursor.pos.row;
+        self.grid[row].wrap_continuation = true;
         self.grid.cursor.should_wrap = false;
         self.damage_cursor();
     }
@@ -1180,7 +1305,7 @@ impl<U: EventListener> Crosswords<U> {
         }
 
         // Check if there's any partial damage
-        if self.damage.lines.iter().any(|line| line.is_damaged()) {
+        if !self.damage.dirty_lines.is_empty() {
             return true;
         }
 
@@ -1189,7 +1314,12 @@ impl<U: EventListener> Crosswords<U> {
     }
 
     #[inline]
-    fn scroll_down_relative(&mut self, origin: Line, mut lines: usize) {
+    fn scroll_down_relative(
+        &mut self,
+        origin: Line,
+        mut lines: usize,
+        move_images: bool,
+    ) {
         debug!(
             "Scrolling down relative: origin={}, lines={}",
             origin, lines
@@ -1217,7 +1347,16 @@ impl<U: EventListener> Crosswords<U> {
 
         // Scroll between origin and bottom
         self.grid.sync_template_style();
+        let old_top = self.grid.lines_evicted() as i64 + self.history_size() as i64;
+        let last = self.grid.last_column();
+        for row in region.start.0..region.end.0 {
+            self.grid[Line(row)][last].set_wrapline(false);
+            self.grid[Line(row)].wrap_continuation = false;
+        }
         self.grid.scroll_down(&region, lines);
+        if move_images {
+            self.scroll_kitty_with_margins(&region, lines as i64, old_top);
+        }
         self.mark_fully_damaged();
         // Partial-region scrolls move grid-plane images with their
         // content (kitty placements float and are not adjusted).
@@ -1228,13 +1367,25 @@ impl<U: EventListener> Crosswords<U> {
     }
 
     #[inline]
-    pub fn scroll_up_relative(&mut self, origin: Line, mut lines: usize) {
+    pub fn scroll_up_relative(&mut self, origin: Line, lines: usize) {
+        self.scroll_up_relative_inner(origin, lines, true, true);
+    }
+
+    fn scroll_up_relative_inner(
+        &mut self,
+        origin: Line,
+        mut lines: usize,
+        preserve_wrap: bool,
+        move_images: bool,
+    ) {
         lines = std::cmp::min(
             lines,
             (self.scroll_region.end - self.scroll_region.start).0 as usize,
         );
 
         let region = origin..self.scroll_region.end;
+
+        let history = preserve_wrap && region.start == 0;
 
         // Scroll selection.
         if self.selection.is_some() {
@@ -1246,7 +1397,41 @@ impl<U: EventListener> Crosswords<U> {
 
         self.grid.sync_template_style();
         let pinned_offset = self.grid.display_offset();
-        self.grid.scroll_up(&region, lines);
+        let old_top = self.grid.lines_evicted() as i64 + self.history_size() as i64;
+        if history {
+            self.grid.scroll_up(&region, lines);
+        } else {
+            if !preserve_wrap {
+                let last = self.grid.last_column();
+                for row in region.start.0..region.end.0 {
+                    self.grid[Line(row)][last].set_wrapline(false);
+                    self.grid[Line(row)].wrap_continuation = false;
+                }
+            }
+            self.grid.delete_lines(&region, lines);
+        }
+        if history
+            && region.end.0 as usize == self.grid.screen_lines()
+            && self.grid.history_is_disabled()
+        {
+            // No-history scrolling shifts active rows in place. Tracked image
+            // pins move up with them and clamp at row zero, unlike pins whose
+            // history rows are erased or evicted.
+            let new_top = self.grid.lines_evicted() as i64 + self.history_size() as i64;
+            for p in self.graphics.kitty_placements.values_mut() {
+                let row = p.dest_row - old_top;
+                if p.relative.is_none()
+                    && (0..self.grid.screen_lines() as i64).contains(&row)
+                {
+                    let next = new_top + (row - lines as i64).max(0);
+                    self.graphics.kitty_graphics_dirty |= next != p.dest_row;
+                    p.dest_row = next;
+                }
+            }
+        }
+        if move_images {
+            self.scroll_kitty_with_margins(&region, -(lines as i64), old_top);
+        }
 
         // A viewport pinned in scrollback normally absorbs the scroll:
         // the offset grows and the same absolute rows stay on screen.
@@ -1254,7 +1439,8 @@ impl<U: EventListener> Crosswords<U> {
         // every visible row changes while the region damage below only
         // covers active-area lines. Nothing less than full damage is
         // correct then.
-        if region.start == 0
+        if history
+            && region.start == 0
             && pinned_offset != 0
             && self.grid.display_offset() != pinned_offset + lines
         {
@@ -1263,7 +1449,7 @@ impl<U: EventListener> Crosswords<U> {
 
         // Scroll vi mode cursor.
         let viewport_top = Line(-(self.grid.display_offset() as i32));
-        let top = if region.start == 0 {
+        let top = if history && region.start == 0 {
             viewport_top
         } else {
             region.start
@@ -1285,15 +1471,12 @@ impl<U: EventListener> Crosswords<U> {
             // Placements whose rows all scrolled off the ring expire,
             // like kitty: the image data survives for future
             // placements, the placement itself dies with its content.
-            let base = self.grid.lines_evicted() as i64;
-            self.graphics
-                .kitty_placements
-                .retain(|_, p| p.dest_row + p.rows as i64 > base);
+            self.expire_kitty_placements();
             self.graphics.kitty_graphics_dirty = true;
         }
         // Grid-plane images follow their content through region
         // scrolls; kitty placements float and are not adjusted.
-        if region.start.0 == 0 {
+        if history && region.start.0 == 0 {
             if (region.end.0 as usize) < self.grid.screen_lines() {
                 // History grew under the fixed bottom rows.
                 self.shift_atlas_placements_below(region.end, lines as i64);
@@ -1304,6 +1487,78 @@ impl<U: EventListener> Crosswords<U> {
             self.shift_atlas_placements_in_region(&region, -(lines as i64));
         }
         self.expire_atlas_placements();
+    }
+
+    /// Kitty images fully inside margins scroll and crop at the margins.
+    /// Other images keep their viewport position, including when the row
+    /// operation added history above a fixed part of the screen.
+    fn scroll_kitty_with_margins(
+        &mut self,
+        region: &Range<Line>,
+        delta: i64,
+        old_top: i64,
+    ) {
+        if self.graphics.kitty_placements.is_empty()
+            || (region.start == 0 && region.end.0 as usize == self.grid.screen_lines())
+        {
+            return;
+        }
+        let new_top = self.grid.lines_evicted() as i64 + self.history_size() as i64;
+        let screen_lines = self.grid.screen_lines() as i64;
+        let cell_size = (
+            self.graphics.cell_width.round() as usize,
+            self.graphics.cell_height.round() as usize,
+        );
+        let top = i64::from(region.start.0);
+        let bottom = i64::from(region.end.0);
+        let images = &self.graphics.kitty_images;
+        let mut changed = false;
+        self.graphics.kitty_placements.retain(|_, p| {
+            if p.relative.is_some() {
+                return true;
+            }
+            let y = p.dest_row - old_top;
+            if y < 0 || y >= screen_lines {
+                return true;
+            }
+            let mut next = y;
+            let rows = i64::from(p.rows);
+            if p.columns > 0 && rows > 0 && y >= top && y + rows <= bottom {
+                next = y + delta;
+                let above = (top - next).max(0);
+                let below = (next + rows - bottom).max(0);
+                if above >= rows || below >= rows {
+                    changed = true;
+                    return false;
+                }
+                let crop = above.max(below);
+                if crop > 0 {
+                    let Some(image) = images.get(&p.image_id) else {
+                        return true;
+                    };
+                    if !p.clip_rows(
+                        (image.data.width, image.data.height),
+                        cell_size,
+                        crop as u32,
+                        above > 0,
+                    ) {
+                        changed = true;
+                        return false;
+                    }
+                    changed = true;
+                    next = next.max(top);
+                }
+            }
+            let row = new_top + next;
+            changed |= row != p.dest_row;
+            p.dest_row = row;
+            true
+        });
+        if changed {
+            self.graphics.remove_orphaned_placements();
+            self.graphics.kitty_graphics_dirty = true;
+            self.send_graphics_updates();
+        }
     }
 
     /// Drop sixel/iTerm2 placements whose rows all scrolled off the
@@ -1475,10 +1730,15 @@ impl<U: EventListener> Crosswords<U> {
 
     #[inline(always)]
     pub fn write_at_cursor(&mut self, c: char) {
-        let c = self.grid.cursor.charsets[self.active_charset].map(c);
+        let charset = self.single_shift.take().unwrap_or(self.active_charset);
+        let c = self.grid.cursor.charsets[charset].map(c);
+        self.write_at_cursor_with_wide(c, Wide::Narrow);
+    }
+
+    fn write_at_cursor_with_wide(&mut self, c: char, wide: Wide) {
         self.grid.sync_template_style();
         let template = self.cell_template();
-        self.write_cell(c, template);
+        self.write_cell_with_wide(c, template, wide);
     }
 
     /// Write an already-charset-mapped `c` into the cursor cell, taking a
@@ -1513,24 +1773,28 @@ impl<U: EventListener> Crosswords<U> {
         // Boundary right of the final cell.
         if col >= columns {
             let last = Column(columns - 1);
-            if matches!(self.grid[line][last].wide(), Wide::LeadingSpacer) {
-                self.grid[line][last].set_wide(Wide::Narrow);
+            if self.grid[line][last].wrapline()
+                && matches!(self.grid[line][last].wide(), Wide::LeadingSpacer)
+            {
+                self.grid[line][last] = blank;
+                self.grid[line][last].set_wrapline(true);
             }
             return;
         }
 
-        // A wide char at column 0 pairs with a `LeadingSpacer` closing
-        // the previous row; a mutation reaching columns 0/1 severs
-        // that link. Mirrors `write_cell`'s revert (including its
-        // history-row reach when line 0 scrolled something out).
+        // Only a wrap continuation links the first wide cell to the
+        // preceding spacer head, which may be in history.
         if col <= 1
+            && self.grid[line].wrap_continuation
             && matches!(self.grid[line][Column(0)].wide(), Wide::Wide)
             && line != self.grid.topmost_line()
         {
             let last = self.grid.last_column();
             let prev = &mut self.grid[line - 1i32][last];
             if matches!(prev.wide(), Wide::LeadingSpacer) {
-                prev.set_wide(Wide::Narrow);
+                let wrapped = prev.wrapline();
+                *prev = blank;
+                prev.set_wrapline(wrapped);
                 if line.0 > 0 {
                     self.damage.damage_line((line.0 - 1) as usize);
                 }
@@ -1567,19 +1831,14 @@ impl<U: EventListener> Crosswords<U> {
         }
     }
 
-    /// Append `c` to the cluster of the cell most recently written at
-    /// the cursor (legacy zero-width semantics: `saturating_sub`
-    /// column math, so a mark at column 0 targets column 0).
+    /// Append `c` to the preceding cell's cluster. At column zero only a
+    /// pending wrap leaves a preceding base under the cursor.
     fn attach_to_prev_cell(&mut self, c: char) {
-        let mut column = self.grid.cursor.pos.col;
-        if !self.grid.cursor.should_wrap {
-            column.0 = column.saturating_sub(1);
-        }
-
+        let Some(column) = self.prev_cell_col() else {
+            return;
+        };
+        let column = Column(column);
         let row = self.grid.cursor.pos.row;
-        if matches!(self.grid[row][column].wide(), Wide::Spacer) {
-            column.0 = column.saturating_sub(1);
-        }
 
         // A bg-only cell reuses the extras-id bits for its color
         // channel: reading them as an id would clone an unrelated
@@ -1686,8 +1945,7 @@ impl<U: EventListener> Crosswords<U> {
                 // it, so validity is judged against the *last* codepoint
                 // of the cluster, not its base. The width helpers are
                 // no-ops when the cell is already in the target state.
-                if vs_is_valid_base(last_cp, c) {
-                    self.widen_prev_cell();
+                if vs_is_valid_base(last_cp, c) && self.widen_prev_cell() {
                     self.attach_to_prev_cell(c);
                 }
                 // Invalid selector: ignore. The cell is untouched, so
@@ -1701,14 +1959,30 @@ impl<U: EventListener> Crosswords<U> {
             }
             _ if width == 0 => self.attach_to_prev_cell(c),
             _ => {
-                self.widen_prev_cell();
-                self.attach_to_prev_cell(c);
+                if self.widen_prev_cell() {
+                    self.attach_to_prev_cell(c);
+                }
             }
         }
         true
     }
 
+    // A split wide pair leaves a blank with the current background. Preserve
+    // the logical line's wrap marker, but discard the old glyph's attributes.
+    fn clear_wide_neighbor(&mut self, line: Line, col: Column) {
+        let bg = self.grid.template_style().bg;
+        let mut blank = self.grid.blank_with_bg(bg);
+        blank.set_wrapline(self.grid[line][col].wrapline());
+        self.grid[line][col] = blank;
+        self.grid[line].has_styles |= blank.carries_style();
+    }
+
+    #[inline]
     fn write_cell(&mut self, c: char, template: crate::crosswords::square::Square) {
+        self.write_cell_with_wide(c, template, Wide::Narrow);
+    }
+
+    fn write_cell_with_wide(&mut self, c: char, template: Square, new_wide: Wide) {
         use crate::crosswords::square::{Square, Wide};
 
         // DEC semantics: printing into a cell covered by a sixel or iTerm2
@@ -1727,10 +2001,16 @@ impl<U: EventListener> Crosswords<U> {
         let has_extras = template.extras_id().is_some();
         let styled = template.carries_style();
         let cursor_square = self.grid.cursor_square();
+        let wrapline = cursor_square.wrapline();
 
-        // Fast path: overwriting a narrow cell. One resolve, one packed store.
-        if !matches!(cursor_square.wide(), Wide::Wide | Wide::Spacer) {
+        // Matching widths need no neighbor cleanup. Narrow destinations also
+        // have no old wide pair to repair.
+        if cursor_square.wide() == new_wide
+            || !matches!(cursor_square.wide(), Wide::Wide | Wide::Spacer)
+        {
             *cursor_square = Square::from_template(template, c);
+            cursor_square.set_wide(new_wide);
+            cursor_square.set_wrapline(wrapline);
             if has_extras || styled {
                 let row = self.grid.cursor.pos.row;
                 self.grid[row].has_extras |= has_extras;
@@ -1743,20 +2023,27 @@ impl<U: EventListener> Crosswords<U> {
         let wide = matches!(cursor_square.wide(), Wide::Wide);
         let point = self.grid.cursor.pos;
         if wide && point.col < self.grid.last_column() {
-            self.grid[point.row][point.col + 1].set_wide(Wide::Narrow);
+            self.clear_wide_neighbor(point.row, point.col + 1);
         } else if point.col > 0 {
-            self.grid[point.row][point.col - 1].clear();
+            self.clear_wide_neighbor(point.row, point.col - 1);
         }
         // Remove leading spacers.
-        if point.col <= 1 && point.row != self.grid.topmost_line() {
+        if (point.col == Column(0) || (!wide && point.col == Column(1)))
+            && point.row.0 > 0
+        {
             let column = self.grid.last_column();
             let prev = &mut self.grid[point.row - 1i32][column];
             if matches!(prev.wide(), Wide::LeadingSpacer) {
                 prev.set_wide(Wide::Narrow);
+                if point.row.0 > 0 {
+                    self.damage.damage_line((point.row.0 - 1) as usize);
+                }
             }
         }
 
         *self.grid.cursor_cell() = Square::from_template(template, c);
+        self.grid.cursor_cell().set_wide(new_wide);
+        self.grid.cursor_cell().set_wrapline(wrapline);
         if has_extras || styled {
             let row = self.grid.cursor.pos.row;
             self.grid[row].has_extras |= has_extras;
@@ -1808,15 +2095,9 @@ impl<U: EventListener> Crosswords<U> {
                 }
             }
 
-            self.write_at_cursor(c);
-            self.grid
-                .cursor_cell()
-                .set_wide(crate::crosswords::square::Wide::Wide);
+            self.write_at_cursor_with_wide(c, Wide::Wide);
             self.grid.cursor.pos.col += 1;
-            self.write_at_cursor(' ');
-            self.grid
-                .cursor_cell()
-                .set_wide(crate::crosswords::square::Wide::Spacer);
+            self.write_at_cursor_with_wide(' ', Wide::Spacer);
         } else {
             self.write_at_cursor(c);
         }
@@ -1829,6 +2110,92 @@ impl<U: EventListener> Crosswords<U> {
         } else {
             self.grid.cursor.should_wrap = true;
         }
+    }
+
+    /// Write ordinary mixed-width text up to the current row boundary.
+    /// Complex clusters and row-edge wide characters retain the scalar paths.
+    fn write_ordinary_row(
+        &mut self,
+        template: Square,
+        cps: &[u32],
+        table: &[u8],
+        clustering: bool,
+    ) -> usize {
+        use crate::crosswords::square::Wide;
+
+        if !self.mode.contains(Mode::LINE_WRAP) {
+            return 0;
+        }
+        if self.grid.cursor.should_wrap {
+            self.wrapline();
+        }
+        let columns = self.grid.columns();
+        let start = self.grid.cursor.pos.col.0;
+        let line = self.grid.cursor.pos.row;
+        let row = &mut self.grid[line];
+        let wrapline = row.inner[columns - 1].wrapline();
+        let mut col = start;
+        let mut written = 0;
+        let mut spacer = Square::from_template(template, ' ');
+        spacer.set_wide(Wide::Spacer);
+        let clear_left = start != 0 && row.inner[start].wide() == Wide::Spacer;
+        let mut clear_right = false;
+        let mut clear_previous_leading = false;
+        for &cp in cps {
+            let properties = crate::codepoint_width::print_properties_in(table, cp);
+            let width = match properties.width() {
+                Some(width @ (1 | 2)) => width as usize,
+                _ => break,
+            };
+            if (clustering && !properties.ordinary())
+                || cp == crate::ansi::kitty_virtual::PLACEHOLDER as u32
+                || col + width > columns
+            {
+                break;
+            }
+            // Everything inside the written span is replaced. Only a pair
+            // crossing either edge can leave an old neighbour behind.
+            clear_right = row.inner[col + width - 1].wide() == Wide::Wide;
+            if col <= 1 && !(col == 0 && width == 2) {
+                clear_previous_leading |=
+                    Square::any_needs_wide_cleanup(&row.inner[col..(col + width).min(2)]);
+            }
+            let c = char::from_u32(cp).unwrap_or('\u{fffd}');
+            let mut cell = Square::from_template(template, c);
+            if width == 2 {
+                cell.set_wide(Wide::Wide);
+                row.inner[col + 1] = spacer;
+            }
+            row.inner[col] = cell;
+            col += width;
+            written += 1;
+        }
+        if written != 0 {
+            row.inner[columns - 1].set_wrapline(wrapline);
+            row.occ = row.occ.max(col);
+            row.dirty = true;
+            row.has_extras |= template.extras_id().is_some();
+            row.has_styles |= template.carries_style();
+            if clear_left {
+                self.clear_wide_neighbor(line, Column(start - 1));
+            }
+            if clear_right && col < columns {
+                self.clear_wide_neighbor(line, Column(col));
+            }
+            if clear_previous_leading && line.0 > 0 {
+                let previous = &mut self.grid[line - 1i32][Column(columns - 1)];
+                if previous.wide() == Wide::LeadingSpacer {
+                    previous.set_wide(Wide::Narrow);
+                    if line.0 > 0 {
+                        self.damage.damage_line((line.0 - 1) as usize);
+                    }
+                }
+            }
+            self.grid.cursor.pos.col = Column(col.min(columns - 1));
+            self.grid.cursor.should_wrap = col == columns;
+            self.damage.damage_line(line.0 as usize);
+        }
+        written
     }
 
     /// Bulk-write a run of width-1 codepoints, mirroring the ASCII bulk
@@ -1862,16 +2229,16 @@ impl<U: EventListener> Crosswords<U> {
             {
                 let line = self.grid.cursor.pos.row;
                 let row = &mut self.grid[line];
+                let wrapline = row.inner[columns - 1].wrapline();
                 let cells = &mut row[Column(cursor_col)..Column(cursor_col + take)];
-                let needs_cleanup = cells
-                    .iter()
-                    .fold(false, |acc, c| acc | c.needs_wide_cleanup());
+                let needs_cleanup = Square::any_needs_wide_cleanup(cells);
                 if !needs_cleanup {
                     for (cell, &cp) in cells.iter_mut().zip(&cps[idx..idx + take]) {
                         let c = char::from_u32(cp).unwrap_or('\u{FFFD}');
                         *cell =
                             crate::crosswords::square::Square::from_template(template, c);
                     }
+                    row.inner[columns - 1].set_wrapline(wrapline);
                     if template_has_extras {
                         row.has_extras = true;
                     }
@@ -1938,10 +2305,9 @@ impl<U: EventListener> Crosswords<U> {
             {
                 let line = self.grid.cursor.pos.row;
                 let row = &mut self.grid[line];
+                let wrapline = row.inner[columns - 1].wrapline();
                 let cells = &mut row[Column(cursor_col)..Column(cursor_col + take * 2)];
-                let needs_cleanup = cells
-                    .iter()
-                    .fold(false, |acc, c| acc | c.needs_wide_cleanup());
+                let needs_cleanup = Square::any_needs_wide_cleanup(cells);
                 if !needs_cleanup {
                     for (pair, &cp) in
                         cells.chunks_exact_mut(2).zip(&cps[idx..idx + take])
@@ -1952,6 +2318,7 @@ impl<U: EventListener> Crosswords<U> {
                         pair[0] = wide;
                         pair[1] = spacer;
                     }
+                    row.inner[columns - 1].set_wrapline(wrapline);
                     if template_has_extras {
                         row.has_extras = true;
                     }
@@ -2000,7 +2367,14 @@ impl<U: EventListener> Crosswords<U> {
     /// pair's spacer to its lead. `None` when no such cell exists.
     fn prev_cell_col(&self) -> Option<usize> {
         let col = self.grid.cursor.pos.col.0;
-        let col = if self.grid.cursor.should_wrap {
+        let wrap = self.mode.contains(Mode::LINE_WRAP);
+        let current = self.grid[self.grid.cursor.pos.row][Column(col)];
+        let cluster_at_edge = !wrap
+            && self.mode.contains(Mode::GRAPHEME_CLUSTER)
+            && col > 0
+            && col == self.grid.columns() - 1
+            && current.c() != '\0';
+        let col = if (wrap && self.grid.cursor.should_wrap) || cluster_at_edge {
             col
         } else {
             col.checked_sub(1)?
@@ -2017,20 +2391,20 @@ impl<U: EventListener> Crosswords<U> {
     /// mode-2027 cluster continuation (a width-bearing codepoint
     /// joining a narrow cluster makes the whole cluster wide).
     #[inline(never)]
-    fn widen_prev_cell(&mut self) {
+    fn widen_prev_cell(&mut self) -> bool {
         let columns = self.grid.columns();
         // No wide pair fits on one column, so leave the base narrow: the
         // wrap branch below would place the trailing Spacer at column 1 of
         // the new row, off the end of it.
         if columns < 2 {
-            return;
+            return false;
         }
         let row = self.grid.cursor.pos.row;
         let Some(base_col) = self.prev_cell_col() else {
-            return;
+            return false;
         };
         if !matches!(self.grid[row][Column(base_col)].wide(), Wide::Narrow) {
-            return;
+            return true;
         }
 
         let spacer_col = base_col + 1;
@@ -2043,7 +2417,7 @@ impl<U: EventListener> Crosswords<U> {
             // on the new row, preserving the original cell's style and
             // any extras (zerowidth combining chars attached before VS16).
             if !self.mode.contains(Mode::LINE_WRAP) {
-                return;
+                return false;
             }
 
             // Snapshot the base cell — `write_at_cursor` below replaces
@@ -2061,6 +2435,14 @@ impl<U: EventListener> Crosswords<U> {
             let new_row = self.grid.cursor.pos.row;
             let mut moved = base_snapshot;
             moved.set_wide(Wide::Wide);
+            // Install the requested width during cleanup, so an existing
+            // spacer cannot erase the moved base or its previous-row link.
+            self.grid.sync_template_style();
+            self.write_cell_with_wide(
+                base_snapshot.c(),
+                self.cell_template(),
+                Wide::Wide,
+            );
             self.grid[new_row][Column(0)] = moved;
             // IndexMut doesn't maintain the row hints; without them,
             // reclaim would sweep this cell's live slots.
@@ -2072,8 +2454,7 @@ impl<U: EventListener> Crosswords<U> {
             }
 
             self.grid.cursor.pos.col = Column(1);
-            self.write_at_cursor(' ');
-            self.grid.cursor_cell().set_wide(Wide::Spacer);
+            self.write_cell_with_wide(' ', self.cell_template(), Wide::Spacer);
 
             if 2 < columns {
                 self.grid.cursor.pos.col = Column(2);
@@ -2083,7 +2464,7 @@ impl<U: EventListener> Crosswords<U> {
 
             self.damage.damage_line(row.0 as usize);
             self.damage.damage_line(new_row.0 as usize);
-            return;
+            return true;
         }
 
         self.grid[row][Column(base_col)].set_wide(Wide::Wide);
@@ -2100,37 +2481,29 @@ impl<U: EventListener> Crosswords<U> {
         }
 
         self.damage.damage_line(row.0 as usize);
+        true
     }
 
     /// Shrink the wide pair preceding the cursor back to a narrow cell,
-    /// clearing its spacer and retracting the cursor. No-op unless a
+    /// releasing its spacer and retracting the cursor. No-op unless a
     /// wide pair is there. Validity-free counterpart of
     /// [`widen_prev_cell`]: VS15 demotion (via `apply_emoji_vs15`,
     /// which gates on the base) and mode-2027 cluster continuation
     /// (which gates on the cluster's last codepoint) share it.
     fn narrow_prev_cell(&mut self) {
         let row = self.grid.cursor.pos.row;
-        let cursor_col = self.grid.cursor.pos.col.0;
-        let should_wrap = self.grid.cursor.should_wrap;
-
-        let (base_col, spacer_col) = if should_wrap {
-            if cursor_col == 0 {
-                return;
-            }
-            (cursor_col - 1, cursor_col)
-        } else {
-            if cursor_col < 2 {
-                return;
-            }
-            (cursor_col - 2, cursor_col - 1)
+        let Some(base_col) = self.prev_cell_col() else {
+            return;
         };
 
         if !matches!(self.grid[row][Column(base_col)].wide(), Wide::Wide) {
             return;
         }
 
+        let spacer_col = base_col + 1;
         self.grid[row][Column(base_col)].set_wide(Wide::Narrow);
-        self.grid[row][Column(spacer_col)] = Square::default();
+        self.grid[row][Column(spacer_col)].set_wide(Wide::Narrow);
+        self.grid[row][Column(spacer_col)].set_c('\0');
 
         self.grid.cursor.pos.col = Column(spacer_col);
         self.grid.cursor.should_wrap = false;
@@ -2174,126 +2547,206 @@ impl<U: EventListener> Crosswords<U> {
         buf
     }
 
+    /// Copy visible state and report whether every source row was modified.
+    /// This content hint is independent of full damage from viewport moves;
+    /// destination dirty flags retain their existing redraw semantics.
     pub fn snapshot_visible(
         &mut self,
         damage: &crate::event::TerminalDamage,
         dst: &mut Vec<Row<Square>>,
-        row_styles: &mut Vec<Vec<crate::crosswords::style::Style>>,
-        extras: &mut rustc_hash::FxHashMap<u16, crate::crosswords::square::Extras>,
-    ) {
+        row_styles: &mut Vec<snapshot::RowStyles>,
+        extras: &mut snapshot::SnapshotExtras,
+    ) -> bool {
+        self.snapshot_visible_impl(damage, dst, row_styles, extras, None)
+    }
+
+    /// Capture rows and the style values they need under the terminal lock.
+    /// Resolve the returned token after unlocking. Its borrow prevents reading
+    /// partially resolved styles; dropping it also completes the snapshot.
+    pub fn snapshot_visible_deferred<'a>(
+        &mut self,
+        damage: &crate::event::TerminalDamage,
+        dst: &'a mut Vec<Row<Square>>,
+        row_styles: &'a mut Vec<snapshot::RowStyles>,
+        extras: &mut snapshot::SnapshotExtras,
+        deferred: &'a mut snapshot::DeferredStyles,
+    ) -> snapshot::CapturedStyles<'a> {
+        let all_rows_modified =
+            self.snapshot_visible_impl(damage, dst, row_styles, extras, Some(deferred));
+        snapshot::CapturedStyles {
+            rows: dst,
+            styles: row_styles,
+            deferred,
+            all_rows_modified,
+        }
+    }
+
+    fn snapshot_visible_impl(
+        &mut self,
+        damage: &crate::event::TerminalDamage,
+        dst: &mut Vec<Row<Square>>,
+        row_styles: &mut Vec<snapshot::RowStyles>,
+        extras: &mut snapshot::SnapshotExtras,
+        mut deferred: Option<&mut snapshot::DeferredStyles>,
+    ) -> bool {
         use crate::event::TerminalDamage;
         let (start, end) = self.visible_line_bounds();
         let count = (end - start) as usize;
 
         let needs_full = matches!(damage, TerminalDamage::Full)
             || dst.len() != count
-            || row_styles.len() != count;
+            || row_styles.len() != count
+            || extras.row_count() != count;
+
+        // A Noop/CursorOnly frame normally has nothing to copy, but rows
+        // written after the damage event was consumed (e.g. a graphics
+        // insert racing a redraw) still carry their dirty bit.
+        let dirty = if needs_full {
+            0..count
+        } else {
+            self.grid.raw.dirty_line_range(Line(start), count)
+        };
+        if !needs_full && dirty.is_empty() {
+            self.grid.raw.acknowledge_snapshot();
+            return false;
+        }
+
+        if let Some(deferred) = deferred.as_mut() {
+            let cells = if self.grid.styles().len() <= 1 {
+                0
+            } else {
+                dirty
+                    .clone()
+                    .map(|y| &self.grid[Line(start + y as i32)])
+                    .filter(|row| row.has_styles && (needs_full || row.dirty))
+                    .map(|row| row.inner.len())
+                    .sum()
+            };
+            deferred.begin(self.grid.styles(), cells);
+        }
 
         // Styles are resolved to values per copied row, so the snapshot
         // holds no style ids at all: sweeps reusing ids, table growth,
         // and grid swaps can't affect rows copied on earlier frames.
         if needs_full {
-            dst.clear();
-            dst.reserve(count);
-            row_styles.resize_with(count, Vec::new);
-            extras.clear();
-            for (i, row_idx) in (start..end).enumerate() {
-                let src = &self.grid[Line(row_idx)];
-                let mut copied = src.clone();
-                copied.dirty = true;
-                dst.push(copied);
-                self.grid.resolve_row_styles(src, &mut row_styles[i]);
-                self.refresh_row_extras(src, extras);
-            }
-            for row_idx in start..end {
-                self.grid[Line(row_idx)].dirty = false;
-            }
-            return;
+            return self.snapshot_full(dst, row_styles, extras, deferred);
         }
 
-        // A Noop/CursorOnly frame normally has nothing to copy, but rows
-        // written after the damage event was consumed (e.g. a graphics
-        // insert racing a redraw) still carry their dirty bit. Fall
-        // through when any row is dirty so the snapshot can't go stale.
-        if matches!(damage, TerminalDamage::Noop | TerminalDamage::CursorOnly) {
-            let any_dirty = (0..count as i32).any(|y| self.grid[Line(start + y)].dirty);
-            if !any_dirty {
-                return;
-            }
-        }
-
+        extras.begin(count, false);
+        let mut modified = 0;
         #[allow(clippy::needless_range_loop)]
-        for y in 0..count {
+        for y in dirty {
             let row_idx = start + y as i32;
             if !self.grid[Line(row_idx)].dirty {
                 continue;
             }
             let src = &self.grid[Line(row_idx)];
-            dst[y].copy_from(src);
+            // Glyphs/flags can change while style and extras IDs stay put.
+            // The branchless reduction vectorizes over compact cell words;
+            // managed values are still checked against their live tables.
+            let unchanged = snapshot::metadata_matches(src, &dst[y]);
+            dst[y].copy_snapshot_from(src);
             dst[y].dirty = true;
-            self.grid.resolve_row_styles(src, &mut row_styles[y]);
-            self.refresh_row_extras(src, extras);
-        }
-        for row_idx in start..end {
-            self.grid[Line(row_idx)].dirty = false;
-        }
-    }
-
-    /// Insert (overwriting) every extras id referenced by `row`'s
-    /// cells into `extras`. Overwrite semantics are deliberate — when
-    /// Live slots are immutable under interning (writers copy-on-
-    // write into fresh ids), so an overwrite here only ever swaps
-    // which immutable content a row's ids resolve to.
-    /// zerowidth combining codepoint appended to an existing cell),
-    /// the cell's row is marked dirty by the surrounding `IndexMut`
-    /// write, so any other rows referencing the same id pick up the
-    /// fresh data on this row's refresh.
-    fn refresh_row_extras(
-        &self,
-        row: &Row<Square>,
-        extras: &mut rustc_hash::FxHashMap<u16, crate::crosswords::square::Extras>,
-    ) {
-        if !row.has_extras {
-            return;
-        }
-        for sq in &row.inner {
-            if let Some(id) = sq.extras_id_checked() {
-                if let Some(live) = self.grid.extras_table.get(id) {
-                    extras.insert(id, live.clone());
+            if !src.has_styles
+                || !deferred
+                    .as_mut()
+                    .is_some_and(|styles| styles.capture(y, unchanged))
+            {
+                if unchanged {
+                    row_styles[y].resolve_unchanged(src, self.grid.styles());
+                } else {
+                    self.grid.resolve_row_styles(src, &mut row_styles[y]);
                 }
             }
+            if unchanged {
+                extras.refresh_unchanged(y, &self.grid.extras_table);
+            } else {
+                extras.refresh(y, src, &self.grid.extras_table);
+            }
+            self.grid[Line(row_idx)].dirty = false;
+            modified += 1;
         }
+        self.grid.raw.acknowledge_snapshot();
+        modified == count
+    }
+
+    // Full capture needs rotation and dependency validation scratch. Keep it
+    // out of the small dirty-row path's stack frame and register allocation.
+    #[inline(never)]
+    fn snapshot_full(
+        &mut self,
+        dst: &mut Vec<Row<Square>>,
+        row_styles: &mut Vec<snapshot::RowStyles>,
+        extras: &mut snapshot::SnapshotExtras,
+        mut deferred: Option<&mut snapshot::DeferredStyles>,
+    ) -> bool {
+        let (start, end) = self.visible_line_bounds();
+        let count = (end - start) as usize;
+        let retained = dst.len() == count
+            && row_styles.len() == count
+            && extras.row_count() == count;
+        if !retained {
+            self.fill_visible_rows(dst);
+            row_styles.resize_with(count, snapshot::RowStyles::default);
+        }
+        extras.begin(count, !retained);
+        let top = self
+            .lines_evicted()
+            .saturating_add((self.history_size() - self.display_offset()) as u64);
+        extras.align(dst, row_styles, top, self.columns());
+        for (i, row_idx) in (start..end).enumerate() {
+            let src = &self.grid[Line(row_idx)];
+            // Full redraws include scrolling and UI damage. Reuse the
+            // moved row's dependencies when only glyphs/flags changed;
+            // IDs alone never establish that their values are unchanged.
+            let unchanged = retained && snapshot::metadata_matches(src, &dst[i]);
+            if retained {
+                dst[i].copy_snapshot_from(src);
+            }
+            dst[i].dirty = true;
+            if !src.has_styles
+                || !deferred
+                    .as_mut()
+                    .is_some_and(|styles| styles.capture(i, unchanged))
+            {
+                if unchanged {
+                    row_styles[i].resolve_unchanged(src, self.grid.styles());
+                } else {
+                    self.grid.resolve_row_styles(src, &mut row_styles[i]);
+                }
+            }
+            if unchanged {
+                extras.refresh_unchanged(i, &self.grid.extras_table);
+            } else {
+                extras.refresh(i, src, &self.grid.extras_table);
+            }
+        }
+        let all_modified = self.grid.raw.take_lines_dirty(Line(start), count);
+        self.grid.raw.acknowledge_snapshot();
+        all_modified
     }
 
     /// Half-open grid line range currently on screen, as `(start, end)`.
     ///
-    /// This is the full screen height offset by the scrollback position, and
-    /// deliberately has nothing to do with `scroll_region`: DECSTBM bounds
-    /// where scrolling happens, not what is displayed. Both were once read
-    /// from `scroll_region`, so an app that narrowed it (vim, less, htop,
-    /// tmux, man) lost rows off the snapshot.
+    /// DECSTBM limits scrolling, not visibility; using it here drops rows when
+    /// a TUI narrows the scrolling region.
     #[inline]
     fn visible_line_bounds(&self) -> (i32, i32) {
         let scroll = self.display_offset() as i32;
         (-scroll, self.grid.screen_lines() as i32 - scroll)
     }
 
-    /// Copy the visible viewport into `dst` in place. Reuses both the
-    /// outer `Vec`'s capacity and each inner `Row`'s `Vec<Square>`
-    /// allocation (via [`Row::copy_from`]) so the renderer's frame
-    /// buffer doesn't reallocate every frame at steady state.
+    /// Retain the viewport and each row's allocation across full redraws, so
+    /// scrolling and tab switches do not allocate another screen of cells.
     #[inline]
     pub fn fill_visible_rows(&self, dst: &mut Vec<Row<Square>>) {
         let (start, end) = self.visible_line_bounds();
         let count = (end - start) as usize;
 
-        // Copy each visible row into the matching slot. Excess slots
-        // get truncated; missing ones get pushed (with a fresh `Row`
-        // each — first-frame allocation only).
         for (i, row_idx) in (start..end).enumerate() {
             let src = &self.grid[Line(row_idx)];
             if let Some(dst_row) = dst.get_mut(i) {
-                dst_row.copy_from(src);
+                dst_row.copy_snapshot_from(src);
             } else {
                 dst.push(src.clone());
             }
@@ -2385,64 +2838,29 @@ impl<U: EventListener> Crosswords<U> {
     }
 
     pub fn swap_alt(&mut self) {
-        if !self.mode.contains(Mode::ALT_SCREEN) {
-            // Set alt screen cursor to the current primary screen cursor.
+        let entering = !self.mode.contains(Mode::ALT_SCREEN);
+        self.screen_mode_state[3] = entering;
+        if entering {
+            self.save_cursor_position();
+            self.swap_alt_inner(false);
+            self.clear_screen(ClearMode::All);
+            // Clear with the alternate screen's old pen, then carry over
+            // the primary cursor and re-intern its style in this grid.
+            self.grid.cursor = self.inactive_grid.cursor.clone();
+            self.grid.cursor.style_dirty = true;
+            self.grid.sync_template_style();
+        } else {
+            self.swap_alt_inner(false);
+        }
+    }
+
+    fn swap_alt_inner(&mut self, copy_cursor: bool) {
+        // Written cells keep their links; the outgoing cursor ends its link.
+        self.set_hyperlink(None);
+        if copy_cursor {
             self.inactive_grid.cursor = self.grid.cursor.clone();
-
-            // Style ids are local to a grid's table too: the cloned
-            // template carries a primary-table id, so force the
-            // `sync_template_style` below to re-intern `pending_style`
-            // (the id-independent value) into the alt table.
+            // Style ids belong to a grid. Re-intern the copied style below.
             self.inactive_grid.cursor.style_dirty = true;
-
-            // Extras ids are local to a grid's table. If the template
-            // carries a hyperlink (OSC 8 open across the screen
-            // switch), re-intern it into the alt table; a foreign id
-            // would resolve against the wrong table on every cell the
-            // alt screen writes.
-            if let Some(id) = self.inactive_grid.cursor.template.extras_id() {
-                let hyperlink = self
-                    .grid
-                    .extras_table
-                    .get(id)
-                    .and_then(|extras| extras.hyperlink.clone());
-                let new_id = hyperlink.map(|hyperlink| {
-                    self.inactive_grid
-                        .alloc_extras(crate::crosswords::square::Extras {
-                            hyperlink: Some(hyperlink),
-                            ..Default::default()
-                        })
-                });
-                self.inactive_grid
-                    .cursor
-                    .template
-                    .set_extras_id(new_id.filter(|&id| id != 0));
-            }
-
-            // Drop information about the primary screens saved cursor.
-            self.grid.saved_cursor = self.grid.cursor.clone();
-
-            // Reset alternate screen contents.
-            self.inactive_grid.sync_template_style();
-            self.inactive_grid.reset_region(..);
-
-            // The alt screen starts blank: sixel/iTerm2 placements
-            // stashed from a previous alt session die with its
-            // contents (DEC grid-plane semantics; kitty state
-            // intentionally persists per screen).
-            let stale = &mut self.graphics.kitty_inactive_screen;
-            if !stale.atlas_placements.is_empty() {
-                let keys: Vec<u64> = stale.atlas_key_refs.keys().copied().collect();
-                {
-                    let mut removals = self.graphics.texture_operations.lock();
-                    removals.extend(keys.iter().copied());
-                }
-                stale.atlas_placements.clear();
-                stale.atlas_key_refs.clear();
-                // The bytes go back to the budget with the textures.
-                self.graphics.untrack_atlas_keys(&keys);
-                self.send_graphics_updates();
-            }
         }
 
         mem::swap(
@@ -2455,6 +2873,7 @@ impl<U: EventListener> Crosswords<U> {
         );
 
         mem::swap(&mut self.grid, &mut self.inactive_grid);
+        self.grid.sync_template_style();
         self.mode ^= Mode::ALT_SCREEN;
         self.selection = None;
 
@@ -2466,6 +2885,23 @@ impl<U: EventListener> Crosswords<U> {
             self.send_graphics_updates();
         }
         self.mark_fully_damaged();
+    }
+
+    fn report_cursor_position(&self, private: bool) {
+        let pos = self.grid.cursor.pos;
+        let row = if self.mode.contains(Mode::ORIGIN) {
+            pos.row.0.saturating_sub(self.scroll_region.start.0).max(0)
+        } else {
+            pos.row.0
+        };
+        let text = if private {
+            // DECXCPR includes a page number; there is only one page.
+            format!("\x1b[?{};{};1R", row + 1, pos.col + 1)
+        } else {
+            format!("\x1b[{};{}R", row + 1, pos.col + 1)
+        };
+        self.event_proxy
+            .send_event(RioEvent::PtyWrite(self.route_id, text), self.window_id);
     }
 
     #[inline]
@@ -2509,6 +2945,12 @@ impl<U: EventListener> Crosswords<U> {
 
     pub fn bounds_to_string(&self, start: Pos, end: Pos) -> String {
         let mut text = String::new();
+        self.bounds_to_string_into(start, end, &mut text);
+        text
+    }
+
+    fn bounds_to_string_into(&self, start: Pos, end: Pos, text: &mut String) {
+        text.clear();
         let mut blank_rows: usize = 0;
         let mut blank_cells: usize = 0;
         let last_col = self.grid.last_column();
@@ -2530,9 +2972,9 @@ impl<U: EventListener> Crosswords<U> {
                 blank_cells = 0;
             }
 
-            let mut row_text = String::new();
+            let row_start = text.len();
             let had_content = self.append_cells(
-                &mut row_text,
+                text,
                 line,
                 start_col..end_col,
                 line == end.row,
@@ -2545,12 +2987,10 @@ impl<U: EventListener> Crosswords<U> {
                 continue;
             }
 
-            for _ in 0..blank_rows {
-                text.push('\n');
+            if blank_rows != 0 {
+                text.insert_str(row_start, &"\n".repeat(blank_rows));
             }
             blank_rows = 0;
-
-            text.push_str(&row_text);
 
             let cur_wraps = self.grid[line][last_col].wrapline();
             if end_col >= last_col && !cur_wraps {
@@ -2559,7 +2999,9 @@ impl<U: EventListener> Crosswords<U> {
             }
         }
 
-        text.strip_suffix('\n').map(str::to_owned).unwrap_or(text)
+        if text.ends_with('\n') {
+            text.pop();
+        }
     }
 
     /// Convert a single line in the grid to a String. Used by Block selection;
@@ -2610,8 +3052,50 @@ impl<U: EventListener> Crosswords<U> {
         }
 
         let mut tab_mode = false;
-        for column in (cols.start.0..line_length.0).map(Column::from) {
-            let cell = &grid_line[column];
+        let cells = grid_line
+            .inner
+            .get(cols.start.0..line_length.0)
+            .unwrap_or_default();
+        // Copy ordinary ASCII rows as one UTF-8 span. The general selection
+        // path below still owns tabs, wide spacers and combining characters.
+        // Preserve its deferred trailing spaces across soft-wrapped rows.
+        if !grid_line.has_extras && cells.len() <= 256 {
+            let mut ascii = [0u8; 256];
+            let mut end = 0;
+            let ordinary =
+                cells
+                    .iter()
+                    .zip(&mut ascii)
+                    .enumerate()
+                    .all(|(i, (cell, byte))| {
+                        let c = cell.c();
+                        if c > '\u{7f}' || c == '\t' || cell.wide() != Wide::Narrow {
+                            return false;
+                        }
+                        *byte = if c == '\0' { b' ' } else { c as u8 };
+                        if *byte != b' ' {
+                            end = i + 1;
+                        }
+                        true
+                    });
+            if ordinary {
+                if end != 0 {
+                    for _ in 0..*blank_cells {
+                        text.push(' ');
+                    }
+                    // SAFETY: every stored byte is ASCII.
+                    text.push_str(unsafe {
+                        std::str::from_utf8_unchecked(&ascii[..end])
+                    });
+                    *blank_cells = cells.len() - end;
+                    return true;
+                }
+                *blank_cells += cells.len();
+                return false;
+            }
+        }
+        for (offset, cell) in cells.iter().enumerate() {
+            let column = Column(cols.start.0 + offset);
 
             // Skip over cells until next tab-stop once a tab was found.
             if tab_mode {
@@ -2718,26 +3202,592 @@ impl<U: EventListener> Crosswords<U> {
 }
 
 impl<U: EventListener> Crosswords<U> {
+    pub fn set_clipboard_policy(&mut self, policy: crate::clipboard::ClipboardPolicy) {
+        self.clipboard_policy = policy;
+        if policy.write == crate::clipboard::Access::Deny {
+            self.kitty_clipboard_session.cancel_write();
+        }
+    }
+
+    pub fn clipboard_policy(&self) -> crate::clipboard::ClipboardPolicy {
+        self.clipboard_policy
+    }
+
+    pub fn invalidate_clipboard_requests(&mut self) {
+        self.kitty_clipboard_session.reset();
+    }
+
+    pub fn clipboard_generation(&self) -> u64 {
+        self.kitty_clipboard_session.generation()
+    }
+
+    pub fn clipboard_search_paste(
+        &self,
+        generation: u64,
+        search_generation: u64,
+        text: Arc<crate::clipboard::buffer::ResponseBuffer>,
+    ) {
+        if generation == self.clipboard_generation() {
+            self.event_proxy.send_event(
+                RioEvent::ClipboardSearchPaste(
+                    self.route_id,
+                    generation,
+                    search_generation,
+                    text,
+                ),
+                self.window_id,
+            );
+        }
+    }
+
+    fn emit_clipboard_reply(&self, bytes: &[u8]) {
+        use crate::clipboard::buffer::{Budget, ResponseBuffer};
+        use std::io::Write;
+        let mut response = ResponseBuffer::new(Budget::global());
+        if response.write_all(bytes).is_ok() {
+            self.event_proxy.send_event(
+                RioEvent::ClipboardReply(self.route_id, Arc::new(response)),
+                self.window_id,
+            );
+        }
+    }
+
+    pub fn clipboard_paste_event(
+        &mut self,
+        location: ClipboardType,
+        available: &[String],
+    ) -> std::io::Result<Option<crate::clipboard::buffer::ResponseBuffer>> {
+        if !self.mode.contains(Mode::KITTY_PASTE_EVENTS) {
+            return Ok(None);
+        }
+        self.kitty_clipboard_session
+            .paste_event(location, available)
+            .map(Some)
+    }
+
+    pub fn clipboard_request_current(
+        &self,
+        request: &crate::clipboard::kitty::Request,
+    ) -> bool {
+        self.kitty_clipboard_session.current(request)
+    }
+    pub fn clipboard_request_granted(
+        &mut self,
+        request: &crate::clipboard::kitty::Request,
+    ) -> bool {
+        self.kitty_clipboard_session.granted(request)
+    }
+    pub fn approve_clipboard_request(
+        &mut self,
+        request: &crate::clipboard::kitty::Request,
+    ) -> bool {
+        self.kitty_clipboard_session.approve(request)
+    }
     /// Ids of graphics still displayed (atlas placements + kitty).
     fn collect_used_graphic_ids(&mut self) -> std::collections::HashSet<u64> {
         self.graphics.collect_active_graphic_ids()
     }
 
-    fn cleanup_unused_kitty_images(&mut self) {
-        // Collect all currently used graphic IDs from the grid
-        let used_ids = self.collect_used_graphic_ids();
+    fn split_erase_boundary(&mut self, row: Line, col: usize, blank: Square) {
+        // EL/ED do not sever the spacer head on the preceding wrapped row.
+        if col > 0
+            && col < self.grid.columns()
+            && self.grid[row][Column(col - 1)].wide() == Wide::Wide
+        {
+            self.clear_pair_preserving_wrapline(row, col - 1, blank);
+        }
+    }
 
-        // Convert to u32 for kitty_images map
-        let used_kitty_ids: std::collections::HashSet<u32> =
-            used_ids.iter().map(|&id| id as u32).collect();
+    fn split_ech_boundary(&mut self, row: Line, col: usize, blank: Square) {
+        let last = self.grid.last_column();
+        if col <= 1
+            && self.grid[row].wrap_continuation
+            && self.grid[row][Column(0)].wide() == Wide::Wide
+            && row != self.grid.topmost_line()
+            && self.grid[row - 1i32][last].wide() == Wide::LeadingSpacer
+        {
+            let wrapped = self.grid[row - 1i32][last].wrapline();
+            self.grid[row - 1i32][last] = blank;
+            self.grid[row - 1i32][last].set_wrapline(wrapped);
+            if row.0 > 0 {
+                self.damage.damage_line(row.0 as usize - 1);
+            }
+        }
+        if col >= self.grid.columns()
+            && self.grid[row][last].wrapline()
+            && self.grid[row][last].wide() == Wide::LeadingSpacer
+        {
+            let wrapped = self.grid[row][last].wrapline();
+            self.grid[row][last] = blank;
+            self.grid[row][last].set_wrapline(wrapped);
+        }
+        self.split_wide_seam(row, col, blank);
+    }
 
-        // Delete images not in use
-        self.graphics
-            .delete_kitty_images(|id, _| !used_kitty_ids.contains(id));
+    fn reset_erase_wrap(&mut self, row: Line, blank: Square) {
+        let last = self.grid.last_column();
+        if !self.grid[row][last].wrapline() {
+            return;
+        }
+        self.grid[row][last].set_wrapline(false);
+        if row.0 + 1 < self.grid.screen_lines() as i32 {
+            self.grid[row + 1i32].wrap_continuation = false;
+            self.damage.damage_line(row.0 as usize + 1);
+        }
+        if self.grid[row][last].wide() == Wide::LeadingSpacer {
+            self.grid[row][last] = blank;
+        }
+    }
+
+    fn erase_unprotected_range(
+        &mut self,
+        row: Line,
+        left: usize,
+        right: usize,
+        blank: Square,
+        preserve_wrap: bool,
+    ) {
+        use crate::crosswords::square::CellFlags;
+        if !preserve_wrap {
+            self.reset_erase_wrap(row, blank);
+        }
+        let last = self.grid.last_column();
+        let wrapped = self.grid[row][last].wrapline();
+        let mut col = left;
+        while col < right {
+            if self.grid[row][Column(col)]
+                .cell_flags()
+                .contains(CellFlags::PROTECTED)
+            {
+                col += 1;
+                continue;
+            }
+            let start = col;
+            col += 1;
+            while col < right
+                && !self.grid[row][Column(col)]
+                    .cell_flags()
+                    .contains(CellFlags::PROTECTED)
+            {
+                col += 1;
+            }
+            self.split_erase_boundary(row, start, blank);
+            self.split_erase_boundary(row, col, blank);
+            self.grid[row].has_styles |= blank.carries_style();
+            for cell in &mut self.grid[row][Column(start)..Column(col)] {
+                *cell = blank;
+            }
+            self.clip_atlas_placements(row.0, row.0 + 1, start, col);
+        }
+        self.grid[row][last].set_wrapline(preserve_wrap && wrapped);
+        self.damage.damage_line(row.0 as usize);
+    }
+
+    fn erase_display(&mut self, mode: ClearMode, protected: bool) {
+        use crate::crosswords::grid::row::SemanticPrompt;
+
+        if !matches!(mode, ClearMode::Saved) {
+            self.grid.cursor.should_wrap = false;
+        }
+        self.grid.sync_template_style();
+        let bg = self.grid.template_style().bg;
+        let blank = self.grid.blank_with_bg(bg);
+
+        let screen_lines = self.grid.screen_lines();
+
+        match mode {
+            ClearMode::Above => {
+                let cursor = self.grid.cursor.pos;
+
+                if cursor.row > 0 {
+                    // Fully clear all lines before the current line.
+                    if protected {
+                        for row in 0..cursor.row.0 {
+                            self.erase_unprotected_range(
+                                Line(row),
+                                0,
+                                self.grid.columns(),
+                                blank,
+                                true,
+                            );
+                        }
+                    } else {
+                        self.grid.reset_region(..cursor.row);
+                    }
+                }
+
+                let wrapped = self.grid[cursor.row][self.grid.last_column()].wrapline();
+                // Clear up to the current column in the current line.
+                let end = std::cmp::min(cursor.col + 1, Column(self.grid.columns()));
+                if protected {
+                    self.erase_unprotected_range(cursor.row, 0, end.0, blank, true);
+                } else {
+                    self.split_erase_boundary(cursor.row, 0, blank);
+                    self.split_erase_boundary(cursor.row, end.0, blank);
+                    self.grid[cursor.row].has_styles |= blank.carries_style();
+                    for cell in &mut self.grid[cursor.row][..end] {
+                        *cell = blank;
+                    }
+                }
+
+                let last = self.grid.last_column();
+                self.grid[cursor.row][last].set_wrapline(wrapped);
+                let range = Line(0)..=cursor.row;
+                self.selection =
+                    self.selection.take().filter(|s| !s.intersects_range(range));
+
+                let columns = self.grid.columns();
+                self.clip_atlas_placements(0, cursor.row.0, 0, columns);
+                self.clip_atlas_placements(cursor.row.0, cursor.row.0 + 1, 0, end.0);
+            }
+            ClearMode::Below => {
+                let cursor = self.grid.cursor.pos;
+                self.reset_erase_wrap(cursor.row, blank);
+                if protected {
+                    self.erase_unprotected_range(
+                        cursor.row,
+                        cursor.col.0,
+                        self.grid.columns(),
+                        blank,
+                        false,
+                    );
+                } else {
+                    self.split_erase_boundary(cursor.row, cursor.col.0, blank);
+                    self.grid[cursor.row].has_styles |= blank.carries_style();
+                    for cell in &mut self.grid[cursor.row][cursor.col..] {
+                        *cell = blank;
+                    }
+                }
+
+                if (cursor.row.0 as usize) < screen_lines - 1 {
+                    if protected {
+                        for row in cursor.row.0 + 1..screen_lines as i32 {
+                            self.erase_unprotected_range(
+                                Line(row),
+                                0,
+                                self.grid.columns(),
+                                blank,
+                                true,
+                            );
+                        }
+                    } else {
+                        self.grid.reset_region((cursor.row + 1)..);
+                    }
+                }
+
+                let range = cursor.row..Line(screen_lines as i32);
+                self.selection =
+                    self.selection.take().filter(|s| !s.intersects_range(range));
+
+                let columns = self.grid.columns();
+                self.clip_atlas_placements(
+                    cursor.row.0,
+                    cursor.row.0 + 1,
+                    cursor.col.0,
+                    columns,
+                );
+                self.clip_atlas_placements(
+                    cursor.row.0 + 1,
+                    screen_lines as i32,
+                    0,
+                    columns,
+                );
+            }
+            ClearMode::All | ClearMode::Scroll => {
+                // Like Ghostty, ED2 preserves screen contents in history
+                // only when the last nonempty row belongs to a prompt.
+                // ED22 explicitly requests that behavior for any content.
+                let at_prompt = (0..screen_lines)
+                    .rev()
+                    .find_map(|row| {
+                        let row = &self.grid[Line(row as i32)];
+                        if row.semantic_prompt != SemanticPrompt::None {
+                            Some(true)
+                        } else if row.inner.iter().any(|cell| {
+                            !cell.is_bg_only()
+                                && !matches!(cell.c(), '\0' | '\t')
+                                && !matches!(
+                                    cell.wide(),
+                                    Wide::Spacer | Wide::LeadingSpacer
+                                )
+                        }) {
+                            Some(false)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(false);
+                if self.mode.contains(Mode::ALT_SCREEN)
+                    || (!matches!(mode, ClearMode::Scroll) && !at_prompt)
+                {
+                    if protected && matches!(mode, ClearMode::All) {
+                        for row in 0..screen_lines {
+                            self.erase_unprotected_range(
+                                Line(row as i32),
+                                0,
+                                self.grid.columns(),
+                                blank,
+                                true,
+                            );
+                        }
+                    } else {
+                        self.grid.reset_region(..);
+                    }
+                    let columns = self.grid.columns();
+                    self.clip_atlas_placements(0, screen_lines as i32, 0, columns);
+                } else {
+                    // The viewport scrolls into history below; atlas
+                    // placements are absolutely anchored and follow
+                    // their content into scrollback untouched.
+                    let old_offset = self.grid.display_offset();
+
+                    self.grid.clear_viewport();
+
+                    // Compute number of lines scrolled by clearing the viewport.
+                    let lines = self.grid.display_offset().saturating_sub(old_offset);
+
+                    self.vi_mode_cursor.pos.row = (self.vi_mode_cursor.pos.row - lines)
+                        .grid_clamp(&self.grid, Boundary::Grid);
+                }
+
+                // Erase any image content still visible after the optional
+                // scroll. Placements wholly in history remain intact.
+                self.clip_atlas_placements(
+                    0,
+                    screen_lines as i32,
+                    0,
+                    self.grid.columns(),
+                );
+                if !self.graphics.kitty_images.is_empty() {
+                    self.delete_graphics(
+                        crate::ansi::kitty_graphics_protocol::DeleteRequest {
+                            frame_number: 0,
+                            action: b'A',
+                            image_id: 0,
+                            image_number: 0,
+                            placement_id: 0,
+                            x: 0,
+                            y: 0,
+                            z_index: 0,
+                            delete_data: true,
+                        },
+                    );
+                    // Erasing the display also reclaims stored images that
+                    // have no remaining direct or virtual placement.
+                    let used: std::collections::HashSet<_> = self
+                        .graphics
+                        .kitty_placements
+                        .keys()
+                        .chain(self.graphics.kitty_virtual_placements.keys())
+                        .map(|key| key.0)
+                        .collect();
+                    self.graphics
+                        .delete_kitty_images(|id, _| !used.contains(id));
+                    self.send_graphics_updates();
+                }
+                if matches!(mode, ClearMode::Scroll) {
+                    self.grid.cursor.pos = Pos::new(Line(0), Column(0));
+                }
+                self.grid.cursor.should_wrap = false;
+                self.selection = None;
+            }
+            ClearMode::Saved if self.history_size() > 0 => {
+                self.clear_kitty_history_placements(false);
+                self.grid.clear_history();
+                self.expire_kitty_placements();
+                self.expire_atlas_placements();
+
+                self.vi_mode_cursor.pos.row = self
+                    .vi_mode_cursor
+                    .pos
+                    .row
+                    .grid_clamp(&self.grid, Boundary::Cursor);
+
+                self.selection = self
+                    .selection
+                    .take()
+                    .filter(|s| !s.intersects_range(..Line(0)));
+            }
+            // We have no history to clear.
+            ClearMode::Saved => (),
+        }
+
+        // Mark affected lines as damaged based on clear mode
+        match mode {
+            ClearMode::Above => {
+                let cursor_row = self.grid.cursor.pos.row.0 as usize;
+                for line in 0..=cursor_row {
+                    self.damage.damage_line(line);
+                }
+            }
+            ClearMode::Below => {
+                let cursor_row = self.grid.cursor.pos.row.0 as usize;
+                for line in cursor_row..screen_lines {
+                    self.damage.damage_line(line);
+                }
+            }
+            ClearMode::All | ClearMode::Scroll | ClearMode::Saved => {
+                self.mark_fully_damaged();
+            }
+        }
+        if !self.graphics.kitty_placements.is_empty() {
+            self.graphics.kitty_graphics_dirty = true;
+        }
+    }
+
+    fn erase_line(&mut self, mode: LineClearMode, protected: bool) {
+        let bg = self.grid.template_style().bg;
+        let blank = self.grid.blank_with_bg(bg);
+        let point = self.grid.cursor.pos;
+        self.grid.cursor.should_wrap = false;
+
+        let (left, right) = match mode {
+            LineClearMode::Right => (point.col, Column(self.grid.columns())),
+            LineClearMode::Left => (Column(0), point.col + 1),
+            LineClearMode::All => (Column(0), Column(self.grid.columns())),
+        };
+
+        self.damage.damage_line(point.row.0 as usize);
+        let wrapped = self.grid[point.row][self.grid.last_column()].wrapline();
+        if !matches!(mode, LineClearMode::Left) {
+            self.reset_erase_wrap(point.row, blank);
+        }
+
+        if protected {
+            let left = if left.0 > 0 && self.grid[point.row][left].wide() == Wide::Spacer
+            {
+                left - 1
+            } else {
+                left
+            };
+            let right = if right.0 < self.grid.columns()
+                && self.grid[point.row][right - 1].wide() == Wide::Wide
+            {
+                right + 1
+            } else {
+                right
+            };
+            self.erase_unprotected_range(
+                point.row,
+                left.0,
+                right.0,
+                blank,
+                matches!(mode, LineClearMode::Left),
+            );
+        } else {
+            self.split_erase_boundary(point.row, left.0, blank);
+            self.split_erase_boundary(point.row, right.0, blank);
+            let row = &mut self.grid[point.row];
+            row.has_styles |= blank.carries_style();
+            for cell in &mut row[left..right] {
+                *cell = blank;
+            }
+        }
+        if matches!(mode, LineClearMode::Left) {
+            let last = self.grid.last_column();
+            self.grid[point.row][last].set_wrapline(wrapped);
+        }
+        let range = self.grid.cursor.pos.row..=self.grid.cursor.pos.row;
+        self.selection = self.selection.take().filter(|s| !s.intersects_range(range));
+        if !protected {
+            self.clip_atlas_placements(point.row.0, point.row.0 + 1, left.0, right.0);
+        }
+        if !self.graphics.kitty_placements.is_empty() {
+            self.graphics.kitty_graphics_dirty = true;
+        }
+    }
+
+    fn clear_kitty_history_placements(&mut self, inactive: bool) {
+        let grid = if inactive {
+            &self.inactive_grid
+        } else {
+            &self.grid
+        };
+        if grid.history_size() == 0 {
+            return;
+        }
+        let base = grid.lines_evicted() as i64;
+        let top = base + grid.history_size() as i64;
+        let placements = if inactive {
+            &mut self.graphics.kitty_inactive_screen.kitty_placements
+        } else {
+            &mut self.graphics.kitty_placements
+        };
+        let before = placements.len();
+        placements
+            .retain(|_, p| p.relative.is_some() || (!p.expired && p.dest_row >= top));
+        let changed = before != placements.len();
+        self.graphics.remove_orphaned_placements();
+        self.graphics.kitty_graphics_dirty |= changed && !inactive;
+    }
+
+    fn expire_kitty_placements(&mut self) {
+        let base = self.grid.lines_evicted() as i64;
+        for placement in self.graphics.kitty_placements.values_mut() {
+            if !placement.expired
+                && placement.relative.is_none()
+                && placement.dest_row < base
+            {
+                placement.expired = true;
+                self.graphics.kitty_graphics_dirty = true;
+            }
+        }
+        let base = self.inactive_grid.lines_evicted() as i64;
+        for placement in self
+            .graphics
+            .kitty_inactive_screen
+            .kitty_placements
+            .values_mut()
+        {
+            if placement.relative.is_none() && placement.dest_row < base {
+                placement.expired = true;
+            }
+        }
     }
 }
 
 impl<U: EventListener> Handler for Crosswords<U> {
+    fn kitty_animation_image_identity(
+        &self,
+        image_id: u32,
+        image_number: u32,
+    ) -> Result<crate::ansi::kitty_animation::ImageIdentity, &'static str> {
+        self.graphics.kitty_image_identity(image_id, image_number)
+    }
+    fn kitty_image_by_number(&self, number: u32) -> Option<u32> {
+        self.graphics.kitty_image_numbers.get(&number).copied()
+    }
+    fn kitty_assign_image_number(&mut self, image_id: u32, number: u32) {
+        self.graphics.kitty_image_numbers.insert(number, image_id);
+    }
+    fn kitty_animation(
+        &mut self,
+        request: crate::ansi::kitty_animation::Request,
+    ) -> Result<(u32, Option<u32>), crate::ansi::kitty_animation::Failure> {
+        if let Some(target) = request.target {
+            if self
+                .graphics
+                .kitty_image_identity(request.image_id, request.image_number)?
+                != target
+            {
+                return Err("ENOENT: image not found".into());
+            }
+        }
+        let result = self.graphics.execute_animation(
+            request.image_id,
+            request.image_number,
+            request.command,
+        )?;
+        self.mark_fully_damaged();
+        self.send_graphics_updates();
+        Ok(result)
+    }
+    fn finish_input_batch(&mut self) {
+        self.grid.enforce_history_byte_limit();
+        self.inactive_grid.enforce_history_byte_limit();
+        self.expire_kitty_placements();
+    }
+
     #[inline]
     fn set_mode(&mut self, mode: AnsiMode) {
         let mode = match mode {
@@ -2829,9 +3879,24 @@ impl<U: EventListener> Handler for Crosswords<U> {
         trace!("Setting private mode: {:?}", mode);
         match mode {
             NamedPrivateMode::UrgencyHints => self.mode.insert(Mode::URGENCY_HINTS),
+            NamedPrivateMode::SwapScreen | NamedPrivateMode::SwapScreenAndClear => {
+                self.screen_mode_state
+                    [usize::from(mode == NamedPrivateMode::SwapScreenAndClear)] = true;
+                if !self.mode.contains(Mode::ALT_SCREEN) {
+                    self.swap_alt_inner(true);
+                }
+            }
+            NamedPrivateMode::SaveRestoreCursor => {
+                self.screen_mode_state[2] = true;
+                self.save_cursor_position();
+            }
             NamedPrivateMode::SwapScreenAndSetRestoreCursor => {
+                self.screen_mode_state[3] = true;
                 if !self.mode.contains(Mode::ALT_SCREEN) {
                     self.swap_alt();
+                } else {
+                    self.save_cursor_position();
+                    self.clear_screen(ClearMode::All);
                 }
             }
             NamedPrivateMode::ShowCursor => self.mode.insert(Mode::SHOW_CURSOR),
@@ -2863,6 +3928,9 @@ impl<U: EventListener> Handler for Crosswords<U> {
             }
             NamedPrivateMode::ReportFocusInOut => self.mode.insert(Mode::FOCUS_IN_OUT),
             NamedPrivateMode::BracketedPaste => self.mode.insert(Mode::BRACKETED_PASTE),
+            NamedPrivateMode::KittyPasteEvents => {
+                self.mode.insert(Mode::KITTY_PASTE_EVENTS)
+            }
             // Mouse encodings are mutually exclusive.
             NamedPrivateMode::SgrMouse => {
                 self.mode.remove(Mode::UTF8_MOUSE);
@@ -2874,7 +3942,10 @@ impl<U: EventListener> Handler for Crosswords<U> {
             }
             NamedPrivateMode::AlternateScroll => self.mode.insert(Mode::ALTERNATE_SCROLL),
             NamedPrivateMode::LineWrap => self.mode.insert(Mode::LINE_WRAP),
-            NamedPrivateMode::Origin => self.mode.insert(Mode::ORIGIN),
+            NamedPrivateMode::Origin => {
+                self.mode.insert(Mode::ORIGIN);
+                self.goto(Line(0), Column(0));
+            }
             NamedPrivateMode::ColumnMode => self.deccolm(),
             NamedPrivateMode::BlinkingCursor => {
                 self.blinking_cursor = true;
@@ -2919,10 +3990,26 @@ impl<U: EventListener> Handler for Crosswords<U> {
         trace!("Unsetting private mode: {:?}", mode);
         match mode {
             NamedPrivateMode::UrgencyHints => self.mode.remove(Mode::URGENCY_HINTS),
-            NamedPrivateMode::SwapScreenAndSetRestoreCursor => {
+            NamedPrivateMode::SwapScreen | NamedPrivateMode::SwapScreenAndClear => {
+                self.screen_mode_state
+                    [usize::from(mode == NamedPrivateMode::SwapScreenAndClear)] = false;
                 if self.mode.contains(Mode::ALT_SCREEN) {
-                    self.swap_alt();
+                    if mode == NamedPrivateMode::SwapScreenAndClear {
+                        self.clear_screen(ClearMode::All);
+                    }
+                    self.swap_alt_inner(true);
                 }
+            }
+            NamedPrivateMode::SaveRestoreCursor => {
+                self.screen_mode_state[2] = false;
+                self.restore_cursor_position();
+            }
+            NamedPrivateMode::SwapScreenAndSetRestoreCursor => {
+                self.screen_mode_state[3] = false;
+                if self.mode.contains(Mode::ALT_SCREEN) {
+                    self.swap_alt_inner(false);
+                }
+                self.restore_cursor_position();
             }
             NamedPrivateMode::ShowCursor => self.mode.remove(Mode::SHOW_CURSOR),
             NamedPrivateMode::CursorKeys => self.mode.remove(Mode::APP_CURSOR),
@@ -2939,11 +4026,17 @@ impl<U: EventListener> Handler for Crosswords<U> {
             }
             NamedPrivateMode::ReportFocusInOut => self.mode.remove(Mode::FOCUS_IN_OUT),
             NamedPrivateMode::BracketedPaste => self.mode.remove(Mode::BRACKETED_PASTE),
+            NamedPrivateMode::KittyPasteEvents => {
+                self.mode.remove(Mode::KITTY_PASTE_EVENTS)
+            }
             NamedPrivateMode::SgrMouse => self.mode.remove(Mode::SGR_MOUSE),
             NamedPrivateMode::Utf8Mouse => self.mode.remove(Mode::UTF8_MOUSE),
             NamedPrivateMode::AlternateScroll => self.mode.remove(Mode::ALTERNATE_SCROLL),
             NamedPrivateMode::LineWrap => self.mode.remove(Mode::LINE_WRAP),
-            NamedPrivateMode::Origin => self.mode.remove(Mode::ORIGIN),
+            NamedPrivateMode::Origin => {
+                self.mode.remove(Mode::ORIGIN);
+                self.goto(Line(0), Column(0));
+            }
             NamedPrivateMode::ColumnMode => self.deccolm(),
             NamedPrivateMode::BlinkingCursor => {
                 self.blinking_cursor = false;
@@ -2994,8 +4087,11 @@ impl<U: EventListener> Handler for Crosswords<U> {
                 NamedPrivateMode::UrgencyHints => {
                     self.mode.contains(Mode::URGENCY_HINTS).into()
                 }
+                NamedPrivateMode::SwapScreen => self.screen_mode_state[0].into(),
+                NamedPrivateMode::SwapScreenAndClear => self.screen_mode_state[1].into(),
+                NamedPrivateMode::SaveRestoreCursor => self.screen_mode_state[2].into(),
                 NamedPrivateMode::SwapScreenAndSetRestoreCursor => {
-                    self.mode.contains(Mode::ALT_SCREEN).into()
+                    self.screen_mode_state[3].into()
                 }
                 NamedPrivateMode::BracketedPaste => {
                     self.mode.contains(Mode::BRACKETED_PASTE).into()
@@ -3008,6 +4104,9 @@ impl<U: EventListener> Handler for Crosswords<U> {
                     }
                 }
                 NamedPrivateMode::SyncUpdate => ModeState::Reset,
+                NamedPrivateMode::KittyPasteEvents => {
+                    self.mode.contains(Mode::KITTY_PASTE_EVENTS).into()
+                }
                 NamedPrivateMode::ColumnMode => ModeState::NotSupported,
             },
             PrivateMode::Unknown(_) => ModeState::NotSupported,
@@ -3067,6 +4166,10 @@ impl<U: EventListener> Handler for Crosswords<U> {
         self.active_charset = index;
     }
 
+    fn single_shift(&mut self, index: CharsetIndex) {
+        self.single_shift = Some(index);
+    }
+
     #[inline]
     fn move_forward(&mut self, cols: Column) {
         let last_column =
@@ -3095,20 +4198,22 @@ impl<U: EventListener> Handler for Crosswords<U> {
         trace!("Moving backward {} tabs", count);
 
         for _ in 0..count {
-            let mut col = self.grid.cursor.pos.col;
+            let col = self.grid.cursor.pos.col;
 
             if col == 0 {
                 break;
             }
 
+            let mut destination = Column(0);
             for i in (0..(col.0)).rev() {
                 if self.tabs[Column(i)] {
-                    col = Column(i);
+                    destination = Column(i);
                     break;
                 }
             }
-            self.grid.cursor.pos.col = col;
+            self.grid.cursor.pos.col = destination;
         }
+        self.grid.cursor.should_wrap = false;
 
         let line = self.grid.cursor.pos.row.0 as usize;
         self.damage.damage_line(line);
@@ -3121,7 +4226,10 @@ impl<U: EventListener> Handler for Crosswords<U> {
 
     #[inline]
     fn goto_col(&mut self, col: Column) {
-        self.goto(self.grid.cursor.pos.row, col)
+        self.damage_cursor();
+        self.grid.cursor.pos.col = std::cmp::min(col, self.grid.last_column());
+        self.grid.cursor.should_wrap = false;
+        self.damage_cursor();
     }
 
     #[inline]
@@ -3139,28 +4247,50 @@ impl<U: EventListener> Handler for Crosswords<U> {
 
     #[inline]
     fn move_up(&mut self, rows: usize) {
-        self.goto(self.grid.cursor.pos.row - rows, self.grid.cursor.pos.col)
+        let row = self.grid.cursor.pos.row;
+        let top = if row >= self.scroll_region.start {
+            self.scroll_region.start
+        } else {
+            Line(0)
+        };
+        self.damage_cursor();
+        self.grid.cursor.pos.row =
+            std::cmp::max(row - rows.min(self.grid.screen_lines()), top);
+        self.grid.cursor.should_wrap = false;
+        self.damage_cursor();
     }
 
     #[inline]
     fn move_down(&mut self, rows: usize) {
-        self.goto(self.grid.cursor.pos.row + rows, self.grid.cursor.pos.col)
+        let row = self.grid.cursor.pos.row;
+        let bottom = if row < self.scroll_region.end {
+            self.scroll_region.end - 1
+        } else {
+            self.grid.bottommost_line()
+        };
+        self.damage_cursor();
+        self.grid.cursor.pos.row =
+            std::cmp::min(row + rows.min(self.grid.screen_lines()), bottom);
+        self.grid.cursor.should_wrap = false;
+        self.damage_cursor();
     }
 
     #[inline]
     fn move_down_and_cr(&mut self, rows: usize) {
-        self.goto(self.grid.cursor.pos.row + rows, Column(0))
+        self.move_down(rows);
+        self.carriage_return();
     }
 
     #[inline]
     fn move_up_and_cr(&mut self, lines: usize) {
-        self.goto(self.grid.cursor.pos.row - lines, Column(0))
+        self.move_up(lines);
+        self.carriage_return();
     }
 
     #[inline]
     fn scroll_up(&mut self, lines: usize) {
         let origin = self.scroll_region.start;
-        self.scroll_up_relative(origin, lines);
+        self.scroll_up_relative_inner(origin, lines, origin == 0, true);
     }
 
     #[inline]
@@ -3169,7 +4299,8 @@ impl<U: EventListener> Handler for Crosswords<U> {
         let lines = std::cmp::min(self.grid.screen_lines() - origin.0 as usize, lines);
 
         if lines > 0 && self.scroll_region.contains(&origin) {
-            self.scroll_up_relative(origin, lines);
+            self.scroll_up_relative_inner(origin, lines, false, false);
+            self.carriage_return();
         }
     }
 
@@ -3200,16 +4331,28 @@ impl<U: EventListener> Handler for Crosswords<U> {
 
     #[inline]
     fn erase_chars(&mut self, count: Column) {
+        self.grid.cursor.should_wrap = false;
         let start = self.grid.cursor.pos.col;
-        let end = std::cmp::min(start + count, Column(self.grid.columns()));
+        let mut end = std::cmp::min(start + count, Column(self.grid.columns()));
+        let line = self.grid.cursor.pos.row;
+        if end.0 > 0
+            && end.0 < self.grid.columns()
+            && self.grid[line][end - 1].wide() == Wide::Wide
+        {
+            end += 1;
+        }
 
         // Cleared cells have current background color set.
         let bg = self.grid.template_style().bg;
         let blank = self.grid.blank_with_bg(bg);
-        let line = self.grid.cursor.pos.row;
         self.damage.damage_line(line.0 as usize);
-        self.split_wide_seam(line, start.0, blank);
-        self.split_wide_seam(line, end.0, blank);
+        self.split_ech_boundary(line, start.0, blank);
+        self.split_ech_boundary(line, end.0, blank);
+        self.reset_erase_wrap(line, blank);
+        if self.grid.protection_mode == Some(crate::ansi::ProtectionMode::Iso) {
+            self.erase_unprotected_range(line, start.0, end.0, blank, true);
+            return;
+        }
         let row = &mut self.grid[line];
         row.has_styles |= blank.carries_style();
         for cell in &mut row[start..end] {
@@ -3228,10 +4371,13 @@ impl<U: EventListener> Handler for Crosswords<U> {
         let blank = self.grid.blank_with_bg(bg);
 
         // Ensure deleting within terminal bounds.
-        let count = std::cmp::min(count, columns);
-
         let start = self.grid.cursor.pos.col.0;
-        let end = std::cmp::min(start + count, columns - 1);
+        let count = std::cmp::min(count, columns - start);
+        self.grid.cursor.should_wrap = false;
+        if count == 0 {
+            return;
+        }
+        let end = start + count;
         let num_cells = columns - end;
 
         let line = self.grid.cursor.pos.row;
@@ -3239,9 +4385,10 @@ impl<U: EventListener> Handler for Crosswords<U> {
         self.split_wide_seam(line, start, blank);
         self.split_wide_seam(line, (start + count).min(columns), blank);
         self.split_wide_seam(line, columns, blank);
+        // Reset before shifting so the wrap marker cannot move into the text.
+        self.reset_erase_wrap(line, blank);
         self.grid[line].has_styles |= blank.carries_style();
         let row = &mut self.grid[line][..];
-
         for offset in 0..num_cells {
             row.swap(start + offset, end + offset);
         }
@@ -3261,19 +4408,25 @@ impl<U: EventListener> Handler for Crosswords<U> {
     #[inline]
     fn scroll_down(&mut self, lines: usize) {
         let origin = self.scroll_region.start;
-        self.scroll_down_relative(origin, lines);
+        self.scroll_down_relative(origin, lines, true);
     }
 
     #[inline]
     fn insert_blank_lines(&mut self, lines: usize) {
         let origin = self.grid.cursor.pos.row;
-        if self.scroll_region.contains(&origin) {
-            self.scroll_down_relative(origin, lines);
+        if lines > 0 && self.scroll_region.contains(&origin) {
+            self.scroll_down_relative(origin, lines, false);
+            self.carriage_return();
         }
     }
 
     #[inline]
     fn insert_blank(&mut self, count: usize) {
+        self.grid.cursor.should_wrap = false;
+        if count == 0 {
+            return;
+        }
+        let columns = self.grid.columns();
         let bg = self.grid.template_style().bg;
         let blank = self.grid.blank_with_bg(bg);
 
@@ -3287,8 +4440,9 @@ impl<U: EventListener> Handler for Crosswords<U> {
 
         let line = self.grid.cursor.pos.row;
         self.damage.damage_line(line.0 as usize);
-        self.split_wide_seam(line, source.0, blank);
-        self.split_wide_seam(line, self.grid.columns(), blank);
+        // ICH repairs an in-row split pair without clearing a spacer head
+        // on the preceding row, unlike DCH and ECH.
+        self.split_erase_boundary(line, source.0, blank);
         // The last shifted cell lands on the row's final column; if it
         // is a wide lead its spacer will not survive the shift, so
         // clear the pair up front.
@@ -3304,6 +4458,10 @@ impl<U: EventListener> Handler for Crosswords<U> {
 
         self.grid[line].has_styles |= blank.carries_style();
         let row = &mut self.grid[line][..];
+        // ICH preserves the logical row's wrap state, independently of the
+        // cells that move. The marker belongs on the final column.
+        let wrapped = row[columns - 1].wrapline();
+        row[columns - 1].set_wrapline(false);
 
         for offset in (0..num_cells).rev() {
             row.swap(destination + offset, source.0 + offset);
@@ -3314,9 +4472,9 @@ impl<U: EventListener> Handler for Crosswords<U> {
         for cell in &mut row[source.0..destination] {
             *cell = blank;
         }
+        row[columns - 1].set_wrapline(wrapped);
         // Placement-model approximation: image cells from the insert
         // point onward stop showing their slices.
-        let columns = self.grid.columns();
         self.clip_atlas_placements(line.0, line.0 + 1, source.0, columns);
     }
 
@@ -3334,11 +4492,60 @@ impl<U: EventListener> Handler for Crosswords<U> {
     }
 
     #[inline]
+    fn soft_reset(&mut self) {
+        self.mode
+            .remove(Mode::INSERT | Mode::ORIGIN | Mode::APP_CURSOR | Mode::APP_KEYPAD);
+        self.mode.insert(Mode::SHOW_CURSOR | Mode::LINE_WRAP);
+        self.scroll_region = Line(0)..Line(self.grid.screen_lines() as i32);
+        self.grid.cursor.pending_style = Default::default();
+        self.grid.cursor.style_dirty = true;
+        self.grid.cursor.charsets = Default::default();
+        self.grid
+            .cursor
+            .template
+            .remove_cell_flag(crate::crosswords::square::CellFlags::PROTECTED);
+        self.grid.protection_mode = None;
+        self.active_charset = Default::default();
+        self.single_shift = None;
+        self.grid.saved_cursor = Default::default();
+        self.grid.saved_origin = false;
+        self.grid.saved_charset = Default::default();
+        self.grid.saved_single_shift = None;
+        self.modify_other_keys = 0;
+        self.set_cursor_style(None, false);
+        for index in 0..256 {
+            if self.colors[index].is_some() {
+                self.reset_color(index);
+            }
+        }
+        self.mark_fully_damaged();
+    }
+
+    fn set_protection(&mut self, protected: bool, mode: crate::ansi::ProtectionMode) {
+        if protected {
+            self.grid.protection_mode = Some(mode);
+            self.grid
+                .cursor
+                .template
+                .insert_cell_flag(crate::crosswords::square::CellFlags::PROTECTED);
+        } else {
+            self.grid
+                .cursor
+                .template
+                .remove_cell_flag(crate::crosswords::square::CellFlags::PROTECTED);
+        }
+    }
+
     fn reset_state(&mut self) {
+        self.kitty_clipboard_session.reset();
+        self.program_status.reset();
+        self.program_status_changed();
         if self.mode.contains(Mode::ALT_SCREEN) {
             std::mem::swap(&mut self.grid, &mut self.inactive_grid);
         }
         self.active_charset = Default::default();
+        self.single_shift = None;
+        self.screen_mode_state = [false; 4];
         self.cursor_shape = self.default_cursor_shape;
         self.grid.reset();
         self.inactive_grid.reset();
@@ -3352,6 +4559,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
         self.inactive_keyboard_mode_idx = 0;
         if !self.title.is_empty() {
             self.title = String::from("");
+            self.metadata.lock().title.clear();
             self.event_proxy.send_event(
                 RioEvent::Title(self.route_id, String::new()),
                 self.window_id,
@@ -3466,6 +4674,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
         let title = title.unwrap_or_default();
         if title != self.title {
             self.title = title;
+            self.metadata.lock().title.clone_from(&self.title);
             self.event_proxy.send_event(
                 RioEvent::Title(self.route_id, self.title.clone()),
                 self.window_id,
@@ -3474,16 +4683,48 @@ impl<U: EventListener> Handler for Crosswords<U> {
     }
 
     fn set_progress_report(&mut self, report: crate::event::ProgressReport) {
-        self.event_proxy
-            .send_event(RioEvent::ProgressReport(report), self.window_id);
+        if self.program_status.set_legacy_progress(report) {
+            // Preserve the legacy event for embedders; Rio's frontend uses
+            // the pane-scoped change event to select the visible report.
+            self.event_proxy
+                .send_event(RioEvent::ProgressReport(report), self.window_id);
+            self.program_status_changed();
+        }
+    }
+
+    fn set_program_status(&mut self, report: crate::program_status::ProgramStatusRecord) {
+        self.program_status.apply(report);
+        self.program_status_changed();
+    }
+
+    fn query_program_status(&mut self, terminator: &str) {
+        self.event_proxy.send_event(RioEvent::PtyWrite(self.route_id,
+            format!("\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth{terminator}")),
+            self.window_id);
+    }
+
+    fn shell_prompt_start(&mut self) {
+        self.end_program_activity();
     }
 
     fn set_current_directory(&mut self, path: std::path::PathBuf) {
         trace!("Setting working directory {:?}", path);
+        self.remote_directory = None;
         if self.current_directory.as_deref() == Some(path.as_path()) {
             return;
         }
         self.current_directory = Some(path);
+        self.event_proxy.send_event(
+            RioEvent::CurrentDirectoryChanged(self.route_id),
+            self.window_id,
+        );
+    }
+
+    fn set_remote_directory(&mut self, host: String, path: std::path::PathBuf) {
+        if self.remote_directory.as_ref() == Some(&(host.clone(), path.clone())) {
+            return;
+        }
+        self.remote_directory = Some((host, path));
         self.event_proxy.send_event(
             RioEvent::CurrentDirectoryChanged(self.route_id),
             self.window_id,
@@ -3499,7 +4740,18 @@ impl<U: EventListener> Handler for Crosswords<U> {
     }
 
     fn set_user_var(&mut self, name: String, value: String) {
-        self.user_vars.insert(name, value);
+        if self.user_vars.get(&name) != Some(&value) {
+            match name.as_str() {
+                "RIO_APP" => {
+                    self.metadata.lock().app = (!value.is_empty()).then(|| value.clone());
+                }
+                "RIO_SSH" => self.metadata.lock().remote = value == "1",
+                _ => (),
+            }
+            self.user_vars.insert(name, value);
+            self.event_proxy
+                .send_event(RioEvent::Render, self.window_id);
+        }
     }
 
     #[inline]
@@ -3532,9 +4784,50 @@ impl<U: EventListener> Handler for Crosswords<U> {
         self.mode.remove(Mode::APP_KEYPAD);
     }
 
+    fn kitty_clipboard(&mut self, metadata: &[u8], payload: &[u8], terminator: &str) {
+        use crate::clipboard::kitty::{Effect, Terminator};
+        let terminator = if terminator == "\x07" {
+            Terminator::Bell
+        } else {
+            Terminator::String
+        };
+        if let Some(effect) = self.kitty_clipboard_session.handle(
+            metadata,
+            payload,
+            terminator,
+            self.clipboard_policy,
+        ) {
+            let event = match effect {
+                Effect::Reply(bytes) => {
+                    self.emit_clipboard_reply(&bytes);
+                    return;
+                }
+                Effect::Request(request) => RioEvent::KittyClipboardRequest(
+                    self.route_id,
+                    std::sync::Arc::new(request),
+                ),
+            };
+            self.event_proxy.send_event(event, self.window_id);
+        }
+    }
+
+    fn kitty_clipboard_abort(&mut self, terminator: &str) {
+        use crate::clipboard::kitty::Terminator;
+        if let Some(bytes) = self.kitty_clipboard_session.abort(if terminator == "\x07" {
+            Terminator::Bell
+        } else {
+            Terminator::String
+        }) {
+            self.emit_clipboard_reply(&bytes);
+        }
+    }
+
     /// Store data into clipboard.
     #[inline]
     fn clipboard_store(&mut self, clipboard: u8, base64: &[u8]) {
+        if self.clipboard_policy.write == crate::clipboard::Access::Deny {
+            return;
+        }
         let clipboard_type = match clipboard {
             b'c' => ClipboardType::Clipboard,
             b'p' | b's' => ClipboardType::Selection,
@@ -3542,11 +4835,18 @@ impl<U: EventListener> Handler for Crosswords<U> {
         };
 
         if let Some(bytes) = crate::simd_base64::decode(base64) {
-            if let Ok(text) = simd_utf8::from_utf8_to_string(&bytes) {
-                self.event_proxy.send_event(
-                    RioEvent::ClipboardStore(clipboard_type, text),
-                    self.window_id,
-                );
+            if let Ok(text) = simd_utf8::validate(&bytes) {
+                if let Ok(request) = self.kitty_clipboard_session.legacy_request(
+                    clipboard_type,
+                    clipboard,
+                    Some(text.to_owned()),
+                    crate::clipboard::kitty::Terminator::String,
+                ) {
+                    self.event_proxy.send_event(
+                        RioEvent::KittyClipboardRequest(self.route_id, Arc::new(request)),
+                        self.window_id,
+                    );
+                }
             }
         }
     }
@@ -3563,6 +4863,10 @@ impl<U: EventListener> Handler for Crosswords<U> {
 
     #[inline(never)]
     fn input(&mut self, c: char) {
+        // A single shift is consumed even by a combining character that
+        // attaches to an earlier cell instead of writing a new one.
+        let charset = self.single_shift.take().unwrap_or(self.active_charset);
+        let c = self.grid.cursor.charsets[charset].map(c);
         // A Glyph Protocol registration does NOT change a codepoint's
         // logical width: the cell layout stays consistent with system
         // `wcwidth` so the cursor / selection / copy never desync with a
@@ -3638,13 +4942,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
         let columns = self.grid.columns();
         if self.mode.contains(Mode::INSERT) && self.grid.cursor.pos.col + width < columns
         {
-            let line = self.grid.cursor.pos.row;
-            let col = self.grid.cursor.pos.col;
-            let row = &mut self.grid[line][..];
-
-            for col in (col.0..(columns - width)).rev() {
-                row.swap(col + width, col);
-            }
+            self.insert_blank(width);
         }
 
         // Set the per-row kitty placeholder flag so the renderer can
@@ -3667,7 +4965,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
         };
 
         if width == 1 {
-            self.write_at_cursor(c);
+            self.write_at_cursor_with_wide(c, Wide::Narrow);
         } else {
             if self.grid.cursor.pos.col + 1 >= columns {
                 if self.mode.contains(Mode::LINE_WRAP) {
@@ -3684,13 +4982,11 @@ impl<U: EventListener> Handler for Crosswords<U> {
             }
 
             // Wide character itself.
-            self.write_at_cursor(c);
-            self.grid.cursor_cell().set_wide(Wide::Wide);
+            self.write_at_cursor_with_wide(c, Wide::Wide);
 
             // Spacer cell after it.
             self.grid.cursor.pos.col += 1;
-            self.write_at_cursor(' ');
-            self.grid.cursor_cell().set_wide(Wide::Spacer);
+            self.write_at_cursor_with_wide(' ', Wide::Spacer);
         }
 
         // Mark cursor line as damaged for partial rendering
@@ -3709,15 +5005,13 @@ impl<U: EventListener> Handler for Crosswords<U> {
         // bulk-handling it correctly outweighs the win. Non-ASCII charsets
         // fall back too: decode runs can carry ASCII that needs mapping.
         let active = self.grid.cursor.charsets[self.active_charset];
-        if self.mode.contains(Mode::INSERT)
+        let clustering = self.mode.contains(Mode::GRAPHEME_CLUSTER);
+        if self.single_shift.is_some()
+            || self.mode.contains(Mode::INSERT)
             || active != crate::crosswords::pos::StandardCharset::Ascii
-            // Grapheme clustering decides cell layout per codepoint
-            // against the previous cell; the bulk writers place whole
-            // width-runs at once and would split clusters. ASCII bulk
-            // paths stay fast: ASCII never continues a cluster, and
-            // the cluster check anchors on the previous cell, so it
-            // self-invalidates across a bulk run.
-            || self.mode.contains(Mode::GRAPHEME_CLUSTER)
+            || (clustering
+                && (!self.mode.contains(Mode::LINE_WRAP)
+                    || !self.graphics.atlas_placements.is_empty()))
         {
             for &cp in codepoints {
                 let c = char::from_u32(cp).unwrap_or('\u{FFFD}');
@@ -3752,13 +5046,25 @@ impl<U: EventListener> Handler for Crosswords<U> {
         let template = self.cell_template();
         let template_has_extras = template.extras_id().is_some();
 
+        let table = crate::codepoint_width::print_table();
         let mut i = 0;
         let n = codepoints.len();
+        let mut next_properties = None;
+        let mut previous_ordinary = false;
         while i < n {
             let cp = codepoints[i];
-            let width = match crate::codepoint_width::width_in(table, cp) {
+            let properties = next_properties.take().unwrap_or_else(|| {
+                crate::codepoint_width::print_properties_in(table, cp)
+            });
+            let width = match properties.width() {
                 Some(w) => w,
                 None => {
+                    // Preserve scalar replacement for non-scalars passed
+                    // through the public codepoint API in cluster mode.
+                    if clustering && char::from_u32(cp).is_none() {
+                        self.input('\u{fffd}');
+                    }
+                    previous_ordinary = false;
                     i += 1;
                     continue;
                 }
@@ -3771,13 +5077,51 @@ impl<U: EventListener> Handler for Crosswords<U> {
                 // new one).
                 let c = char::from_u32(cp).unwrap_or('\u{FFFD}');
                 self.input(c);
+                previous_ordinary = false;
                 i += 1;
                 continue;
+            }
+
+            // Other cannot extend a cluster except after Prepend. Resolve
+            // that boundary, then batch ordinary same-width characters.
+            // Combining marks, Hangul, emoji and Indic classes keep the full
+            // cluster path. Latin-1 retains input()'s existing break policy.
+            if clustering && !properties.ordinary() {
+                self.input(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                previous_ordinary = false;
+                i += 1;
+                continue;
+            }
+            if clustering && !previous_ordinary && cp > 0xff {
+                let after_prepend = self.prev_cell_col().is_some_and(|col| {
+                    let cell = self.grid[self.grid.cursor.pos.row][Column(col)];
+                    if !matches!(
+                        cell.content_tag(),
+                        crate::crosswords::square::ContentTag::Codepoint
+                    ) {
+                        return false;
+                    }
+                    let last = cell
+                        .extras_id()
+                        .and_then(|id| self.grid.extras_table.get(id))
+                        .and_then(|extras| extras.zerowidth.last().copied())
+                        .unwrap_or(cell.c());
+                    last > '\u{ff}'
+                        && crate::grapheme_lut::class_of(last)
+                            == rio_unicode::grapheme::GraphemeClass::Prepend as u8
+                });
+                if after_prepend {
+                    self.input(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                    previous_ordinary = false;
+                    i += 1;
+                    continue;
+                }
             }
 
             if cp == crate::ansi::kitty_virtual::PLACEHOLDER as u32 {
                 let c = char::from_u32(cp).unwrap_or('\u{FFFD}');
                 self.write_codepoint_cell(cp, c, width);
+                previous_ordinary = false;
                 i += 1;
                 continue;
             }
@@ -3786,12 +5130,37 @@ impl<U: EventListener> Handler for Crosswords<U> {
             let mut j = i + 1;
             while j < n {
                 let next = codepoints[j];
+                let properties = crate::codepoint_width::print_properties_in(table, next);
                 if next == crate::ansi::kitty_virtual::PLACEHOLDER as u32
-                    || crate::codepoint_width::width_in(table, next) != Some(width)
+                    || properties.width() != Some(width)
+                    || (clustering && !properties.ordinary())
                 {
+                    next_properties = Some(properties);
                     break;
                 }
                 j += 1;
+            }
+
+            // Short width changes otherwise repeat row setup and destination
+            // scans. Keep long homogeneous runs on their vectorizable path.
+            if j - i <= 4
+                && next_properties.is_some_and(|next| {
+                    matches!(next.width(), Some(1 | 2))
+                        && (!clustering || next.ordinary())
+                })
+            {
+                let written = self.write_ordinary_row(
+                    template,
+                    &codepoints[i..],
+                    table,
+                    clustering,
+                );
+                if written != 0 {
+                    next_properties = None;
+                    previous_ordinary = true;
+                    i += written;
+                    continue;
+                }
             }
 
             if width == 1 {
@@ -3799,6 +5168,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
             } else {
                 self.write_wide_run(template, template_has_extras, &codepoints[i..j]);
             }
+            previous_ordinary = true;
             i = j;
         }
     }
@@ -3823,6 +5193,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
         debug_assert!(s.is_ascii());
         let active = self.grid.cursor.charsets[self.active_charset];
         if active != crate::crosswords::pos::StandardCharset::Ascii
+            || self.single_shift.is_some()
             || self.mode.contains(Mode::INSERT)
         {
             for c in s.chars() {
@@ -3878,11 +5249,9 @@ impl<U: EventListener> Handler for Crosswords<U> {
             if !has_atlas {
                 let line = self.grid.cursor.pos.row;
                 let row = &mut self.grid[line];
+                let wrapline = row.inner[columns - 1].wrapline();
                 let cells = &mut row[Column(cursor_col)..Column(cursor_col + take)];
-                // Branchless fold; an early-exit any() does not vectorize.
-                let needs_cleanup = cells
-                    .iter()
-                    .fold(false, |acc, c| acc | c.needs_wide_cleanup());
+                let needs_cleanup = Square::any_needs_wide_cleanup(cells);
                 if !needs_cleanup {
                     let src = &bytes[idx..idx + take];
                     for (cell, &b) in cells.iter_mut().zip(src) {
@@ -3890,6 +5259,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
                             template, b as char,
                         );
                     }
+                    row.inner[columns - 1].set_wrapline(wrapline);
                     if template_has_extras {
                         row.has_extras = true;
                     }
@@ -4030,14 +5400,17 @@ impl<U: EventListener> Handler for Crosswords<U> {
                 self.event_proxy
                     .send_event(RioEvent::PtyWrite(self.route_id, text), self.window_id);
             }
-            6 => {
-                let pos = self.grid.cursor.pos;
-                let text = format!("\x1b[{};{}R", pos.row + 1, pos.col + 1);
-                self.event_proxy
-                    .send_event(RioEvent::PtyWrite(self.route_id, text), self.window_id);
-            }
+            6 => self.report_cursor_position(false),
             _ => debug!("unknown device status query: {}", arg),
         };
+    }
+
+    #[inline]
+    fn private_device_status(&mut self, arg: usize) {
+        match arg {
+            6 => self.report_cursor_position(true),
+            _ => debug!("unknown private device status query: {}", arg),
+        }
     }
 
     #[inline]
@@ -4061,131 +5434,14 @@ impl<U: EventListener> Handler for Crosswords<U> {
 
     #[inline]
     fn clear_screen(&mut self, mode: ClearMode) {
-        self.grid.sync_template_style();
-        let bg = self.grid.template_style().bg;
-        let blank = self.grid.blank_with_bg(bg);
+        self.erase_display(
+            mode,
+            self.grid.protection_mode == Some(crate::ansi::ProtectionMode::Iso),
+        );
+    }
 
-        let screen_lines = self.grid.screen_lines();
-
-        match mode {
-            ClearMode::Above => {
-                let cursor = self.grid.cursor.pos;
-
-                // If clearing more than one line.
-                if cursor.row > 1 {
-                    // Fully clear all lines before the current line.
-                    self.grid.reset_region(..cursor.row);
-                }
-
-                // Clear up to the current column in the current line.
-                let end = std::cmp::min(cursor.col + 1, Column(self.grid.columns()));
-                self.split_wide_seam(cursor.row, 0, blank);
-                self.split_wide_seam(cursor.row, end.0, blank);
-                self.grid[cursor.row].has_styles |= blank.carries_style();
-                for cell in &mut self.grid[cursor.row][..end] {
-                    *cell = blank;
-                }
-
-                let range = Line(0)..=cursor.row;
-                self.selection =
-                    self.selection.take().filter(|s| !s.intersects_range(range));
-
-                let columns = self.grid.columns();
-                self.clip_atlas_placements(0, cursor.row.0, 0, columns);
-                self.clip_atlas_placements(cursor.row.0, cursor.row.0 + 1, 0, end.0);
-            }
-            ClearMode::Below => {
-                let cursor = self.grid.cursor.pos;
-                self.split_wide_seam(cursor.row, cursor.col.0, blank);
-                self.grid[cursor.row].has_styles |= blank.carries_style();
-                for cell in &mut self.grid[cursor.row][cursor.col..] {
-                    *cell = blank;
-                }
-
-                if (cursor.row.0 as usize) < screen_lines - 1 {
-                    self.grid.reset_region((cursor.row + 1)..);
-                }
-
-                let range = cursor.row..Line(screen_lines as i32);
-                self.selection =
-                    self.selection.take().filter(|s| !s.intersects_range(range));
-
-                let columns = self.grid.columns();
-                self.clip_atlas_placements(
-                    cursor.row.0,
-                    cursor.row.0 + 1,
-                    cursor.col.0,
-                    columns,
-                );
-                self.clip_atlas_placements(
-                    cursor.row.0 + 1,
-                    screen_lines as i32,
-                    0,
-                    columns,
-                );
-            }
-            ClearMode::All => {
-                if self.mode.contains(Mode::ALT_SCREEN) {
-                    self.grid.reset_region(..);
-                    let columns = self.grid.columns();
-                    self.clip_atlas_placements(0, screen_lines as i32, 0, columns);
-                } else {
-                    // The viewport scrolls into history below; atlas
-                    // placements are absolutely anchored and follow
-                    // their content into scrollback untouched.
-                    let old_offset = self.grid.display_offset();
-
-                    self.grid.clear_viewport();
-
-                    // Compute number of lines scrolled by clearing the viewport.
-                    let lines = self.grid.display_offset().saturating_sub(old_offset);
-
-                    self.vi_mode_cursor.pos.row = (self.vi_mode_cursor.pos.row - lines)
-                        .grid_clamp(&self.grid, Boundary::Grid);
-                }
-
-                self.selection = None;
-            }
-            ClearMode::Saved if self.history_size() > 0 => {
-                self.grid.clear_history();
-                self.expire_atlas_placements();
-
-                self.vi_mode_cursor.pos.row = self
-                    .vi_mode_cursor
-                    .pos
-                    .row
-                    .grid_clamp(&self.grid, Boundary::Cursor);
-
-                self.selection = self
-                    .selection
-                    .take()
-                    .filter(|s| !s.intersects_range(..Line(0)));
-            }
-            // We have no history to clear.
-            ClearMode::Saved => (),
-        }
-
-        // Mark affected lines as damaged based on clear mode
-        match mode {
-            ClearMode::Above => {
-                let cursor_row = self.grid.cursor.pos.row.0 as usize;
-                for line in 0..=cursor_row {
-                    self.damage.damage_line(line);
-                }
-            }
-            ClearMode::Below => {
-                let cursor_row = self.grid.cursor.pos.row.0 as usize;
-                for line in cursor_row..screen_lines {
-                    self.damage.damage_line(line);
-                }
-            }
-            ClearMode::All | ClearMode::Saved => {
-                self.mark_fully_damaged();
-            }
-        }
-        if !self.graphics.kitty_placements.is_empty() {
-            self.graphics.kitty_graphics_dirty = true;
-        }
+    fn clear_screen_selective(&mut self, mode: ClearMode) {
+        self.erase_display(mode, true);
     }
 
     #[inline]
@@ -4202,6 +5458,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
 
     #[inline]
     fn linefeed(&mut self) {
+        self.grid.cursor.should_wrap = false;
         let next = self.grid.cursor.pos.row + 1;
         if next == self.scroll_region.end {
             self.scroll_up_relative(self.scroll_region.start, 1);
@@ -4306,32 +5563,39 @@ impl<U: EventListener> Handler for Crosswords<U> {
 
     #[inline]
     fn clipboard_load(&mut self, clipboard: u8, terminator: &str) {
+        if self.clipboard_policy.read == crate::clipboard::Access::Deny {
+            return;
+        }
         let clipboard_type = match clipboard {
             b'c' => ClipboardType::Clipboard,
             b'p' | b's' => ClipboardType::Selection,
             _ => return,
         };
 
-        let terminator = terminator.to_owned();
+        let terminator = if terminator == "\x07" {
+            crate::clipboard::kitty::Terminator::Bell
+        } else {
+            crate::clipboard::kitty::Terminator::String
+        };
 
-        self.event_proxy.send_event(
-            RioEvent::ClipboardLoad(
-                self.route_id,
-                clipboard_type,
-                Arc::new(move |text| {
-                    let base64 = general_purpose::STANDARD.encode(text);
-                    format!("\x1b]52;{};{}{}", clipboard as char, base64, terminator)
-                }),
-            ),
-            self.window_id,
-        );
+        if let Ok(request) = self.kitty_clipboard_session.legacy_request(
+            clipboard_type,
+            clipboard,
+            None,
+            terminator,
+        ) {
+            self.event_proxy.send_event(
+                RioEvent::KittyClipboardRequest(self.route_id, Arc::new(request)),
+                self.window_id,
+            );
+        }
     }
 
     #[inline]
     fn put_tab(&mut self, mut count: u16) {
-        // A tab after the last column is the same as a linebreak.
+        // HT moves within the current row. A pending wrap is consumed only
+        // by printing, not by a tab at the right edge.
         if self.grid.cursor.should_wrap {
-            self.wrapline();
             return;
         }
 
@@ -4395,6 +5659,9 @@ impl<U: EventListener> Handler for Crosswords<U> {
     #[inline]
     fn save_cursor_position(&mut self) {
         self.grid.saved_cursor = self.grid.cursor.clone();
+        self.grid.saved_origin = self.mode.contains(Mode::ORIGIN);
+        self.grid.saved_charset = self.active_charset;
+        self.grid.saved_single_shift = self.single_shift;
     }
 
     #[inline]
@@ -4402,39 +5669,41 @@ impl<U: EventListener> Handler for Crosswords<U> {
         trace!("Restoring cursor position");
 
         self.damage_cursor();
+        // OSC 8 state is independent of the saved cursor. Keep the active
+        // template's link rather than reviving the link present at DECSC.
+        let active_template = self.grid.cursor.template;
         self.grid.cursor = self.grid.saved_cursor.clone();
+        self.mode.set(Mode::ORIGIN, self.grid.saved_origin);
+        self.active_charset = self.grid.saved_charset;
+        self.single_shift = self.grid.saved_single_shift;
+        self.grid
+            .cursor
+            .template
+            .set_extras_id(active_template.extras_id());
+        if active_template.has_hyperlink() {
+            self.grid
+                .cursor
+                .template
+                .insert_cell_flag(crate::crosswords::square::CellFlags::HYPERLINK);
+        } else {
+            self.grid
+                .cursor
+                .template
+                .remove_cell_flag(crate::crosswords::square::CellFlags::HYPERLINK);
+        }
         self.damage_cursor();
     }
 
     #[inline]
     fn clear_line(&mut self, mode: LineClearMode) {
-        let bg = self.grid.template_style().bg;
-        let blank = self.grid.blank_with_bg(bg);
-        let point = self.grid.cursor.pos;
-        let should_wrap = self.grid.cursor.should_wrap;
+        self.erase_line(
+            mode,
+            self.grid.protection_mode == Some(crate::ansi::ProtectionMode::Iso),
+        );
+    }
 
-        let (left, right) = match mode {
-            LineClearMode::Right if should_wrap => return,
-            LineClearMode::Right => (point.col, Column(self.grid.columns())),
-            LineClearMode::Left => (Column(0), point.col + 1),
-            LineClearMode::All => (Column(0), Column(self.grid.columns())),
-        };
-
-        self.damage.damage_line(point.row.0 as usize);
-
-        self.split_wide_seam(point.row, left.0, blank);
-        self.split_wide_seam(point.row, right.0, blank);
-        let row = &mut self.grid[point.row];
-        row.has_styles |= blank.carries_style();
-        for cell in &mut row[left..right] {
-            *cell = blank;
-        }
-        let range = self.grid.cursor.pos.row..=self.grid.cursor.pos.row;
-        self.selection = self.selection.take().filter(|s| !s.intersects_range(range));
-        self.clip_atlas_placements(point.row.0, point.row.0 + 1, left.0, right.0);
-        if !self.graphics.kitty_placements.is_empty() {
-            self.graphics.kitty_graphics_dirty = true;
-        }
+    fn clear_line_selective(&mut self, mode: LineClearMode) {
+        self.erase_line(mode, true);
     }
 
     #[inline]
@@ -4719,7 +5988,15 @@ impl<U: EventListener> Handler for Crosswords<U> {
         );
 
         // Only scan the grid for used IDs when eviction is actually needed
-        if self.graphics.total_bytes + graphic_bytes > self.graphics.total_limit {
+        if graphic_bytes > self.graphics.total_limit
+            || self.graphics.pending.len() >= 4096
+            || self.graphics.atlas_placements.len() >= 4096
+        {
+            return;
+        }
+        if self.graphics.total_bytes.saturating_add(graphic_bytes)
+            > self.graphics.total_limit
+        {
             let used_ids = self.collect_used_graphic_ids();
             debug!(
                 "insert_graphic: {} images currently in use in grid, need eviction",
@@ -4731,7 +6008,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
                     "Failed to evict enough images for {} bytes, image may not display",
                     graphic_bytes
                 );
-                // Continue anyway - let it fail gracefully rather than silently dropping
+                return;
             }
         }
 
@@ -4916,7 +6193,24 @@ impl<U: EventListener> Handler for Crosswords<U> {
     }
 
     #[inline]
-    fn store_graphic(&mut self, graphic: GraphicData) {
+    fn begin_graphic_transmission(&mut self, image_id: u32) {
+        if self.graphics.kitty_images.contains_key(&image_id) {
+            self.delete_graphics(crate::ansi::kitty_graphics_protocol::DeleteRequest {
+                frame_number: 0,
+                action: b'I',
+                image_id,
+                image_number: 0,
+                placement_id: 0,
+                x: 0,
+                y: 0,
+                z_index: 0,
+                delete_data: true,
+            });
+        }
+    }
+
+    #[inline]
+    fn store_graphic(&mut self, graphic: GraphicData) -> bool {
         // a=t: Store graphic without displaying.
         // No GPU upload here — pixel data is sent to GPU when a=p placement arrives.
         let image_id = graphic.id.get() as u32;
@@ -4924,73 +6218,47 @@ impl<U: EventListener> Handler for Crosswords<U> {
             "Storing kitty graphic: id={}, {}x{}",
             image_id, graphic.width, graphic.height
         );
-        // Retransmission of an id with live placements: refresh their
-        // grid footprint against the new dimensions and push the new
-        // pixels so the display updates without a re-place.
-        let has_placements = self
-            .graphics
-            .kitty_placements
-            .keys()
-            .any(|(id, _)| *id == image_id)
-            || self
-                .graphics
-                .kitty_virtual_placements
-                .keys()
-                .any(|(id, _)| *id == image_id);
-        let image_width = graphic.width;
-        let image_height = graphic.height;
-        self.graphics.store_kitty_image(image_id, None, graphic);
-
-        if has_placements {
-            self.refresh_placements_for_image(image_id, image_width, image_height);
-            self.ensure_kitty_upload(image_id);
+        if !self.graphics.store_kitty_image(image_id, None, graphic) {
+            return false;
         }
         self.send_graphics_updates();
-    }
-
-    fn kitty_transmit_and_display(
-        &mut self,
-        graphic_data: GraphicData,
-        placement: crate::ansi::kitty_graphics_protocol::PlacementRequest,
-    ) {
-        let image_id = graphic_data.id.get() as u32;
-        debug!(
-            "Kitty transmit+display: id={}, {}x{}",
-            image_id, graphic_data.width, graphic_data.height
-        );
-
-        // `a=T` + `U=1` is what `kitten icat --unicode-placeholder`
-        // emits: combined transmit+place where the placement is virtual.
-        // Route to the virtual-placement path so only metadata is
-        // registered (the application emits U+10EEEE cells itself).
-        // Like the a=t path, a retransmission with live placements of
-        // this id must refresh them against the new dimensions.
-        let image_width = graphic_data.width;
-        let image_height = graphic_data.height;
-
-        if placement.virtual_placement {
-            self.graphics
-                .store_kitty_image(image_id, None, graphic_data);
-            self.refresh_placements_for_image(image_id, image_width, image_height);
-            self.ensure_kitty_upload(image_id);
-            self.place_virtual_graphic(placement);
-            return;
-        }
-
-        // Store takes ownership and sets transmit_time.
-        self.graphics
-            .store_kitty_image(image_id, None, graphic_data);
-        self.refresh_placements_for_image(image_id, image_width, image_height);
-
-        // Place as overlay — handles GPU upload internally.
-        self.place_kitty_overlay(image_id, &placement);
+        true
     }
 
     #[inline]
+    fn graphic_placement_error(
+        &self,
+        placement: &crate::ansi::kitty_graphics_protocol::PlacementRequest,
+    ) -> Option<&'static str> {
+        self.graphics.resolve_placement_parent(placement).err()
+    }
+
+    #[inline]
+    fn can_place_graphic(
+        &self,
+        placement: &crate::ansi::kitty_graphics_protocol::PlacementRequest,
+    ) -> bool {
+        self.graphics.can_place_kitty(
+            placement.image_id,
+            placement.placement_id,
+            placement.virtual_placement,
+        )
+    }
+
     fn place_graphic(
         &mut self,
         placement: crate::ansi::kitty_graphics_protocol::PlacementRequest,
     ) -> bool {
+        if self.graphics.resolve_placement_parent(&placement).is_err() {
+            return false;
+        }
+        if !self.graphics.can_place_kitty(
+            placement.image_id,
+            placement.placement_id,
+            placement.virtual_placement,
+        ) {
+            return false;
+        }
         debug!(
             "Kitty graphics placement: image_id={}, x={}, y={}, columns={}, rows={}, virtual={}",
             placement.image_id,
@@ -5044,19 +6312,69 @@ impl<U: EventListener> Handler for Crosswords<U> {
         );
 
         let mut overlay_changed = false;
+        let previous: Vec<_> = if delete.delete_data {
+            self.graphics
+                .kitty_placements
+                .keys()
+                .chain(self.graphics.kitty_virtual_placements.keys())
+                .copied()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut reclaim = std::collections::HashSet::new();
+        if delete.delete_data {
+            match delete.action {
+                b'i' | b'I' if delete.placement_id == 0 => {
+                    reclaim.insert(delete.image_id);
+                }
+                b'n' | b'N' if delete.placement_id == 0 => {
+                    let number = if delete.image_number != 0 {
+                        delete.image_number
+                    } else {
+                        delete.image_id
+                    };
+                    if let Some(&id) = self.graphics.kitty_image_numbers.get(&number) {
+                        reclaim.insert(id);
+                    }
+                }
+                b'r' | b'R' if delete.y != 0 && delete.x <= delete.y => {
+                    reclaim.extend(
+                        self.graphics
+                            .kitty_images
+                            .keys()
+                            .copied()
+                            .filter(|id| *id >= delete.x && *id <= delete.y),
+                    );
+                }
+                _ => {}
+            }
+        }
 
         match delete.action {
+            b'f' | b'F' => {
+                overlay_changed = self.graphics.delete_animation_frame(
+                    delete.image_id,
+                    delete.image_number,
+                    delete.frame_number,
+                    delete.delete_data,
+                );
+            }
             b'a' | b'A' => {
                 // "All placements visible on screen": virtual (U=1)
                 // placements are not visible by themselves and survive,
                 // as do the images they keep alive (kitty's
                 // clear_filter_func skips virtual refs).
-                overlay_changed = !self.graphics.kitty_placements.is_empty();
-                self.graphics.kitty_placements.clear();
-
-                if delete.delete_data {
-                    self.cleanup_unused_kitty_images();
-                }
+                let top = self.grid.lines_evicted() as i64 + self.history_size() as i64;
+                let bottom = top + self.grid.screen_lines() as i64;
+                let before = self.graphics.kitty_placements.len();
+                self.graphics.kitty_placements.retain(|_, p| {
+                    p.expired
+                        || p.relative.is_some()
+                        || p.dest_row >= bottom
+                        || p.dest_row.saturating_add(i64::from(p.rows)) <= top
+                });
+                overlay_changed = before != self.graphics.kitty_placements.len();
             }
             b'i' | b'I' => {
                 let image_id_to_match = delete.image_id;
@@ -5066,10 +6384,10 @@ impl<U: EventListener> Handler for Crosswords<U> {
                 if delete.placement_id != 0 {
                     self.graphics
                         .kitty_placements
-                        .remove(&(image_id_to_match, delete.placement_id));
+                        .remove(&(image_id_to_match, u64::from(delete.placement_id)));
                     self.graphics
                         .kitty_virtual_placements
-                        .remove(&(image_id_to_match, delete.placement_id));
+                        .remove(&(image_id_to_match, u64::from(delete.placement_id)));
                 } else {
                     self.graphics
                         .kitty_placements
@@ -5081,11 +6399,6 @@ impl<U: EventListener> Handler for Crosswords<U> {
                 overlay_changed = self.graphics.kitty_placements.len()
                     + self.graphics.kitty_virtual_placements.len()
                     != before;
-
-                if delete.delete_data {
-                    self.graphics
-                        .delete_kitty_images(|id, _| *id == image_id_to_match);
-                }
             }
             b'c' | b'C' => {
                 let cursor_pos = self.grid.cursor.pos;
@@ -5096,16 +6409,14 @@ impl<U: EventListener> Handler for Crosswords<U> {
                     + cursor_pos.row.0 as i64;
                 let before = self.graphics.kitty_placements.len();
                 self.graphics.kitty_placements.retain(|_, p| {
-                    !(p.dest_col <= col
-                        && col < p.dest_col + p.columns as usize
-                        && p.dest_row <= abs_row
-                        && abs_row < p.dest_row + p.rows as i64)
+                    p.expired
+                        || p.relative.is_some()
+                        || !(p.dest_col <= col
+                            && col < p.dest_col + p.columns as usize
+                            && p.dest_row <= abs_row
+                            && abs_row < p.dest_row + p.rows as i64)
                 });
                 overlay_changed = self.graphics.kitty_placements.len() != before;
-
-                if delete.delete_data {
-                    self.cleanup_unused_kitty_images();
-                }
             }
             b'p' | b'P' => {
                 if delete.x > 0 && delete.y > 0 {
@@ -5118,16 +6429,14 @@ impl<U: EventListener> Handler for Crosswords<U> {
                     let c = col.0;
                     let before = self.graphics.kitty_placements.len();
                     self.graphics.kitty_placements.retain(|_, p| {
-                        !(p.dest_col <= c
-                            && c < p.dest_col + p.columns as usize
-                            && p.dest_row <= abs_row
-                            && abs_row < p.dest_row + p.rows as i64)
+                        p.expired
+                            || p.relative.is_some()
+                            || !(p.dest_col <= c
+                                && c < p.dest_col + p.columns as usize
+                                && p.dest_row <= abs_row
+                                && abs_row < p.dest_row + p.rows as i64)
                     });
                     overlay_changed = self.graphics.kitty_placements.len() != before;
-                }
-
-                if delete.delete_data {
-                    self.cleanup_unused_kitty_images();
                 }
             }
             b'x' | b'X' => {
@@ -5136,13 +6445,11 @@ impl<U: EventListener> Handler for Crosswords<U> {
                     let c = col.0;
                     let before = self.graphics.kitty_placements.len();
                     self.graphics.kitty_placements.retain(|_, p| {
-                        !(p.dest_col <= c && c < p.dest_col + p.columns as usize)
+                        p.expired
+                            || p.relative.is_some()
+                            || !(p.dest_col <= c && c < p.dest_col + p.columns as usize)
                     });
                     overlay_changed = self.graphics.kitty_placements.len() != before;
-                }
-
-                if delete.delete_data {
-                    self.cleanup_unused_kitty_images();
                 }
             }
             b'y' | b'Y' => {
@@ -5153,13 +6460,12 @@ impl<U: EventListener> Handler for Crosswords<U> {
                         + row.0 as i64;
                     let before = self.graphics.kitty_placements.len();
                     self.graphics.kitty_placements.retain(|_, p| {
-                        !(p.dest_row <= abs_row && abs_row < p.dest_row + p.rows as i64)
+                        p.expired
+                            || p.relative.is_some()
+                            || !(p.dest_row <= abs_row
+                                && abs_row < p.dest_row + p.rows as i64)
                     });
                     overlay_changed = self.graphics.kitty_placements.len() != before;
-                }
-
-                if delete.delete_data {
-                    self.cleanup_unused_kitty_images();
                 }
             }
             b'z' | b'Z' => {
@@ -5167,10 +6473,6 @@ impl<U: EventListener> Handler for Crosswords<U> {
                 let before = self.graphics.kitty_placements.len();
                 self.graphics.kitty_placements.retain(|_, p| p.z_index != z);
                 overlay_changed = self.graphics.kitty_placements.len() != before;
-
-                if delete.delete_data {
-                    self.cleanup_unused_kitty_images();
-                }
             }
             b'n' | b'N' => {
                 // Delete by image number — look up image_id from the
@@ -5190,10 +6492,10 @@ impl<U: EventListener> Handler for Crosswords<U> {
                     if delete.placement_id != 0 {
                         self.graphics
                             .kitty_placements
-                            .remove(&(image_id, delete.placement_id));
+                            .remove(&(image_id, u64::from(delete.placement_id)));
                         self.graphics
                             .kitty_virtual_placements
-                            .remove(&(image_id, delete.placement_id));
+                            .remove(&(image_id, u64::from(delete.placement_id)));
                     } else {
                         self.graphics
                             .kitty_placements
@@ -5205,10 +6507,6 @@ impl<U: EventListener> Handler for Crosswords<U> {
                     overlay_changed = self.graphics.kitty_placements.len()
                         + self.graphics.kitty_virtual_placements.len()
                         != before;
-
-                    if delete.delete_data {
-                        self.graphics.delete_kitty_images(|id, _| *id == image_id);
-                    }
                 }
             }
             b'q' | b'Q' => {
@@ -5224,24 +6522,22 @@ impl<U: EventListener> Handler for Crosswords<U> {
                     let c = col.0;
                     let before = self.graphics.kitty_placements.len();
                     self.graphics.kitty_placements.retain(|_, p| {
-                        !(p.z_index == z
-                            && p.dest_col <= c
-                            && c < p.dest_col + p.columns as usize
-                            && p.dest_row <= abs_row
-                            && abs_row < p.dest_row + p.rows as i64)
+                        p.expired
+                            || p.relative.is_some()
+                            || !(p.z_index == z
+                                && p.dest_col <= c
+                                && c < p.dest_col + p.columns as usize
+                                && p.dest_row <= abs_row
+                                && abs_row < p.dest_row + p.rows as i64)
                     });
                     overlay_changed = self.graphics.kitty_placements.len() != before;
-                }
-
-                if delete.delete_data {
-                    self.cleanup_unused_kitty_images();
                 }
             }
             b'r' | b'R' => {
                 // Delete by image ID range [x..y]
                 let range_start = delete.x;
                 let range_end = delete.y;
-                if range_start > 0 && range_end >= range_start {
+                if range_end != 0 && range_end >= range_start {
                     let before = self.graphics.kitty_placements.len()
                         + self.graphics.kitty_virtual_placements.len();
                     self.graphics
@@ -5253,12 +6549,6 @@ impl<U: EventListener> Handler for Crosswords<U> {
                     overlay_changed = self.graphics.kitty_placements.len()
                         + self.graphics.kitty_virtual_placements.len()
                         != before;
-
-                    if delete.delete_data {
-                        self.graphics.delete_kitty_images(|id, _| {
-                            *id >= range_start && *id <= range_end
-                        });
-                    }
                 }
             }
             _ => {
@@ -5267,6 +6557,29 @@ impl<U: EventListener> Handler for Crosswords<U> {
                     delete.action as char
                 );
             }
+        }
+
+        let before = self.graphics.kitty_placements.len();
+        self.graphics.remove_orphaned_placements();
+        overlay_changed |= before != self.graphics.kitty_placements.len();
+        if delete.delete_data {
+            let remaining: std::collections::HashSet<_> = self
+                .graphics
+                .kitty_placements
+                .keys()
+                .chain(self.graphics.kitty_virtual_placements.keys())
+                .copied()
+                .collect();
+            reclaim.extend(
+                previous
+                    .into_iter()
+                    .filter(|key| !remaining.contains(key))
+                    .map(|key| key.0),
+            );
+            let used: std::collections::HashSet<_> =
+                remaining.iter().map(|key| key.0).collect();
+            self.graphics
+                .delete_kitty_images(|id, _| reclaim.contains(id) && !used.contains(id));
         }
 
         if overlay_changed {
@@ -5455,6 +6768,36 @@ impl<U: EventListener> Handler for Crosswords<U> {
         );
     }
 
+    fn parse_kitty_graphics(
+        &mut self,
+        params: &[&[u8]],
+    ) -> Option<crate::ansi::kitty_graphics_protocol::KittyGraphicsResponse> {
+        let images = &self.graphics.kitty_images;
+        let numbers = &self.graphics.kitty_image_numbers;
+        crate::ansi::kitty_graphics_protocol::parse_with_resources(
+            params,
+            &mut self.graphics.kitty_chunking_state,
+            |mut candidate| {
+                for _ in 0..images.len() + 2 {
+                    if candidate != 0 && !images.contains_key(&candidate) {
+                        return candidate;
+                    }
+                    candidate = candidate.wrapping_add(1);
+                }
+                unreachable!("an unused image ID exists beyond the retained images")
+            },
+            |image_id, image_number| {
+                crate::ansi::graphics::Graphics::image_identity(
+                    images,
+                    numbers,
+                    image_id,
+                    image_number,
+                )
+                .map(Some)
+            },
+        )
+    }
+
     #[inline]
     fn kitty_chunking_state_mut(
         &mut self,
@@ -5559,6 +6902,15 @@ impl<U: EventListener> Crosswords<U> {
         image_id: u32,
         placement: &crate::ansi::kitty_graphics_protocol::PlacementRequest,
     ) {
+        let Ok(relative) = self.graphics.resolve_placement_parent(placement) else {
+            return;
+        };
+        if !self
+            .graphics
+            .can_place_kitty(image_id, placement.placement_id, false)
+        {
+            return;
+        }
         let (image_width, image_height, transmit_time) =
             match self.graphics.get_kitty_image(image_id) {
                 Some(s) => (s.data.width, s.data.height, s.transmission_time),
@@ -5583,35 +6935,26 @@ impl<U: EventListener> Crosswords<U> {
         // never affects where the placement lands. Both crop and
         // display size are re-resolved at render time, so these
         // values only drive the grid footprint (spans and cursor
-        // movement). A crop fully outside the image still stores the
-        // placement — it renders nothing and occupies no cells, and
-        // can become visible after a retransmission with larger
-        // dimensions.
-        let (display_w, display_h) = match crate::ansi::graphics::resolve_source_rect(
-            placement.x,
-            placement.y,
-            placement.width,
-            placement.height,
-            image_width,
-            image_height,
-        ) {
-            Some((_, _, source_width, source_height)) => {
-                crate::ansi::graphics::kitty_display_size(
-                    source_width,
-                    source_height,
-                    placement.columns,
-                    placement.rows,
-                    cell_width,
-                    cell_height,
-                )
-            }
-            None => (0, 0),
-        };
-
-        if display_w > MAX_GRAPHIC_DIMENSIONS[0] || display_h > MAX_GRAPHIC_DIMENSIONS[1]
-        {
-            return;
-        }
+        // movement). Empty source axes still participate in sizing:
+        // requested spans and subcell offsets can give them a cell footprint.
+        let (_, _, source_width, source_height) =
+            crate::ansi::graphics::kitty_source_rect(
+                placement.x,
+                placement.y,
+                placement.width,
+                placement.height,
+                image_width,
+                image_height,
+            );
+        let (display_w, display_h) = crate::ansi::graphics::kitty_display_size(
+            source_width,
+            source_height,
+            placement.columns,
+            placement.rows,
+            cell_width,
+            cell_height,
+            (placement.cell_x_offset, placement.cell_y_offset),
+        );
 
         // Memory is managed in store_kitty_image (eviction happens there)
 
@@ -5627,37 +6970,17 @@ impl<U: EventListener> Crosswords<U> {
             + self.history_size() as i64
             + cursor_row as i64;
 
-        // kitty spec the `X=`/`Y=` sub-cell offset must be smaller
-        // than the cell size. The stored value stays raw (a later cell
-        // size change re-clamps at read time without losing the
-        // original); these clamped copies only drive span derivation.
-        let cell_x_offset = (placement.cell_x_offset as usize).min(cell_width - 1);
-        let cell_y_offset = (placement.cell_y_offset as usize).min(cell_height - 1);
-
-        // Compute cell-based size.
-        //
-        // the trick is the sub-cell offset shifts the image
-        // within its first cell, so it can spill into one extra
-        // row/column. Include it so cursor movement and row occupation
-        // cover the full image. An invisible placement (degenerate
-        // crop) occupies no cells at all.
-        let (columns, rows) = if display_w == 0 || display_h == 0 {
-            (0, 0)
-        } else {
-            let columns = if placement.columns > 0 {
-                placement.columns
-            } else {
-                (display_w + cell_x_offset).div_ceil(cell_width) as u32
-            };
-            let rows = if placement.rows > 0 {
-                placement.rows
-            } else {
-                (display_h + cell_y_offset).div_ceil(cell_height) as u32
-            };
-            (columns, rows)
-        };
+        // Include clamped subcell offsets when deriving a cell span.
+        // Keep the raw offsets so future cell-size changes can re-clamp them.
+        let (columns, rows) = crate::ansi::graphics::kitty_grid_size(
+            (display_w, display_h),
+            (placement.columns, placement.rows),
+            (cell_width, cell_height),
+            (placement.cell_x_offset, placement.cell_y_offset),
+        );
 
         // Create overlay placement.
+        self.graphics.reap_expired_kitty_placements();
         //
         // Per kitty spec, when the client doesn't supply `p=` (or sends
         // p=0) the terminal must allocate a unique internal placement_id
@@ -5668,9 +6991,11 @@ impl<U: EventListener> Crosswords<U> {
         let placement_id = if placement.placement_id == 0 {
             self.graphics.allocate_internal_placement_id()
         } else {
-            placement.placement_id
+            u64::from(placement.placement_id)
         };
         let kitty_placement = KittyPlacement {
+            expired: false,
+            relative,
             image_id,
             placement_id,
             source_x: placement.x,
@@ -5694,12 +7019,18 @@ impl<U: EventListener> Crosswords<U> {
         self.graphics
             .kitty_placements
             .insert((image_id, placement_id), kitty_placement);
+        self.graphics
+            .kitty_virtual_placements
+            .remove(&(image_id, placement_id));
         self.graphics.kitty_graphics_dirty = true;
 
         self.graphics.queue_kitty_upload(image_id);
         self.send_graphics_updates();
 
         // Handle cursor movement per kitty spec
+        if relative.is_some() {
+            return;
+        }
         match placement.cursor_movement {
             0 => {
                 // C=0: Move cursor to after the image
@@ -5717,34 +7048,6 @@ impl<U: EventListener> Crosswords<U> {
 
     /// Refresh the grid footprint of every live placement of an image
     /// after its pixel data changed dimensions.
-    pub fn refresh_placements_for_image(
-        &mut self,
-        image_id: u32,
-        image_width: usize,
-        image_height: usize,
-    ) {
-        let cell_w = self.graphics.cell_width.round() as usize;
-        let cell_h = self.graphics.cell_height.round() as usize;
-        for ((id, _), p) in self.graphics.kitty_placements.iter_mut() {
-            if *id == image_id {
-                p.rescale(image_width, image_height, cell_w, cell_h);
-            }
-        }
-        // A virtual placement keeps its source rect; if the new pixels
-        // no longer cover it, fall back to the whole image rather than
-        // rendering nothing at the placeholder cells.
-        for ((id, _), vp) in self.graphics.kitty_virtual_placements.iter_mut() {
-            if *id == image_id
-                && (vp.x as usize >= image_width || vp.y as usize >= image_height)
-            {
-                vp.x = 0;
-                vp.y = 0;
-                vp.width = 0;
-                vp.height = 0;
-            }
-        }
-    }
-
     /// Queue the stored pixels of `image_id` for the GPU unless the
     /// texture already holds them. Returns whether an upload was queued.
     fn ensure_kitty_upload(&mut self, image_id: u32) -> bool {
@@ -5757,32 +7060,36 @@ impl<U: EventListener> Crosswords<U> {
         }
     }
 
-    /// Move the cursor past a placement (`C=0`): linefeed once per
-    /// occupied row so the whole image scrolls into view, then land on
-    /// the image's last row at the first column after it, clamped to
-    /// the grid edge. An invisible placement (zero span) leaves the
-    /// cursor untouched.
+    /// Move past a placement, wrapping once if it reaches the right edge.
+    /// Allow movement to the scroll-region bottom and one screen of scrolling.
     fn advance_cursor_past_placement(
         &mut self,
         dest_col: usize,
         columns: u32,
         rows: u32,
     ) {
-        if rows == 0 {
-            return;
-        }
-        for _ in 0..rows {
+        let target_col = dest_col.saturating_add(columns as usize);
+        let wraps = target_col >= self.grid.columns();
+        let requested_rows =
+            (rows.saturating_sub(1) as usize).saturating_add(usize::from(wraps));
+        let rows_before_scroll = if self.scroll_region.contains(&self.grid.cursor.pos.row)
+        {
+            (self.scroll_region.end.0 - 1 - self.grid.cursor.pos.row.0) as usize
+        } else {
+            0
+        };
+        let rows_to_move = requested_rows
+            .min(rows_before_scroll.saturating_add(self.grid.screen_lines()));
+        for _ in 0..rows_to_move {
             self.linefeed();
         }
-        if self.grid.cursor.pos.row.0 > 0 {
-            self.grid.cursor.pos.row -= 1;
-        }
-        let col = (dest_col + columns as usize).min(self.grid.columns() - 1);
-        self.grid.cursor.pos.col = Column(col);
+        self.damage_cursor();
+        self.grid.cursor.pos.col = Column(if wraps { 0 } else { target_col });
         // Any cursor repositioning discards a pending wrap, otherwise
         // the next printed character wraps a row below the intended
         // caption position.
         self.grid.cursor.should_wrap = false;
+        self.damage_cursor();
     }
 
     /// Register a virtual placement (kitty graphics `a=p,U=1`).
@@ -5799,6 +7106,13 @@ impl<U: EventListener> Crosswords<U> {
         &mut self,
         placement: crate::ansi::kitty_graphics_protocol::PlacementRequest,
     ) {
+        if !self.graphics.can_place_kitty(
+            placement.image_id,
+            placement.placement_id,
+            true,
+        ) {
+            return;
+        }
         use crate::ansi::graphics::VirtualPlacement;
 
         debug!(
@@ -5806,9 +7120,14 @@ impl<U: EventListener> Crosswords<U> {
             placement.image_id, placement.placement_id, placement.columns, placement.rows
         );
 
+        let placement_id = if placement.placement_id == 0 {
+            self.graphics.allocate_internal_placement_id()
+        } else {
+            u64::from(placement.placement_id)
+        };
         let vp = VirtualPlacement {
             image_id: placement.image_id,
-            placement_id: placement.placement_id,
+            placement_id,
             columns: placement.columns,
             rows: placement.rows,
             x: placement.x,
@@ -5816,12 +7135,19 @@ impl<U: EventListener> Crosswords<U> {
             width: placement.width,
             height: placement.height,
         };
+        self.graphics.reap_expired_kitty_placements();
         self.graphics
             .kitty_virtual_placements
-            .insert((placement.image_id, placement.placement_id), vp);
+            .insert((placement.image_id, placement_id), vp);
+        self.graphics
+            .kitty_placements
+            .remove(&(placement.image_id, placement_id));
         self.graphics.kitty_graphics_dirty = true;
     }
 }
+
+#[cfg(test)]
+mod conformance_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5848,6 +7174,1331 @@ mod tests {
         let size = CrosswordsSize::new(4, 4);
         let window_id = crate::event::WindowId::from(0);
         Crosswords::new(size, CursorShape::Block, VoidListener {}, window_id, 0, 10)
+    }
+
+    #[test]
+    fn implicit_kitty_placements_do_not_alias_explicit_ids() {
+        use crate::performer::handler::Processor;
+        for id in [1, 0x80000000, u32::MAX] {
+            for implicit_first in [false, true] {
+                for delete_action in ['i', 'I'] {
+                    let mut terminal = make_crosswords();
+                    terminal.graphics.cell_width = 8.0;
+                    terminal.graphics.cell_height = 16.0;
+                    let mut processor = Processor::default();
+                    let first_id = if implicit_first { 0 } else { id };
+                    let second_id = if implicit_first { id } else { 0 };
+                    processor.advance(&mut terminal, format!(
+                        "\x1b_Ga=T,i=1,p={first_id},f=32,s=1,v=1,C=1;AQIDBA==\x1b\\\x1b[3;3H\x1b_Ga=p,i=1,p={second_id},C=1\x1b\\"
+                    ).as_bytes());
+                    assert_eq!(terminal.graphics.kitty_placements.len(), 2);
+                    assert!(terminal
+                        .graphics
+                        .kitty_placements
+                        .contains_key(&(1, u64::from(id))));
+                    processor.advance(
+                        &mut terminal,
+                        format!("\x1b_Ga=d,d={delete_action},i=1,p={id}\x1b\\")
+                            .as_bytes(),
+                    );
+                    assert_eq!(terminal.graphics.kitty_placements.len(), 1);
+                    let retained =
+                        terminal.graphics.kitty_placements.values().next().unwrap();
+                    assert_eq!(
+                        crate::ansi::graphics::public_placement_id(retained.placement_id),
+                        0
+                    );
+                    assert_eq!(retained.dest_col, if implicit_first { 0 } else { 2 });
+                    assert!(terminal.graphics.kitty_images.contains_key(&1));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn kitty_visible_delete_preserves_history_virtual_chains_and_unplaced_images() {
+        use crate::performer::handler::Processor;
+        let mut terminal = make_crosswords();
+        terminal.graphics.cell_width = 8.0;
+        terminal.graphics.cell_height = 16.0;
+        let mut processor = Processor::default();
+        for (id, extra) in [
+            (1, ""),
+            (2, ",P=1,Q=1"),
+            (3, ",a=t"),
+            (4, ",U=1"),
+            (5, ",P=4,Q=1"),
+        ] {
+            processor.advance(
+                &mut terminal,
+                format!("\x1b_Ga=T,i={id},p=1,f=32,s=1,v=1,C=1{extra};AQIDBA==\x1b\\")
+                    .as_bytes(),
+            );
+        }
+        processor.advance(&mut terminal, b"\n\n\n\n\n\x1b_Ga=T,i=6,p=1,f=32,s=1,v=1,C=1;AQIDBA==\x1b\\\x1b_Ga=d,d=A\x1b\\");
+        for id in [1, 2, 3, 4, 5] {
+            assert!(
+                terminal.graphics.kitty_images.contains_key(&id),
+                "image {id}"
+            );
+        }
+        for id in [1, 2, 5] {
+            assert!(
+                terminal.graphics.kitty_placements.contains_key(&(id, 1)),
+                "placement {id}"
+            );
+        }
+        assert!(terminal
+            .graphics
+            .kitty_virtual_placements
+            .contains_key(&(4, 1)));
+        assert!(!terminal.graphics.kitty_images.contains_key(&6));
+    }
+
+    #[test]
+    fn kitty_uppercase_delete_only_reclaims_selected_unused_images() {
+        use crate::performer::handler::Processor;
+        let mut terminal = make_crosswords();
+        terminal.graphics.cell_width = 8.0;
+        terminal.graphics.cell_height = 16.0;
+        let mut processor = Processor::default();
+        processor.advance(&mut terminal, b"\x1b_Ga=T,i=1,p=1,f=32,s=1,v=1,C=1;AQIDBA==\x1b\\\x1b_Ga=p,i=1,p=2,C=1\x1b\\\x1b_Ga=t,i=3,f=32,s=1,v=1;AQIDBA==\x1b\\\x1b_Ga=d,d=I,i=1,p=1\x1b\\");
+        assert!(terminal.graphics.kitty_images.contains_key(&1));
+        assert!(terminal.graphics.kitty_placements.contains_key(&(1, 2)));
+        processor.advance(&mut terminal, b"\x1b_Ga=d,d=I,i=3,p=99\x1b\\");
+        assert!(terminal.graphics.kitty_images.contains_key(&3));
+        processor.advance(&mut terminal, b"\x1b_Ga=d,d=I,i=1,p=2\x1b\\");
+        assert!(!terminal.graphics.kitty_images.contains_key(&1));
+        assert!(terminal.graphics.kitty_images.contains_key(&3));
+    }
+
+    #[test]
+    fn animation_chunks_survive_control_but_reject_replaced_or_deleted_targets() {
+        use crate::performer::handler::Processor;
+        let mut terminal = make_crosswords();
+        let mut processor = Processor::default();
+        let root = b"\x1b_Ga=t,i=1,f=32,s=1,v=1;/wAA/w==\x1b\\";
+        processor.advance(&mut terminal, root);
+        processor.advance(&mut terminal,b"\x1b_Ga=f,i=1,f=32,s=1,v=1;AAD//w==\x1b\\\x1b_Ga=f,i=1,r=3,f=32,s=1,v=1,m=1;/wA=\x1b\\\x1b_Ga=a,i=1,c=2\x1b\\");
+        assert_eq!(
+            terminal.graphics.kitty_images[&1].data.pixels,
+            [0, 0, 255, 255]
+        );
+        processor.advance(
+            &mut terminal,
+            b"\x1b_Gm=0;AP8=\x1b\\\x1b_Ga=a,i=1,c=3\x1b\\",
+        );
+        assert_eq!(terminal.graphics.kitty_animations[&1].frame_count(), 3);
+        assert_eq!(
+            terminal.graphics.kitty_images[&1].data.pixels,
+            [255, 0, 0, 255]
+        );
+
+        processor.advance(&mut terminal, root);
+        processor.advance(&mut terminal, b"\x1b_Ga=f,i=1,f=32,s=1,v=1,m=1;AAA=\x1b\\");
+        terminal.store_graphic(kitty_test_image(1, 1, 1));
+        let replaced = terminal.graphics.kitty_images[&1].data.pixels.clone();
+        processor.advance(&mut terminal, b"\x1b_Gm=0;//8=\x1b\\");
+        assert!(terminal.graphics.kitty_animations.is_empty());
+        assert_eq!(terminal.graphics.kitty_images[&1].data.pixels, replaced);
+        assert_eq!(terminal.graphics.total_bytes, 4);
+
+        processor.advance(&mut terminal,b"\x1b_Ga=f,i=1,f=32,s=1,v=1,m=1;AAA=\x1b\\\x1b_Ga=d,d=I,i=1\x1b\\\x1b_Gm=0;//8=\x1b\\");
+        assert!(terminal.graphics.kitty_images.is_empty());
+        assert!(terminal.graphics.kitty_animations.is_empty());
+        assert_eq!(terminal.graphics.total_bytes, 0);
+
+        processor.advance(&mut terminal, root);
+        let identity = terminal.graphics.kitty_image_identity(1, 0).unwrap();
+        processor.advance(&mut terminal, b"\x1b_Ga=f,i=1,f=32,s=1,v=1,m=1;AAA=\x1b\\");
+        terminal.graphics.clear_all_kitty_state();
+        terminal.store_graphic(kitty_test_image(1, 1, 1));
+        assert_ne!(
+            terminal.graphics.kitty_image_identity(1, 0).unwrap(),
+            identity
+        );
+        processor.advance(&mut terminal, b"\x1b_Gm=0;//8=\x1b\\");
+        assert!(terminal.graphics.kitty_animations.is_empty());
+        assert_eq!(terminal.graphics.total_bytes, 4);
+    }
+
+    #[test]
+    fn numbered_images_bind_put_and_animation_replies_to_the_allocated_id() {
+        use crate::performer::handler::Processor;
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut terminal = Crosswords::new(
+            CrosswordsSize::new(80, 24),
+            CursorShape::Block,
+            TestListener {
+                events: events.clone(),
+            },
+            WindowId::from(0),
+            0,
+            100,
+        );
+        terminal.graphics.cell_width = 8.0;
+        terminal.graphics.cell_height = 16.0;
+        let mut processor = Processor::default();
+        processor.advance(&mut terminal, b"\x1b_Ga=t,I=42,f=32,s=1,v=1;/wAA/w==\x1b\\");
+        let id = terminal.graphics.kitty_image_numbers[&42];
+        events.borrow_mut().clear();
+        processor.advance(
+            &mut terminal,
+            b"\x1b_Ga=p,I=42,p=3,C=1\x1b\\\x1b_Ga=f,I=42,f=32,s=1,v=1;AAD//w==\x1b\\",
+        );
+        let replies: Vec<_> = events
+            .borrow()
+            .iter()
+            .filter_map(|event| match event {
+                RioEvent::PtyWrite(_, reply) => Some(reply.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            replies,
+            [
+                format!("\x1b_Gi={id},I=42,p=3;OK\x1b\\"),
+                format!("\x1b_Gi={id},I=42,r=2;OK\x1b\\")
+            ]
+        );
+        assert!(terminal.graphics.kitty_placements.contains_key(&(id, 3)));
+    }
+
+    #[test]
+    fn kitty_animation_errors_preserve_pixels_and_obey_quiet_modes() {
+        use crate::performer::handler::Processor;
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut terminal = Crosswords::new(
+            CrosswordsSize::new(80, 24),
+            CursorShape::Block,
+            TestListener {
+                events: events.clone(),
+            },
+            WindowId::from(0),
+            0,
+            100,
+        );
+        let mut processor = Processor::default();
+        processor.advance(&mut terminal, b"\x1b_Ga=t,i=1,f=32,s=1,v=1;/wAA/w==\x1b\\");
+        terminal.graphics.total_limit = 4;
+        for quiet in 0..=2 {
+            for (command, payload, error) in [
+                (
+                    "a=f,i=1,r=9,f=32,s=1,v=1",
+                    "AQI=",
+                    "i=1;ENODATA: insufficient data",
+                ),
+                (
+                    "a=f,i=99,r=9,f=99,s=1,v=1",
+                    "AQI=",
+                    "i=99,r=9;ENOENT: image not found",
+                ),
+                (
+                    "a=f,i=1,r=9,f=99,s=1,v=1",
+                    "AQI=",
+                    "i=1,r=9;EINVAL: unsupported format",
+                ),
+                (
+                    "a=f,i=1,r=2,c=99,f=32,s=1,v=1",
+                    "AQIDBA==",
+                    "i=1,r=2;EINVAL: base frame not found",
+                ),
+                (
+                    "a=f,i=99,r=2,f=32,s=1,v=1",
+                    "AQIDBA==",
+                    "i=99,r=2;ENOENT: image not found",
+                ),
+                (
+                    "a=f,i=1,r=2,f=32,s=2,v=1",
+                    "AQIDBAECAwQ=",
+                    "i=1;EINVAL: frame dimensions exceed image",
+                ),
+                (
+                    "a=c,i=1,r=1,c=99",
+                    "",
+                    "i=1;ENOENT:destination frame not found",
+                ),
+                (
+                    "a=c,i=1,r=1,c=1",
+                    "",
+                    "i=1;EINVAL:source and destination rectangles overlap",
+                ),
+                (
+                    "a=f,i=1,r=2,f=32,s=1,v=1",
+                    "AQIDBA==",
+                    "i=1,r=2;ENOSPC: animation frame storage full",
+                ),
+            ] {
+                events.borrow_mut().clear();
+                processor.advance(
+                    &mut terminal,
+                    format!("\x1b_G{command},q={quiet};{payload}\x1b\\x").as_bytes(),
+                );
+                let replies: Vec<_> = events
+                    .borrow()
+                    .iter()
+                    .filter_map(|event| match event {
+                        RioEvent::PtyWrite(_, reply) => Some(reply.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    replies,
+                    if quiet == 2 {
+                        vec![]
+                    } else {
+                        vec![format!("\x1b_G{error}\x1b\\")]
+                    }
+                );
+                assert_eq!(
+                    terminal.graphics.kitty_images[&1].data.pixels,
+                    [255, 0, 0, 255]
+                );
+                assert_eq!(terminal.graphics.total_bytes, 4);
+                assert!(terminal.graphics.kitty_animations.is_empty());
+            }
+        }
+        assert_eq!(terminal.grid.cursor.pos.col, Column(27));
+    }
+
+    #[test]
+    fn kitty_animation_frame_deletion_promotes_root_and_supports_image_numbers() {
+        use crate::performer::handler::Processor;
+        let mut terminal = make_crosswords();
+        let mut processor = Processor::default();
+        processor.advance(&mut terminal, b"\x1b_Ga=t,I=42,f=32,s=1,v=1;/wAA/w==\x1b\\");
+        let id = terminal.graphics.kitty_image_numbers[&42];
+        assert_ne!(id, 0);
+        processor.advance(&mut terminal,b"\x1b_Ga=f,I=42,f=32,s=1,v=1;AAD//w==\x1b\\\x1b_Ga=a,I=42,c=2\x1b\\\x1b_Ga=d,d=f,I=42,r=1\x1b\\");
+        assert_eq!(terminal.graphics.total_bytes, 4);
+        assert_eq!(
+            terminal.graphics.kitty_images[&id].data.pixels,
+            [0, 0, 255, 255]
+        );
+        assert_eq!(terminal.graphics.kitty_animations[&id].frame_count(), 1);
+        processor.advance(&mut terminal, b"\x1b_Ga=d,d=f,I=42,r=99\x1b\\");
+        assert!(terminal.graphics.kitty_images.contains_key(&id));
+        processor.advance(&mut terminal, b"\x1b_Ga=d,d=F,I=42,r=99\x1b\\");
+        assert!(terminal.graphics.kitty_images.is_empty());
+        assert!(terminal.graphics.kitty_animations.is_empty());
+        assert_eq!(terminal.graphics.total_bytes, 0);
+    }
+
+    #[test]
+    fn kitty_animation_bytes_follow_eviction_replacement_and_both_screens() {
+        use crate::performer::handler::Processor;
+        let mut terminal = make_crosswords();
+        let mut processor = Processor::default();
+        let root = b"\x1b_Ga=t,i=1,f=32,s=1,v=1;/wAA/w==\x1b\\";
+        let frame = b"\x1b_Ga=f,i=1,f=32,s=1,v=1;AAD//w==\x1b\\";
+        processor.advance(&mut terminal, root);
+        processor.advance(&mut terminal, frame);
+        assert_eq!(terminal.graphics.total_bytes, 8);
+        terminal.swap_alt();
+        processor.advance(&mut terminal, root);
+        processor.advance(&mut terminal, frame);
+        assert_eq!(terminal.graphics.total_bytes, 16);
+        terminal.swap_alt();
+        terminal.graphics.total_limit = 16;
+        processor.advance(&mut terminal, frame);
+        assert_eq!(terminal.graphics.total_bytes, 12);
+        assert_eq!(terminal.graphics.kitty_animations[&1].frame_count(), 3);
+        assert!(terminal
+            .graphics
+            .kitty_inactive_screen
+            .kitty_images
+            .is_empty());
+        assert!(terminal
+            .graphics
+            .kitty_inactive_screen
+            .kitty_animations
+            .is_empty());
+        processor.advance(&mut terminal, root);
+        assert!(terminal.graphics.kitty_animations.is_empty());
+        assert_eq!(terminal.graphics.total_bytes, 4);
+        terminal.graphics.clear_all_kitty_state();
+        assert_eq!(terminal.graphics.total_bytes, 0);
+    }
+
+    #[test]
+    fn chunked_animation_frame_keeps_the_first_command_metadata() {
+        use crate::performer::handler::Processor;
+        let mut terminal = make_crosswords();
+        let mut processor = Processor::default();
+        processor.advance(&mut terminal,b"\x1b_Ga=t,i=1,f=32,s=1,v=1;/wAA/w==\x1b\\\x1b_Ga=f,i=1,f=32,s=1,v=1,m=1,z=60;AAA=\x1b\\");
+        assert!(terminal.graphics.kitty_animations.is_empty());
+        processor.advance(
+            &mut terminal,
+            b"\x1b_Gm=0;//8=\x1b\\\x1b_Ga=a,i=1,c=2\x1b\\",
+        );
+        assert_eq!(
+            terminal.graphics.kitty_images[&1].data.pixels,
+            [0, 0, 255, 255]
+        );
+        assert_eq!(terminal.graphics.kitty_animations[&1].frame_count(), 2);
+        assert_eq!(terminal.graphics.total_bytes, 8);
+    }
+
+    #[test]
+    fn kitty_animation_frame_control_and_composition_use_the_real_protocol_path() {
+        use crate::performer::handler::Processor;
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut terminal = Crosswords::new(
+            CrosswordsSize::new(80, 24),
+            CursorShape::Block,
+            TestListener {
+                events: events.clone(),
+            },
+            WindowId::from(0),
+            0,
+            100,
+        );
+        terminal.graphics.cell_width = 8.0;
+        terminal.graphics.cell_height = 16.0;
+        let mut processor = Processor::default();
+        processor.advance(
+            &mut terminal,
+            b"\x1b_Ga=T,i=7,p=1,f=32,s=1,v=1,C=1;/wAA/w==\x1b\\",
+        );
+        events.borrow_mut().clear();
+        processor.advance(
+            &mut terminal,
+            b"\x1b_Ga=f,i=7,f=32,s=1,v=1,z=50;AAD//w==\x1b\\",
+        );
+        let replies: Vec<_> = events
+            .borrow()
+            .iter()
+            .filter_map(|event| match event {
+                RioEvent::PtyWrite(_, reply) => Some(reply.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(replies, ["\x1b_Gi=7,r=2;OK\x1b\\"]);
+        assert_eq!(terminal.graphics.total_bytes, 8);
+        assert_eq!(
+            terminal.graphics.kitty_images[&7].data.pixels,
+            [255, 0, 0, 255]
+        );
+        let stamp = terminal.graphics.kitty_images[&7].transmission_time;
+        events.borrow_mut().clear();
+        processor.advance(&mut terminal, b"\x1b_Ga=a,i=7,c=2\x1b\\");
+        assert!(!events
+            .borrow()
+            .iter()
+            .any(|event| matches!(event, RioEvent::PtyWrite(..))));
+        assert_eq!(
+            terminal.graphics.kitty_images[&7].data.pixels,
+            [0, 0, 255, 255]
+        );
+        assert!(terminal.graphics.kitty_images[&7].transmission_time > stamp);
+        processor.advance(
+            &mut terminal,
+            b"\x1b_Ga=c,i=7,r=2,c=1,w=1,h=1,C=1\x1b\\\x1b_Ga=a,i=7,c=1\x1b\\",
+        );
+        assert_eq!(
+            terminal.graphics.kitty_images[&7].data.pixels,
+            [0, 0, 255, 255]
+        );
+        processor.advance(&mut terminal, b"\x1b_Ga=d,d=I,i=7\x1b\\");
+        assert_eq!(terminal.graphics.total_bytes, 0);
+        assert!(terminal.graphics.kitty_animations.is_empty());
+    }
+
+    #[test]
+    fn kitty_animation_budget_rejection_preserves_rgb_root_until_conversion_fits() {
+        use crate::performer::handler::Processor;
+        use rio_graphics::ColorType;
+        let mut terminal = make_crosswords();
+        let mut root = kitty_test_image(1, 1, 1);
+        root.color_type = ColorType::Rgb;
+        root.pixels = vec![1, 2, 3];
+        terminal.store_graphic(root);
+        terminal.graphics.total_limit = 7;
+        let mut processor = Processor::default();
+        let frame = b"\x1b_Ga=f,i=1,f=32,s=1,v=1;AQIDBA==\x1b\\";
+        processor.advance(&mut terminal, frame);
+        assert_eq!(terminal.graphics.total_bytes, 3);
+        assert_eq!(
+            terminal.graphics.kitty_images[&1].data.color_type,
+            ColorType::Rgb
+        );
+        assert!(terminal.graphics.kitty_animations.is_empty());
+        terminal.graphics.total_limit = 8;
+        processor.advance(&mut terminal, frame);
+        assert_eq!(terminal.graphics.total_bytes, 8);
+        assert_eq!(
+            terminal.graphics.kitty_images[&1].data.pixels,
+            [1, 2, 3, 255]
+        );
+        assert_eq!(terminal.graphics.kitty_animations[&1].frame_count(), 2);
+        terminal.graphics.clear_all_kitty_state();
+        assert_eq!(terminal.graphics.total_bytes, 0);
+    }
+
+    #[test]
+    fn relative_geometry_keeps_its_own_crop_and_offsets_across_reflow() {
+        use crate::ansi::graphics::{kitty_overlay_geometry, OverlayViewport};
+        use crate::performer::handler::Processor;
+        let mut terminal = Crosswords::new(
+            CrosswordsSize::new_with_dimensions(50, 10, 500, 200, 10, 20),
+            CursorShape::Block,
+            VoidListener {},
+            WindowId::from(0),
+            0,
+            100,
+        );
+        let mut processor = Processor::default();
+        processor.advance(&mut terminal, b"$ kitten icat /path/to/image.png\r\n\x1b_Ga=T,i=1,p=1,f=32,s=1,v=1,C=1,X=8,Y=10;AQIDBA==\x1b\\\x1b_Ga=T,i=2,p=1,f=32,s=2,v=1,c=1,r=1,x=1,w=1,X=3,Y=4,P=1,Q=1,H=2,V=1;AQIDBAECAwQ=\x1b\\");
+        for (resize, x, y) in [(false, 23.0, 44.0), (true, 27.0, 76.0)] {
+            if resize {
+                terminal.resize(CrosswordsSize::new_with_dimensions(
+                    20, 10, 240, 240, 12, 24,
+                ));
+            }
+            let snapshot = terminal.graphics.resolved_kitty_placements();
+            let child = snapshot.iter().find(|p| p.image_id == 2).unwrap();
+            let viewport = OverlayViewport {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                cell_width: terminal.graphics.cell_width,
+                cell_height: terminal.graphics.cell_height,
+                history_size: (terminal.grid.lines_evicted()
+                    + terminal.history_size() as u64)
+                    as i64,
+                display_offset: 0,
+                screen_lines: 10,
+            };
+            let geometry = kitty_overlay_geometry(child, 2, 1, &viewport).unwrap();
+            if resize {
+                // The wrapped command shifts the root to absolute row 2;
+                // trailing blanks absorb the added row without growing history.
+                assert_eq!(terminal.graphics.kitty_placements[&(1, 1)].dest_row, 2);
+                assert_eq!(terminal.history_size(), 0);
+            }
+            assert_eq!((geometry.x, geometry.y), (x, y));
+            assert_eq!(geometry.source_rect, [0.5, 0.0, 1.0, 1.0]);
+        }
+    }
+
+    #[test]
+    fn retransmission_removes_dormant_crop_placements() {
+        use crate::performer::handler::Processor;
+        let mut terminal = make_crosswords();
+        terminal.graphics.cell_width = 8.0;
+        terminal.graphics.cell_height = 16.0;
+        let mut processor = Processor::default();
+        processor.advance(
+            &mut terminal,
+            b"\x1b_Ga=T,i=1,p=1,f=32,s=1,v=1,x=2,C=1;AQIDBA==\x1b\\",
+        );
+        let placement = &terminal.graphics.kitty_placements[&(1, 1)];
+        assert_eq!((placement.columns, placement.rows), (0, 1));
+        processor.advance(
+            &mut terminal,
+            b"\x1b_Ga=t,i=1,f=32,s=4,v=1;AQIDBAECAwQBAgMEAQIDBA==\x1b\\",
+        );
+        assert!(!terminal.graphics.kitty_placements.contains_key(&(1, 1)));
+        processor.advance(&mut terminal, b"\x1b_Ga=p,i=1,p=1,x=2,C=1\x1b\\");
+        assert_eq!(terminal.graphics.kitty_placements[&(1, 1)].rows, 1);
+    }
+
+    #[test]
+    fn reducing_primary_history_on_alt_screen_keeps_alt_parent_chains() {
+        use crate::performer::handler::Processor;
+        let mut terminal = make_crosswords();
+        terminal.graphics.cell_width = 8.0;
+        terminal.graphics.cell_height = 16.0;
+        let mut processor = Processor::default();
+        let images = b"\x1b_Ga=T,i=1,p=1,f=32,s=1,v=1,C=1;AQIDBA==\x1b\\\x1b_Ga=T,i=2,p=1,f=32,s=1,v=1,P=1,Q=1,H=1,V=1;AQIDBA==\x1b\\";
+        processor.advance(&mut terminal, images);
+        processor.advance(&mut terminal, b"\n\n\n\n\n\n");
+        terminal.swap_alt();
+        processor.advance(&mut terminal, images);
+        terminal.set_scrollback_limits(0, None);
+        assert_eq!(terminal.graphics.kitty_placements.len(), 2);
+        assert!(terminal
+            .graphics
+            .kitty_inactive_screen
+            .kitty_placements
+            .is_empty());
+        terminal.swap_alt();
+        assert!(terminal.graphics.kitty_placements.is_empty());
+        assert_eq!(
+            terminal
+                .graphics
+                .kitty_inactive_screen
+                .kitty_placements
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn clearing_or_reducing_history_reaps_relative_parent_chains() {
+        use crate::performer::handler::Processor;
+        for clear in [true, false] {
+            let mut terminal = make_crosswords();
+            terminal.graphics.cell_width = 8.0;
+            terminal.graphics.cell_height = 16.0;
+            let mut processor = Processor::default();
+            processor.advance(&mut terminal, b"\x1b_Ga=T,i=1,p=1,f=32,s=1,v=1,C=1;AQIDBA==\x1b\\\x1b_Ga=T,i=2,p=1,f=32,s=1,v=1,P=1,Q=1,H=1,V=1;AQIDBA==\x1b\\\n\n\n\n\n\n");
+            assert!(terminal.history_size() > 0);
+            assert_eq!(terminal.graphics.kitty_placements.len(), 2);
+            if clear {
+                terminal.clear_saved_history();
+            } else {
+                terminal.set_scrollback_limits(0, None);
+            }
+            assert!(
+                terminal.graphics.kitty_placements.is_empty(),
+                "clear={clear}"
+            );
+            assert_eq!(terminal.graphics.kitty_images.len(), 2);
+        }
+    }
+
+    #[test]
+    fn omitted_relative_parent_id_selects_a_stable_virtual_root() {
+        use crate::performer::handler::Processor;
+        let mut terminal = make_crosswords();
+        terminal.graphics.cell_width = 8.0;
+        terminal.graphics.cell_height = 16.0;
+        let mut processor = Processor::default();
+        processor.advance(&mut terminal, b"\x1b_Ga=T,i=1,p=4,f=32,s=1,v=1,U=1;AQIDBA==\x1b\\\x1b_Ga=p,i=1,p=2,U=1\x1b\\\x1b_Ga=T,i=2,p=1,f=32,s=1,v=1,P=1;AQIDBA==\x1b\\");
+        assert_eq!(
+            terminal.graphics.kitty_placements[&(2, 1)]
+                .relative
+                .unwrap()
+                .placement_id,
+            2
+        );
+        processor.advance(&mut terminal, b"\x1b_Ga=d,d=i,i=1,p=2\x1b\\");
+        // Q=0 resolves once; deleting that root must not attach the child
+        // to a different placement of the same image.
+        assert!(terminal.graphics.kitty_placements.is_empty());
+        assert!(terminal
+            .graphics
+            .kitty_virtual_placements
+            .contains_key(&(1, 4)));
+    }
+
+    #[test]
+    fn relative_chains_can_root_at_virtual_placements_and_follow_kind_replacement() {
+        use crate::performer::handler::Processor;
+        let mut terminal = make_crosswords();
+        terminal.graphics.cell_width = 8.0;
+        terminal.graphics.cell_height = 16.0;
+        let mut processor = Processor::default();
+        processor.advance(&mut terminal, b"\x1b_Ga=T,i=1,p=4,f=32,s=1,v=1,U=1;AQIDBA==\x1b\\\x1b_Ga=T,i=2,p=1,f=32,s=1,v=1,P=1,Q=4,H=-1,V=2;AQIDBA==\x1b\\\x1b_Ga=T,i=3,p=1,f=32,s=1,v=1,P=2,Q=1,H=2,V=1;AQIDBA==\x1b\\");
+        assert_eq!(terminal.graphics.kitty_placements.len(), 2);
+        let snapshot = terminal.graphics.resolved_kitty_placements();
+        let child = snapshot.iter().find(|p| p.image_id == 3).unwrap();
+        let root = child.relative.unwrap();
+        assert_eq!(
+            (
+                root.image_id,
+                root.placement_id,
+                root.horizontal,
+                root.vertical
+            ),
+            (1, 4, 1, 3)
+        );
+        // Changing the root's kind keeps the same public identity and children.
+        processor.advance(&mut terminal, b"\x1b_Ga=p,i=1,p=4,C=1\x1b\\");
+        assert!(!terminal
+            .graphics
+            .kitty_virtual_placements
+            .contains_key(&(1, 4)));
+        assert_eq!(terminal.graphics.kitty_placements.len(), 3);
+        processor.advance(&mut terminal, b"\x1b_Ga=p,i=1,p=4,U=1\x1b\\");
+        assert!(!terminal.graphics.kitty_placements.contains_key(&(1, 4)));
+        assert_eq!(terminal.graphics.kitty_placements.len(), 2);
+        processor.advance(&mut terminal, b"\x1b_Ga=d,d=i,i=1,p=4\x1b\\");
+        assert!(terminal.graphics.kitty_placements.is_empty());
+    }
+
+    #[test]
+    fn relative_placement_errors_reach_the_client_with_quiet_modes() {
+        use crate::performer::handler::Processor;
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut terminal = Crosswords::new(
+            CrosswordsSize::new(80, 24),
+            CursorShape::Block,
+            TestListener {
+                events: events.clone(),
+            },
+            WindowId::from(0),
+            0,
+            100,
+        );
+        terminal.graphics.cell_width = 8.0;
+        terminal.graphics.cell_height = 16.0;
+        let mut processor = Processor::default();
+        processor.advance(&mut terminal, b"\x1b_Ga=T,i=1,p=1,f=32,s=1,v=1,C=1;AQIDBA==\x1b\\\x1b_Ga=T,i=2,p=1,f=32,s=1,v=1,P=1,Q=1;AQIDBA==\x1b\\");
+        for quiet in 0..=2 {
+            for (parent, error) in [
+                ("P=1,Q=1", "EINVAL: placement cannot be its own parent"),
+                ("P=99", "ENOPARENT: parent image not found"),
+                ("P=1,Q=99", "ENOPARENT: parent placement not found"),
+                ("P=2,Q=1", "ECYCLE: parent chain creates a cycle"),
+            ] {
+                events.borrow_mut().clear();
+                processor.advance(
+                    &mut terminal,
+                    format!("\x1b_Ga=p,i=1,p=1,{parent},q={quiet}\x1b\\ok").as_bytes(),
+                );
+                let replies: Vec<_> = events
+                    .borrow()
+                    .iter()
+                    .filter_map(|event| match event {
+                        RioEvent::PtyWrite(_, reply) => Some(reply.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    replies,
+                    if quiet == 2 {
+                        vec![]
+                    } else {
+                        vec![format!("\x1b_Gi=1,p=1;{error}\x1b\\")]
+                    }
+                );
+                assert!(terminal.graphics.kitty_placements[&(1, 1)]
+                    .relative
+                    .is_none());
+            }
+        }
+        assert_eq!(terminal.grid.cursor.pos.col, Column(24));
+    }
+
+    #[test]
+    fn relative_placements_follow_parent_chains_and_die_with_the_parent() {
+        use crate::ansi::graphics::{kitty_overlay_geometry, OverlayViewport};
+        use crate::performer::handler::Processor;
+        let mut terminal = make_crosswords();
+        terminal.graphics.cell_width = 8.0;
+        terminal.graphics.cell_height = 16.0;
+        let mut processor = Processor::default();
+        for (id, parent) in [(1, ""), (2, ",P=1,Q=1,H=-1,V=2"), (3, ",P=2,Q=1,H=2,V=-1")]
+        {
+            processor.advance(
+                &mut terminal,
+                format!("\x1b_Ga=T,i={id},p=1,f=32,s=1,v=1,C=1{parent};AQIDBA==\x1b\\")
+                    .as_bytes(),
+            );
+        }
+        assert_eq!(terminal.graphics.kitty_placements.len(), 3);
+        assert_eq!(terminal.grid.cursor.pos, Pos::new(Line(0), Column(0)));
+        let snapshot = terminal.graphics.resolved_kitty_placements();
+        let child = snapshot.iter().find(|p| p.image_id == 3).unwrap();
+        let viewport = OverlayViewport {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            cell_width: 8.0,
+            cell_height: 16.0,
+            history_size: 0,
+            display_offset: 0,
+            screen_lines: 4,
+        };
+        let geometry = kitty_overlay_geometry(child, 1, 1, &viewport).unwrap();
+        assert_eq!((geometry.x, geometry.y), (8.0, 16.0));
+        // Replacing the root moves descendants without changing their metadata.
+        processor.advance(&mut terminal, b"\x1b[2;2H\x1b_Ga=p,i=1,p=1,C=1\x1b\\");
+        let moved = terminal.graphics.resolved_kitty_placements();
+        let child = moved.iter().find(|p| p.image_id == 3).unwrap();
+        let geometry = kitty_overlay_geometry(child, 1, 1, &viewport).unwrap();
+        assert_eq!((geometry.x, geometry.y), (16.0, 32.0));
+        processor.advance(&mut terminal, b"\x1b_Ga=d,d=i,i=1,p=1\x1b\\");
+        assert!(terminal.graphics.kitty_placements.is_empty());
+        assert_eq!(terminal.graphics.kitty_images.len(), 3);
+    }
+
+    #[test]
+    fn relative_placement_rejection_preserves_existing_pixels_and_placements() {
+        use crate::performer::handler::Processor;
+        let mut terminal = make_crosswords();
+        terminal.graphics.cell_width = 8.0;
+        terminal.graphics.cell_height = 16.0;
+        let mut processor = Processor::default();
+        processor.advance(
+            &mut terminal,
+            b"\x1b_Ga=T,i=1,p=1,f=32,s=1,v=1,C=1;AQIDBA==\x1b\\",
+        );
+        let original = terminal.graphics.kitty_images[&1].transmission_time;
+        for parent in [",P=1,Q=1", ",P=99", ",P=1,Q=99"] {
+            processor.advance(
+                &mut terminal,
+                format!("\x1b_Ga=p,i=1,p=1,C=1{parent}\x1b\\").as_bytes(),
+            );
+            assert_eq!(
+                terminal.graphics.kitty_images[&1].transmission_time,
+                original
+            );
+            assert!(terminal.graphics.kitty_placements[&(1, 1)]
+                .relative
+                .is_none());
+        }
+        processor.advance(
+            &mut terminal,
+            b"\x1b_Ga=T,i=2,p=1,f=32,s=1,v=1,C=1,P=1;AQIDBA==\x1b\\",
+        );
+        processor.advance(&mut terminal, b"\x1b_Ga=p,i=1,p=1,P=2,Q=1\x1b\\");
+        assert!(terminal.graphics.kitty_placements[&(1, 1)]
+            .relative
+            .is_none());
+        for id in 3..=9 {
+            processor.advance(
+                &mut terminal,
+                format!(
+                    "\x1b_Ga=T,i={id},p=1,f=32,s=1,v=1,C=1,P={},Q=1;AQIDBA==\x1b\\",
+                    id - 1
+                )
+                .as_bytes(),
+            );
+            assert!(terminal.graphics.kitty_placements.contains_key(&(id, 1)));
+        }
+        processor.advance(
+            &mut terminal,
+            b"\x1b_Ga=T,i=10,p=1,f=32,s=1,v=1,C=1,P=9,Q=1;AQIDBA==\x1b\\",
+        );
+        assert!(terminal.graphics.kitty_images.contains_key(&10));
+        assert!(!terminal.graphics.kitty_placements.contains_key(&(10, 1)));
+    }
+
+    #[test]
+    fn graphics_budget_errors_remove_replaced_images_and_allow_text_recovery() {
+        use crate::performer::handler::Processor;
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let listener = TestListener {
+            events: events.clone(),
+        };
+        let mut terminal = Crosswords::new(
+            CrosswordsSize::new(80, 24),
+            CursorShape::Block,
+            listener,
+            WindowId::from(0),
+            0,
+            100,
+        );
+        terminal.graphics.total_limit = 4;
+        let mut processor = Processor::default();
+        for quiet in [0, 1, 2] {
+            processor
+                .advance(&mut terminal, b"\x1b_Ga=t,i=1,f=32,s=1,v=1;AQIDBA==\x1b\\");
+            events.borrow_mut().clear();
+            let command =
+                format!("\x1b_Ga=t,i=1,f=32,s=2,v=1,q={quiet};AQIDBAUGBwg=\x1b\\");
+            processor.advance(&mut terminal, command.as_bytes());
+            let replies: Vec<String> = events
+                .borrow()
+                .iter()
+                .filter_map(|event| match event {
+                    RioEvent::PtyWrite(_, value) => Some(value.clone()),
+                    _ => None,
+                })
+                .collect();
+            if quiet == 2 {
+                assert!(replies.is_empty());
+            } else {
+                assert_eq!(replies.len(), 1);
+                assert!(replies[0].contains("ENOSPC"), "{replies:?}");
+            }
+            assert_eq!(terminal.graphics.total_bytes, 0);
+            assert!(!terminal.graphics.kitty_images.contains_key(&1));
+        }
+        processor.advance(&mut terminal, b"\x1b_Ga=t,i=1,f=32,s=1,v=1;AQIDBA==\x1b\\");
+        for id in 0..4096 {
+            processor.advance(
+                &mut terminal,
+                format!("\x1b_Ga=p,U=1,i=1,p={id},q=2\x1b\\").as_bytes(),
+            );
+        }
+        assert_eq!(terminal.graphics.kitty_virtual_placements.len(), 4096);
+        events.borrow_mut().clear();
+        processor.advance(&mut terminal, b"\x1b_Ga=p,U=1,i=1,p=9999,q=1\x1b\\ok");
+        assert!(events.borrow().iter().any(|event| matches!(event, RioEvent::PtyWrite(_, reply) if reply.contains("ENOSPC"))));
+        assert_eq!(terminal.graphics.kitty_virtual_placements.len(), 4096);
+        assert_eq!(terminal.grid[Line(0)][Column(0)].c(), 'o');
+        assert_eq!(terminal.grid[Line(0)][Column(1)].c(), 'k');
+    }
+
+    #[test]
+    fn graphics_updates_allow_one_outstanding_batch_and_keep_latest_pixels() {
+        use crate::performer::handler::Processor;
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let listener = TestListener {
+            events: events.clone(),
+        };
+        let mut terminal = Crosswords::new(
+            CrosswordsSize::new(80, 24),
+            CursorShape::Block,
+            listener,
+            WindowId::from(0),
+            0,
+            100,
+        );
+        terminal.graphics.coalesce_updates = true;
+        let mut processor = Processor::default();
+        for _ in 0..100 {
+            processor.advance(
+                &mut terminal,
+                b"\x1b_Ga=T,U=1,i=1,f=32,s=1,v=1,q=2;AQIDBA==\x1b\\",
+            );
+        }
+        let batches = || {
+            events
+                .borrow()
+                .iter()
+                .filter(|event| matches!(event, RioEvent::UpdateGraphics { .. }))
+                .count()
+        };
+        assert_eq!(batches(), 1);
+        assert_eq!(terminal.graphics.pending_images.len(), 1);
+        terminal.acknowledge_graphics_update();
+        assert_eq!(batches(), 2);
+        assert!(terminal.graphics.pending_images.is_empty());
+        terminal.acknowledge_graphics_update();
+        assert!(!terminal.graphics.update_in_flight);
+        assert_eq!(batches(), 2);
+    }
+
+    #[test]
+    fn history_byte_configuration_follows_primary_screen_and_survives_reset() {
+        use crate::performer::handler::Processor;
+        let mut terminal = make_crosswords();
+        let mut processor = Processor::default();
+        terminal.set_scrollback_limits(100, Some(0));
+        processor.advance(&mut terminal, &b"line\r\n".repeat(20));
+        assert_eq!(terminal.history_size(), 0);
+        processor.advance(&mut terminal, b"\x1b[?1049h");
+        terminal.set_scrollback_limits(100, Some(10_000));
+        processor.advance(&mut terminal, &b"line\r\n".repeat(20));
+        assert_eq!(terminal.history_size(), 0);
+        processor.advance(&mut terminal, b"\x1b[?1049l\x1bc");
+        processor.advance(&mut terminal, &b"line\r\n".repeat(20));
+        assert!(terminal.history_size() > 0);
+        assert!(terminal.grid.history_budget_charge() <= 10_000);
+    }
+
+    #[test]
+    fn disabling_history_erases_image_anchors_and_restores_live_viewport() {
+        use crate::performer::handler::Processor;
+        let mut terminal = Crosswords::new(
+            CrosswordsSize::new(8, 4),
+            CursorShape::Block,
+            VoidListener,
+            WindowId::from(0),
+            0,
+            100,
+        );
+        terminal.graphics.cell_width = 8.0;
+        terminal.graphics.cell_height = 16.0;
+        let mut processor = Processor::default();
+        processor.advance(&mut terminal, b"\x1b[2;3H\x1b_Ga=T,i=1,p=1,f=32,s=1,v=1,c=2,r=8,C=1;AQIDBA==\x1b\\\x1b[H\n\n\n\n\n\n\n");
+        assert_eq!(terminal.history_size(), 4);
+        assert!(terminal.graphics.kitty_placements.contains_key(&(1, 1)));
+        terminal.scroll_display(Scroll::Delta(2));
+        terminal.set_scrollback_limits(100, Some(0));
+        assert_eq!(terminal.history_size(), 0);
+        assert!(terminal.graphics.kitty_placements.is_empty());
+        assert!(terminal.graphics.kitty_images.contains_key(&1));
+        terminal.set_scrollback_limits(100, None);
+        processor.advance(&mut terminal, b"\n\n");
+        assert_eq!(terminal.grid.display_offset(), 0);
+    }
+
+    #[test]
+    fn history_budget_includes_styles_created_by_erase_and_sync_replay() {
+        use crate::performer::handler::Processor;
+        let mut terminal = make_crosswords();
+        let mut processor = Processor::default();
+        processor.advance(&mut terminal, &b"line\r\n".repeat(30));
+        let budget = terminal.grid.history_budget_charge();
+        terminal.set_scrollback_limits(10, Some(budget));
+        for input in [
+            b"\x1b[4;44m\x1b[2J".as_slice(),
+            b"\x1b[?2026h\x1b[9;45m\x1b[2J\x1b[?2026l",
+        ] {
+            processor.advance(&mut terminal, input);
+            assert!(terminal.grid.history_budget_charge() <= budget);
+        }
+    }
+
+    #[test]
+    fn program_status_protocol_replies_route_and_validates_atomically() {
+        use crate::performer::handler::Processor;
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut terminal = Crosswords::new(
+            CrosswordsSize::new(10, 10),
+            CursorShape::Block,
+            TestListener {
+                events: events.clone(),
+            },
+            WindowId::from(0),
+            42,
+            10,
+        );
+        let mut parser = Processor::default();
+        for terminator in ["\x07", "\x1b\\"] {
+            parser.advance(&mut terminal, format!("\x1b]7501;?{terminator}").as_bytes());
+            assert!(events.borrow().iter().any(|e| matches!(e,
+                RioEvent::PtyWrite(42, text) if text == &format!(
+                    "\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth{terminator}"))));
+        }
+        assert!(!terminal.program_status.received_report());
+        for chunk in b"\x1b]7501;state=blocked:kind=question:msg=aGk=\x1b\\".chunks(3) {
+            parser.advance(&mut terminal, chunk);
+        }
+        assert_eq!(
+            terminal.program_status.current().unwrap().msg.as_deref(),
+            Some("hi")
+        );
+        assert!(events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, RioEvent::ProgramStatusChanged(42))));
+        let revision = terminal.program_status.revision();
+        for body in [
+            "state=error:msg=AA==".to_owned(),
+            "state=clear:id=bad//id".to_owned(),
+            "state=done;app=cargo".to_owned(),
+            format!("state=done:unknown={}", "a".repeat(4096)),
+        ] {
+            parser.advance(&mut terminal, format!("\x1b]7501;{body}\x07").as_bytes());
+            assert_eq!(terminal.program_status.revision(), revision);
+        }
+        // Detection never resets existing records.
+        parser.advance(&mut terminal, b"\x1b]7501;?\x07");
+        assert_eq!(terminal.program_status.revision(), revision);
+    }
+
+    #[test]
+    fn program_status_lifetime_is_independent_of_screen_and_soft_reset() {
+        use crate::performer::handler::Processor;
+        use crate::program_status::ProgramState;
+        let mut terminal = make_crosswords();
+        let mut parser = Processor::default();
+        parser.advance(
+            &mut terminal,
+            b"\x1b]7501;state=working\x07\x1b]7501;state=done:id=result\x07",
+        );
+        parser.advance(&mut terminal, b"\x1b[?1049h\x1b[!p\x1b[?1049l");
+        assert_eq!(terminal.program_status.records().len(), 2);
+        // Continuation markers do not finish the program's lifetime.
+        parser.advance(&mut terminal, b"\x1b]133;P;k=c\x07");
+        assert_eq!(terminal.program_status.records().len(), 2);
+        parser.advance(&mut terminal, b"\x1b]133;A\x07");
+        assert_eq!(terminal.program_status.records().len(), 1);
+        assert_eq!(
+            terminal.program_status.current().unwrap().state,
+            ProgramState::Done
+        );
+        parser.advance(&mut terminal, b"\x1b]7501;state=blocked:id=child\x07");
+        terminal.exit();
+        assert_eq!(terminal.program_status.records().len(), 1);
+        parser.advance(&mut terminal, b"\x1bc");
+        assert!(terminal.program_status.records().is_empty());
+        assert!(!terminal.program_status.received_report());
+    }
+
+    #[test]
+    fn legacy_progress_clear_does_not_resurrect_an_earlier_native_result() {
+        use crate::performer::handler::Processor;
+        use crate::program_status::ProgramState;
+        let mut terminal = make_crosswords();
+        let mut parser = Processor::default();
+        parser.advance(
+            &mut terminal,
+            b"\x1b]7501;state=done:app=old-build\x07\x1b]133;A\x07\x1b]9;4;1;40\x07",
+        );
+        assert_eq!(
+            terminal.program_status.display_status().unwrap().progress,
+            Some(40)
+        );
+        parser.advance(&mut terminal, b"\x1b]9;4;0\x07");
+        assert!(terminal.program_status.display_status().is_none());
+        parser.advance(&mut terminal, b"\x1b]133;A\x07");
+        assert!(terminal.program_status.display_status().is_none());
+        parser.advance(&mut terminal, b"\x1b]7501;state=working:app=new-build\x07");
+        let status = terminal.program_status.display_status().unwrap();
+        assert_eq!(status.state, ProgramState::Working);
+        assert_eq!(status.app.as_deref(), Some("new-build"));
+    }
+
+    #[test]
+    fn native_status_owns_the_command_despite_interleaved_legacy_reports() {
+        use crate::performer::handler::Processor;
+        for terminator in ["\x07", "\x1b\\"] {
+            for state in ["working", "blocked", "done", "error", "idle", "clear"] {
+                let mut terminal = make_crosswords();
+                let mut parser = Processor::default();
+                parser.advance(&mut terminal, b"\x1b]9;4;1;20\x07");
+                let native = format!("\x1b]7501;state={state}:app=native{terminator}");
+                for chunk in native.as_bytes().chunks(3) {
+                    parser.advance(&mut terminal, chunk);
+                }
+                let expected = terminal.program_status.display_status();
+                let revision = terminal.program_status.revision();
+                for legacy in ["1;90", "3", "4;65", "2;10", "0"] {
+                    let sequence = format!("\x1b]9;4;{legacy}{terminator}");
+                    for chunk in sequence.as_bytes().chunks(2) {
+                        parser.advance(&mut terminal, chunk);
+                    }
+                    assert_eq!(terminal.program_status.display_status(), expected);
+                    assert_eq!(terminal.program_status.revision(), revision);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn status_detection_and_malformed_native_reports_do_not_claim_progress() {
+        use crate::performer::handler::Processor;
+        let mut terminal = make_crosswords();
+        let mut parser = Processor::default();
+        for native in ["?", "state=unknown", "state=working:id=bad//id"] {
+            parser.advance(&mut terminal, format!("\x1b]7501;{native}\x07").as_bytes());
+            assert!(!terminal.program_status.received_report());
+        }
+        parser.advance(&mut terminal, b"\x1b]9;4;1;60\x07");
+        assert_eq!(
+            terminal.program_status.display_status().unwrap().progress,
+            Some(60)
+        );
+    }
+
+    #[test]
+    fn program_status_sequence_limit_includes_actual_terminator() {
+        use crate::performer::handler::Processor;
+        let mut terminal = make_crosswords();
+        let mut parser = Processor::default();
+        for terminator in ["\x07", "\x1b\\"] {
+            let header = "\x1b]7501;state=working:unknown=";
+            let padding = crate::program_status::MAX_SEQUENCE_BYTES
+                - header.len()
+                - terminator.len();
+            let sequence = format!("{header}{}{terminator}", "a".repeat(padding));
+            let before = terminal.program_status.revision();
+            parser.advance(&mut terminal, sequence.as_bytes());
+            assert_eq!(terminal.program_status.revision(), before + 1);
+            let oversized = format!("{header}{}{terminator}", "a".repeat(padding + 1));
+            parser.advance(&mut terminal, oversized.as_bytes());
+            assert_eq!(terminal.program_status.revision(), before + 1);
+        }
+    }
+
+    #[test]
+    fn legacy_alternate_modes_preserve_primary_and_clear_on_exit() {
+        use crate::performer::handler::Processor;
+        for mode in [47, 1047] {
+            let mut terminal = make_crosswords();
+            let mut parser = Processor::default();
+            parser.advance(&mut terminal, format!("P\x1b[H\x1b[?{mode}hA").as_bytes());
+            assert!(terminal.mode.contains(Mode::ALT_SCREEN));
+            assert_eq!(terminal.inactive_grid[Line(0)][Column(0)].c(), 'P');
+            parser.advance(&mut terminal, format!("\x1b[?{mode}l").as_bytes());
+            assert_eq!(terminal.grid[Line(0)][Column(0)].c(), 'P');
+            parser.advance(&mut terminal, b"\x1b[?47h");
+            assert_eq!(
+                terminal.grid[Line(0)][Column(0)].c(),
+                if mode == 47 { 'A' } else { '\0' }
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_1049_clears_alt_and_restores_each_saved_cursor() {
+        use crate::performer::handler::Processor;
+        let mut terminal = make_crosswords();
+        let mut parser = Processor::default();
+        parser.advance(&mut terminal, b"P\x1b[?1049hA\x1b[?1049h");
+        assert_eq!(terminal.grid[Line(0)][Column(1)].c(), '\0');
+        parser.advance(&mut terminal, b"B\x1b8Y");
+        assert_eq!(terminal.grid[Line(0)][Column(2)].c(), 'Y');
+        parser.advance(&mut terminal, b"\x1b[?1049lX\x1b[?1049lZ");
+        assert_eq!(terminal.grid[Line(0)][Column(0)].c(), 'P');
+        assert_eq!(terminal.grid[Line(0)][Column(1)].c(), 'Z');
+        assert_eq!(terminal.grid[Line(0)][Column(2)].c(), '\0');
+    }
+
+    #[test]
+    fn saved_cursor_restores_origin_and_selected_charset() {
+        use crate::performer::handler::Processor;
+        let mut terminal = make_crosswords();
+        let mut parser = Processor::default();
+        parser.advance(&mut terminal, b"\x1b[2;4r\x1b[?6h\x1b)0\x0e\x1b7");
+        parser.advance(&mut terminal, b"\x1b[?6l\x0f\x1b8\x1b[1;1Hq");
+        assert!(terminal.mode.contains(Mode::ORIGIN));
+        assert_eq!(terminal.grid[Line(1)][Column(0)].c(), '\u{2500}');
+    }
+
+    #[test]
+    fn display_erasure_reclaims_unplaced_images_and_keeps_virtual_references() {
+        use crate::performer::handler::Processor;
+        let mut terminal = make_crosswords();
+        let mut parser = Processor::default();
+        parser.advance(&mut terminal, b"\x1b_Ga=t,i=1,f=32,s=1,v=1;AQIDBA==\x1b\\\x1b_Ga=T,i=2,U=1,c=1,r=1,f=32,s=1,v=1;AQIDBA==\x1b\\");
+        assert!(terminal.graphics.kitty_images.contains_key(&1));
+        assert!(terminal.graphics.kitty_images.contains_key(&2));
+        parser.advance(&mut terminal, b"\x1b[2J");
+        assert!(!terminal.graphics.kitty_images.contains_key(&1));
+        assert!(terminal.graphics.kitty_images.contains_key(&2));
+    }
+
+    #[test]
+    fn soft_reset_discards_only_the_active_saved_cursor() {
+        use crate::performer::handler::Processor;
+        let mut terminal = make_crosswords();
+        let mut parser = Processor::default();
+        parser.advance(
+            &mut terminal,
+            b"\x1b[2;3H\x1b7\x1b[?1049hA\x1b[3;4H\x1b7\x1b[!p",
+        );
+        assert_eq!(terminal.grid.cursor.pos, Pos::new(Line(2), Column(3)));
+        parser.advance(&mut terminal, b"\x1b8");
+        assert_eq!(terminal.grid.cursor.pos, Pos::new(Line(0), Column(0)));
+        parser.advance(&mut terminal, b"\x1b[?1049l");
+        assert_eq!(terminal.grid.cursor.pos, Pos::new(Line(1), Column(2)));
+    }
+
+    #[test]
+    fn single_shift_applies_to_one_printed_character_across_chunks() {
+        use crate::performer::handler::Processor;
+        for chunk in [1, 2, 17, 65536] {
+            for (text, expected) in [
+                ("\x1b*0\x1bNqq", ['\u{2500}', 'q']),
+                ("\x1b(0\x1b*B\x1bNqq", ['q', '\u{2500}']),
+            ] {
+                let mut terminal = make_crosswords();
+                let mut parser = Processor::default();
+                for bytes in text.as_bytes().chunks(chunk) {
+                    parser.advance(&mut terminal, bytes);
+                }
+                assert_eq!(terminal.grid[Line(0)][Column(0)].c(), expected[0]);
+                assert_eq!(terminal.grid[Line(0)][Column(1)].c(), expected[1]);
+            }
+        }
+    }
+
+    #[test]
+    fn protected_cells_survive_selective_erasure_in_scalar_and_bulk_input() {
+        use crate::crosswords::square::CellFlags;
+        use crate::performer::handler::Processor;
+        for iso in [false, true] {
+            for chunk in [1, 17, 65536] {
+                let mut terminal = new_term(8, 4);
+                let mut parser = Processor::default();
+                let start = if iso { "\x1bV" } else { "\x1b[1\"q" };
+                let end = if iso { "\x1bW" } else { "\x1b[0\"q" };
+                let text =
+                    format!("{start}\x1b[41mP界e\u{301} {end}\x1b[0mU\r\x1b[44m\x1b[?2K");
+                for bytes in text.as_bytes().chunks(chunk) {
+                    parser.advance(&mut terminal, bytes);
+                }
+                assert_eq!(terminal.grid[Line(0)][Column(0)].c(), 'P');
+                assert_eq!(terminal.grid[Line(0)][Column(1)].wide(), Wide::Wide);
+                assert_eq!(terminal.grid[Line(0)][Column(2)].wide(), Wide::Spacer);
+                assert!(terminal.grid[Line(0)][Column(4)]
+                    .cell_flags()
+                    .contains(CellFlags::PROTECTED));
+                assert_eq!(terminal.grid[Line(0)][Column(5)].c(), '\0');
+                parser.advance(&mut terminal, b"\x1b[2K");
+                assert_eq!(
+                    terminal.grid[Line(0)][Column(0)].c(),
+                    if iso { 'P' } else { '\0' }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_state_insert_printing_keeps_wide_cells_and_wraps() {
+        use crate::performer::handler::Processor;
+        for chunk in [1, 17, 65536] {
+            let mut term = new_term(3, 5);
+            let mut parser = Processor::default();
+            let text = "q界q\x1b[4h\x1b[Hq界\r\nZ\x1b[6n";
+            for bytes in text.as_bytes().chunks(chunk) {
+                parser.advance(&mut term, bytes);
+            }
+            assert!(term.grid[Line(0)][Column(2)].wrapline());
+            assert_eq!(term.grid[Line(0)][Column(1)].c(), '界');
+            assert_eq!(term.grid[Line(0)][Column(1)].wide(), Wide::Wide);
+            assert_eq!(term.grid[Line(0)][Column(2)].wide(), Wide::Spacer);
+        }
+    }
+
+    #[test]
+    fn mixed_state_protection_end_retains_last_enabled_mode() {
+        use crate::performer::handler::Processor;
+        for (text, expected) in [
+            ("\x1bVabc\x1b[0\"q\r\x1b[2K", 'a'),
+            ("\x1b[1\"qabc\x1bW\r\x1b[2K", '\0'),
+        ] {
+            let mut term = new_term(8, 3);
+            Processor::default().advance(&mut term, text.as_bytes());
+            assert_eq!(term.grid[Line(0)][Column(0)].c(), expected);
+        }
+    }
+
+    #[test]
+    fn mixed_state_display_erasure_cancels_pending_wrap() {
+        use crate::performer::handler::Processor;
+        for command in ["J", "1J", "2J", "?J", "?1J", "?2J", "3J"] {
+            let mut term = new_term(3, 3);
+            let mut parser = Processor::default();
+            parser.advance(&mut term, b"abc");
+            assert!(term.grid.cursor.should_wrap);
+            parser.advance(&mut term, format!("\x1b[{command}").as_bytes());
+            assert_eq!(term.grid.cursor.should_wrap, command == "3J", "{command}");
+        }
+    }
+
+    #[test]
+    fn mixed_state_alt_entry_clears_with_destination_background() {
+        use crate::config::colors::AnsiColor;
+        use crate::performer::handler::Processor;
+        let mut term = new_term(8, 3);
+        let mut parser = Processor::default();
+        parser.advance(&mut term, b"\x1b[44m\x1b[?1049h");
+        assert_eq!(
+            term.grid.style_of(&term.grid[Line(0)][Column(0)]).bg,
+            AnsiColor::Named(NamedColor::Background)
+        );
+        parser.advance(&mut term, b"X\x1b[?1049l\x1b[42m\x1b[?1049h");
+        assert_eq!(
+            term.grid.style_of(&term.grid[Line(0)][Column(0)]).bg,
+            AnsiColor::Indexed(4)
+        );
+        parser.advance(&mut term, b"Y");
+        assert_eq!(
+            term.grid.style_of(&term.grid[Line(0)][Column(0)]).bg,
+            AnsiColor::Named(NamedColor::Green)
+        );
+    }
+
+    #[test]
+    fn mixed_state_edits_preserve_history_spacer() {
+        use crate::performer::handler::Processor;
+        for edit in ["e\u{301}", "\x1b[2@"] {
+            let mut term = new_term(3, 3);
+            let mut parser = Processor::default();
+            parser.advance(&mut term, "ab界\r\ncd\r\nEF\x1b8".as_bytes());
+            assert_eq!(term.grid[Line(-1)][Column(2)].wide(), Wide::LeadingSpacer);
+            parser.advance(&mut term, edit.as_bytes());
+            assert_eq!(term.grid[Line(-1)][Column(2)].wide(), Wide::LeadingSpacer);
+        }
+    }
+
+    #[test]
+    fn mixed_state_dch_resets_following_wrap_continuation() {
+        use crate::performer::handler::Processor;
+        let mut term = new_term(3, 5);
+        let mut parser = Processor::default();
+        parser.advance(&mut term, "ab界\r\ncd\r\nEF\x1b8".as_bytes());
+        assert!(term.grid[Line(1)].wrap_continuation);
+        parser.advance(&mut term, b"\x1b[P");
+        assert!(!term.grid[Line(1)].wrap_continuation);
     }
 
     #[test]
@@ -5881,9 +8532,431 @@ mod tests {
         // style value carried over from the primary screen.
         let style = cw.grid.style_of(&cw.grid.cursor.template);
         assert_eq!(style.bg, red);
-        // And the cleared alt cells were stamped with a local id too.
+        // The alternate screen was cleared with its own default pen before
+        // the primary cursor style was copied.
         let sq = cw.grid[Line(0)][Column(0)];
-        assert_eq!(cw.grid.style_of(&sq).bg, red);
+        assert_eq!(
+            cw.grid.style_of(&sq).bg,
+            AnsiColor::Named(NamedColor::Background)
+        );
+    }
+
+    #[test]
+    fn scrolling_snapshots_move_retained_row_allocations() {
+        use std::fmt::Write;
+        let mut cw = new_term(120, 80);
+        let mut processor = crate::performer::handler::Processor::default();
+        let mut input = String::new();
+        for n in 0..200 {
+            write!(input, "\x1b[31m{n}\x1b[0m e\u{301}\r\n").unwrap();
+        }
+        processor.advance(&mut cw, input.as_bytes());
+        cw.scroll_display(Scroll::Top);
+        let (mut rows, mut styles, mut extras) = Default::default();
+        cw.snapshot_visible(&TerminalDamage::Full, &mut rows, &mut styles, &mut extras);
+        let allocation = rows[1].inner.as_ptr();
+        let expected = rows[1].clone();
+        let expected_style = styles[1].clone();
+        cw.scroll_display(Scroll::Delta(-1));
+        cw.snapshot_visible(&TerminalDamage::Full, &mut rows, &mut styles, &mut extras);
+        assert_eq!(rows[0], expected);
+        assert_eq!(styles[0], expected_style);
+        assert_eq!(rows[0].inner.as_ptr(), allocation);
+        assert!(rows.iter().all(|row| row.dirty));
+    }
+
+    #[test]
+    fn moving_snapshot_caches_match_fresh_captures() {
+        use std::collections::HashSet;
+        use std::fmt::Write;
+        for deferred in [false, true] {
+            let mut cw = new_term(32, 8);
+            cw.grid.update_history(32);
+            let mut processor = crate::performer::handler::Processor::default();
+            let mut input = String::new();
+            for n in 0..100 {
+                write!(input, "\x1b[38;5;{}m{n} \x1b[0m\x1b]8;id={n};https://example.test/{n}\x07e\u{301}界\x1b]8;;\x07\r\n", n % 16).unwrap();
+            }
+            processor.advance(&mut cw, input.as_bytes());
+            let (mut rows, mut styles, mut extras): (
+                Vec<Row<Square>>,
+                Vec<snapshot::RowStyles>,
+                snapshot::SnapshotExtras,
+            ) = Default::default();
+            let mut scratch = snapshot::DeferredStyles::default();
+            for step in 0..160 {
+                let mut damage = TerminalDamage::Full;
+                match step % 16 {
+                    0 => cw.scroll_display(Scroll::Top),
+                    1 | 2 => cw.scroll_display(Scroll::Delta(-1)),
+                    3 => cw.scroll_display(Scroll::Delta(1)),
+                    4 => cw.scroll_display(Scroll::Delta(-4)),
+                    5 => cw.scroll_display(Scroll::Bottom),
+                    6 => processor.advance(&mut cw, input.as_bytes()),
+                    7 => {
+                        processor.advance(&mut cw, b"\x1b[1;1H\x1b[44m\x1b[2K");
+                        damage = TerminalDamage::Partial;
+                    }
+                    8 => processor.advance(&mut cw, b"\x1b[?1049h\x1b[34malt"),
+                    9 => processor.advance(&mut cw, b"\x1b[?1049l"),
+                    10 => cw.resize(CrosswordsSize::new(19, 5)),
+                    11 => cw.resize(CrosswordsSize::new(32, 8)),
+                    12 => {
+                        // Overlays edit resolved values, not the source IDs.
+                        for row in &mut styles {
+                            row.make_mut(cw.columns())[0].flags |=
+                                style::StyleFlags::INVERSE;
+                        }
+                    }
+                    13 => {
+                        cw = new_term(32, 8);
+                        cw.grid.update_history(32);
+                        processor = crate::performer::handler::Processor::default();
+                        processor.advance(&mut cw, input.as_bytes());
+                    }
+                    14 => damage = TerminalDamage::Noop,
+                    _ => processor.advance(&mut cw, b"\x1b[3J\x1b[0m\x1b[2J"),
+                }
+                let (start, end) = cw.visible_line_bounds();
+                let all_modified = (start..end).all(|y| cw.grid[Line(y)].dirty);
+                let actual = if deferred {
+                    cw.snapshot_visible_deferred(
+                        &damage,
+                        &mut rows,
+                        &mut styles,
+                        &mut extras,
+                        &mut scratch,
+                    )
+                    .resolve()
+                } else {
+                    cw.snapshot_visible(&damage, &mut rows, &mut styles, &mut extras)
+                };
+                assert_eq!(actual, all_modified, "source damage at {step}");
+                let (mut fresh_rows, mut fresh_styles, mut fresh_extras) =
+                    Default::default();
+                cw.snapshot_visible(
+                    &TerminalDamage::Full,
+                    &mut fresh_rows,
+                    &mut fresh_styles,
+                    &mut fresh_extras,
+                );
+                assert_eq!(rows, fresh_rows, "cells at {step}, deferred={deferred}");
+                assert_eq!(
+                    styles, fresh_styles,
+                    "styles at {step}, deferred={deferred}"
+                );
+                let mut ids = HashSet::new();
+                for row in &rows {
+                    if matches!(damage, TerminalDamage::Full) {
+                        assert!(row.dirty, "redraw at {step}");
+                    }
+                    for cell in &row.inner {
+                        if let Some(id) = cell.extras_id_checked() {
+                            ids.insert(id);
+                            assert_eq!(
+                                extras.get(&id),
+                                fresh_extras.get(&id),
+                                "extras {id} at {step}"
+                            );
+                        }
+                    }
+                }
+                assert_eq!(extras.len(), ids.len(), "offscreen extras at {step}");
+                for row in &mut rows {
+                    row.dirty = false;
+                }
+                cw.reset_damage();
+            }
+        }
+    }
+
+    #[test]
+    fn full_snapshots_refresh_reused_ids_and_preserve_frozen_values() {
+        let mut cw = new_term(120, 80);
+        let mut processor = crate::performer::handler::Processor::default();
+        processor.advance(&mut cw, "\x1b[31me\u{301}\x1b[0m default".as_bytes());
+        let (mut rows, mut styles, mut extras) = Default::default();
+        cw.snapshot_visible(&TerminalDamage::Full, &mut rows, &mut styles, &mut extras);
+        let frozen_styles = styles.clone();
+        let frozen_extras = extras.clone();
+        let id = rows[0][Column(0)].extras_id().unwrap();
+        let raw = rows[0][Column(0)];
+
+        // Both intern tables restart, with the same raw cell bits but new
+        // meanings. Coordinate alignment must never bypass value validation.
+        cw = new_term(120, 80);
+        processor.advance(&mut cw, "\x1b[34me\u{308}\x1b[0m default".as_bytes());
+        assert_eq!(cw.grid[Line(0)][Column(0)], raw);
+        let mut scratch = snapshot::DeferredStyles::default();
+        let captured = cw.snapshot_visible_deferred(
+            &TerminalDamage::Full,
+            &mut rows,
+            &mut styles,
+            &mut extras,
+            &mut scratch,
+        );
+        // Palette ownership must still hold if the terminal changes again
+        // between capture and deferred style resolution.
+        let expected_style = cw.grid.style_of(&raw);
+        cw = new_term(120, 80);
+        processor.advance(&mut cw, b"\x1b[32mgreen");
+        captured.resolve();
+        assert_eq!(styles[0].at(0), expected_style);
+        assert_ne!(styles[0], frozen_styles[0]);
+        assert_eq!(extras.get(&id).unwrap().zerowidth, ['\u{308}']);
+        assert_eq!(frozen_extras.get(&id).unwrap().zerowidth, ['\u{301}']);
+    }
+
+    #[test]
+    fn snapshot_releases_extras_after_the_last_visible_reference() {
+        let mut cw = make_crosswords();
+        let mut processor = crate::performer::handler::Processor::default();
+        processor.advance(&mut cw, "e\u{301}\x1b[2;1He\u{301}".as_bytes());
+        let (mut rows, mut styles, mut extras) = Default::default();
+        cw.snapshot_visible(&TerminalDamage::Full, &mut rows, &mut styles, &mut extras);
+        assert_eq!(extras.len(), 1);
+
+        processor.advance(&mut cw, b"\x1b[1;1Hx");
+        cw.snapshot_visible(
+            &TerminalDamage::Partial,
+            &mut rows,
+            &mut styles,
+            &mut extras,
+        );
+        assert_eq!(extras.len(), 1);
+        let id = rows[1][Column(0)].extras_id().unwrap();
+        assert_eq!(extras.get(&id).unwrap().zerowidth, ['\u{301}']);
+
+        processor.advance(&mut cw, b"\x1b[2;1Hy");
+        cw.snapshot_visible(
+            &TerminalDamage::Partial,
+            &mut rows,
+            &mut styles,
+            &mut extras,
+        );
+        assert!(extras.is_empty());
+    }
+
+    #[test]
+    fn snapshot_refreshes_recycled_extras_without_mutating_older_snapshots() {
+        let mut cw = make_crosswords();
+        let mut processor = crate::performer::handler::Processor::default();
+        processor.advance(&mut cw, "e\u{301}".as_bytes());
+        let (mut rows, mut styles, mut extras) = Default::default();
+        cw.snapshot_visible(&TerminalDamage::Full, &mut rows, &mut styles, &mut extras);
+        let id = rows[0][Column(0)].extras_id().unwrap();
+        let older = extras.clone();
+
+        processor.advance(&mut cw, b"\x1b[1;1Hx");
+        cw.grid
+            .extras_table
+            .sweep_unmarked(&vec![0; grid::ID_BITSET_WORDS]);
+        processor.advance(&mut cw, "\x1b[1;1He\u{308}".as_bytes());
+        assert_eq!(cw.grid[Line(0)][Column(0)].extras_id(), Some(id));
+        cw.snapshot_visible(
+            &TerminalDamage::Partial,
+            &mut rows,
+            &mut styles,
+            &mut extras,
+        );
+        assert_eq!(extras.get(&id).unwrap().zerowidth, ['\u{308}']);
+        assert_eq!(older.get(&id).unwrap().zerowidth, ['\u{301}']);
+        assert_eq!(extras.len(), 1);
+    }
+
+    #[test]
+    fn deferred_snapshots_match_eager_updates() {
+        use crate::performer::handler::Processor;
+        let mut eager = new_term(120, 80);
+        let mut deferred = new_term(120, 80);
+        let mut eager_parser = Processor::default();
+        let mut deferred_parser = Processor::default();
+        let (mut rows, mut styles, mut extras) = Default::default();
+        let (mut reference_rows, mut reference_styles, mut reference_extras) =
+            Default::default();
+        let mut scratch = snapshot::DeferredStyles::default();
+        let mut initial = String::new();
+        for n in 0..1000 {
+            use std::fmt::Write;
+            write!(initial, "\x1b[38;5;{}mline {n} e\u{301}界\r\n", n % 64).unwrap();
+        }
+        let inputs: &[&[u8]] = &[
+            initial.as_bytes(),
+            b"",                         // Clean frame.
+            b"\x1b[1;1H\x1b[31mchanged", // Partial, palette larger than one row.
+            b"\x1b[42m\x1b[2K",          // Inline erased background.
+            b"",                         // Scroll history in the next three steps.
+            b"",
+            b"",
+            b"\x1b[?1049h\x1b[34malternate",
+            b"\x1b[?1049l",
+            b"\x1b]8;;https://example.test\x07linked\x1b]8;;\x07",
+            b"", // Resize with reflow, then grow again.
+            b"",
+        ];
+        for (step, input) in inputs.iter().enumerate() {
+            eager_parser.advance(&mut eager, input);
+            deferred_parser.advance(&mut deferred, input);
+            for terminal in [&mut eager, &mut deferred] {
+                match step {
+                    4 => terminal.scroll_display(Scroll::Top),
+                    5 => terminal.scroll_display(Scroll::Delta(-1)),
+                    6 => terminal.scroll_display(Scroll::Bottom),
+                    10 => terminal.resize(CrosswordsSize::new(61, 25)),
+                    11 => terminal.resize(CrosswordsSize::new(120, 80)),
+                    _ => (),
+                }
+            }
+            let damage = eager.peek_damage_event().unwrap_or(TerminalDamage::Noop);
+            let expected = eager.snapshot_visible(
+                &damage,
+                &mut reference_rows,
+                &mut reference_styles,
+                &mut reference_extras,
+            );
+            let actual = deferred
+                .snapshot_visible_deferred(
+                    &damage,
+                    &mut rows,
+                    &mut styles,
+                    &mut extras,
+                    &mut scratch,
+                )
+                .resolve();
+            assert_eq!(actual, expected, "source damage at step {step}");
+            assert_eq!(rows, reference_rows, "cells at step {step}");
+            assert_eq!(styles, reference_styles, "styles at step {step}");
+            eager.reset_damage();
+            deferred.reset_damage();
+        }
+    }
+
+    #[test]
+    fn deferred_snapshot_owns_styles_across_grid_replacement() {
+        use crate::performer::handler::Processor;
+        let mut terminal = new_term(120, 80);
+        let mut processor = Processor::default();
+        processor.advance(&mut terminal, b"\x1b[31mred\x1b[0m default");
+        let old_id = terminal.grid[Line(0)][Column(0)].style_id();
+        let expected = terminal.grid.styles()[old_id as usize];
+        let (mut rows, mut styles, mut extras) = Default::default();
+        let mut deferred = snapshot::DeferredStyles::default();
+        let captured = terminal.snapshot_visible_deferred(
+            &TerminalDamage::Full,
+            &mut rows,
+            &mut styles,
+            &mut extras,
+            &mut deferred,
+        );
+
+        // Mimic a grid swap or style-ID reclamation while the renderer works
+        // unlocked. The same ID now means blue in the live terminal.
+        terminal = new_term(120, 80);
+        processor.advance(&mut terminal, b"\x1b[34mblue\x1b[0m default");
+        assert_eq!(terminal.grid[Line(0)][Column(0)].style_id(), old_id);
+        assert_ne!(terminal.grid.styles()[old_id as usize], expected);
+        captured.resolve();
+        assert_eq!(styles[0].at(0), expected);
+        assert_eq!(styles[0].at(4), style::Style::DEFAULT);
+
+        drop(terminal.snapshot_visible_deferred(
+            &TerminalDamage::Full,
+            &mut rows,
+            &mut styles,
+            &mut extras,
+            &mut deferred,
+        ));
+        let previous = styles.clone();
+        terminal.reset_damage();
+        processor.advance(&mut terminal, b"\x1b[2;1H\x1b[32mgreen");
+        terminal
+            .snapshot_visible_deferred(
+                &TerminalDamage::Partial,
+                &mut rows,
+                &mut styles,
+                &mut extras,
+                &mut deferred,
+            )
+            .resolve();
+        assert_eq!(styles[0], previous[0]);
+        assert_ne!(styles[1], previous[1]);
+        let mut reference_rows = Vec::new();
+        let mut reference_styles = Vec::new();
+        let mut reference_extras = snapshot::SnapshotExtras::default();
+        terminal.snapshot_visible(
+            &TerminalDamage::Full,
+            &mut reference_rows,
+            &mut reference_styles,
+            &mut reference_extras,
+        );
+        assert_eq!(rows, reference_rows);
+        assert_eq!(styles, reference_styles);
+    }
+
+    #[test]
+    #[ignore = "manual snapshot lock-time measurement; run in release mode"]
+    fn snapshot_style_capture_timings() {
+        use crate::config::colors::{AnsiColor, ColorRgb};
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+        for colors in [0, 2, 64, 4096, 9600] {
+            let mut cw = new_term(120, 80);
+            for y in 0..80 {
+                cw.goto(Line(y), Column(0));
+                for x in 0..120 {
+                    if colors == 0 {
+                        cw.input('x');
+                        continue;
+                    }
+                    let n = (y as usize * 120 + x) % colors;
+                    cw.terminal_attribute(Attr::Foreground(AnsiColor::Spec(ColorRgb {
+                        r: n as u8,
+                        g: (n >> 8) as u8,
+                        b: 100,
+                    })));
+                    cw.input('x');
+                }
+            }
+            let mut rows = Vec::new();
+            let mut styles = Vec::new();
+            let mut extras = snapshot::SnapshotExtras::default();
+            let mut deferred = snapshot::DeferredStyles::default();
+            for round in 0..4 {
+                let mut eager = Duration::ZERO;
+                let mut capture = Duration::ZERO;
+                let mut finish = Duration::ZERO;
+                for _ in 0..2000 {
+                    let start = Instant::now();
+                    cw.snapshot_visible(
+                        &TerminalDamage::Full,
+                        &mut rows,
+                        &mut styles,
+                        &mut extras,
+                    );
+                    eager += start.elapsed();
+                    black_box((&rows, &styles));
+                    let start = Instant::now();
+                    let captured = cw.snapshot_visible_deferred(
+                        &TerminalDamage::Full,
+                        &mut rows,
+                        &mut styles,
+                        &mut extras,
+                        &mut deferred,
+                    );
+                    capture += start.elapsed();
+                    let start = Instant::now();
+                    captured.resolve();
+                    finish += start.elapsed();
+                    black_box((&rows, &styles));
+                }
+                eprintln!(
+                    "colors={colors} round={round} eager={:?} capture={:?} finish={:?}",
+                    eager / 2000,
+                    capture / 2000,
+                    finish / 2000
+                );
+            }
+        }
     }
 
     #[test]
@@ -5894,7 +8967,7 @@ mod tests {
         let mut cw = make_crosswords();
         let mut rows = Vec::new();
         let mut row_styles = Vec::new();
-        let mut extras = rustc_hash::FxHashMap::default();
+        let mut extras = snapshot::SnapshotExtras::default();
 
         let red = AnsiColor::Spec(ColorRgb { r: 250, g: 0, b: 0 });
         cw.terminal_attribute(Attr::Background(red));
@@ -5903,8 +8976,8 @@ mod tests {
         cw.snapshot_visible(&damage, &mut rows, &mut row_styles, &mut extras);
         cw.reset_damage();
         assert_eq!(row_styles.len(), rows.len());
-        assert_eq!(row_styles[0][0].bg, red);
-        assert_eq!(row_styles[0][1].bg, Style::default().bg);
+        assert_eq!(row_styles[0].at(0).bg, red);
+        assert_eq!(row_styles[0].at(1).bg, Style::default().bg);
 
         // Rows copied on earlier frames hold resolved values, so table
         // mutations between frames cannot retint them: only the row the
@@ -5916,8 +8989,8 @@ mod tests {
         let damage = cw.peek_damage_event().unwrap();
         cw.snapshot_visible(&damage, &mut rows, &mut row_styles, &mut extras);
         cw.reset_damage();
-        assert_eq!(row_styles[0][0].bg, red);
-        assert_eq!(row_styles[1][0].bg, blue);
+        assert_eq!(row_styles[0].at(0).bg, red);
+        assert_eq!(row_styles[1].at(0).bg, blue);
 
         // An instance switch arrives as Full damage and re-resolves
         // everything against the newly active grid's table.
@@ -5926,8 +8999,52 @@ mod tests {
         assert!(matches!(damage, TerminalDamage::Full));
         cw.snapshot_visible(&damage, &mut rows, &mut row_styles, &mut extras);
         cw.reset_damage();
-        // The alt screen was cleared with the carried blue bg template.
-        assert_eq!(row_styles[0][0].bg, blue);
+        // The destination was cleared before the blue cursor was copied.
+        assert_eq!(rows[0][Column(0)], Square::default());
+        assert_eq!(row_styles[0].at(0), Style::default());
+    }
+
+    #[test]
+    fn snapshot_separates_source_changes_from_full_redraw_flags() {
+        use crate::event::TerminalDamage;
+        let mut cw = make_crosswords();
+        let (mut rows, mut styles, mut extras) =
+            (Vec::new(), Vec::new(), snapshot::SnapshotExtras::default());
+        assert!(cw.snapshot_visible(
+            &TerminalDamage::Full,
+            &mut rows,
+            &mut styles,
+            &mut extras
+        ));
+        for row in &mut rows {
+            row.dirty = false;
+        }
+        assert!(!cw.snapshot_visible(
+            &TerminalDamage::Full,
+            &mut rows,
+            &mut styles,
+            &mut extras
+        ));
+        assert!(
+            rows.iter().all(|row| row.dirty),
+            "full redraw remains visible to library consumers"
+        );
+        cw.grid[Line(0)][Column(0)].set_c('x');
+        assert!(!cw.snapshot_visible(
+            &TerminalDamage::Partial,
+            &mut rows,
+            &mut styles,
+            &mut extras
+        ));
+        for y in 0..cw.screen_lines() {
+            cw.grid[Line(y as i32)][Column(0)].set_c('y');
+        }
+        assert!(cw.snapshot_visible(
+            &TerminalDamage::Full,
+            &mut rows,
+            &mut styles,
+            &mut extras
+        ));
     }
 
     #[test]
@@ -6804,6 +9921,58 @@ mod tests {
             cw.cell_hyperlink(Line(0), Column(1)).is_none(),
             "cells after the OSC 8 reset must not inherit the previous link",
         );
+    }
+
+    #[test]
+    fn osc8_hyperlink_uri_keeps_semicolons() {
+        use crate::performer::handler::Processor;
+
+        let size = CrosswordsSize::new(40, 5);
+        let window_id = crate::event::WindowId::from(0);
+        let mut cw = Crosswords::new(
+            size,
+            CursorShape::Block,
+            VoidListener {},
+            window_id,
+            0,
+            10_000,
+        );
+        let mut processor = Processor::default();
+
+        processor.advance(&mut cw, b"\x1b]8;;https://x.dev/a;b;\x07X\x1b]8;;\x07");
+
+        let hl = cw.cell_hyperlink(Line(0), Column(0)).expect("hyperlink");
+        assert_eq!(hl.uri(), "https://x.dev/a;b;");
+    }
+
+    #[test]
+    fn osc8_hyperlink_invalid_utf8_and_id_close() {
+        use crate::performer::handler::Processor;
+
+        let size = CrosswordsSize::new(40, 5);
+        let window_id = crate::event::WindowId::from(0);
+        let mut cw = Crosswords::new(
+            size,
+            CursorShape::Block,
+            VoidListener {},
+            window_id,
+            0,
+            10_000,
+        );
+        let mut processor = Processor::default();
+
+        processor.advance(
+            &mut cw,
+            b"\x1b]8;;https://a.example\x07A\
+              \x1b]8;;file:///caf\xe9\x07B\
+              \x1b]8;id=foo;\x07C",
+        );
+
+        let a = cw.cell_hyperlink(Line(0), Column(0)).expect("hyperlink");
+        assert_eq!(a.uri(), "https://a.example");
+        let b = cw.cell_hyperlink(Line(0), Column(1)).expect("hyperlink");
+        assert_eq!(b.uri(), "file:///caf\u{FFFD}");
+        assert!(cw.cell_hyperlink(Line(0), Column(2)).is_none());
     }
 
     /// OSC 8 hyperlinks span multiple lines when the parser writes a
@@ -7833,6 +11002,182 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_packet_overflow_aborts_without_publishing_partial_data() {
+        use crate::performer::handler::Processor;
+        use std::{cell::RefCell, rc::Rc};
+        for (command, aborts) in [("5522", true), ("2", false)] {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let mut term = Crosswords::new(
+                CrosswordsSize::new(10, 10),
+                CursorShape::Block,
+                TestListener {
+                    events: events.clone(),
+                },
+                WindowId::from(0),
+                71,
+                10,
+            );
+            let mut processor = Processor::default();
+            processor.advance(&mut term, b"\x1b]5522;type=write:id=overflow\x07\x1b]5522;type=wdata:mime=YQ==;YQ==\x07");
+            let mut packet = format!("\x1b]{command};type=wdata:mime=Yg==;").into_bytes();
+            packet.extend(std::iter::repeat_n(b'A', 64 * 1024 + 1));
+            packet.extend_from_slice(b"\x1b\\");
+            for chunk in packet.chunks(4096) {
+                processor.advance(&mut term, chunk);
+            }
+            processor.advance(&mut term, b"\x1b]5522;type=wdata\x07z");
+            assert_eq!(events.borrow().iter().any(|event| matches!(event, RioEvent::ClipboardReply(71, response) if response.as_slice() == b"\x1b]5522;type=write:status=EFBIG:id=overflow\x1b\\")), aborts);
+            assert_eq!(
+                events
+                    .borrow()
+                    .iter()
+                    .any(|event| matches!(event, RioEvent::KittyClipboardRequest(..))),
+                !aborts
+            );
+            assert_eq!(term.grid[Line(0)][Column(0)].c(), 'z');
+        }
+    }
+
+    #[test]
+    fn osc52_uses_shared_policy_and_originating_session() {
+        use crate::clipboard::{Access, ClipboardPolicy};
+        use crate::performer::handler::Processor;
+        use std::{cell::RefCell, rc::Rc};
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut term = Crosswords::new(
+            CrosswordsSize::new(10, 10),
+            CursorShape::Block,
+            TestListener {
+                events: events.clone(),
+            },
+            WindowId::from(0),
+            71,
+            10,
+        );
+        let mut processor = Processor::default();
+        term.set_clipboard_policy(ClipboardPolicy {
+            read: Access::Deny,
+            write: Access::Deny,
+            ..Default::default()
+        });
+        processor.advance(&mut term, b"\x1b]52;c;?\x07\x1b]52;c;aGVsbG8=\x07");
+        assert!(!events.borrow().iter().any(|event| matches!(
+            event,
+            RioEvent::KittyClipboardRequest(..)
+                | RioEvent::ClipboardLoad(..)
+                | RioEvent::ClipboardStore(..)
+        )));
+        term.set_clipboard_policy(ClipboardPolicy {
+            read: Access::Ask,
+            write: Access::Ask,
+            ..Default::default()
+        });
+        processor.advance(&mut term, b"\x1b]52;c;?\x07\x1b]52;c;aGVsbG8=\x1b\\");
+        let captured = events.borrow();
+        let requests: Vec<_> = captured
+            .iter()
+            .filter_map(|event| match event {
+                RioEvent::KittyClipboardRequest(route, request) => {
+                    Some((*route, request))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(requests.len(), 2);
+        for (route, request) in requests {
+            assert_eq!(route, 71);
+            assert!(term.clipboard_request_current(request));
+            assert!(!request.prompt_exempt());
+            assert!(request
+                .status(crate::clipboard::kitty::Status::Permission)
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn kitty_paste_event_mode_set_query_reset() {
+        use crate::performer::handler::Processor;
+        use std::{cell::RefCell, rc::Rc};
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut term = Crosswords::new(
+            CrosswordsSize::new(10, 10),
+            CursorShape::Block,
+            TestListener {
+                events: events.clone(),
+            },
+            WindowId::from(0),
+            71,
+            10,
+        );
+        let mut processor = Processor::default();
+        processor.advance(&mut term, b"\x1b[?5522$p\x1b[?5522h\x1b[?5522$p");
+        assert!(term.mode.contains(Mode::KITTY_PASTE_EVENTS));
+        assert!(events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, RioEvent::PtyWrite(71,s) if s == "\x1b[?5522;2$y")));
+        assert!(events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, RioEvent::PtyWrite(71,s) if s == "\x1b[?5522;1$y")));
+        processor.advance(&mut term, b"\x1bc");
+        assert!(!term.mode.contains(Mode::KITTY_PASTE_EVENTS));
+        assert!(term
+            .clipboard_paste_event(ClipboardType::Clipboard, &[])
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn kitty_clipboard_session_routes_commits_and_cancels_on_reset() {
+        use crate::clipboard::kitty::Request;
+        use crate::performer::handler::Processor;
+        use std::{cell::RefCell, rc::Rc};
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut term = Crosswords::new(
+            CrosswordsSize::new(10, 10),
+            CursorShape::Block,
+            TestListener {
+                events: events.clone(),
+            },
+            WindowId::from(0),
+            71,
+            10,
+        );
+        let mut processor = Processor::default();
+        processor.advance(&mut term, b"\x1b]5522;type=write:id=old\x07\x1b]5522;type=wdata:mime=YQ==;YQ\x07\x1b]5522;type=write:id=new\x07\x1b]5522;type=wdata:mime=YQ==;Yg==\x07\x1b]5522;type=wdata\x07");
+        let captured = events.borrow();
+        let requests: Vec<_> = captured
+            .iter()
+            .filter_map(|e| match e {
+                RioEvent::KittyClipboardRequest(route, request) => Some((route, request)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(*requests[0].0, 71);
+        let Request::Write { committed, .. } = requests[0].1.as_ref() else {
+            panic!("expected commit")
+        };
+        assert_eq!(committed.metadata.id, "new");
+        assert_eq!(committed.contents[0].data.as_slice(), b"b");
+        drop(captured);
+        events.borrow_mut().clear();
+        processor.advance(&mut term, b"\x1b]5522;type=write:id=reset\x07\x1b]5522;type=wdata:mime=YQ==;YQ==\x07\x1bc\x1b]5522;type=wdata\x07");
+        assert!(!events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, RioEvent::KittyClipboardRequest(..))));
+        events.borrow_mut().clear();
+        processor.advance(&mut term, b"\x1b]5522;type=write:id=bad\x07\x1b]5522;type=wdata:mime=***;YQ==\x07\x1b]5522;type=wdata\x07");
+        assert!(events.borrow().iter().any(|e| matches!(e, RioEvent::ClipboardReply(71, response) if response.as_slice() == b"\x1b]5522;type=write:status=EINVAL:id=bad\x07")));
+        assert!(!events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, RioEvent::KittyClipboardRequest(..))));
+    }
+
+    #[test]
     fn test_xtversion_report() {
         use std::cell::RefCell;
         use std::rc::Rc;
@@ -7873,6 +11218,156 @@ mod tests {
                 );
             }
             other => panic!("Expected PtyWrite event, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn chrome_metadata_follows_protocol_updates_and_reset() {
+        let mut term = Crosswords::new(
+            CrosswordsSize::new(80, 24),
+            CursorShape::Block,
+            VoidListener,
+            WindowId::from(0),
+            0,
+            0,
+        );
+        let metadata = term.metadata.clone();
+        let mut parser = crate::performer::handler::Processor::default();
+        parser.advance(
+            &mut term,
+            b"\x1b]2;original\x07\x1b[22;0t\x1b]2;changed\x07",
+        );
+        assert_eq!(metadata.lock().title, "changed");
+        parser.advance(&mut term, b"\x1b[23;0t");
+        assert_eq!(metadata.lock().title, "original");
+        parser.advance(&mut term, b"\x1b]1337;SetUserVar=RIO_APP=Y29kZXg=\x07\x1b]1337;SetUserVar=RIO_SSH=MQ==\x07");
+        assert_eq!(metadata.lock().app.as_deref(), Some("codex"));
+        assert!(metadata.lock().remote);
+        parser.advance(
+            &mut term,
+            b"\x1b]7501;state=working:app=codex:progress=25\x1b\\",
+        );
+        assert_eq!(metadata.lock().status, term.program_status.display_status());
+        assert_eq!(
+            metadata.lock().status_revision,
+            term.program_status.revision()
+        );
+        parser.advance(&mut term, b"\x1b]9;4;2;0\x07");
+        assert_eq!(metadata.lock().status, term.program_status.display_status());
+        parser.advance(&mut term, b"\x1bc");
+        assert!(metadata.lock().title.is_empty());
+        assert!(metadata.lock().status.is_none());
+        assert_eq!(
+            metadata.lock().status_revision,
+            term.program_status.revision()
+        );
+        parser.advance(
+            &mut term,
+            b"\x1b]1337;SetUserVar=RIO_APP=\x07\x1b]1337;SetUserVar=RIO_SSH=MA==\x07",
+        );
+        assert!(metadata.lock().app.is_none());
+        assert!(!metadata.lock().remote);
+    }
+
+    #[cfg(feature = "graphics")]
+    #[test]
+    fn expired_kitty_anchors_retain_bitmaps_until_placement_reaping() {
+        use crate::performer::handler::Processor;
+        let mut term = new_term(8, 3);
+        term.graphics.cell_width = 10.0;
+        term.graphics.cell_height = 20.0;
+        let mut parser = Processor::default();
+        term.set_scrollback_limits(1, None);
+        parser.advance(
+            &mut term,
+            b"\x1b_Ga=T,i=1,p=1,f=32,s=1,v=1,c=1,r=10000,C=1;AQIDBA==\x1b\\",
+        );
+        parser.advance(
+            &mut term,
+            b"\x1b_Ga=T,i=2,p=1,f=32,s=1,v=1,c=1,r=1,C=1,P=1,Q=1;AQIDBA==\x1b\\",
+        );
+        parser.advance(&mut term, "line\r\n".repeat(20).as_bytes());
+        assert!(term.graphics.resolved_kitty_placements().is_empty());
+        assert!(
+            term.graphics.kitty_placements.contains_key(&(1, 1)),
+            "{:?}",
+            term.graphics.kitty_placements
+        );
+        parser.advance(&mut term, b"\x1b[2J");
+        assert!(term.graphics.kitty_images.contains_key(&1));
+        assert!(term.graphics.kitty_images.contains_key(&2));
+        let expired = term.graphics.kitty_placements[&(1, 1)].clone();
+        for id in 2..4096 {
+            let mut copy = expired.clone();
+            copy.placement_id = id;
+            term.graphics.kitty_placements.insert((1, id), copy);
+        }
+        assert_eq!(term.graphics.kitty_placements.len(), 4096);
+        assert!(term.graphics.can_place_kitty(1, 4097, false));
+        parser.advance(&mut term, b"\x1b_Ga=p,i=1,p=4097,c=1,r=1,C=1\x1b\\\x1b[2J");
+        assert!(term.graphics.kitty_images.is_empty());
+    }
+
+    #[test]
+    fn title_state_preserves_whitespace_across_chunks() {
+        use crate::performer::handler::Processor;
+        for command in [0, 2] {
+            for chunk in [1, 7, 65536] {
+                for title in ["  spaced  ", "   ", "\u{2003}界\u{2003}"] {
+                    let mut term = new_term(8, 3);
+                    let mut parser = Processor::default();
+                    let text = format!("\x1b]{command};{title}\x1b\\");
+                    for bytes in text.as_bytes().chunks(chunk) {
+                        parser.advance(&mut term, bytes);
+                    }
+                    assert_eq!(term.title, title);
+                    assert_eq!(term.metadata.lock().title, title);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn title_state_stack_ignores_unsupported_selectors() {
+        use crate::performer::handler::Processor;
+        for (suffix, supported) in [
+            ("", false),
+            (";0", true),
+            (";1", false),
+            (";2", true),
+            (";3", false),
+            (";0;0", true),
+            (";2;2", true),
+            (";2;1", true),
+            (";2;65535", true),
+            (";2;0;0", false),
+            (":0;2", false),
+            (";2:0", false),
+        ] {
+            let mut term = new_term(8, 3);
+            let mut parser = Processor::default();
+            parser.advance(&mut term, b"\x1b]2;before\x07");
+            parser.advance(&mut term, format!("\x1b[22{suffix}t").as_bytes());
+            parser.advance(&mut term, b"\x1b]2;after\x07\x1b[23;0t");
+            assert_eq!(
+                term.title,
+                if supported { "before" } else { "after" },
+                "push {suffix}"
+            );
+
+            parser.advance(&mut term, b"\x1b]2;before\x07\x1b[22;0t\x1b]2;after\x07");
+            parser.advance(&mut term, format!("\x1b[23{suffix}t").as_bytes());
+            assert_eq!(
+                term.title,
+                if supported { "before" } else { "after" },
+                "pop {suffix}"
+            );
+            parser.advance(&mut term, b"\x1b]2;final\x07\x1b[23;0t");
+            assert_eq!(
+                term.title,
+                if supported { "final" } else { "before" },
+                "remaining {suffix}"
+            );
         }
     }
 
@@ -8230,6 +11725,55 @@ mod tests {
     }
 
     #[test]
+    fn erased_prompt_rows_do_not_reflow_into_history() {
+        use crate::performer::handler::Processor;
+        let mut term = new_term(150, 36);
+        let mut parser = Processor::default();
+        parser.advance(&mut term, b"cwd\r\n> \x1b[38;2;205;214;244m\x1b[J");
+        let cursor = term.grid.cursor.pos;
+
+        term.resize(CrosswordsSize::new(74, 35));
+        assert_eq!(term.history_size(), 0);
+        term.resize(CrosswordsSize::new(150, 36));
+        assert_eq!(term.history_size(), 0);
+        assert_eq!(term.grid.cursor.pos, cursor);
+    }
+
+    #[test]
+    fn row_erasure_preserves_only_the_background() {
+        use crate::performer::handler::Processor;
+
+        // ED, IL, DL and scrolling all recycle whole rows through the grid.
+        for (erase, rows) in [
+            ("\x1b[J", 0..4),
+            ("\x1b[2J", 0..4),
+            ("\x1b[L", 0..1),
+            ("\x1b[M", 3..4),
+            ("\x1b[S", 3..4),
+            ("\x1b[T", 0..1),
+        ] {
+            for background in ["", "\x1b[48;5;42m", "\x1b[48;2;10;20;30m"] {
+                let mut term = new_term(12, 4);
+                let mut parser = Processor::default();
+                let input = format!("\x1b[1;4;7;38;2;205;214;244m{background}{erase}");
+                parser.advance(&mut term, input.as_bytes());
+                let expected = crate::crosswords::style::Style {
+                    bg: term.grid.template_style().bg,
+                    ..Default::default()
+                };
+                for row in rows.clone() {
+                    for column in 0..12 {
+                        let cell = term.grid[Line(row)][Column(column)];
+                        assert_eq!(term.grid.style_of(&cell), expected, "{input:?}");
+                        assert_eq!(cell.c(), '\0');
+                        assert!(!cell.has_extras());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn vs16_widens_text_presentation_emoji() {
         use crate::performer::handler::Handler;
         let mut cw = new_term(10, 3);
@@ -8320,11 +11864,9 @@ mod tests {
         assert_eq!(cw.grid.cursor.pos.col, Column(0));
     }
 
-    /// Repairing a stranded spacer at the row's last column must keep
-    /// WRAPLINE: the flag marks the logical line for reflow, and the
-    /// op never targeted that cell.
+    /// ECH repairs its wide boundary and resets the row's soft wrap.
     #[test]
-    fn seam_repair_preserves_wrapline() {
+    fn erase_chars_repairs_pair_and_resets_wrapline() {
         use crate::performer::handler::Handler;
         let mut cw = new_term(4, 3);
         cw.input('a');
@@ -8335,7 +11877,8 @@ mod tests {
         cw.goto(Line(0), Column(2));
         cw.erase_chars(Column(1)); // blank the lead; sweep repairs the spacer
         assert_eq!(cw.grid[Line(0)][Column(3)].wide(), Wide::Narrow);
-        assert!(cw.grid[Line(0)][Column(3)].wrapline());
+        assert!(!cw.grid[Line(0)][Column(3)].wrapline());
+        assert!(!cw.grid[Line(1)].wrap_continuation);
     }
 
     /// ED partial-row clears split pairs at the cursor boundary too.
@@ -8439,10 +11982,9 @@ mod tests {
         assert_eq!(cw.grid[Line(0)][Column(1)].c(), '\0');
     }
 
-    /// Clearing the wide char at column 0 of a wrapped row must revert
-    /// the `LeadingSpacer` closing the previous row.
+    /// EL retains the preceding row's spacer head, matching Ghostty.
     #[test]
-    fn clear_line_reverts_stale_leading_spacer() {
+    fn clear_line_preserves_preceding_spacer_head() {
         use crate::performer::handler::Handler;
         let mut cw = new_term(3, 3);
         cw.input('a');
@@ -8451,7 +11993,8 @@ mod tests {
         assert_eq!(cw.grid[Line(0)][Column(2)].wide(), Wide::LeadingSpacer);
         cw.goto(Line(1), Column(0));
         cw.clear_line(LineClearMode::All);
-        assert_eq!(cw.grid[Line(0)][Column(2)].wide(), Wide::Narrow);
+        assert_eq!(cw.grid[Line(0)][Column(2)].wide(), Wide::LeadingSpacer);
+        assert_eq!(cw.grid[Line(1)][Column(0)].wide(), Wide::Narrow);
     }
 
     #[test]
@@ -8674,6 +12217,138 @@ mod tests {
         assert_eq!(cw.grid.cursor.pos.col, Column(3));
     }
 
+    #[test]
+    fn clustered_bulk_runs_match_scalar_input_across_wraps_and_chunks() {
+        use crate::performer::handler::Handler;
+        let alphabet = [
+            0x61, 0xa9, 0xe9, 0x301, 0x600, 0xd4e, 0x110bd, 0x4e00, 0x20000, 0x10ffff,
+            0x200d, 0xfe0f, 0xfe0e, 0x1f469, 0x1f33e, 0x1f1e7, 0x1f1f7, 0xd800, 0x110000,
+        ];
+        let mut seed = 42u64;
+        let mut codepoints = vec![0xd4e, 0x20000, 0x20001, 0x61, 0x301, 0xe9, 0x62];
+        for _ in 0..400 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            codepoints.push(alphabet[(seed >> 32) as usize % alphabet.len()]);
+        }
+        for cols in [1, 2, 3, 20] {
+            for chunk in [1, 2, 7, 64] {
+                let mut scalar = term_2027(cols, 3);
+                let mut bulk = term_2027(cols, 3);
+                for &cp in &codepoints {
+                    scalar.input(char::from_u32(cp).unwrap_or('\u{fffd}'));
+                }
+                for run in codepoints.chunks(chunk) {
+                    bulk.input_codepoints(run);
+                }
+                assert_eq!(bulk.grid.cursor.pos, scalar.grid.cursor.pos);
+                assert_eq!(bulk.grid.cursor.should_wrap, scalar.grid.cursor.should_wrap);
+                assert_eq!(bulk.grid.topmost_line(), scalar.grid.topmost_line());
+                for line in scalar.grid.topmost_line().0..3 {
+                    for col in 0..cols {
+                        let a = bulk.grid[Line(line)][Column(col)];
+                        let b = scalar.grid[Line(line)][Column(col)];
+                        assert_eq!(
+                            (a.c(), a.wide()),
+                            (b.c(), b.wide()),
+                            "cols={cols} chunk={chunk} cell={line},{col}"
+                        );
+                        assert_eq!(a.cell_flags(), b.cell_flags());
+                        assert_eq!(
+                            extras_of(&bulk, line, col),
+                            extras_of(&scalar, line, col)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_bulk_writes_match_scalar_over_existing_wide_cells() {
+        use crate::performer::handler::Handler;
+
+        let runs: Vec<Vec<u32>> = [
+            "a中é日b界c",
+            "中a日é界b",
+            "é日a中\u{301}b界",
+            "\u{600}中a日é界",
+            "中a\u{1f469}\u{200d}\u{1f33e}é日",
+            "a中é日\u{10eeee}b界",
+            "é日a中\u{20000}b",
+        ]
+        .iter()
+        .map(|s| s.chars().map(u32::from).collect())
+        .collect();
+        for cols in [1, 2, 3, 5, 8, 20, 120] {
+            for clustering in [false, true] {
+                for wrapping in [false, true] {
+                    for chunk in [1, 2, 7, 64] {
+                        let make = || {
+                            let mut cw = new_term(cols, 3);
+                            cw.mode.set(Mode::GRAPHEME_CLUSTER, clustering);
+                            for _ in 0..cols * 2 {
+                                cw.input('中');
+                                cw.input('a');
+                            }
+                            cw.mode.set(Mode::LINE_WRAP, wrapping);
+                            cw.terminal_attribute(Attr::Bold);
+                            cw.set_hyperlink(Some(Hyperlink::new(
+                                Some("mixed"),
+                                "https://example.com/mixed",
+                            )));
+                            cw
+                        };
+                        let mut bulk = make();
+                        let mut scalar = make();
+                        for (edit, run) in runs.iter().cycle().take(21).enumerate() {
+                            let line = Line((edit % 3) as i32);
+                            let col = Column(edit % cols);
+                            bulk.goto(line, col);
+                            scalar.goto(line, col);
+                            for &cp in run {
+                                scalar.input(char::from_u32(cp).unwrap());
+                            }
+                            for part in run.chunks(chunk) {
+                                bulk.input_codepoints(part);
+                            }
+                            assert_eq!(bulk.grid.cursor.pos, scalar.grid.cursor.pos);
+                            assert_eq!(
+                                bulk.grid.cursor.should_wrap,
+                                scalar.grid.cursor.should_wrap
+                            );
+                            assert_eq!(
+                                bulk.grid.topmost_line(),
+                                scalar.grid.topmost_line()
+                            );
+                            for line in scalar.grid.topmost_line().0..3 {
+                                let row = &bulk.grid[Line(line)];
+                                for col in 0..cols {
+                                    let a = row[Column(col)];
+                                    let b = scalar.grid[Line(line)][Column(col)];
+                                    assert_eq!(
+                                        (a.c(), a.wide(), a.cell_flags(), a.style_id()),
+                                        (b.c(), b.wide(), b.cell_flags(), b.style_id()),
+                                        "cols={cols} clustering={clustering} wrapping={wrapping} chunk={chunk} edit={edit} cell={line},{col}"
+                                    );
+                                    assert_eq!(
+                                        extras_of(&bulk, line, col),
+                                        extras_of(&scalar, line, col)
+                                    );
+                                    assert_eq!(
+                                        bulk.cell_hyperlink(Line(line), Column(col)),
+                                        scalar.cell_hyperlink(Line(line), Column(col))
+                                    );
+                                    assert!(a.extras_id().is_none() || row.has_extras);
+                                    assert!(a.style_id() == 0 || row.has_styles);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Reflow moves a cluster atomically: the wide pair and its
     /// attached codepoints survive shrink-rewrap and grow-unwrap.
     #[test]
@@ -8748,14 +12423,14 @@ mod tests {
     }
 
     #[test]
-    fn hyperlink_crosses_alt_screen_into_the_alt_table() {
+    fn hyperlink_ends_before_copying_the_alt_cursor() {
         use crate::performer::handler::Handler;
         let mut cw = new_term(6, 3);
         let link = Hyperlink::new(None::<&str>, "https://alt.example");
         cw.set_hyperlink(Some(link.clone()));
         cw.swap_alt();
         cw.input('x');
-        assert_eq!(cw.cell_hyperlink(Line(0), Column(0)), Some(link));
+        assert!(cw.cell_hyperlink(Line(0), Column(0)).is_none());
         cw.swap_alt();
     }
 
@@ -9471,11 +13146,12 @@ mod tests {
         processor.advance(&mut cw, cells.as_bytes());
 
         // Metadata stored.
-        let vp = cw
-            .graphics
-            .kitty_virtual_placements
-            .get(&(image_id, 0))
-            .expect("virtual placement registered");
+        let vp = crate::ansi::kitty_virtual::resolve_virtual_placement(
+            &cw.graphics.kitty_virtual_placements,
+            image_id,
+            0,
+        )
+        .expect("virtual placement registered");
         assert_eq!(vp.columns, cols);
         assert_eq!(vp.rows, rows);
 
@@ -9598,11 +13274,12 @@ mod tests {
         cells.push_str("\x1b[0m");
         processor.advance(&mut cw, cells.as_bytes());
 
-        let vp = cw
-            .graphics
-            .kitty_virtual_placements
-            .get(&(image_id, 0))
-            .expect("a=T,U=1 must register a virtual placement");
+        let vp = crate::ansi::kitty_virtual::resolve_virtual_placement(
+            &cw.graphics.kitty_virtual_placements,
+            image_id,
+            0,
+        )
+        .expect("a=T,U=1 must register a virtual placement");
         assert_eq!((vp.columns, vp.rows), (0, 0), "c=/r= omitted on the wire");
         assert!(
             cw.graphics.get_kitty_image(image_id).is_some(),
@@ -9622,11 +13299,8 @@ mod tests {
             assert_eq!(zw, &[DIACRITICS[row], DIACRITICS[0]]);
         }
 
-        // The renderer's geometry for each row's run: with the grid
-        // implied from a 2×2 px image on 1×2 px cells (2 cols × 1 row),
-        // row 0 is visible and drawn 1:1. Before the fix the placement
-        // box collapsed to one cell and row 1 of a taller image drew
-        // nothing while row 0 squeezed the whole image.
+        // A 2x2 px image on 1x2 px cells occupies two columns and one row, so
+        // the first placeholder run uses the image's full vertical extent.
         let run = crate::ansi::kitty_virtual::PlaceholderRun {
             image_id,
             placement_id: 0,
@@ -9698,6 +13372,7 @@ mod tests {
         };
         let place = |cw: &mut Crosswords<VoidListener>, id: u32, pid: u32| {
             assert!(cw.place_graphic(PlacementRequest {
+                relative: None,
                 image_id: id,
                 placement_id: pid,
                 x: 0,
@@ -9715,6 +13390,7 @@ mod tests {
             }));
         };
         let delete = |action: u8, image_id: u32, placement_id: u32| DeleteRequest {
+            frame_number: 0,
             action,
             image_id,
             image_number: 0,
@@ -9786,6 +13462,7 @@ mod tests {
 
         let cursor_before = cw.grid.cursor.pos;
         let placement = PlacementRequest {
+            relative: None,
             image_id: 1234,
             placement_id: 0,
             x: 0,
@@ -9805,11 +13482,12 @@ mod tests {
         assert!(cw.place_graphic(placement), "image exists, must place");
 
         // Metadata stored …
-        let vp = cw
-            .graphics
-            .kitty_virtual_placements
-            .get(&(1234, 0))
-            .expect("virtual placement registered");
+        let vp = crate::ansi::kitty_virtual::resolve_virtual_placement(
+            &cw.graphics.kitty_virtual_placements,
+            1234,
+            0,
+        )
+        .expect("virtual placement registered");
         assert_eq!(vp.image_id, 1234);
         assert_eq!(vp.columns, 8);
         assert_eq!(vp.rows, 4);
@@ -9852,6 +13530,7 @@ mod tests {
         placement_id: u32,
     ) -> crate::ansi::kitty_graphics_protocol::PlacementRequest {
         crate::ansi::kitty_graphics_protocol::PlacementRequest {
+            relative: None,
             image_id,
             placement_id,
             x: 0,
@@ -9896,8 +13575,12 @@ mod tests {
         assert!(cw.place_graphic(virtual_request(1234, 7)));
         assert!(!cw.ensure_kitty_upload(1234));
 
-        // A retransmission of a placed id uploads the new pixels once.
+        // Retransmission removes the old placements. The next placement
+        // uploads the replacement pixels once.
         cw.store_graphic(kitty_test_image(1234, 2, 2));
+        assert!(!uploaded(&cw, 1234));
+        assert!(cw.graphics.kitty_virtual_placements.is_empty());
+        assert!(cw.place_graphic(virtual_request(1234, 7)));
         assert!(uploaded(&cw, 1234));
         assert!(!cw.ensure_kitty_upload(1234));
 
@@ -9925,6 +13608,7 @@ mod tests {
         cw.graphics.cell_height = 20.0;
         cw.store_graphic(kitty_test_image(3, 10, 20));
         cw.place_graphic(PlacementRequest {
+            relative: None,
             virtual_placement: false,
             columns: 0,
             rows: 0,
@@ -10010,6 +13694,7 @@ mod tests {
         cw.store_graphic(kitty_test_image(1, 2, 2));
         cw.place_graphic(virtual_request(1, 1));
         cw.delete_graphics(DeleteRequest {
+            frame_number: 0,
             action: b'I',
             delete_data: true,
             image_id: 1,
@@ -10049,13 +13734,14 @@ mod tests {
     }
 
     #[test]
-    fn cursor_delete_with_data_keeps_virtually_placed_images() {
+    fn cursor_delete_with_data_keeps_virtual_and_unplaced_images() {
         use crate::ansi::kitty_graphics_protocol::DeleteRequest;
         let mut cw = make_crosswords();
         cw.store_graphic(kitty_test_image(1, 1, 1));
         cw.place_graphic(virtual_request(1, 1));
         cw.store_graphic(kitty_test_image(2, 1, 1));
         cw.delete_graphics(DeleteRequest {
+            frame_number: 0,
             action: b'C',
             delete_data: true,
             image_id: 0,
@@ -10066,7 +13752,7 @@ mod tests {
             z_index: 0,
         });
         assert!(cw.graphics.get_kitty_image(1).is_some());
-        assert!(cw.graphics.get_kitty_image(2).is_none());
+        assert!(cw.graphics.get_kitty_image(2).is_some());
     }
 
     #[test]
@@ -10107,6 +13793,7 @@ mod tests {
         cw.place_graphic(virtual_request(1, 1));
         cw.store_graphic(kitty_test_image(2, 10, 20));
         cw.place_graphic(PlacementRequest {
+            relative: None,
             virtual_placement: false,
             columns: 0,
             rows: 0,
@@ -10115,6 +13802,7 @@ mod tests {
         assert_eq!(cw.graphics.kitty_placements.len(), 1);
 
         cw.delete_graphics(DeleteRequest {
+            frame_number: 0,
             action: b'A',
             delete_data: true,
             image_id: 0,
@@ -10140,6 +13828,7 @@ mod tests {
         cw.place_graphic(virtual_request(9, 1));
 
         cw.delete_graphics(DeleteRequest {
+            frame_number: 0,
             action: b'R',
             delete_data: true,
             image_id: 0,
@@ -10165,7 +13854,7 @@ mod tests {
     }
 
     #[test]
-    fn retransmit_resets_virtual_source_rect_outside_new_image() {
+    fn retransmission_removes_all_virtual_placements() {
         let mut cw = make_crosswords();
         cw.store_graphic(kitty_test_image(9, 100, 100));
         let mut req = virtual_request(9, 1);
@@ -10180,10 +13869,8 @@ mod tests {
         cw.place_graphic(req);
 
         cw.store_graphic(kitty_test_image(9, 20, 20));
-        let stale = &cw.graphics.kitty_virtual_placements[&(9, 1)];
-        assert_eq!((stale.x, stale.y, stale.width, stale.height), (0, 0, 0, 0));
-        let kept = &cw.graphics.kitty_virtual_placements[&(9, 2)];
-        assert_eq!((kept.x, kept.width), (5, 10));
+        assert!(cw.graphics.kitty_virtual_placements.is_empty());
+        assert!(cw.graphics.get_kitty_image(9).is_some());
     }
 
     /// DECSTBM bounds where scrolling happens, not what is on screen. Both

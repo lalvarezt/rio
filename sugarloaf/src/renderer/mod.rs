@@ -11,8 +11,6 @@ use crate::context::webgpu::WgpuContext;
 use crate::context::{Context, ContextType};
 use crate::font::FontLibrary;
 use crate::layout::TextDimensions;
-use crate::renderer::image_cache::ImageCache;
-use crate::Graphics;
 use compositor::{Compositor, Rect, Vertex};
 use rustc_hash::FxHashMap;
 // Only the macOS Metal path and the wgpu path use bare `mem::` (they
@@ -78,7 +76,6 @@ pub struct WgpuRenderer {
     instance_buffer: wgpu::Buffer,
     constant_bind_group: wgpu::BindGroup,
     layout_bind_group: wgpu::BindGroup,
-    layout_bind_group_layout: wgpu::BindGroupLayout,
     transform: wgpu::Buffer,
     pipeline: wgpu::RenderPipeline,
     instanced_pipeline: wgpu::RenderPipeline,
@@ -566,7 +563,6 @@ impl MetalRenderer {
         instances: &[batch::QuadInstance],
         vertices: &[Vertex],
         draw_cmds: &[batch::DrawCmd],
-        images: &ImageCache,
         render_encoder: &RenderCommandEncoderRef,
         context: &MetalContext,
         instance_buffer: &InstanceBuffer,
@@ -619,9 +615,6 @@ impl MetalRenderer {
 
         render_encoder.set_fragment_sampler_state(0, Some(&self.sampler));
 
-        let color_textures = images.get_metal_textures();
-        let mask_texture = images.get_mask_texture();
-
         let mut current_pipeline_instanced = false;
         let mut pipeline_set = false;
 
@@ -629,40 +622,8 @@ impl MetalRenderer {
         let globals_size = mem::size_of::<Globals>() as u64;
 
         for cmd in draw_cmds {
-            let (color_layer, mask_layer) = match cmd {
-                batch::DrawCmd::Instanced {
-                    color_layer,
-                    mask_layer,
-                    ..
-                } => (*color_layer, *mask_layer),
-                batch::DrawCmd::Vertices {
-                    color_layer,
-                    mask_layer,
-                    ..
-                } => (*color_layer, *mask_layer),
-            };
-
-            // Bind textures
-            if color_layer > 0 {
-                let idx = (color_layer - 1) as usize;
-                if idx < color_textures.len() {
-                    render_encoder.set_fragment_texture(0, Some(color_textures[idx]));
-                } else {
-                    render_encoder.set_fragment_texture(0, None);
-                }
-            } else {
-                render_encoder.set_fragment_texture(0, None);
-            }
-
-            if mask_layer > 0 {
-                if let Some(mask_tex) = mask_texture {
-                    render_encoder.set_fragment_texture(1, Some(mask_tex));
-                } else {
-                    render_encoder.set_fragment_texture(1, None);
-                }
-            } else {
-                render_encoder.set_fragment_texture(1, None);
-            }
+            render_encoder.set_fragment_texture(0, None);
+            render_encoder.set_fragment_texture(1, None);
 
             match cmd {
                 batch::DrawCmd::Instanced { offset, count, .. } => {
@@ -737,6 +698,19 @@ enum ImageTexture {
     /// shared sampler at upload time, so draw paths just bind it).
     #[cfg(target_os = "linux")]
     Vulkan(vulkan::VulkanImageTexture),
+}
+
+#[cfg(feature = "wgpu")]
+impl ImageTexture {
+    fn wgpu_view(&self) -> Option<&wgpu::TextureView> {
+        match self {
+            Self::Wgpu { view, .. } => Some(view),
+            #[cfg(target_os = "macos")]
+            Self::Metal(_) => None,
+            #[cfg(target_os = "linux")]
+            Self::Vulkan(_) => None,
+        }
+    }
 }
 
 /// Per-image texture entry stored in the renderer.
@@ -845,7 +819,6 @@ pub struct Renderer {
     instances: Vec<batch::QuadInstance>,
     vertices: Vec<Vertex>,
     draw_cmds: Vec<batch::DrawCmd>,
-    images: ImageCache,
     /// Per-image GPU textures (one map, any backend).
     image_textures: FxHashMap<u64, ImageTextureEntry>,
     /// Sum of `bytes` across `image_textures`; compared against
@@ -1028,7 +1001,6 @@ impl Renderer {
             instances: vec![],
             vertices: vec![],
             draw_cmds: vec![],
-            images: ImageCache::new(context),
             image_textures: FxHashMap::default(),
             image_texture_bytes: 0,
             image_frame_counter: 0,
@@ -1044,7 +1016,7 @@ impl Renderer {
 
     /// Drain per-frame batch state that was populated via
     /// `rect` / `quad` / etc. Normally `comp.batches` is drained
-    /// inside `compute_updates` → `comp.finish()` during a render;
+    /// inside `prepare` → `comp.finish()` during a render;
     /// when the caller skips the GPU submit entirely (see
     /// `Sugarloaf::discard_frame`), those recorded primitives would
     /// otherwise pile into the next presented frame.
@@ -1069,8 +1041,6 @@ impl Renderer {
     pub fn prepare(
         &mut self,
         context: &mut crate::context::Context,
-        _state: &crate::sugarloaf::state::SugarState,
-        _graphics: &mut Graphics,
         image_data: &mut rustc_hash::FxHashMap<
             u64,
             crate::sugarloaf::graphics::GraphicDataEntry,
@@ -1084,19 +1054,13 @@ impl Renderer {
         self.vertices.clear();
         self.draw_cmds.clear();
 
-        // The per-id `Content.states` walk is gone — non-Text content
-        // arms (Rect/RoundedRect/Line/Triangle/Polygon/Arc/Image) had
-        // no rio caller passing `Some(id)`, so the Content registry
-        // never accumulated them. Immediate-mode primitives flow
-        // through `Renderer::rect/quad/...` straight into
-        // `comp.batches`; rich-text emission is handled by the grid
-        // pass and `sugarloaf::text`.
-
         // Image overlays: rio is responsible for not leaving stale
         // overlays for hidden panels (callers `clear_image_overlays_for`
         // on hide / panel removal). The renderer just drains whatever
         // `image_overlays` currently holds.
-        let overlays: Vec<_> = image_overlays.values().flat_map(|v| v.iter()).collect();
+        let mut overlays: Vec<_> =
+            image_overlays.values().flat_map(|v| v.iter()).collect();
+        overlays.sort_by_key(|overlay| (overlay.z_index, overlay.image_id));
         if !overlays.is_empty() {
             self.render_graphic_overlays(context, image_data, &overlays);
         } else {
@@ -1133,7 +1097,6 @@ impl Renderer {
         self.instances.clear();
         self.vertices.clear();
         self.draw_cmds.clear();
-        self.images.process_atlases(context);
         self.comp
             .finish(&mut self.instances, &mut self.vertices, &mut self.draw_cmds);
 
@@ -1675,15 +1638,6 @@ impl Renderer {
     }
 
     #[inline]
-    pub fn clear_atlas(&mut self) {
-        self.images.clear_atlas();
-        self.image_textures.clear();
-        self.image_texture_bytes = 0;
-        self.image_draws.clear();
-        tracing::info!("Renderer atlas cleared");
-    }
-
-    #[inline]
     #[allow(clippy::too_many_arguments)]
     pub fn rect(
         &mut self,
@@ -1706,6 +1660,11 @@ impl Renderer {
             &color,
             order,
         );
+    }
+
+    /// Set the shape clip in physical pixels and return the previous clip.
+    pub(crate) fn set_shape_clip(&mut self, clip: [f32; 4]) -> [f32; 4] {
+        std::mem::replace(&mut self.comp.batches.clip_rect, clip)
     }
 
     /// Add a rounded rectangle with the specified border radius
@@ -1761,33 +1720,6 @@ impl Renderer {
             &background_color,
             corner_radii,
             order,
-        );
-    }
-
-    #[inline]
-    #[allow(clippy::too_many_arguments)]
-    pub fn add_image_rect(
-        &mut self,
-        x: f32,
-        y: f32,
-        width: f32,
-        height: f32,
-        color: [f32; 4],
-        coords: [f32; 4],
-        depth: f32,
-        atlas_layer: i32,
-    ) {
-        self.comp.batches.add_image_rect(
-            &Rect {
-                x,
-                y,
-                width,
-                height,
-            },
-            depth,
-            &color,
-            &coords,
-            atlas_layer,
         );
     }
 
@@ -1869,7 +1801,6 @@ impl Renderer {
         // Destructure to get independent borrows of different fields
         let Self {
             brush_type,
-            images,
             instances,
             vertices,
             draw_cmds,
@@ -1880,12 +1811,9 @@ impl Renderer {
         } = self;
 
         if let RendererType::Wgpu(brush) = brush_type {
-            let color_views = images.get_texture_views();
-            let mask_texture_view = images.get_mask_texture_view();
-
             let has_images = !image_draws.is_empty();
             let has_background = background_image_texture.is_some();
-            if (color_views.is_empty() || (instances.is_empty() && vertices.is_empty()))
+            if (instances.is_empty() && vertices.is_empty())
                 && !has_images
                 && !has_background
             {
@@ -1896,7 +1824,7 @@ impl Renderer {
             // composite on top. Single fullscreen instance, dedicated
             // vertex buffer, reuses the kitty image pipeline + sampler.
             if let Some(bg_tex) = background_image_texture.as_ref() {
-                if let ImageTexture::Wgpu { view, .. } = &bg_tex.gpu {
+                if let Some(view) = bg_tex.gpu.wgpu_view() {
                     let instance = ImageInstance {
                         dest_pos: [0.0, 0.0],
                         dest_size: [ctx.size.width, ctx.size.height],
@@ -1962,7 +1890,7 @@ impl Renderer {
                         continue;
                     }
                     if let Some(img) = image_textures.get(&draw.image_id) {
-                        if let ImageTexture::Wgpu { view, .. } = &img.gpu {
+                        if let Some(view) = img.gpu.wgpu_view() {
                             let bg = ctx.device.create_bind_group(
                                 &wgpu::BindGroupDescriptor {
                                     label: None,
@@ -2043,33 +1971,6 @@ impl Renderer {
             let mut pipeline_set = false;
 
             for cmd in draw_cmds {
-                let (color_layer, mask_layer) = match cmd {
-                    batch::DrawCmd::Instanced {
-                        color_layer,
-                        mask_layer,
-                        ..
-                    } => (*color_layer, *mask_layer),
-                    batch::DrawCmd::Vertices {
-                        color_layer,
-                        mask_layer,
-                        ..
-                    } => (*color_layer, *mask_layer),
-                };
-
-                // Bind textures for this batch
-                let color_view = if color_layer > 0 {
-                    let idx = (color_layer - 1) as usize;
-                    color_views.get(idx).unwrap_or(&color_views[0])
-                } else {
-                    &color_views[0]
-                };
-                let final_mask_view = if mask_layer > 0 {
-                    mask_texture_view.unwrap_or(color_views[0])
-                } else {
-                    color_views[0]
-                };
-                brush.update_bind_group(ctx, color_view, final_mask_view);
-
                 match cmd {
                     batch::DrawCmd::Instanced { offset, count, .. } => {
                         if !pipeline_set || !current_pipeline_instanced {
@@ -2120,7 +2021,7 @@ impl Renderer {
                         continue;
                     }
                     if let Some(img) = image_textures.get(&draw.image_id) {
-                        if let ImageTexture::Wgpu { view, .. } = &img.gpu {
+                        if let Some(view) = img.gpu.wgpu_view() {
                             let bg = ctx.device.create_bind_group(
                                 &wgpu::BindGroupDescriptor {
                                     label: None,
@@ -2349,7 +2250,6 @@ impl Renderer {
                         &self.instances,
                         &self.vertices,
                         &self.draw_cmds,
-                        &self.images,
                         render_encoder,
                         context,
                         &instance_buffer,
@@ -2465,18 +2365,10 @@ impl Renderer {
         });
     }
 
-    /// Record sugarloaf's own draws inside the active dynamic-rendering
-    /// pass that `Sugarloaf::render_vulkan` opens. Order:
-    /// 1. Background image (full-screen quad).
-    /// 2. BelowText image overlays (kitty / sixel placements with
-    ///    `dest_pos.z < 0`).
-    /// 3. Rich-text quad pass — `quad()` / `rect()` calls + cell
-    ///    underline decorations (dashed/dotted/curly handled in
-    ///    `quad.frag.glsl`).
-    /// 4. Non-quad geometry — `polygon()` / `line()` / `triangle()`
-    ///    / `arc()` calls (cursor underline shape, hint highlights).
-    /// 5. AboveText image overlays.
-    /// 6. Optional bootstrap rect (`RIO_VULKAN_BOOTSTRAP=1`).
+    /// Record image layers and grids inside the active dynamic-rendering pass.
+    /// Background images precede BelowBg images, grid backgrounds, BelowText
+    /// images, grid glyphs, and AboveText images. UI quads and geometry follow
+    /// terminal content, then the optional bootstrap rectangle.
     ///
     /// Glyph atlas sampling through this pipeline isn't ported —
     /// grid text + UI text overlay each own dedicated atlas
@@ -2491,6 +2383,8 @@ impl Renderer {
         &mut self,
         cmd: ash::vk::CommandBuffer,
         frame: &crate::context::vulkan::VulkanFrame,
+        context: &crate::context::vulkan::VulkanContext,
+        grids: &mut [(&mut crate::grid::GridRenderer, crate::grid::GridUniforms)],
     ) {
         let viewport = [frame.extent.width as f32, frame.extent.height as f32];
         let slot = frame.slot;
@@ -2500,6 +2394,20 @@ impl Renderer {
         // texture lookup needs an immutable borrow on
         // `self.image_textures` which would conflict with the
         // brush's `&mut self`.
+        let mut draws: Vec<(ash::vk::DescriptorSet, ImageInstance)> = self
+            .image_draws
+            .iter()
+            .filter(|d| d.layer == ImageLayer::BelowBg)
+            .filter_map(|d| {
+                let entry = self.image_textures.get(&d.image_id)?;
+                if let ImageTexture::Vulkan(tex) = &entry.gpu {
+                    Some((tex.descriptor_set, d.instance))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let background_end = draws.len();
         let below: Vec<(ash::vk::DescriptorSet, ImageInstance)> = self
             .image_draws
             .iter()
@@ -2527,7 +2435,11 @@ impl Renderer {
             })
             .collect();
 
+        draws.extend(below);
+        let text_end = draws.len();
+        draws.extend(above);
         if let RendererType::Vulkan(brush) = &mut self.brush_type {
+            brush.prepare_image_overlays(slot, viewport, &draws);
             if let Some(bg) = &self.background_image_texture {
                 if let ImageTexture::Vulkan(tex) = &bg.gpu {
                     brush.render_background_image(
@@ -2539,10 +2451,22 @@ impl Renderer {
                 }
             }
 
-            brush.render_image_overlays(cmd, slot, viewport, &below);
+            brush.render_image_overlays(cmd, slot, &draws[..background_end], 0);
+            for (grid, uniforms) in grids.iter_mut() {
+                grid.render_bg_vulkan(context, cmd, slot, uniforms);
+            }
+            brush.render_image_overlays(
+                cmd,
+                slot,
+                &draws[background_end..text_end],
+                background_end,
+            );
+            for (grid, uniforms) in grids.iter_mut() {
+                grid.render_text_vulkan(context, cmd, slot, uniforms);
+            }
+            brush.render_image_overlays(cmd, slot, &draws[text_end..], text_end);
             brush.render_quads(cmd, slot, viewport, &self.instances);
             brush.render_geometry(cmd, slot, viewport, &self.vertices);
-            brush.render_image_overlays(cmd, slot, viewport, &above);
             brush.draw_bootstrap(cmd);
         }
     }
@@ -2559,11 +2483,6 @@ impl Renderer {
     /// upload them to a per-instance vertex buffer; we just iterate.
     pub(crate) fn instances(&self) -> &[crate::renderer::batch::QuadInstance] {
         &self.instances
-    }
-
-    /// Image cache for CPU rasterizer atlas sampling.
-    pub(crate) fn image_cache(&self) -> &ImageCache {
-        &self.images
     }
 
     pub fn resize(&mut self, context: &mut Context) {
@@ -3054,7 +2973,6 @@ impl WgpuRenderer {
 
         WgpuRenderer {
             layout_bind_group,
-            layout_bind_group_layout,
             constant_bind_group,
             transform,
             pipeline,
@@ -3125,72 +3043,6 @@ impl WgpuRenderer {
 
         let vertex_count = vertices.len() as u32;
         rpass.draw(0..vertex_count, 0..1);
-    }
-
-    #[inline]
-    pub fn render_range(
-        &mut self,
-        ctx: &mut WgpuContext,
-        vertices: &[Vertex],
-        rpass: &mut wgpu::RenderPass,
-        range: std::ops::Range<usize>,
-    ) {
-        if range.is_empty() {
-            return;
-        }
-
-        let queue = &mut ctx.queue;
-
-        // Ensure buffer is large enough
-        if vertices.len() > self.supported_vertex_buffer {
-            self.vertex_buffer.destroy();
-            self.supported_vertex_buffer = (vertices.len() as f32 * 1.25) as usize;
-            self.vertex_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("sugarloaf::rich_text::Pipeline vertices"),
-                size: mem::size_of::<Vertex>() as u64
-                    * self.supported_vertex_buffer as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        }
-
-        // Write all vertices to buffer (we need the full buffer for correct indexing)
-        let vertices_bytes: &[u8] = bytemuck::cast_slice(vertices);
-        if !vertices_bytes.is_empty() {
-            queue.write_buffer(&self.vertex_buffer, 0, vertices_bytes);
-        }
-
-        rpass.set_pipeline(&self.pipeline);
-        rpass.set_bind_group(0, &self.constant_bind_group, &[]);
-        rpass.set_bind_group(1, &self.layout_bind_group, &[]);
-        rpass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-
-        // Draw only the specified range
-        rpass.draw(range.start as u32..range.end as u32, 0..1);
-    }
-
-    pub fn update_bind_group(
-        &mut self,
-        ctx: &WgpuContext,
-        color_view: &wgpu::TextureView,
-        mask_view: &wgpu::TextureView,
-    ) {
-        // Always update bind group since different batches need different textures
-        self.layout_bind_group =
-            ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &self.layout_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(color_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(mask_view),
-                    },
-                ],
-                label: Some("rich_text::Pipeline uniforms"),
-            });
     }
 }
 

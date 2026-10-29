@@ -30,6 +30,14 @@ const MAX_OSC_PARAMS: usize = 16;
 /// `OscBuffer::overflow`.
 const OSC_FIXED_LEN: usize = 2048;
 
+/// Ordinary control strings and reusable buffers need no more than 64 KiB.
+pub(super) const MAX_CONTROL_BYTES: usize = 64 * 1024;
+/// Encoded OSC 52 data, allowing clipboard transfers up to about 12 MiB.
+const MAX_CLIPBOARD_BYTES: usize = 16 * 1024 * 1024;
+/// Base64 expansion of the existing 400 MiB Kitty image limit, plus headers.
+pub(super) const MAX_GRAPHICS_BYTES: usize =
+    (400 * 1024 * 1024usize).div_ceil(3) * 4 + MAX_CONTROL_BYTES;
+
 /// Parser for raw _VTE_ protocol which delegates actions to a [`Perform`].
 #[derive(Default)]
 pub struct Parser {
@@ -41,6 +49,10 @@ pub struct Parser {
     osc_raw: OscBuffer,
     osc_params: [(usize, usize); MAX_OSC_PARAMS],
     osc_num_params: usize,
+    /// Zero selects the ordinary limit until the command number is complete.
+    osc_max_bytes: usize,
+    osc_discarded: bool,
+    osc_command: Option<u16>,
     ignoring: bool,
     partial_utf8: [u8; 4],
     partial_utf8_len: usize,
@@ -83,13 +95,17 @@ impl OscBuffer {
     }
 
     #[inline]
-    fn push(&mut self, byte: u8) {
+    fn try_push(&mut self, byte: u8, limit: usize) -> bool {
+        debug_assert!(limit >= OSC_FIXED_LEN);
+        if self.overflow.is_empty() && self.fixed_len < OSC_FIXED_LEN {
+            self.fixed[self.fixed_len] = byte;
+            self.fixed_len += 1;
+            return true;
+        }
+        if self.len() >= limit {
+            return false;
+        }
         if self.overflow.is_empty() {
-            if self.fixed_len < OSC_FIXED_LEN {
-                self.fixed[self.fixed_len] = byte;
-                self.fixed_len += 1;
-                return;
-            }
             // Spill: promote the current contents to the heap once, then
             // append. After this point, `overflow.len() >= OSC_FIXED_LEN`,
             // so the `is_empty()` check above stays false until `clear`.
@@ -97,6 +113,7 @@ impl OscBuffer {
                 .extend_from_slice(&self.fixed[..self.fixed_len]);
         }
         self.overflow.push(byte);
+        true
     }
 
     /// Bulk append, equivalent to pushing every byte: fills the fixed
@@ -104,19 +121,26 @@ impl OscBuffer {
     /// and appends there (same final contents as per-byte pushes; the
     /// stale `fixed_len` is never read while `overflow` is non-empty).
     #[inline]
-    fn extend_from_slice(&mut self, bytes: &[u8]) {
+    fn try_extend_from_slice(&mut self, bytes: &[u8], limit: usize) -> bool {
+        debug_assert!(limit >= OSC_FIXED_LEN);
         if self.overflow.is_empty() {
             let fits = OSC_FIXED_LEN - self.fixed_len;
             if bytes.len() <= fits {
                 self.fixed[self.fixed_len..self.fixed_len + bytes.len()]
                     .copy_from_slice(bytes);
                 self.fixed_len += bytes.len();
-                return;
+                return true;
             }
+        }
+        if bytes.len() > limit.saturating_sub(self.len()) {
+            return false;
+        }
+        if self.overflow.is_empty() {
             self.overflow
                 .extend_from_slice(&self.fixed[..self.fixed_len]);
         }
         self.overflow.extend_from_slice(bytes);
+        true
     }
 
     #[inline]
@@ -131,9 +155,11 @@ impl OscBuffer {
     #[inline]
     fn clear(&mut self) {
         self.fixed_len = 0;
-        // Keep `overflow`'s capacity so a session that hits one large paste
-        // doesn't re-allocate on the next one.
-        self.overflow.clear();
+        if self.overflow.capacity() > MAX_CONTROL_BYTES {
+            self.overflow = Vec::new();
+        } else {
+            self.overflow.clear();
+        }
     }
 }
 
@@ -214,14 +240,15 @@ impl Parser {
                         self.ignoring = true;
                         i += 1;
                     } else {
-                        let mut param = self.param;
+                        let mut param = self.param as u32;
                         while i < bytes.len() && bytes[i].is_ascii_digit() {
-                            param = param
-                                .saturating_mul(10)
-                                .saturating_add((bytes[i] - b'0') as u16);
+                            // The u16-clamped input fits a multiply-add in u32,
+                            // so one final clamp replaces two saturating ops.
+                            param = (param * 10 + (bytes[i] - b'0') as u32)
+                                .min(u16::MAX as u32);
                             i += 1;
                         }
-                        self.param = param;
+                        self.param = param as u16;
                     }
                 }
                 0x3A => {
@@ -252,7 +279,11 @@ impl Parser {
             State::CsiIntermediate => self.advance_csi_intermediate(performer, byte),
             State::CsiParam => self.advance_csi_param(performer, byte),
             State::DcsEntry => self.advance_dcs_entry(performer, byte),
-            State::DcsIgnore => self.anywhere(performer, byte),
+            State::DcsIgnore => {
+                if byte < 0x80 {
+                    self.anywhere(performer, byte);
+                }
+            }
             State::DcsIntermediate => self.advance_dcs_intermediate(performer, byte),
             State::DcsParam => self.advance_dcs_param(performer, byte),
             State::DcsPassthrough => self.advance_dcs_passthrough(performer, byte),
@@ -347,10 +378,7 @@ impl Parser {
                 self.action_paramnext(byte);
                 self.state = State::DcsParam
             }
-            0x3A => {
-                self.action_subparam();
-                self.state = State::DcsParam
-            }
+            0x3A => self.state = State::DcsIgnore,
             0x3B => {
                 self.action_param();
                 self.state = State::DcsParam
@@ -386,7 +414,7 @@ impl Parser {
                 self.state = State::DcsIntermediate
             }
             0x30..=0x39 => self.action_paramnext(byte),
-            0x3A => self.action_subparam(),
+            0x3A => self.state = State::DcsIgnore,
             0x3B => self.action_param(),
             0x3C..=0x3F => self.state = State::DcsIgnore,
             0x40..=0x7E => self.action_hook(performer, byte),
@@ -398,7 +426,7 @@ impl Parser {
     #[inline(always)]
     fn advance_dcs_passthrough<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         match byte {
-            0x00..=0x17 | 0x19 | 0x1C..=0x7E => performer.put(byte),
+            0x00..=0x17 | 0x19 | 0x1C..=0x7E | 0x80..=0xFF => performer.put(byte),
             0x18 | 0x1A => {
                 performer.unhook();
                 performer.execute(byte);
@@ -410,11 +438,6 @@ impl Parser {
                 self.state = State::Escape
             }
             0x7F => (),
-            0x9C => {
-                performer.unhook();
-                self.state = State::Ground
-            }
-            _ => (),
         }
     }
 
@@ -477,6 +500,7 @@ impl Parser {
                 self.state = State::Ground
             }
             0x1B => (),
+            0x80..=0x9F => self.anywhere(performer, byte),
             _ => (),
         }
     }
@@ -509,7 +533,7 @@ impl Parser {
     ) -> usize {
         let n = find_osc_boundary(bytes);
         if n != 0 {
-            self.osc_raw.extend_from_slice(&bytes[..n]);
+            self.osc_extend(&bytes[..n]);
         }
         if n == bytes.len() {
             return n;
@@ -524,7 +548,7 @@ impl Parser {
         performer: &mut P,
         bytes: &[u8],
     ) -> usize {
-        let n = find_string_c0(bytes);
+        let n = find_opaque_boundary(bytes);
         if n != 0 {
             performer.apc_put_slice(&bytes[..n]);
         }
@@ -541,7 +565,7 @@ impl Parser {
         performer: &mut P,
         bytes: &[u8],
     ) -> usize {
-        let n = find_string_c0(bytes);
+        let n = find_opaque_boundary(bytes);
         if n != 0 {
             performer.sos_put_slice(&bytes[..n]);
         }
@@ -558,7 +582,7 @@ impl Parser {
         performer: &mut P,
         bytes: &[u8],
     ) -> usize {
-        let n = find_string_c0(bytes);
+        let n = find_opaque_boundary(bytes);
         if n != 0 {
             performer.pm_put_slice(&bytes[..n]);
         }
@@ -612,72 +636,43 @@ impl Parser {
 
     #[inline(always)]
     fn advance_apc_string<P: Perform>(&mut self, performer: &mut P, byte: u8) {
-        // Bytes stream straight through to `performer.apc_put`; the Performer
-        // owns its own accumulation buffer (`apc_state.buffer`) and parses
-        // kitty-style headers from there. The parser keeps no APC state.
-        match byte {
-            0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1C..=0x1F => (), // Ignore control bytes
-            0x07 => {
-                // Bell-terminated APC.
-                performer.apc_end();
-                self.state = State::Ground;
-            }
-            0x18 | 0x1A => {
-                // C0 termination (CAN or SUB).
-                performer.apc_put(byte);
-                performer.apc_end();
-                performer.execute(byte);
-                self.state = State::Ground;
-            }
-            0x1B => {
-                // Start of ST termination (`\x1b\`).
-                performer.apc_end();
-                self.state = State::Escape;
-            }
-            0x20..=0xFF => performer.apc_put(byte),
-        }
+        self.advance_opaque_string(performer, byte);
     }
 
     #[inline(always)]
     fn advance_sos_string<P: Perform>(&mut self, performer: &mut P, byte: u8) {
-        match byte {
-            0x07 => {
-                performer.sos_end();
-                self.state = State::Ground
-            }
-            0x18 | 0x1A => {
-                performer.sos_end();
-                performer.execute(byte);
-                self.state = State::Ground
-            }
-            0x1B => {
-                performer.sos_end();
-                self.state = State::Escape
-            }
-            0x20..=0xFF => performer.sos_put(byte),
-            // Ignore all other control bytes.
-            _ => (),
-        }
+        self.advance_opaque_string(performer, byte);
     }
 
     #[inline(always)]
     fn advance_pm_string<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        self.advance_opaque_string(performer, byte);
+    }
+
+    fn advance_opaque_string<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         match byte {
-            0x07 => {
-                performer.pm_end();
-                self.state = State::Ground
+            0x18 | 0x1A | 0x1B | 0x80..=0x9F => {
+                // CAN/SUB and C1 interruptions must not publish a partial
+                // graphics command. ST is a proper terminator.
+                match self.state {
+                    State::ApcString if !matches!(byte, 0x1B | 0x9C) => {
+                        performer.apc_abort()
+                    }
+                    State::ApcString => performer.apc_end(),
+                    State::SosString => performer.sos_end(),
+                    State::PmString => performer.pm_end(),
+                    _ => unreachable!(),
+                }
+                self.anywhere(performer, byte);
             }
-            0x18 | 0x1A => {
-                performer.pm_end();
-                performer.execute(byte);
-                self.state = State::Ground
-            }
-            0x1B => {
-                performer.pm_end();
-                self.state = State::Escape
-            }
-            0x20..=0xFF => performer.pm_put(byte),
-            // Ignore all other control bytes.
+            0x00..=0x17 | 0x19 | 0x1C..=0x7F => match self.state {
+                State::ApcString => performer.apc_put(byte),
+                State::SosString => performer.sos_put(byte),
+                State::PmString => performer.pm_put(byte),
+                _ => unreachable!(),
+            },
+            // Opaque strings are seven-bit payloads. High bytes outside C1
+            // have no action in Ghostty's sos_pm_apc_string state.
             _ => (),
         }
     }
@@ -685,13 +680,35 @@ impl Parser {
     #[inline(always)]
     fn anywhere<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         match byte {
-            0x18 | 0x1A => {
+            0x18 | 0x1A | 0x80..=0x8F | 0x91..=0x97 | 0x99..=0x9A => {
                 performer.execute(byte);
                 self.state = State::Ground
             }
             0x1B => {
                 self.reset_params();
                 self.state = State::Escape
+            }
+            0x9C => self.state = State::Ground,
+            0x90 | 0x98 | 0x9B | 0x9D..=0x9F => {
+                self.reset_params();
+                self.state = match byte {
+                    0x90 => State::DcsEntry,
+                    0x98 => {
+                        performer.sos_start();
+                        State::SosString
+                    }
+                    0x9B => State::CsiEntry,
+                    0x9D => State::OscString,
+                    0x9E => {
+                        performer.pm_start();
+                        State::PmString
+                    }
+                    0x9F => {
+                        performer.apc_start();
+                        State::ApcString
+                    }
+                    _ => unreachable!(),
+                };
             }
             _ => (),
         }
@@ -777,6 +794,34 @@ impl Parser {
     /// Add OSC param separator.
     #[inline]
     fn action_osc_put_param(&mut self) {
+        if self.osc_discarded {
+            return;
+        }
+        if self.osc_payload_is_verbatim() {
+            self.action_osc_put(b';');
+        } else {
+            self.push_osc_param();
+        }
+    }
+
+    #[inline]
+    fn osc_payload_is_verbatim(&self) -> bool {
+        let param = |i: usize| {
+            let (start, end) = self.osc_params[i];
+            self.osc_raw.slice(start, end)
+        };
+        match self.osc_num_params {
+            1 => param(0) == b"7",
+            2 => param(0) == b"8" || (param(0) == b"9" && param(1) == b"9"),
+            _ => false,
+        }
+    }
+
+    #[inline]
+    fn push_osc_param(&mut self) {
+        if self.osc_discarded {
+            return;
+        }
         let idx = self.osc_raw.len();
 
         let param_idx = self.osc_num_params;
@@ -796,18 +841,65 @@ impl Parser {
         }
 
         self.osc_num_params += 1;
+        if param_idx == 0 {
+            self.osc_command = std::str::from_utf8(self.osc_raw.slice(0, idx))
+                .ok()
+                .and_then(|command| command.parse().ok());
+            self.osc_max_bytes = match self.osc_raw.slice(0, idx) {
+                b"7501" => crate::program_status::MAX_SEQUENCE_BYTES,
+                b"52" => MAX_CLIPBOARD_BYTES,
+                b"1337" => MAX_GRAPHICS_BYTES,
+                _ => MAX_CONTROL_BYTES,
+            };
+        }
+    }
+
+    fn osc_extend(&mut self, bytes: &[u8]) {
+        if self.osc_discarded {
+            return;
+        }
+        if !self.osc_raw.try_extend_from_slice(bytes, self.osc_limit()) {
+            self.discard_osc();
+        }
     }
 
     #[inline(always)]
     fn action_osc_put(&mut self, byte: u8) {
-        self.osc_raw.push(byte);
+        if self.osc_discarded {
+            return;
+        }
+        if !self.osc_raw.try_push(byte, self.osc_limit()) {
+            self.discard_osc();
+        }
+    }
+
+    #[inline]
+    fn osc_limit(&self) -> usize {
+        if self.osc_max_bytes == 0 {
+            MAX_CONTROL_BYTES
+        } else {
+            self.osc_max_bytes
+        }
+    }
+
+    fn discard_osc(&mut self) {
+        self.osc_discarded = true;
+        self.osc_raw.clear();
+        self.osc_num_params = 0;
     }
 
     fn osc_end<P: Perform>(&mut self, performer: &mut P, byte: u8) {
-        self.action_osc_put_param();
-        self.osc_dispatch(performer, byte);
+        self.push_osc_param();
+        if self.osc_discarded {
+            performer.osc_discarded(self.osc_command, byte == 0x07);
+        } else {
+            self.osc_dispatch(performer, byte);
+        }
         self.osc_raw.clear();
         self.osc_num_params = 0;
+        self.osc_max_bytes = 0;
+        self.osc_discarded = false;
+        self.osc_command = None;
     }
 
     /// Reset escape sequence parameters and intermediates.
@@ -825,15 +917,11 @@ impl Parser {
     /// The aliasing is needed here for multiple slices into self.osc_raw.
     #[inline]
     fn osc_dispatch<P: Perform>(&self, performer: &mut P, byte: u8) {
-        let mut slices: [&[u8]; MAX_OSC_PARAMS] = [&[]; MAX_OSC_PARAMS];
-        for (slice, &(start, end)) in slices
-            .iter_mut()
-            .zip(self.osc_params.iter())
-            .take(self.osc_num_params)
-        {
-            *slice = self.osc_raw.slice(start, end);
+        let mut slices = smallvec::SmallVec::<[&[u8]; MAX_OSC_PARAMS]>::new();
+        for &(start, end) in self.osc_params.iter().take(self.osc_num_params) {
+            slices.push(self.osc_raw.slice(start, end));
         }
-        performer.osc_dispatch(&slices[..self.osc_num_params], byte == 0x07);
+        performer.osc_dispatch(&slices, byte == 0x07);
     }
 
     /// Advance the parser state from ground.
@@ -851,9 +939,7 @@ impl Parser {
 
         // If the next character is ESC, just process it and short-circuit.
         if plain_chars == 0 {
-            self.state = State::Escape;
-            self.reset_params();
-            return 1;
+            return self.start_ground_escape(bytes);
         }
 
         let has_trailing_esc = plain_chars < num_bytes;
@@ -882,11 +968,31 @@ impl Parser {
         }
 
         if has_trailing_esc {
-            self.state = State::Escape;
-            self.reset_params();
-            plain_chars + 1
+            plain_chars + self.start_ground_escape(&bytes[plain_chars..])
         } else {
             num_bytes
+        }
+    }
+
+    #[inline]
+    fn start_ground_escape(&mut self, bytes: &[u8]) -> usize {
+        self.reset_params();
+        // Ground runs stop at ESC. Consume common two-byte introducers
+        // together so SGR/OSC-heavy output avoids another state dispatch.
+        // A split introducer still takes the ordinary Escape path.
+        match bytes.get(1) {
+            Some(b'[') => {
+                self.state = State::CsiEntry;
+                2
+            }
+            Some(b']') => {
+                self.state = State::OscString;
+                2
+            }
+            _ => {
+                self.state = State::Escape;
+                1
+            }
         }
     }
 
@@ -912,7 +1018,9 @@ impl Parser {
                 // is the validated UTF-8 view of those bytes, so it has at least
                 // one character.
                 let c = unsafe { parsed.chars().next().unwrap_unchecked() };
-                performer.print(c);
+                // A completed character has the same control semantics as one
+                // decoded in a bulk run, including UTF-8-encoded C1 controls.
+                Self::dispatch_codepoints(performer, &[c as u32]);
 
                 self.partial_utf8_len = 0;
                 c.len_utf8() - old_bytes
@@ -933,10 +1041,10 @@ impl Parser {
                         parsed.chars().next().unwrap_unchecked()
                     };
 
-                    performer.print(c);
+                    Self::dispatch_codepoints(performer, &[c as u32]);
 
                     self.partial_utf8_len = 0;
-                    return valid_bytes - old_bytes;
+                    return c.len_utf8() - old_bytes;
                 }
 
                 match err.error_len() {
@@ -982,14 +1090,6 @@ impl Parser {
             } else if b < 0x80 {
                 performer.execute(b);
                 i += 1;
-            } else if (0x80..=0x9F).contains(&b) {
-                // Bare C1 control byte: any properly-encoded UTF-8 sequence
-                // starts with `C2..=F4`, so a leading byte in `80..=9F` is
-                // by definition standalone. Some legacy protocols emit C1
-                // controls as raw bytes — dispatch as `execute` rather
-                // than U+FFFD-replacing them.
-                performer.execute(b);
-                i += 1;
             } else {
                 // Multi-byte UTF-8 run. ASCII decodes to itself (ESC never
                 // reaches here), so one simdutf call covers a mixed chunk;
@@ -1015,13 +1115,16 @@ impl Parser {
     /// C++-backed `simdutf` cannot build, and for short runs everywhere
     /// else, where the out-of-line simdutf call costs more than the
     /// decode itself. Same contract as the SIMD path below: each invalid
-    /// maximal subpart becomes one U+FFFD, except a lone C1 byte, which
-    /// keeps its execute semantics through decode.
+    /// maximal subpart becomes one U+FFFD, including lone C1 bytes.
     #[inline]
     fn decode_codepoints_scalar(&mut self, src: &[u8]) {
         self.decode_buf.clear();
         self.decode_buf.reserve(src.len());
+        self.append_codepoints_scalar(src);
+    }
 
+    #[inline]
+    fn append_codepoints_scalar(&mut self, src: &[u8]) {
         let mut consumed = 0;
         while consumed < src.len() {
             match std::str::from_utf8(&src[consumed..]) {
@@ -1037,11 +1140,7 @@ impl Parser {
                     self.decode_buf.extend(valid.chars().map(|c| c as u32));
 
                     let subpart = maximal_subpart(&src[end..]);
-                    if subpart == 1 && (0x80..=0x9F).contains(&src[end]) {
-                        self.decode_buf.push(src[end] as u32);
-                    } else {
-                        self.decode_buf.push(0xFFFD);
-                    }
+                    self.decode_buf.push(0xFFFD);
                     consumed = end + subpart;
                 }
             }
@@ -1068,63 +1167,18 @@ impl Parser {
     #[cfg(not(target_arch = "wasm32"))]
     #[inline]
     fn decode_codepoints_simd(&mut self, src: &[u8]) {
-        self.decode_buf.clear();
-        // Worst case: 1 codepoint per source byte. Reserve up-front so the
-        // raw pointer writes simdutf does are always in-bounds.
-        self.decode_buf.reserve(src.len());
-
-        let mut consumed = 0;
-        while consumed < src.len() {
-            // SAFETY:
-            //  - `src.as_ptr().add(consumed)` is a valid pointer into `src`
-            //    (consumed < src.len()).
-            //  - `decode_buf` has capacity `src.len()` and currently holds
-            //    `decode_buf.len()` items; remaining slots ≥ remaining
-            //    source bytes ≥ codepoints simdutf will produce.
-            let result = unsafe {
-                simdutf::convert_utf8_to_utf32_with_errors(
-                    src.as_ptr().add(consumed),
-                    src.len() - consumed,
-                    self.decode_buf.as_mut_ptr().add(self.decode_buf.len()),
-                )
-            };
-            if result.error == simdutf::ErrorCode::Success {
-                // SAFETY: simdutf wrote `result.count` u32 values.
-                unsafe {
-                    self.decode_buf
-                        .set_len(self.decode_buf.len() + result.count);
-                }
-                return;
-            }
-
-            // simdutf errored at offset `result.count` within the slice
-            // starting at `consumed`. It already wrote codepoints for the
-            // valid prefix; count them so the buffer length stays in sync.
-            let valid_prefix = &src[consumed..consumed + result.count];
-            let written = simdutf::count_utf8(valid_prefix);
-            // SAFETY: simdutf wrote exactly `written` u32 values.
-            unsafe {
-                self.decode_buf.set_len(self.decode_buf.len() + written);
-            }
-
-            // Emit one U+FFFD for the maximal invalid subpart at the error
-            // position and advance past it. A standalone C1 byte keeps its
-            // execute semantics through decode.
-            let err_pos = consumed + result.count;
-            let subpart = maximal_subpart(&src[err_pos..]);
-            if subpart == 1 && (0x80..=0x9F).contains(&src[err_pos]) {
-                self.decode_buf.push(src[err_pos] as u32);
-            } else {
-                self.decode_buf.push(0xFFFD);
-            }
-            consumed = err_pos + subpart;
+        if let Err(err) = crate::simd_utf8::decode_to_utf32(src, &mut self.decode_buf) {
+            // Dense malformed input otherwise re-enters the SIMD dispatcher
+            // once per invalid byte. Decode the rest of this bounded chunk
+            // scalarly, retaining maximal-subpart replacement.
+            self.append_codepoints_scalar(&src[err.valid_up_to()..]);
         }
     }
 
     /// Split a decoded codepoint slice on control codepoints (C0
     /// `U+0000..=U+001F`, DEL, and C1 `U+0080..=U+009F`) and emit
-    /// non-control runs as [`Perform::print_codepoints`], controls as
-    /// [`Perform::execute`].
+    /// non-control runs as [`Perform::print_codepoints`], C0/DEL as
+    /// [`Perform::execute`], and ignoring UTF-8-decoded C1 controls.
     #[inline]
     fn dispatch_codepoints<P: Perform>(performer: &mut P, codepoints: &[u32]) {
         let mut start = 0;
@@ -1133,7 +1187,9 @@ impl Parser {
                 if start < i {
                     performer.print_codepoints(&codepoints[start..i]);
                 }
-                performer.execute(cp as u8);
+                if cp < 0x80 {
+                    performer.execute(cp as u8);
+                }
                 start = i + 1;
             }
         }
@@ -1144,16 +1200,46 @@ impl Parser {
 }
 
 /// Position of the first byte outside printable ASCII (`0x20..=0x7E`),
-/// via a SWAR scan (eight bytes per iteration, little-endian). An
+/// via AVX2/SSE2 on x86-64 and a portable SWAR scan elsewhere. An
 /// early-exit iterator scan does not vectorize; this does the range
 /// test on a whole word at once.
 #[inline]
 fn find_non_printable(bytes: &[u8]) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if bytes.len() >= 128 && std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: runtime detection guards the AVX2 implementation.
+        return unsafe { find_boundary_avx2::<false>(bytes) };
+    }
     const LO: u64 = 0x0101_0101_0101_0101;
     const HI: u64 = 0x8080_8080_8080_8080;
 
     let mut i = 0;
     let len = bytes.len();
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    {
+        use std::arch::x86_64::{
+            _mm_cmpeq_epi8, _mm_cmpgt_epi8, _mm_loadu_si128, _mm_movemask_epi8,
+            _mm_or_si128, _mm_set1_epi8,
+        };
+        // SSE2 is part of the x86-64 baseline. Signed bytes below space also
+        // include every non-ASCII byte; DEL is the only other stop value.
+        // Each unaligned load stays inside the input slice, including tails.
+        unsafe {
+            let space = _mm_set1_epi8(0x20);
+            let delete = _mm_set1_epi8(0x7f);
+            while i + 16 <= len {
+                let word = _mm_loadu_si128(bytes.as_ptr().add(i).cast());
+                let stop = _mm_movemask_epi8(_mm_or_si128(
+                    _mm_cmpgt_epi8(space, word),
+                    _mm_cmpeq_epi8(delete, word),
+                )) as u32;
+                if stop != 0 {
+                    return i + stop.trailing_zeros() as usize;
+                }
+                i += 16;
+            }
+        }
+    }
     while i + 8 <= len {
         let w = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
         let lt20 = w.wrapping_sub(LO * 0x20) & !w & HI;
@@ -1206,25 +1292,49 @@ fn find_osc_boundary(bytes: &[u8]) -> usize {
     len
 }
 
-/// First index whose byte ends an APC/SOS/PM payload run: any C0 byte.
-/// Those states put `0x20..=0xFF` and treat every C0 as terminator,
-/// abort, or ignored.
-fn find_string_c0(bytes: &[u8]) -> usize {
+/// First index whose byte ends an APC/SOS/PM payload run: any C0 or high
+/// byte. C0 payload bytes and C1 transitions use the per-byte handler.
+fn find_opaque_boundary(bytes: &[u8]) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if bytes.len() >= 128 && std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: runtime detection guards the AVX2 implementation.
+        return unsafe { find_boundary_avx2::<true>(bytes) };
+    }
     const LO: u64 = 0x0101_0101_0101_0101;
     const HI: u64 = 0x8080_8080_8080_8080;
 
     let mut i = 0;
     let len = bytes.len();
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    {
+        use std::arch::x86_64::*;
+
+        // Signed bytes below space include both C0 and high bytes. DEL is
+        // valid opaque payload, unlike in printable ground-state runs.
+        // SAFETY: SSE2 is enabled and each unaligned load stays in the slice.
+        unsafe {
+            let space = _mm_set1_epi8(0x20);
+            while i + 16 <= len {
+                let word = _mm_loadu_si128(bytes.as_ptr().add(i).cast());
+                let stop = _mm_cmpgt_epi8(space, word);
+                let mask = _mm_movemask_epi8(stop) as u32;
+                if mask != 0 {
+                    return i + mask.trailing_zeros() as usize;
+                }
+                i += 16;
+            }
+        }
+    }
     while i + 8 <= len {
         let w = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
-        let lt20 = w.wrapping_sub(LO * 0x20) & !w & HI;
+        let lt20 = (w.wrapping_sub(LO * 0x20) & !w & HI) | (w & HI);
         if lt20 != 0 {
             return i + (lt20.trailing_zeros() as usize) / 8;
         }
         i += 8;
     }
     while i < len {
-        if bytes[i] < 0x20 {
+        if bytes[i] < 0x20 || bytes[i] >= 0x80 {
             return i;
         }
         i += 1;
@@ -1232,9 +1342,41 @@ fn find_string_c0(bytes: &[u8]) -> usize {
     len
 }
 
+// Dispatch only long runs here: shorter ones retain the inlined SSE2 path
+// rather than paying for a feature check, function call and AVX transition.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn find_boundary_avx2<const ALLOW_DEL: bool>(bytes: &[u8]) -> usize {
+    use std::arch::x86_64::*;
+
+    let mut i = 0;
+    let space = _mm256_set1_epi8(0x20);
+    let del = _mm256_set1_epi8(0x7f);
+    while i + 32 <= bytes.len() {
+        // SAFETY: the loop bounds every unaligned load to the input slice.
+        let word = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(i).cast()) };
+        let stop = if ALLOW_DEL {
+            _mm256_cmpgt_epi8(space, word)
+        } else {
+            _mm256_or_si256(_mm256_cmpgt_epi8(space, word), _mm256_cmpeq_epi8(word, del))
+        };
+        let mask = _mm256_movemask_epi8(stop) as u32;
+        if mask != 0 {
+            return i + mask.trailing_zeros() as usize;
+        }
+        i += 32;
+    }
+    // At most 31 bytes remain, so the dispatch threshold cannot recurse.
+    i + if ALLOW_DEL {
+        find_opaque_boundary(&bytes[i..])
+    } else {
+        find_non_printable(&bytes[i..])
+    }
+}
+
 /// First index whose byte ends a DCS passthrough run. The put class is
-/// `0x00..=0x17 | 0x19 | 0x1C..=0x7E`; everything else (CAN, SUB, ESC,
-/// DEL, and all bytes above 0x7E) is a terminator or ignored and goes
+/// `0x00..=0x17 | 0x19 | 0x1C..=0x7E | 0x80..=0xFF`; everything else
+/// (CAN, SUB, ESC, DEL) is a terminator or ignored and goes
 /// through the per-byte state machine.
 fn find_dcs_boundary(bytes: &[u8]) -> usize {
     const LO: u64 = 0x0101_0101_0101_0101;
@@ -1252,17 +1394,16 @@ fn find_dcs_boundary(bytes: &[u8]) -> usize {
     let len = bytes.len();
     while i + 8 <= len {
         let w = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
-        let ge80 = w & HI;
         let x = w ^ (LO * 0x7F);
         let eq7f = x.wrapping_sub(LO) & !x & HI;
-        let stop = ge80 | eq7f | eq(w, 0x18) | eq(w, 0x1A) | eq(w, 0x1B);
+        let stop = eq7f | eq(w, 0x18) | eq(w, 0x1A) | eq(w, 0x1B);
         if stop != 0 {
             return i + (stop.trailing_zeros() as usize) / 8;
         }
         i += 8;
     }
     while i < len {
-        if matches!(bytes[i], 0x18 | 0x1A | 0x1B | 0x7F) || bytes[i] >= 0x80 {
+        if matches!(bytes[i], 0x18 | 0x1A | 0x1B | 0x7F) {
             return i;
         }
         i += 1;
@@ -1409,6 +1550,15 @@ enum State {
 /// The methods correspond to actions described in
 /// <http://vt100.net/emu/dec_ansi_parser>.
 pub trait Perform {
+    /// Cancel an APC without applying its partially accumulated command.
+    /// The default retains the historical CAN marker for existing consumers.
+    fn apc_abort(&mut self) {
+        self.apc_put(0x18);
+        self.apc_end();
+    }
+    /// A bounded OSC accumulator discarded a packet. Transactional consumers
+    /// must abort staging rather than later publishing partial contents.
+    fn osc_discarded(&mut self, _command: Option<u16>, _bell_terminated: bool) {}
     /// Draw a character to the screen and update states.
     fn print(&mut self, _c: char) {}
 
@@ -1564,8 +1714,124 @@ pub trait Perform {
 mod tests {
     use super::*;
 
+    #[test]
+    fn byte_scanners_check_every_byte_at_unaligned_boundaries() {
+        for offset in 0..32 {
+            for len in [
+                0, 1, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129,
+            ] {
+                let mut bytes = vec![b'x'; offset + len];
+                assert_eq!(find_non_printable(&bytes[offset..]), len);
+                assert_eq!(find_opaque_boundary(&bytes[offset..]), len);
+                for position in 0..len {
+                    for value in 0..=255u8 {
+                        bytes[offset + position] = value;
+                        let expected = if (0x20..=0x7e).contains(&value) {
+                            len
+                        } else {
+                            position
+                        };
+                        assert_eq!(
+                            find_non_printable(&bytes[offset..]), expected,
+                            "offset {offset}, length {len}, position {position}, byte {value:02x}"
+                        );
+                        assert_eq!(
+                            find_opaque_boundary(&bytes[offset..]),
+                            if (0x20..=0x7f).contains(&value) { len } else { position },
+                            "C0 offset {offset}, length {len}, position {position}, byte {value:02x}"
+                        );
+                        assert_eq!(find_dcs_boundary(&bytes[offset..]), if matches!(value, 0x18 | 0x1a | 0x1b | 0x7f) { position } else { len }, "DCS offset {offset}, length {len}, position {position}, byte {value:02x}");
+                    }
+                    bytes[offset + position] = b'x';
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn program_status_accumulation_is_bounded_and_recovers_after_oversize() {
+        for chunk_size in [1, 17, 8192] {
+            let mut parser = Parser::new();
+            let mut dispatcher = Dispatcher::default();
+            parser.advance(&mut dispatcher, b"\x1b]7501;");
+            for chunk in vec![b'a'; 16 * 1024].chunks(chunk_size) {
+                parser.advance(&mut dispatcher, chunk);
+                assert!(
+                    parser.osc_raw.len() <= crate::program_status::MAX_SEQUENCE_BYTES
+                );
+            }
+            assert!(parser.osc_discarded);
+            parser.advance(&mut dispatcher, b"\x07");
+            assert!(dispatcher.dispatched.is_empty());
+            parser.advance(&mut dispatcher, b"\x1b]7501;state=done\x07");
+            assert_eq!(dispatcher.dispatched.len(), 1);
+        }
+    }
+
+    #[test]
+    fn oversized_osc_is_discarded_until_termination_across_read_boundaries() {
+        for header in [b"\x1b]0;".as_slice(), b"\x1b]8;;", b"\x1b]"] {
+            for terminator in [b"\x07".as_slice(), b"\x1b\\", b"\x18", b"\x1a"] {
+                for chunk_size in [1, 17, 8192, MAX_CONTROL_BYTES + 1] {
+                    let mut parser = Parser::new();
+                    let mut dispatcher = Dispatcher::default();
+                    parser.advance(&mut dispatcher, header);
+                    for chunk in vec![b'x'; MAX_CONTROL_BYTES + 1].chunks(chunk_size) {
+                        parser.advance(&mut dispatcher, chunk);
+                        assert!(parser.osc_raw.len() <= MAX_CONTROL_BYTES);
+                    }
+                    assert!(parser.osc_discarded);
+                    // Separators following a discarded verbatim OSC must not index
+                    // the buffer that was just released or dispatch a partial command.
+                    parser.advance(&mut dispatcher, b";8;;http://example.com;tail");
+                    assert!(dispatcher.dispatched.is_empty());
+                    parser.advance(&mut dispatcher, terminator);
+                    dispatcher.dispatched.clear();
+                    parser.advance(&mut dispatcher, b"ok\x1b]0;title\x07");
+                    assert_eq!(
+                        dispatcher.dispatched,
+                        vec![
+                            Sequence::Print('o'),
+                            Sequence::Print('k'),
+                            Sequence::Osc(vec![b"0".to_vec(), b"title".to_vec()], true),
+                        ]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn osc_limits_preserve_clipboard_and_image_payloads_and_release_large_buffers() {
+        for command in [b"52;c;".as_slice(), b"1337;File=:"] {
+            let mut parser = Parser::new();
+            let mut dispatcher = Dispatcher::default();
+            parser.advance(&mut dispatcher, b"\x1b]");
+            parser.advance(&mut dispatcher, command);
+            parser.advance(&mut dispatcher, &vec![b'a'; 128 * 1024]);
+            assert!(!parser.osc_discarded);
+            assert!(parser.osc_raw.overflow.capacity() > MAX_CONTROL_BYTES);
+            parser.advance(&mut dispatcher, b"\x07");
+            assert_eq!(dispatcher.dispatched.len(), 1);
+            assert_eq!(parser.osc_raw.overflow.capacity(), 0);
+        }
+
+        let mut parser = Parser::new();
+        let mut dispatcher = Dispatcher::default();
+        parser.advance(&mut dispatcher, b"\x1b]52;c;");
+        let prefix = parser.osc_raw.len();
+        parser.advance(&mut dispatcher, &vec![b'a'; MAX_CLIPBOARD_BYTES - prefix]);
+        assert_eq!(parser.osc_raw.len(), MAX_CLIPBOARD_BYTES);
+        assert!(!parser.osc_discarded);
+        parser.advance(&mut dispatcher, b"a");
+        assert!(parser.osc_discarded);
+        assert_eq!(parser.osc_raw.overflow.capacity(), 0);
+        parser.advance(&mut dispatcher, b"\x07");
+        assert!(dispatcher.dispatched.is_empty());
+    }
+
     /// The scalar and simdutf decoders implement the maximal-subpart /
-    /// U+FFFD / lone-C1 contract independently; with short runs routed
+    /// U+FFFD contract independently; with short runs routed
     /// scalar, only inputs >= SIMD_DECODE_MIN reach the simdutf error
     /// loop. Feed the same invalid corpus through both, below and above
     /// the threshold, and require identical output.
@@ -1573,7 +1839,7 @@ mod tests {
     #[test]
     fn scalar_and_simd_decode_agree() {
         let invalid_cases: &[&[u8]] = &[
-            b"\x80",                     // lone continuation (C1: keeps value)
+            b"\x80",                     // lone continuation (C1: U+FFFD)
             b"\xBF",                     // lone continuation (non-C1: U+FFFD)
             b"\xE2\x96",                 // truncated 3-byte sequence
             b"\xF0\x9F\x92",             // truncated 4-byte sequence
@@ -1596,6 +1862,280 @@ mod tests {
                     scalar.decode_buf, simd.decode_buf,
                     "decoder divergence on {case:?} pad {pad}",
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_utf8_dispatch_does_not_depend_on_read_boundaries() {
+        for invalid in [
+            b"\xed\xa0\x80".as_slice(),
+            b"\xe0\x80\x80",
+            b"\xf0\x80\x80\x80",
+            b"\xf4\x90\x80\x80",
+            b"\xe2(\xa1",
+            b"\xc0\xaf",
+        ] {
+            let input =
+                [b"prefix ".as_slice(), invalid, b" suffix\x1b[31mred\x1b[0m"].concat();
+            let mut expected = Dispatcher::default();
+            Parser::default().advance(&mut expected, &input);
+            for chunk_size in 1..=input.len() {
+                let mut actual = Dispatcher::default();
+                let mut parser = Parser::default();
+                for chunk in input.chunks(chunk_size) {
+                    parser.advance(&mut actual, chunk);
+                }
+                assert_eq!(
+                    actual.dispatched, expected.dispatched,
+                    "{invalid:02x?}, chunk {chunk_size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_byte_pairs_dispatch_identically_across_read_boundaries() {
+        // Exercise both the bulk decoder and the carried UTF-8 path. A valid
+        // suffix completes truncated input and verifies parser recovery, so
+        // matching an empty output cannot hide a stuck sequence.
+        for first in 0..=255u8 {
+            for second in 0..=255u8 {
+                let mut input = vec![b'x'; SIMD_DECODE_MIN + 4];
+                input.extend_from_slice(&[first, second]);
+                input.extend_from_slice(b"\x18\x1b[0mend");
+                let mut expected = Dispatcher::default();
+                Parser::new().advance(&mut expected, &input);
+                for split in SIMD_DECODE_MIN + 4..=SIMD_DECODE_MIN + 6 {
+                    let mut actual = Dispatcher::default();
+                    let mut parser = Parser::new();
+                    parser.advance(&mut actual, &input[..split]);
+                    parser.advance(&mut actual, &input[split..]);
+                    assert_eq!(
+                        actual.dispatched, expected.dispatched,
+                        "bytes {first:02x} {second:02x}, split {split}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_c1_controls_are_ignored_across_read_boundaries() {
+        for control in 0x80..=0x9f {
+            // Test both the valid-buffer and valid-prefix branches in the
+            // carried decoder, using an invalid byte after the completed C1.
+            for suffix in [b"".as_slice(), b"\xff"] {
+                let mut parser = Parser::new();
+                let mut dispatcher = Dispatcher::default();
+                parser.advance(&mut dispatcher, &[0xc2]);
+                parser.advance(&mut dispatcher, &[&[control], suffix].concat());
+                let expected = if suffix.is_empty() {
+                    vec![]
+                } else {
+                    vec![Sequence::Print('\u{fffd}')]
+                };
+                assert_eq!(dispatcher.dispatched, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn raw_c1_ground_bytes_are_invalid_utf8() {
+        // Ghostty stream.zig: ground-state UTF-8-decoded C1 controls are
+        // ignored, whereas raw C1 bytes produce replacement characters.
+        for control in 0x80..=0x9f {
+            for pad in [0, SIMD_DECODE_MIN + 4, DECODE_CHUNK] {
+                let mut input = "Ü".as_bytes().to_vec();
+                input.extend(vec![b'x'; pad]);
+                input.extend_from_slice(&[control, b'a']);
+                input.extend(vec![b'x'; pad]);
+                let mut expected = vec![Sequence::Print('Ü')];
+                expected.extend(vec![Sequence::Print('x'); pad]);
+                expected.extend([Sequence::Print('\u{fffd}'), Sequence::Print('a')]);
+                expected.extend(vec![Sequence::Print('x'); pad]);
+                for chunk_size in [1, 17, input.len()] {
+                    let mut parser = Parser::new();
+                    let mut dispatcher = Dispatcher::default();
+                    for chunk in input.chunks(chunk_size) {
+                        parser.advance(&mut dispatcher, chunk);
+                    }
+                    assert_eq!(
+                        dispatcher.dispatched, expected,
+                        "raw {control:02x}, pad {pad}, chunk {chunk_size}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dcs_high_bytes_are_payload_until_seven_bit_terminator() {
+        // Ghostty parse_table.zig: DCS passthrough high bytes are payload,
+        // including C1-range UTF-8 continuations such as the 9C in Ü.
+        let payload: Vec<u8> = (0x80..=0xff).collect();
+        let input = [b"\x1bPq".as_slice(), &payload, b"\x1b\\Z"].concat();
+        for chunk_size in [1, 2, 7, 16, input.len()] {
+            let mut parser = Parser::new();
+            let mut dispatcher = Dispatcher::default();
+            for chunk in input.chunks(chunk_size) {
+                parser.advance(&mut dispatcher, chunk);
+            }
+            let actual: Vec<u8> = dispatcher
+                .dispatched
+                .iter()
+                .filter_map(|s| {
+                    if let Sequence::DcsPut(byte) = s {
+                        Some(*byte)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(actual, payload, "payload with chunk size {chunk_size}");
+            assert_eq!(
+                dispatcher
+                    .dispatched
+                    .iter()
+                    .filter(|s| matches!(s, Sequence::DcsUnhook))
+                    .count(),
+                1
+            );
+            assert_eq!(dispatcher.dispatched.last(), Some(&Sequence::Print('Z')));
+        }
+    }
+
+    #[test]
+    fn c1_transitions_match_ghostty_non_ground_state_table() {
+        for state in [
+            State::Escape,
+            State::EscapeIntermediate,
+            State::CsiEntry,
+            State::CsiParam,
+            State::CsiIntermediate,
+            State::CsiIgnore,
+            State::DcsEntry,
+            State::DcsParam,
+            State::DcsIntermediate,
+            State::DcsIgnore,
+            State::DcsPassthrough,
+            State::OscString,
+            State::ApcString,
+            State::SosString,
+            State::PmString,
+        ] {
+            for byte in 0x80..=0x9f {
+                let expected = if matches!(
+                    state,
+                    State::DcsIgnore | State::DcsPassthrough | State::OscString
+                ) {
+                    state
+                } else {
+                    match byte {
+                        0x90 => State::DcsEntry,
+                        0x98 => State::SosString,
+                        0x9b => State::CsiEntry,
+                        0x9d => State::OscString,
+                        0x9e => State::PmString,
+                        0x9f => State::ApcString,
+                        _ => State::Ground,
+                    }
+                };
+                let mut parser = Parser::new();
+                parser.state = state;
+                let mut dispatcher = Dispatcher::default();
+                parser.advance(&mut dispatcher, &[byte]);
+                assert_eq!(parser.state, expected, "{state:?}, C1 {byte:02x}");
+            }
+        }
+    }
+
+    #[test]
+    fn dcs_subparameters_discard_the_string_without_hooking() {
+        for header in [":", "1:", "1:2", "1;:", "?1:2"] {
+            let input = [
+                b"\x1bP".as_slice(),
+                header.as_bytes(),
+                b"qhidden\x9b31m\x1b\\Z",
+            ]
+            .concat();
+            for split in 0..=input.len() {
+                let mut parser = Parser::new();
+                let mut dispatcher = Dispatcher::default();
+                parser.advance(&mut dispatcher, &input[..split]);
+                parser.advance(&mut dispatcher, &input[split..]);
+                assert_eq!(
+                    dispatcher.dispatched,
+                    [Sequence::Esc(vec![], false, b'\\'), Sequence::Print('Z')],
+                    "header {header}, split {split}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_c1_controls_are_ignored_in_bulk_utf8_runs() {
+        for control in 0x80..=0x9f {
+            for pad in [0, SIMD_DECODE_MIN + 4, DECODE_CHUNK] {
+                let mut input = "Ü".as_bytes().to_vec();
+                input.extend(vec![b'x'; pad]);
+                input.extend([0xc2, control]);
+                input.extend(vec![b'x'; pad]);
+                input.extend("\u{a0}".as_bytes());
+                let mut expected = vec![Sequence::Print('Ü')];
+                expected.extend(vec![Sequence::Print('x'); pad * 2]);
+                expected.push(Sequence::Print('\u{a0}'));
+                for chunk_size in [1, 17, input.len()] {
+                    let mut parser = Parser::new();
+                    let mut dispatcher = Dispatcher::default();
+                    for chunk in input.chunks(chunk_size) {
+                        parser.advance(&mut dispatcher, chunk);
+                    }
+                    assert_eq!(
+                        dispatcher.dispatched, expected,
+                        "encoded {control:02x}, pad {pad}, chunk {chunk_size}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn protocol_dispatch_does_not_depend_on_read_boundaries() {
+        let fragments: &[&[u8]] = &[
+            b"plain text\r\n",
+            "é👩\u{200d}💻".as_bytes(),
+            b"\xc2\x80\xc2\x9f",
+            b"\xf0\x9f\x92",
+            b"\xed\xa0\x80\xe0\x80\xbf",
+            b"\x1b[38:2::255:128:0mcolor\x1b[0m",
+            b"\x1b]8;id=test;https://example.test\x1b\\link\x1b]8;;\x07",
+            b"\x1b]7501;state=running\x07",
+            b"\x1bP1;2$qpayload\x1b\\",
+            b"\x1b_Ga=T,f=32;YWJj\x1b\\",
+            b"\x1bXignored\x1b\\\x1b^private\x1b\\",
+            b"\x1b]2;cancelled\x18",
+            b"\x1b[1;2\x1a",
+            b"\x1b]2;unfinished\x1b",
+        ];
+        // Compose fragments so an incomplete sequence also encounters every
+        // other kind of sequence. Compare semantic callbacks, not batching:
+        // Dispatcher expands print_str/print_codepoints through Perform defaults.
+        for (a, first) in fragments.iter().enumerate() {
+            for (b, second) in fragments.iter().enumerate() {
+                let input = [*first, *second, b"\x18\x1b[0mend"].concat();
+                let mut expected = Dispatcher::default();
+                Parser::new().advance(&mut expected, &input);
+                for split in 0..=input.len() {
+                    let mut actual = Dispatcher::default();
+                    let mut parser = Parser::new();
+                    parser.advance(&mut actual, &input[..split]);
+                    parser.advance(&mut actual, &input[split..]);
+                    assert_eq!(
+                        actual.dispatched, expected.dispatched,
+                        "fragments {a}, {b}, split {split}"
+                    );
+                }
             }
         }
     }
@@ -1623,10 +2163,10 @@ mod tests {
 
     /// Non-circular exhaustive check of the boundary scanners against
     /// the per-byte state machine: for every byte value, a byte is
-    /// "put class" exactly when feeding it to the real handler grows
-    /// the payload, and the scanner must classify it as non-boundary
-    /// exactly then. Both the SWAR lane (16-byte input) and the scalar
-    /// tail (1-byte input) are checked.
+    /// "put class" when feeding it to the real handler grows the payload.
+    /// Opaque C0 payload bytes deliberately take the per-byte path; other
+    /// payload bytes must not stop the scanner. Both the SWAR lane (16-byte
+    /// input) and the scalar tail (1-byte input) are checked.
     #[test]
     fn boundary_scanners_match_state_machine() {
         for b in 0..=255u8 {
@@ -1665,13 +2205,14 @@ mod tests {
                     _ => p.advance_pm_string(&mut d, b),
                 }
                 let events = &d.dispatched[before..];
-                let put = events.len() == 1
+                let put = b >= 0x20
+                    && events.len() == 1
                     && matches!(events[0], Sequence::OpaquePut(..))
                     && p.state != State::Ground
                     && p.state != State::Escape;
-                assert_eq!(find_string_c0(&[b]) == 1, put, "{kind} byte {b:#04x}");
+                assert_eq!(find_opaque_boundary(&[b]) == 1, put, "{kind} byte {b:#04x}");
                 assert_eq!(
-                    find_string_c0(&[b; 16]) == 16,
+                    find_opaque_boundary(&[b; 16]) == 16,
                     put,
                     "{kind} swar byte {b:#04x}"
                 );
@@ -1710,12 +2251,12 @@ mod tests {
             // OSC with many params and an abort.
             b"\x1b]4;1;rgb:aa/bb/cc;2;rgb:dd/ee/ff\x07".to_vec(),
             b"\x1b]0;title\x18after-can".to_vec(),
-            // Kitty APC: ST, BEL, and CAN termination (CAN puts itself).
+            // Kitty APC: ST/CAN termination and embedded BEL payload.
             format!("\x1b_Gf=100,a=T;{big}\x1b\\tail").into_bytes(),
             format!("\x1b_G{big}\x07").into_bytes(),
             b"\x1b_Gpayload\x18rest".to_vec(),
             // DCS sixel: C0s inside payload are put, DEL and >0x7E are
-            // ignored, ST via ESC-backslash and via 8-bit 0x9C.
+            // ignored, ST via ESC-backslash and embedded high-byte payload.
             b"\x1bP0;1q#0;2;0;0;0#1~~@@\x09data\x7fmore\x1b\\after".to_vec(),
             b"\x1bPq~~\xc3\xa9~~\x9cafter".to_vec(),
             b"\x1bPqdata\x1arest".to_vec(),
@@ -1783,6 +2324,34 @@ mod tests {
         OpaquePut(OpaqueSequenceKind, u8),
         OpaqueEnd(OpaqueSequenceKind),
         DcsUnhook,
+    }
+
+    #[test]
+    fn adjacent_escape_introducers_match_split_state_transitions() {
+        let streams: &[&[u8]] = &[
+            b"text\x1b[1;38;2;120;80;40mcolor\x1b[0m\r\n",
+            b"\x1b[?2027h\x1b[4:3m\x1b[2 q\x1b[m",
+            b"\x1b[65534;65535;65536;999999999999999999999999m",
+            b"\x1b[38:2:65536:999999999999999999:0m",
+            b"\x1b[1;2\x18\x1b[3m\x1b[4\x1b[5m",
+            b"\x1b]8;id=link;https://example.org\x1b\\label\x1b]8;;\x07",
+            b"\x1b]0;title\x07\x1b[31m\x1b]9;4;1;20\x1b\\",
+            b"\x1b[1  q\x1b]0;\x18\x1b[?25h\x1b\x1b[0m",
+        ];
+        for stream in streams {
+            let mut reference = Dispatcher::default();
+            let mut parser = Parser::new();
+            for byte in *stream {
+                parser.advance(&mut reference, &[*byte]);
+            }
+            for split in 0..=stream.len() {
+                let mut actual = Dispatcher::default();
+                let mut parser = Parser::new();
+                parser.advance(&mut actual, &stream[..split]);
+                parser.advance(&mut actual, &stream[split..]);
+                assert_eq!(actual.dispatched, reference.dispatched, "split {split}");
+            }
+        }
     }
 
     impl Perform for Dispatcher {
@@ -1927,6 +2496,126 @@ mod tests {
                 assert!(params.iter().all(Vec::is_empty));
             }
             _ => panic!("expected osc sequence"),
+        }
+    }
+
+    #[test]
+    fn osc_parameter_counts_match_at_every_split() {
+        for count in 1..=MAX_OSC_PARAMS + 2 {
+            let params: Vec<_> = (0..count).map(|i| format!("p{i}")).collect();
+            let expected: Vec<_> = params
+                .iter()
+                .take(MAX_OSC_PARAMS)
+                .map(|param| param.as_bytes().to_vec())
+                .collect();
+            for terminator in [0x07, 0x1b] {
+                let mut input = format!("\x1b]{}", params.join(";")).into_bytes();
+                input.push(terminator);
+                for split in 0..=input.len() {
+                    let mut parser = Parser::default();
+                    let mut dispatcher = Dispatcher::default();
+                    parser.advance(&mut dispatcher, &input[..split]);
+                    parser.advance(&mut dispatcher, &input[split..]);
+                    assert_eq!(
+                        dispatcher.dispatched,
+                        vec![Sequence::Osc(expected.clone(), terminator == 0x07)],
+                        "count={count} terminator={terminator} split={split}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn osc_verbatim_tails_survive_every_read_split() {
+        let tail = format!("préfix中{};", ";;a".repeat(MAX_OSC_PARAMS + 3));
+        for (header, mut expected) in [
+            ("7;", vec![b"7".to_vec()]),
+            (
+                "8;id=one:other=two;",
+                vec![b"8".to_vec(), b"id=one:other=two".to_vec()],
+            ),
+            ("9;9;", vec![b"9".to_vec(), b"9".to_vec()]),
+        ] {
+            expected.push(tail.as_bytes().to_vec());
+            for terminator in ["\x07", "\x1b\\"] {
+                let input = format!("\x1b]{header}{tail}{terminator}Z\x1b]9;4;1;50\x07");
+                for split in 0..=input.len() {
+                    let mut dispatcher = Dispatcher::default();
+                    let mut parser = Parser::default();
+                    parser.advance(&mut dispatcher, &input.as_bytes()[..split]);
+                    parser.advance(&mut dispatcher, &input.as_bytes()[split..]);
+                    let osc: Vec<_> = dispatcher
+                        .dispatched
+                        .iter()
+                        .filter_map(|s| match s {
+                            Sequence::Osc(params, _) => Some(params),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(
+                        osc,
+                        vec![
+                            &expected,
+                            &vec![
+                                b"9".to_vec(),
+                                b"4".to_vec(),
+                                b"1".to_vec(),
+                                b"50".to_vec()
+                            ]
+                        ],
+                        "{header}, split={split}"
+                    );
+                    assert!(dispatcher.dispatched.contains(&Sequence::Print('Z')));
+                }
+                let mut bytewise = Dispatcher::default();
+                let mut parser = Parser::default();
+                for byte in input.bytes() {
+                    parser.advance(&mut bytewise, &[byte]);
+                }
+                assert!(bytewise
+                    .dispatched
+                    .contains(&Sequence::Osc(expected.clone(), terminator == "\x07")));
+            }
+        }
+    }
+
+    #[test]
+    fn osc_verbatim_tails_keep_empty_payloads() {
+        for (input, expected) in [
+            (b"\x1b]7;\x07".as_slice(), vec![b"7".to_vec(), vec![]]),
+            (
+                b"\x1b]8;id=one;\x07",
+                vec![b"8".to_vec(), b"id=one".to_vec(), vec![]],
+            ),
+            (b"\x1b]9;9;\x07", vec![b"9".to_vec(), b"9".to_vec(), vec![]]),
+        ] {
+            let mut dispatcher = Dispatcher::default();
+            Parser::default().advance(&mut dispatcher, input);
+            assert_eq!(dispatcher.dispatched[0], Sequence::Osc(expected, true));
+        }
+    }
+
+    #[test]
+    fn osc_verbatim_tail_survives_inline_buffer_overflow() {
+        let uri = format!("https://example.com/{};é", ";x".repeat(OSC_FIXED_LEN));
+        let input = format!("\x1b]8;;{uri}\x1b\\\x1b]8;;\x07");
+        for chunk_size in [1, 2, 17, input.len()] {
+            let mut dispatcher = Dispatcher::default();
+            let mut parser = Parser::default();
+            for chunk in input.as_bytes().chunks(chunk_size) {
+                parser.advance(&mut dispatcher, chunk);
+            }
+            assert_eq!(
+                dispatcher.dispatched[0],
+                Sequence::Osc(
+                    vec![b"8".to_vec(), vec![], uri.as_bytes().to_vec()],
+                    false
+                )
+            );
+            assert!(dispatcher
+                .dispatched
+                .contains(&Sequence::Osc(vec![b"8".to_vec(), vec![], vec![]], true)));
         }
     }
 
@@ -2202,13 +2891,13 @@ mod tests {
 
     #[test]
     fn dcs_reset() {
-        const INPUT: &[u8] = b"\x1b[3;1\x1bP1$tx\x9c";
+        const INPUT: &[u8] = b"\x1b[3;1\x1bP1$tx\x1b\\";
         let mut dispatcher = Dispatcher::default();
         let mut parser = Parser::default();
 
         parser.advance(&mut dispatcher, INPUT);
 
-        assert_eq!(dispatcher.dispatched.len(), 3);
+        assert_eq!(dispatcher.dispatched.len(), 4);
         match &dispatcher.dispatched[0] {
             Sequence::DcsHook(params, intermediates, ignore, _) => {
                 assert_eq!(intermediates, b"$");
@@ -2219,17 +2908,21 @@ mod tests {
         }
         assert_eq!(dispatcher.dispatched[1], Sequence::DcsPut(b'x'));
         assert_eq!(dispatcher.dispatched[2], Sequence::DcsUnhook);
+        assert_eq!(
+            dispatcher.dispatched[3],
+            Sequence::Esc(vec![], false, b'\\')
+        );
     }
 
     #[test]
     fn parse_dcs() {
-        const INPUT: &[u8] = b"\x1bP0;1|17/ab\x9c";
+        const INPUT: &[u8] = b"\x1bP0;1|17/ab\x1b\\";
         let mut dispatcher = Dispatcher::default();
         let mut parser = Parser::default();
 
         parser.advance(&mut dispatcher, INPUT);
 
-        assert_eq!(dispatcher.dispatched.len(), 7);
+        assert_eq!(dispatcher.dispatched.len(), 8);
         match &dispatcher.dispatched[0] {
             Sequence::DcsHook(params, _, _, c) => {
                 assert_eq!(params, &[[0], [1]]);
@@ -2241,6 +2934,10 @@ mod tests {
             assert_eq!(dispatcher.dispatched[1 + i], Sequence::DcsPut(*byte));
         }
         assert_eq!(dispatcher.dispatched[6], Sequence::DcsUnhook);
+        assert_eq!(
+            dispatcher.dispatched[7],
+            Sequence::Esc(vec![], false, b'\\')
+        );
     }
 
     #[test]
@@ -2340,18 +3037,18 @@ mod tests {
         expect_opaque_sequence(
             b"\x1bXTest\x20\xFF;xyz\x1b\\",
             OpaqueSequenceKind::Sos,
-            b"Test\x20\xFF;xyz",
+            b"Test\x20;xyz",
             ST_ESC_SEQUENCE,
         );
     }
 
     #[test]
-    fn sos_bell_terminated() {
+    fn sos_bell_is_payload_until_st() {
         expect_opaque_sequence(
-            b"\x1bXTest\x20\xFF;xyz\x07",
+            b"\x1bXTest\x20\xFF;xyz\x07\x1b\\",
             OpaqueSequenceKind::Sos,
-            b"Test\x20\xFF;xyz",
-            &[],
+            b"Test\x20;xyz\x07",
+            ST_ESC_SEQUENCE,
         );
     }
 
@@ -2370,18 +3067,18 @@ mod tests {
         expect_opaque_sequence(
             b"\x1b^Test\x20\xFF;xyz\x1b\\",
             OpaqueSequenceKind::Pm,
-            b"Test\x20\xFF;xyz",
+            b"Test\x20;xyz",
             ST_ESC_SEQUENCE,
         );
     }
 
     #[test]
-    fn pm_bell_terminated() {
+    fn pm_bell_is_payload_until_st() {
         expect_opaque_sequence(
-            b"\x1b^Test\x20\xFF;xyz\x07",
+            b"\x1b^Test\x20\xFF;xyz\x07\x1b\\",
             OpaqueSequenceKind::Pm,
-            b"Test\x20\xFF;xyz",
-            &[],
+            b"Test\x20;xyz\x07",
+            ST_ESC_SEQUENCE,
         );
     }
 
@@ -2458,18 +3155,18 @@ mod tests {
         expect_opaque_sequence(
             b"\x1b_Test\x20\xFF;xyz\x1b\\",
             OpaqueSequenceKind::Apc,
-            b"Test\x20\xFF;xyz",
+            b"Test\x20;xyz",
             ST_ESC_SEQUENCE,
         );
     }
 
     #[test]
-    fn apc_bell_terminated() {
+    fn apc_bell_is_payload_until_st() {
         expect_opaque_sequence(
-            b"\x1b_Test\x20\xFF;xyz\x07",
+            b"\x1b_Test\x20\xFF;xyz\x07\x1b\\",
             OpaqueSequenceKind::Apc,
-            b"Test\x20\xFF;xyz",
-            &[],
+            b"Test\x20;xyz\x07",
+            ST_ESC_SEQUENCE,
         );
     }
 
@@ -2554,6 +3251,20 @@ mod tests {
     }
 
     #[test]
+    fn partial_utf8_preserves_ascii_before_the_next_partial_character() {
+        for input in ["éC\u{301}", "ĸA界", "éAB\u{301}"] {
+            let expected: Vec<_> = input.chars().map(Sequence::Print).collect();
+            for split in 0..=input.len() {
+                let mut dispatcher = Dispatcher::default();
+                let mut parser = Parser::default();
+                parser.advance(&mut dispatcher, &input.as_bytes()[..split]);
+                parser.advance(&mut dispatcher, &input.as_bytes()[split..]);
+                assert_eq!(dispatcher.dispatched, expected, "{input:?}, split {split}");
+            }
+        }
+    }
+
+    #[test]
     fn partial_invalid_utf8() {
         const INPUT: &[u8] = b"a\xEF\xBCb";
 
@@ -2616,14 +3327,9 @@ mod tests {
         assert_eq!(dispatcher.dispatched.len(), 11);
         assert_eq!(dispatcher.dispatched[0], Sequence::Execute(0));
         assert_eq!(dispatcher.dispatched[1], Sequence::Execute(31));
-        assert_eq!(dispatcher.dispatched[2], Sequence::Execute(128));
-        assert_eq!(dispatcher.dispatched[3], Sequence::Execute(144));
-        assert_eq!(dispatcher.dispatched[4], Sequence::Execute(152));
-        assert_eq!(dispatcher.dispatched[5], Sequence::Execute(155));
-        assert_eq!(dispatcher.dispatched[6], Sequence::Execute(156));
-        assert_eq!(dispatcher.dispatched[7], Sequence::Execute(157));
-        assert_eq!(dispatcher.dispatched[8], Sequence::Execute(158));
-        assert_eq!(dispatcher.dispatched[9], Sequence::Execute(159));
+        for sequence in &dispatcher.dispatched[2..10] {
+            assert_eq!(*sequence, Sequence::Print('\u{fffd}'));
+        }
         assert_eq!(dispatcher.dispatched[10], Sequence::Print('a'));
     }
 

@@ -22,6 +22,7 @@ pub mod error;
 pub mod event;
 pub mod grapheme_lut;
 pub mod performer;
+pub mod program_status;
 pub mod selection;
 pub mod simd_base64;
 pub mod simd_utf8;

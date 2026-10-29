@@ -15,9 +15,10 @@ use regex_automata::{Anchored, Input, MatchKind};
 use tracing::{debug, warn};
 
 use crate::crosswords::grid::{BidirectionalIterator, Dimensions, GridIterator, Indexed};
+use crate::crosswords::snapshot::SnapshotCells;
 use crate::crosswords::square::{Square, Wide};
 use crate::crosswords::Crosswords;
-use crate::crosswords::{Boundary, Column, Direction, Pos, Side};
+use crate::crosswords::{Boundary, Column, Direction, Line, Pos, Side};
 
 /// Used to match equal brackets, when performing a bracket-pair selection.
 const BRACKET_PAIRS: [(char, char); 4] = [('(', ')'), ('[', ']'), ('{', '}'), ('<', '>')];
@@ -31,6 +32,23 @@ pub struct RegexSearch {
     left_rdfa: LazyDfa,
     right_rdfa: LazyDfa,
     right_fdfa: LazyDfa,
+    literal: bool,
+    visible: VisibleMatches,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CachedMatches {
+    hash: u64,
+    columns: usize,
+    cells: SnapshotCells,
+    matches: Vec<Match>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct VisibleMatches {
+    groups: Vec<CachedMatches>,
+    scratch: Vec<CachedMatches>,
+    cells: Vec<Square>,
 }
 
 impl RegexSearch {
@@ -90,7 +108,108 @@ impl RegexSearch {
             left_rdfa,
             right_fdfa,
             right_rdfa,
+            literal: !search.is_empty() && regex::escape(search) == search,
+            visible: VisibleMatches::default(),
         })
+    }
+
+    /// Visible matches, retaining only the previous viewport's logical groups.
+    /// Literal queries reuse unchanged logical groups. Patterns with regex
+    /// syntax keep the full iterator, including its complexity limits,
+    /// anchors, and empty-match handling.
+    /// Content keys survive scrolling without adding revision work to PTY writes.
+    pub fn visible_matches<T: event::EventListener>(
+        &mut self,
+        term: &Crosswords<T>,
+        extra_lines: usize,
+    ) -> Vec<Match> {
+        let viewport_start = Line(-(term.grid.display_offset() as i32));
+        let viewport_end = viewport_start + term.bottommost_line();
+        let mut start = term.line_search_left(Pos::new(viewport_start, Column(0)));
+        let mut end = term.line_search_right(Pos::new(viewport_end, Column(0)));
+        start.row = start.row.max(viewport_start - extra_lines);
+        end.row = end.row.min(viewport_end + extra_lines);
+        let columns = term.columns();
+        if self
+            .visible
+            .groups
+            .first()
+            .is_some_and(|entry| entry.columns != columns)
+        {
+            self.visible = VisibleMatches::default();
+        }
+        // A fully rewritten viewport has no sparse work to reuse. Keep the
+        // contiguous DFA scan; normal snapshots already maintain these bits.
+        let all_dirty = !self.visible.groups.is_empty()
+            && (start.row.0..=end.row.0).all(|row| term.grid[Line(row)].dirty);
+        if !self.literal || all_dirty {
+            return RegexIter::new(start, end, Direction::Right, term, self)
+                .skip_while(|m| m.end().row < viewport_start)
+                .take_while(|m| m.start().row <= viewport_end)
+                .collect();
+        }
+        let mut cache = mem::take(&mut self.visible);
+        let mut old = mem::take(&mut cache.groups);
+        let mut current = mem::take(&mut cache.scratch);
+        current.clear();
+        let mut output = Vec::new();
+
+        while start.row <= end.row {
+            let mut group_end = term.line_search_right(start);
+            if group_end.row >= end.row {
+                group_end = end;
+            }
+            cache.cells.clear();
+            for row in start.row.0..=group_end.row.0 {
+                cache.cells.extend_from_slice(&term.grid[Line(row)].inner);
+            }
+            let hash = SnapshotCells::hash(&cache.cells);
+            let found = old.iter().position(|entry| {
+                entry.hash == hash
+                    && entry.columns == columns
+                    && entry
+                        .cells
+                        .matches(&cache.cells, |id| term.grid.extras_table.shared(id))
+            });
+            let entry = match found {
+                Some(index) => old.swap_remove(index),
+                None => {
+                    let mut entry = old.pop().unwrap_or_default();
+                    entry.hash = hash;
+                    entry.columns = columns;
+                    entry
+                        .cells
+                        .update(&cache.cells, |id| term.grid.extras_table.shared(id));
+                    entry.matches.clear();
+                    entry.matches.extend(
+                        RegexIter::new(start, group_end, Direction::Right, term, self)
+                            .map(|m| {
+                                let mut first = *m.start();
+                                let mut last = *m.end();
+                                first.row -= start.row.0;
+                                last.row -= start.row.0;
+                                first..=last
+                            }),
+                    );
+                    entry
+                }
+            };
+            output.extend(entry.matches.iter().filter_map(|m| {
+                let mut first = *m.start();
+                let mut last = *m.end();
+                first.row += start.row.0;
+                last.row += start.row.0;
+                (last.row >= viewport_start && first.row <= viewport_end)
+                    .then_some(first..=last)
+            }));
+            current.push(entry);
+            start = Pos::new(group_end.row + 1, Column(0));
+        }
+        old.clear();
+        cache.groups = current;
+        cache.scratch = old;
+        self.visible = cache;
+        output
     }
 }
 
@@ -331,8 +450,7 @@ impl<T: event::EventListener> Crosswords<T> {
 
         let mut cell = iter.square();
         self.skip_fullwidth(&mut iter, &mut cell, regex.direction);
-        let mut cell_chars: Vec<char> = Vec::with_capacity(4);
-        self.cell_search_chars(cell, regex.direction, &mut cell_chars);
+        let (mut base, mut cluster) = self.cell_search_chars(cell);
         let mut char_idx = 0;
         let mut last_wrapped = iter.square().wrapline();
 
@@ -355,8 +473,12 @@ impl<T: event::EventListener> Crosswords<T> {
             // text (a decomposed `é`, a ZWJ emoji) can match. Match
             // positions stay cell-granular: the whole cluster is one
             // grid position.
-            'chars: while char_idx < cell_chars.len() {
-                let c = cell_chars[char_idx];
+            'chars: while char_idx <= cluster.len() {
+                let index = match regex.direction {
+                    Direction::Right => char_idx,
+                    Direction::Left => cluster.len() - char_idx,
+                };
+                let c = if index == 0 { base } else { cluster[index - 1] };
                 // Convert char to array of bytes.
                 let mut buf = [0; 4];
                 let utf8_len = c.encode_utf8(&mut buf).len();
@@ -445,7 +567,7 @@ impl<T: event::EventListener> Crosswords<T> {
 
             self.skip_fullwidth(&mut iter, &mut cell, regex.direction);
 
-            self.cell_search_chars(cell, regex.direction, &mut cell_chars);
+            (base, cluster) = self.cell_search_chars(cell);
             char_idx = 0;
             let wrapped = iter.square().wrapline();
 
@@ -481,35 +603,27 @@ impl<T: event::EventListener> Crosswords<T> {
     }
 
     /// The characters a cell contributes to a regex search: its base
-    /// codepoint plus attached cluster codepoints, reversed for a
-    /// leftward search (the byte loop reverses within each char). A
+    /// codepoint plus borrowed attached cluster codepoints. The caller walks
+    /// these in either direction without copying or reversing the cluster. A
     /// bg-only cell stores color where the codepoint lives and reads
     /// as a blank, not as the color bits decoded into a char.
-    fn cell_search_chars(
-        &self,
-        cell: &Square,
-        direction: Direction,
-        out: &mut Vec<char>,
-    ) {
-        out.clear();
+    fn cell_search_chars(&self, cell: &Square) -> (char, &[char]) {
         if !matches!(
             cell.content_tag(),
             crate::crosswords::square::ContentTag::Codepoint
         ) {
-            out.push(' ');
-            return;
+            return (' ', &[]);
         }
-        out.push(cell.c());
-        if cell.has_grapheme() {
-            if let Some(id) = cell.extras_id() {
-                if let Some(extras) = self.grid.extras_table.get(id) {
-                    out.extend(extras.zerowidth.iter().copied());
-                }
-            }
-        }
-        if direction == Direction::Left {
-            out.reverse();
-        }
+        let cluster = cell
+            .has_grapheme()
+            .then(|| {
+                cell.extras_id()
+                    .and_then(|id| self.grid.extras_table.get(id))
+            })
+            .flatten()
+            .map(|extras| extras.zerowidth.as_slice())
+            .unwrap_or(&[]);
+        (cell.c(), cluster)
     }
 
     /// Advance a grid iterator over fullwidth characters.
@@ -796,6 +910,90 @@ mod tests {
     use crate::crosswords::CursorShape;
     use crate::event::VoidListener;
     use rio_unicode::UnicodeWidthChar;
+
+    fn uncached_visible(
+        term: &Crosswords<VoidListener>,
+        regex: &mut RegexSearch,
+        extra_lines: usize,
+    ) -> Vec<Match> {
+        let first = Line(-(term.grid.display_offset() as i32));
+        let last = first + term.bottommost_line();
+        let mut start = term.line_search_left(Pos::new(first, Column(0)));
+        let mut end = term.line_search_right(Pos::new(last, Column(0)));
+        start.row = start.row.max(first - extra_lines);
+        end.row = end.row.min(last + extra_lines);
+        RegexIter::new(start, end, Direction::Right, term, regex)
+            .skip_while(|m| m.end().row < first)
+            .take_while(|m| m.start().row <= last)
+            .collect()
+    }
+
+    #[test]
+    fn visible_matches_follow_edits_wraps_and_regex_fallback() {
+        for pattern in [
+            "hello",
+            "foo",
+            "FOO",
+            "日本",
+            "missing",
+            "hello|foo",
+            "a*",
+            "^hello.*foo$",
+            "(?s:hello.*foo)",
+        ] {
+            let mut term = mock_term("hello foo\r\nhello bar\nhello foo\r\n日本 hello");
+            let mut cached = RegexSearch::new(pattern).unwrap();
+            let mut oracle = RegexSearch::new(pattern).unwrap();
+            for iteration in 0..12 {
+                for limit in [0, 2, 100] {
+                    let expected = uncached_visible(&term, &mut oracle, limit);
+                    assert_eq!(
+                        cached.visible_matches(&term, limit),
+                        expected,
+                        "{pattern}, edit {iteration}"
+                    );
+                    assert_eq!(
+                        cached.visible_matches(&term, limit),
+                        expected,
+                        "{pattern}, repeat {iteration}"
+                    );
+                }
+                term.grid[Line(0)][Column(0)].set_c(if iteration % 2 == 0 {
+                    'H'
+                } else {
+                    'h'
+                });
+                let last = term.grid.last_column();
+                term.grid[Line(1)][last].set_wrapline(iteration % 2 == 0);
+                term.grid.raw.swap(Line(0), Line(2));
+            }
+        }
+    }
+
+    #[test]
+    fn visible_matches_follow_cluster_replacement_without_snapshots() {
+        use crate::performer::handler::Processor;
+        let mut term =
+            mock_term("                \r\n                \r\n                ");
+        let mut processor = Processor::default();
+        let mut cached = RegexSearch::new("e\u{301}").unwrap();
+        let mut oracle = RegexSearch::new("e\u{301}").unwrap();
+        term.grid[Line(2)].dirty = false;
+        for i in 0..10 {
+            processor.advance(
+                &mut term,
+                if i % 2 == 0 {
+                    "\x1b[1;1He\u{301}\x1b[2;1He\u{308}".as_bytes()
+                } else {
+                    "\x1b[1;1He\u{308}\x1b[2;1He\u{301}".as_bytes()
+                },
+            );
+            assert_eq!(
+                cached.visible_matches(&term, 100),
+                uncached_visible(&term, &mut oracle, 100)
+            );
+        }
+    }
 
     pub fn mock_term(content: &str) -> Crosswords<VoidListener> {
         let lines: Vec<&str> = content.split('\n').collect();

@@ -56,6 +56,32 @@ extern "C" {
     fn ptsname(fd: *mut libc::c_int) -> *mut libc::c_char;
 }
 
+fn expand_tilde(dir: &str) -> Option<String> {
+    if dir == "~" || dir.starts_with("~/") {
+        match std::env::var("HOME") {
+            Ok(home) => Some(format!("{home}{}", &dir[1..])),
+            Err(_) => {
+                tracing::warn!(
+                    "working-dir {dir:?} needs HOME; inheriting the current directory"
+                );
+                None
+            }
+        }
+    } else {
+        Some(dir.to_owned())
+    }
+}
+
+fn resolve_working_dir(dir: &Option<String>) -> Option<String> {
+    let expanded = expand_tilde(dir.as_deref()?)?;
+    if std::path::Path::new(&expanded).is_dir() {
+        Some(expanded)
+    } else {
+        tracing::warn!("working-dir {expanded:?} is not a directory; inheriting the current directory");
+        None
+    }
+}
+
 /// Export `envs` in the forked child before exec. Runs post-fork, so
 /// keep it to setenv: the allocations match what `default_shell_command`
 /// already does on this path.
@@ -414,35 +440,22 @@ impl ShellUser {
     /// look for shell, username, longname, and home dir in the respective environment variables
     /// before falling back on looking in to `passwd`.
     fn from_env() -> Result<Self, Error> {
+        let user = std::env::var("USER").ok();
+        let home = std::env::var("HOME").ok();
+        let shell = std::env::var("SHELL").ok();
         let mut buf = [0; 1024];
-        let pw = get_pw_entry(&mut buf);
-
-        let user = match std::env::var("USER") {
-            Ok(user) => user,
-            Err(_) => match pw {
-                Ok(ref pw) => pw.name.to_owned(),
-                Err(err) => return Err(err),
-            },
+        // NSS can contact external services. Resolve passwd only if an
+        // environment value is missing, and share that one lookup.
+        let pw = if user.is_none() || home.is_none() || shell.is_none() {
+            Some(get_pw_entry(&mut buf)?)
+        } else {
+            None
         };
-
-        let home = match std::env::var("HOME") {
-            Ok(home) => home,
-            Err(_) => match pw {
-                Ok(ref pw) => pw.dir.to_owned(),
-                Err(err) => return Err(err),
-            },
-        };
-
-        #[allow(unused_mut)]
-        let mut shell = match std::env::var("SHELL") {
-            Ok(env_shell) => env_shell,
-            Err(_) => match pw {
-                Ok(ref pw) => pw.shell.to_owned(),
-                Err(err) => return Err(err),
-            },
-        };
-
-        Ok(Self { user, home, shell })
+        Ok(Self {
+            user: user.unwrap_or_else(|| pw.as_ref().unwrap().name.to_owned()),
+            home: home.unwrap_or_else(|| pw.as_ref().unwrap().dir.to_owned()),
+            shell: shell.unwrap_or_else(|| pw.as_ref().unwrap().shell.to_owned()),
+        })
     }
 }
 
@@ -513,6 +526,10 @@ pub fn create_pty_with_spawn(
     width: u16,
     height: u16,
 ) -> Result<Pty, Error> {
+    // Flatpak host paths may be absent in the sandbox. Expand here and
+    // validate only when the directory is used by a local child below.
+    let working_directory = working_directory.as_deref().and_then(expand_tilde);
+
     #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
     let mut is_controling_terminal = true;
 
@@ -573,6 +590,7 @@ pub fn create_pty_with_spawn(
 
     // No program means the caller wants the user's default shell, which is the
     // only case that goes through `login`. A named program is spawned as given.
+    #[cfg(target_os = "macos")]
     let uses_default_shell = shell.is_none();
     let shell_program = shell.unwrap_or(&user.shell);
 
@@ -628,7 +646,7 @@ pub fn create_pty_with_spawn(
                 }
             }
 
-            if let Some(directory) = working_directory {
+            if let Some(directory) = &working_directory {
                 with_args.push(format!(
                     "--directory={}",
                     std::path::Path::new(directory).display()
@@ -697,8 +715,10 @@ pub fn create_pty_with_spawn(
     }
 
     // Handle set working directory option.
-    if let Some(dir) = &working_directory {
-        builder.current_dir(dir);
+    if is_controling_terminal {
+        if let Some(dir) = resolve_working_dir(&working_directory) {
+            builder.current_dir(dir);
+        }
     }
 
     // Prepare signal handling before spawning child.
@@ -757,15 +777,21 @@ pub fn default_shell_program() -> String {
         .unwrap_or_default()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn create_pty_with_fork(
     shell: Option<&str>,
     args: &[String],
+    working_directory: &Option<String>,
     envs: &[(String, String)],
     columns: u16,
     rows: u16,
     width: u16,
     height: u16,
 ) -> Result<Pty, Error> {
+    let working_directory = resolve_working_dir(working_directory)
+        .map(CString::new)
+        .transpose()
+        .map_err(|err| Error::new(io::ErrorKind::InvalidInput, err))?;
     let mut main = 0;
     let winsize = Winsize {
         ws_row: rows as libc::c_ushort,
@@ -801,6 +827,12 @@ pub fn create_pty_with_fork(
         )
     } {
         0 => {
+            if let Some(dir) = &working_directory {
+                if unsafe { libc::chdir(dir.as_ptr()) } == -1 {
+                    // The directory may become inaccessible after validation.
+                    unsafe { libc::_exit(126) }
+                }
+            }
             set_child_envs(envs);
             default_shell_command(shell_program, args);
             // Never return into the terminal application in the forked child
@@ -834,6 +866,102 @@ pub fn create_pty_with_fork(
     }
 }
 
+#[cfg(test)]
+mod working_directory_tests {
+    use super::*;
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    fn child_directory(fork: bool, dir: Option<String>) -> PathBuf {
+        let args = vec!["-c".into(), "pwd -P".into()];
+        let mut pty = if fork {
+            create_pty_with_fork(Some("/bin/sh"), &args, &dir, &[], 80, 24, 0, 0)
+        } else {
+            create_pty_with_spawn(Some("/bin/sh"), args, &dir, None, 80, 24, 0, 0)
+        }
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut output = Vec::new();
+        while !output.contains(&b'\n') {
+            assert!(
+                Instant::now() < deadline,
+                "child did not report cwd: {output:?}"
+            );
+            let mut fd = libc::pollfd {
+                fd: pty.file.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            unsafe {
+                libc::poll(&mut fd, 1, 50);
+            }
+            let mut buffer = [0; 1024];
+            match pty.reader().read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => output.extend_from_slice(&buffer[..n]),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(err) => panic!("read child cwd: {err}, output={output:?}"),
+            }
+        }
+        pty.shutdown().unwrap();
+        PathBuf::from(String::from_utf8(output).unwrap().trim())
+    }
+
+    #[test]
+    fn configured_working_directory_reaches_spawn_and_fork() {
+        let dir =
+            std::env::temp_dir().join(format!("rio-pty-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let expected = dir.canonicalize().unwrap();
+        for fork in [false, true] {
+            assert_eq!(
+                child_directory(fork, Some(dir.to_string_lossy().into_owned())),
+                expected,
+                "fork={fork}"
+            );
+        }
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn tilde_working_directory_reaches_spawn_and_fork() {
+        let expected = PathBuf::from(std::env::var_os("HOME").unwrap())
+            .canonicalize()
+            .unwrap();
+        for fork in [false, true] {
+            for dir in ["~", "~/."] {
+                assert_eq!(
+                    child_directory(fork, Some(dir.into())),
+                    expected,
+                    "fork={fork}, dir={dir}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_working_directory_inherits_parent() {
+        let expected = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let file =
+            std::env::temp_dir().join(format!("rio-pty-cwd-file-{}", std::process::id()));
+        std::fs::write(&file, "not a directory").unwrap();
+        for fork in [false, true] {
+            for dir in [file.clone(), file.join("missing")] {
+                assert_eq!(
+                    child_directory(fork, Some(dir.to_string_lossy().into_owned())),
+                    expected,
+                    "fork={fork}, dir={dir:?}"
+                );
+            }
+        }
+        std::fs::remove_file(file).unwrap();
+    }
+}
+
 /// Really only needed on BSD, but should be fine elsewhere.
 fn set_controlling_terminal(fd: libc::c_int) -> Result<(), Error> {
     let res = unsafe {
@@ -861,18 +989,27 @@ unsafe fn set_nonblocking(fd: libc::c_int) {
 }
 
 pub fn command_per_pid(pid: libc::pid_t) -> String {
-    let current_process_name = Command::new("ps")
-        .arg("-p")
-        .arg(format!("{pid:}"))
-        .arg("-o")
-        .arg("comm=")
-        .output()
-        .expect("failed to execute process")
-        .stdout;
+    #[cfg(target_os = "linux")]
+    {
+        // Reading procfs avoids spawning ps for a value that changes on exec;
+        // caching by PID would retain stale names and mishandle PID reuse.
+        std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let current_process_name = Command::new("ps")
+            .arg("-p")
+            .arg(format!("{pid:}"))
+            .arg("-o")
+            .arg("comm=")
+            .output()
+            .map(|output| output.stdout)
+            .unwrap_or_default();
 
-    std::str::from_utf8(&current_process_name)
-        .unwrap_or("")
-        .to_string()
+        std::str::from_utf8(&current_process_name)
+            .unwrap_or("")
+            .to_string()
+    }
 }
 
 impl EventedPty for Pty {
@@ -911,11 +1048,7 @@ struct Passwd<'a> {
 
 /// Return a Passwd struct with pointers into the provided buf.
 ///
-/// # Unsafety
-///
-/// If `buf` is changed while `Passwd` is alive, bad thing will almost certainly happen.
-fn get_pw_entry(buf: &mut [i8; 1024]) -> Result<Passwd<'_>, Error> {
-    // Create zeroed passwd struct.
+fn get_pw_entry(buf: &mut [i8]) -> Result<Passwd<'_>, Error> {
     let mut entry: MaybeUninit<libc::passwd> = MaybeUninit::uninit();
 
     let mut res: *mut libc::passwd = ptr::null_mut();
@@ -931,43 +1064,96 @@ fn get_pw_entry(buf: &mut [i8; 1024]) -> Result<Passwd<'_>, Error> {
             &mut res,
         )
     };
-    let entry = unsafe { entry.assume_init() };
-
-    if status < 0 {
-        return Err(Error::other("getpwuid_r failed"));
+    // POSIX returns positive errno values and leaves entry uninitialized on
+    // failure. Check both status and result before reading any fields.
+    if status != 0 {
+        return Err(Error::from_raw_os_error(status));
     }
 
     if res.is_null() {
         return Err(Error::other("pw not found"));
     }
+    let entry = unsafe { entry.assume_init() };
 
     // Sanity check.
     assert_eq!(entry.pw_uid, uid);
 
     // Build a borrowed Passwd struct.
     Ok(Passwd {
-        name: unsafe { CStr::from_ptr(entry.pw_name).to_str().unwrap() },
-        dir: unsafe { CStr::from_ptr(entry.pw_dir).to_str().unwrap() },
-        shell: unsafe { CStr::from_ptr(entry.pw_shell).to_str().unwrap() },
+        name: unsafe { CStr::from_ptr(entry.pw_name) }
+            .to_str()
+            .map_err(Error::other)?,
+        dir: unsafe { CStr::from_ptr(entry.pw_dir) }
+            .to_str()
+            .map_err(Error::other)?,
+        shell: unsafe { CStr::from_ptr(entry.pw_shell) }
+            .to_str()
+            .map_err(Error::other)?,
     })
 }
 
-/// Unsafe
+#[cfg(test)]
+mod account_tests {
+    use super::*;
+
+    #[test]
+    fn passwd_reports_positive_error_codes_before_reading_entry() {
+        let error = get_pw_entry(&mut [0; 1]).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ERANGE));
+    }
+
+    #[test]
+    fn passwd_entry_borrows_initialized_storage() {
+        let mut buffer = [0; 65536];
+        let entry = get_pw_entry(&mut buffer).unwrap();
+        assert!(!entry.name.is_empty());
+        assert!(!entry.dir.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_name_matches_native_comm_and_missing_process_is_empty() {
+        let pid = std::process::id() as libc::pid_t;
+        assert_eq!(
+            command_per_pid(pid),
+            std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap()
+        );
+        assert!(command_per_pid(-1).is_empty());
+    }
+}
+
 /// Return tty pts name [`String`]
 ///
-/// # Safety
-///
-/// This function is unsafe because it contains the usage of `libc::ptsname`
-/// from libc that's naturally unsafe.
+/// Returns an error if `fd` is not a PTY master.
 pub fn tty_ptsname(fd: libc::c_int) -> Result<String, String> {
-    let c_str: &CStr = unsafe {
-        let name_ptr = ptsname(fd as *mut _);
-        CStr::from_ptr(name_ptr)
-    };
+    let name_ptr = unsafe { ptsname(fd as *mut _) };
+    if name_ptr.is_null() {
+        return Err(Error::last_os_error().to_string());
+    }
+    let c_str: &CStr = unsafe { CStr::from_ptr(name_ptr) };
     let str_slice: &str = c_str.to_str().unwrap();
     let str_buf: String = str_slice.to_owned();
 
     Ok(str_buf)
+}
+
+#[cfg(test)]
+mod ptsname_tests {
+    use super::tty_ptsname;
+
+    #[test]
+    fn invalid_fd_returns_err() {
+        assert!(tty_ptsname(-1).is_err());
+    }
+
+    #[test]
+    fn pty_main_returns_device_path() {
+        let main = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+        assert!(main >= 0);
+        let name = tty_ptsname(main);
+        unsafe { libc::close(main) };
+        assert!(name.unwrap().starts_with("/dev/"));
+    }
 }
 
 pub fn foreground_process_name(main_fd: RawFd, shell_pid: u32) -> String {
@@ -994,6 +1180,85 @@ pub fn foreground_process_name(main_fd: RawFd, shell_pid: u32) -> String {
     let name = macos_process_name(pid);
 
     name
+}
+
+/// Read the foreground command's argv without interpreting a shell command
+/// string. Used when opening another shell beside an interactive SSH client.
+pub fn foreground_process_args(
+    main_fd: RawFd,
+    shell_pid: u32,
+) -> io::Result<Vec<String>> {
+    let foreground = unsafe { libc::tcgetpgrp(main_fd) };
+    let pid = if foreground > 0 {
+        foreground
+    } else {
+        shell_pid as libc::pid_t
+    };
+    #[cfg(target_os = "macos")]
+    {
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        let mut bytes = vec![0u8; 1024 * 1024];
+        let mut size = bytes.len();
+        let result = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as u32,
+                bytes.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        bytes.truncate(size);
+        if bytes.len() < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing argv count",
+            ));
+        }
+        let argc = i32::from_ne_bytes(bytes[..4].try_into().unwrap());
+        if argc <= 0 {
+            return Ok(Vec::new());
+        }
+        let executable_end = bytes[4..]
+            .iter()
+            .position(|b| *b == 0)
+            .map(|i| i + 4)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing executable path")
+            })?;
+        let start = bytes[executable_end..]
+            .iter()
+            .position(|b| *b != 0)
+            .map(|i| i + executable_end)
+            .unwrap_or(bytes.len());
+        return bytes[start..]
+            .split(|b| *b == 0)
+            .take(argc as usize)
+            .map(|arg| {
+                String::from_utf8(arg.to_vec())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            })
+            .collect();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        #[cfg(target_os = "freebsd")]
+        let path = format!("/compat/linux/proc/{pid}/cmdline");
+        #[cfg(not(target_os = "freebsd"))]
+        let path = format!("/proc/{pid}/cmdline");
+        std::fs::read(path)?
+            .split(|byte| *byte == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| {
+                String::from_utf8(arg.to_vec())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            })
+            .collect()
+    }
 }
 
 pub fn foreground_process_path(
@@ -1119,7 +1384,7 @@ mod login_argv_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "freebsd")))]
 mod termp_tests {
     use super::*;
 

@@ -22,6 +22,8 @@ pub struct PlatformConfig {
     pub shell: Option<Shell>,
     #[serde(default = "Option::default")]
     pub navigation: Option<PlatformNavigation>,
+    #[serde(default)]
+    pub panel: Option<super::layout::PanelOverrides>,
     #[serde(default = "Option::default")]
     pub window: Option<PlatformWindow>,
     #[serde(default = "Option::default")]
@@ -41,6 +43,10 @@ pub struct PlatformWindow {
     pub height: Option<i32>,
     #[serde(default = "Option::default")]
     pub mode: Option<window::WindowMode>,
+    #[serde(default)]
+    pub divider: Option<bool>,
+    #[serde(default, rename = "divider-width")]
+    pub divider_width: Option<f32>,
     #[serde(default = "Option::default")]
     pub opacity: Option<f32>,
     #[serde(default = "Option::default")]
@@ -54,8 +60,6 @@ pub struct PlatformWindow {
     pub background_image: Option<sugarloaf::ImageProperties>,
     #[serde(default = "Option::default")]
     pub decorations: Option<window::Decorations>,
-    #[serde(default = "Option::default", rename = "macos-use-unified-titlebar")]
-    pub macos_use_unified_titlebar: Option<bool>,
     #[serde(default = "Option::default", rename = "macos-use-shadow")]
     pub macos_use_shadow: Option<bool>,
     #[serde(default = "Option::default", rename = "macos-traffic-light-position-x")]
@@ -83,17 +87,10 @@ pub struct PlatformWindow {
 
 /// Platform-specific navigation config with optional fields for selective override
 #[derive(Default, Debug, Serialize, Deserialize, PartialEq, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct PlatformNavigation {
-    #[serde(default = "Option::default")]
-    pub mode: Option<navigation::NavigationMode>,
-    #[serde(default = "Option::default", rename = "color-automation")]
-    pub color_automation: Option<Vec<navigation::ColorAutomation>>,
-    #[serde(default = "Option::default")]
-    pub clickable: Option<bool>,
     #[serde(default = "Option::default", rename = "current-working-directory")]
     pub current_working_directory: Option<bool>,
-    #[serde(default = "Option::default", rename = "use-terminal-title")]
-    pub use_terminal_title: Option<bool>,
     #[serde(default = "Option::default", rename = "hide-if-single")]
     pub hide_if_single: Option<bool>,
     #[serde(default = "Option::default", rename = "use-split")]
@@ -104,6 +101,22 @@ pub struct PlatformNavigation {
     pub unfocused_split_opacity: Option<f32>,
     #[serde(default = "Option::default", rename = "max-tab-width")]
     pub max_tab_width: Option<f32>,
+    #[serde(default = "Option::default", rename = "min-tab-width")]
+    pub min_tab_width: Option<f32>,
+    #[serde(default = "Option::default", rename = "tab-icon-size")]
+    pub tab_icon_size: Option<f32>,
+    #[serde(default, rename = "preset")]
+    pub tab_style: Option<navigation::TabStyle>,
+    #[serde(default)]
+    pub tabs: navigation::Tabs,
+    #[serde(default = "Option::default", rename = "tab-glass-intensity")]
+    pub tab_glass_intensity: Option<f32>,
+    #[serde(default = "Option::default", rename = "tab-status-width")]
+    pub tab_status_width: Option<f32>,
+    #[serde(default)]
+    pub animation: Option<navigation::Animation>,
+    #[serde(default, rename = "app-icons")]
+    pub app_icons: Option<std::collections::BTreeMap<String, String>>,
     #[serde(
         default = "Option::default",
         deserialize_with = "crate::config::colors::deserialize_to_arr_opt",

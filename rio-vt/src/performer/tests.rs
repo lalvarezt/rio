@@ -11,18 +11,62 @@ struct TestPty {
     bytes: io::Cursor<Vec<u8>>,
     ending: Option<ErrorKind>,
     exhausted: Option<mpsc::Sender<()>>,
-    writer: Vec<u8>,
+    writer: TestWriter,
     child: Option<corcovado::Registration>,
     registration_error: bool,
     read_event: bool,
     shutdown_calls: usize,
     deregister_calls: usize,
     raw_error: Option<i32>,
+    idle_reads: usize,
+    read_calls: usize,
+    first_read_delay: Option<Duration>,
+    burst_boundary: Option<usize>,
+}
+
+#[derive(Default)]
+struct TestWriter {
+    bytes: Vec<u8>,
+    remaining: Option<usize>,
+}
+impl Write for TestWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let len = self.remaining.unwrap_or(bytes.len()).min(bytes.len());
+        if len == 0 {
+            return Err(ErrorKind::WouldBlock.into());
+        }
+        self.bytes.extend_from_slice(&bytes[..len]);
+        if let Some(remaining) = &mut self.remaining {
+            *remaining -= len;
+        }
+        Ok(len)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl Read for TestPty {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let got = self.bytes.read(buf)?;
+        self.read_calls += 1;
+        if let Some(delay) = self.first_read_delay.take() {
+            std::thread::sleep(delay);
+        }
+        if self.idle_reads != 0 {
+            self.idle_reads -= 1;
+            return Err(ErrorKind::WouldBlock.into());
+        }
+        let limit = if let Some(boundary) = self.burst_boundary {
+            let remaining = boundary - self.bytes.position() as usize;
+            if remaining == 0 {
+                self.burst_boundary = None;
+                return Err(ErrorKind::WouldBlock.into());
+            }
+            remaining.min(buf.len())
+        } else {
+            buf.len()
+        };
+        let got = self.bytes.read(&mut buf[..limit])?;
         if got != 0 {
             return Ok(got);
         }
@@ -41,7 +85,7 @@ impl Read for TestPty {
 
 impl ProcessReadWrite for TestPty {
     type Reader = Self;
-    type Writer = Vec<u8>;
+    type Writer = TestWriter;
     fn reader(&mut self) -> &mut Self {
         self
     }
@@ -127,13 +171,17 @@ fn machine(bytes: Vec<u8>, ending: Option<ErrorKind>) -> Machine<TestPty, VoidLi
             bytes: io::Cursor::new(bytes),
             ending,
             exhausted: None,
-            writer: Vec::new(),
+            writer: TestWriter::default(),
             child: None,
             registration_error: false,
             read_event: false,
             shutdown_calls: 0,
             deregister_calls: 0,
             raw_error: None,
+            idle_reads: 0,
+            read_calls: 0,
+            first_read_delay: None,
+            burst_boundary: None,
         },
         VoidListener,
         WindowId::from(0),
@@ -147,6 +195,65 @@ fn first_line(machine: &Machine<TestPty, VoidListener>, len: usize) -> String {
     (0..len)
         .map(|col| terminal.grid[Line(0)][Column(col)].c())
         .collect()
+}
+
+#[test]
+fn clipboard_credit_survives_channel_queue_and_partial_writes() {
+    use crate::clipboard::buffer::{Budget, ResponseBuffer};
+    let budget = Budget::new(4096);
+    let mut response = ResponseBuffer::new(budget.clone());
+    response.write_all(b"response").unwrap();
+    let mut machine = machine(Vec::new(), None);
+    machine
+        .channel()
+        .send(Msg::Input(Cow::Borrowed(b"")))
+        .unwrap();
+    machine
+        .channel()
+        .send(Msg::ClipboardInput(Arc::new(ResponseBuffer::new(
+            budget.clone(),
+        ))))
+        .unwrap();
+    machine
+        .channel()
+        .send(Msg::ClipboardInput(Arc::new(response)))
+        .unwrap();
+    assert_eq!(budget.used(), 4096);
+    let mut state = State::default();
+    assert!(machine.drain_recv_channel(&mut state));
+    machine.pty.writer.remaining = Some(3);
+    machine.pty_write(&mut state).unwrap();
+    assert_eq!(machine.pty.writer.bytes, b"res");
+    assert_eq!(budget.used(), 4096);
+    machine.pty.writer.remaining = None;
+    machine.pty_write(&mut state).unwrap();
+    assert_eq!(machine.pty.writer.bytes, b"response");
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn shutdown_releases_current_and_undrained_response_credits() {
+    use crate::clipboard::buffer::{Budget, ResponseBuffer};
+    let budget = Budget::new(8192);
+    let mut machine = machine(Vec::new(), None);
+    let sender = machine.channel();
+    let mut first = ResponseBuffer::new(budget.clone());
+    first.write_all(b"first").unwrap();
+    sender.send(Msg::ClipboardInput(Arc::new(first))).unwrap();
+    let mut state = State::default();
+    assert!(machine.drain_recv_channel(&mut state));
+    machine.pty.writer.remaining = Some(1);
+    machine.pty_write(&mut state).unwrap();
+    let mut second = ResponseBuffer::new(budget.clone());
+    second.write_all(b"second").unwrap();
+    sender.send(Msg::ClipboardInput(Arc::new(second))).unwrap();
+    assert_eq!(budget.used(), 8192);
+    machine.finish(&mut state, &mut [0; 32], Ok(ExitReason::Shutdown));
+    assert_eq!(budget.used(), 0);
+    assert!(!state.needs_write());
+    assert!(sender
+        .send(Msg::Input(Cow::Borrowed(b"after shutdown")))
+        .is_err());
 }
 
 // Holding the terminal until the confirming read guarantees the first batch
@@ -209,6 +316,86 @@ fn final_output_can_be_drained_across_multiple_parse_budgets() {
         ReadOutcome::Closed
     );
     assert_eq!(first_line(&machine, 12), "final output");
+}
+
+#[test]
+fn final_drain_waits_for_a_delayed_pump() {
+    let mut machine = machine(b"final output".to_vec(), Some(ErrorKind::WouldBlock));
+    machine.pty.idle_reads = 2;
+    machine.drain_after_exit(
+        &mut State::default(),
+        &mut vec![0; READ_BUFFER_SIZE],
+        Duration::from_millis(25),
+    );
+    assert_eq!(first_line(&machine, 12), "final output");
+}
+
+#[test]
+fn final_drain_stops_at_real_eof() {
+    let mut machine = machine(b"final output".to_vec(), None);
+    machine.drain_after_exit(
+        &mut State::default(),
+        &mut vec![0; READ_BUFFER_SIZE],
+        Duration::from_secs(1),
+    );
+    assert_eq!(machine.pty.read_calls, 2);
+}
+
+#[test]
+fn final_drain_renews_quiet_window_after_a_short_burst() {
+    let mut machine = machine(b"final output".to_vec(), None);
+    // Model a pump publication arriving after the original quiet deadline.
+    // Its confirming WouldBlock must start a new quiet window for the suffix.
+    machine.pty.first_read_delay = Some(Duration::from_millis(10));
+    machine.pty.burst_boundary = Some(5);
+    machine.drain_after_exit(
+        &mut State::default(),
+        &mut vec![0; READ_BUFFER_SIZE],
+        Duration::from_millis(5),
+    );
+    assert_eq!(first_line(&machine, 12), "final output");
+}
+
+#[cfg(windows)]
+#[test]
+fn conpty_exit_preserves_final_output() {
+    for _ in 0..5 {
+        let terminal = Crosswords::new(
+            CrosswordsSize::new(80, 24),
+            CursorShape::Block,
+            VoidListener,
+            WindowId::from(0),
+            0,
+            0,
+        );
+        let pty = teletypewriter::create_pty(
+            Some("cmd.exe"),
+            vec!["/d".into(), "/c".into(), "echo FINAL_OUTPUT_MARKER".into()],
+            &None,
+            None,
+            80,
+            24,
+        )
+        .unwrap();
+        let machine = Machine::new(
+            Arc::new(FairMutex::new(terminal)),
+            pty,
+            VoidListener,
+            WindowId::from(0),
+            0,
+        )
+        .unwrap();
+        let (machine, _) = machine.spawn().join().unwrap();
+        let terminal = machine.terminal.lock();
+        let output: String = (0..24)
+            .flat_map(|row| (0..80).map(move |column| (row, column)))
+            .map(|(row, column)| terminal.grid[Line(row)][Column(column)].c())
+            .collect();
+        assert!(
+            output.contains("FINAL_OUTPUT_MARKER"),
+            "final ConPTY output was lost: {output:?}"
+        );
+    }
 }
 
 #[test]

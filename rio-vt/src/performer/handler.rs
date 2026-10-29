@@ -102,14 +102,40 @@ pub enum ScpUpdateMode {
 }
 
 pub trait Handler {
+    fn kitty_animation_image_identity(
+        &self,
+        _: u32,
+        _: u32,
+    ) -> Result<crate::ansi::kitty_animation::ImageIdentity, &'static str> {
+        Err("EINVAL:unsupported action")
+    }
+    fn kitty_image_by_number(&self, _: u32) -> Option<u32> {
+        None
+    }
+    fn kitty_assign_image_number(&mut self, _: u32, _: u32) {}
+    fn kitty_animation(
+        &mut self,
+        _: crate::ansi::kitty_animation::Request,
+    ) -> Result<(u32, Option<u32>), crate::ansi::kitty_animation::Failure> {
+        Err("EINVAL:unsupported action".into())
+    }
+    /// Bounded maintenance after input, including synchronized replay.
+    fn finish_input_batch(&mut self) {}
+
     /// OSC to set window title.
     fn set_title(&mut self, _: Option<String>) {}
 
     /// OSC to set current directory.
     fn set_current_directory(&mut self, _: std::path::PathBuf) {}
 
+    /// Remote OSC 7 paths stay separate from the local filesystem context.
+    fn set_remote_directory(&mut self, _host: String, _path: std::path::PathBuf) {}
+
     /// OSC 133: mark the cursor row as a semantic prompt row.
     fn set_semantic_prompt(&mut self, _: crate::crosswords::grid::row::SemanticPrompt) {}
+
+    /// OSC 133 A begins a new command lifetime, independently of row marks.
+    fn shell_prompt_start(&mut self) {}
 
     /// OSC 1337 SetUserVar: record a shell-provided variable.
     fn set_user_var(&mut self, _name: String, _value: String) {}
@@ -179,6 +205,9 @@ pub trait Handler {
     /// Report device status.
     fn device_status(&mut self, _: usize) {}
 
+    /// Report DEC private device status.
+    fn private_device_status(&mut self, _: usize) {}
+
     /// Move cursor forward `cols`.
     fn move_forward(&mut self, _: Column) {}
 
@@ -214,8 +243,10 @@ pub trait Handler {
     /// Substitute char under cursor.
     fn substitute(&mut self) {}
 
-    /// Newline.
-    fn newline(&mut self) {}
+    /// Handle LF, VT, or FF. Implementations may also apply newline mode.
+    fn newline(&mut self) {
+        self.linefeed();
+    }
 
     /// Set current position as a tabstop.
     fn set_horizontal_tabstop(&mut self) {}
@@ -258,9 +289,15 @@ pub trait Handler {
 
     /// Clear current line.
     fn clear_line(&mut self, _mode: LineClearMode) {}
+    fn clear_line_selective(&mut self, mode: LineClearMode) {
+        self.clear_line(mode);
+    }
 
     /// Clear screen.
     fn clear_screen(&mut self, _mode: ClearMode) {}
+    fn clear_screen_selective(&mut self, mode: ClearMode) {
+        self.clear_screen(mode);
+    }
 
     /// Set tab stops at every `interval`.
     fn set_tabs(&mut self, _interval: u16) {}
@@ -270,6 +307,9 @@ pub trait Handler {
 
     /// Reset terminal state.
     fn reset_state(&mut self) {}
+    /// Reset operating state without clearing cells or moving the cursor.
+    fn soft_reset(&mut self) {}
+    fn set_protection(&mut self, _protected: bool, _mode: crate::ansi::ProtectionMode) {}
 
     /// Reverse Index.
     ///
@@ -316,6 +356,7 @@ pub trait Handler {
     /// 'Invoke' one of G0 to G3 in the GL area. Also referred to as shift in,
     /// shift out and locking shift depending on the set being activated.
     fn set_active_charset(&mut self, _: CharsetIndex) {}
+    fn single_shift(&mut self, _: CharsetIndex) {}
 
     /// Assign a graphic character set to G0, G1, G2 or G3.
     ///
@@ -337,6 +378,11 @@ pub trait Handler {
 
     /// Load data from clipboard.
     fn clipboard_load(&mut self, _: u8, _: &str) {}
+
+    /// Handle OSC 5522 metadata and encoded payload. The frontend must apply
+    /// clipboard permissions before publishing writes or returning contents.
+    fn kitty_clipboard(&mut self, _: &[u8], _: &[u8], _: &str) {}
+    fn kitty_clipboard_abort(&mut self, _: &str) {}
 
     /// Run the decaln routine.
     fn decaln(&mut self) {}
@@ -380,18 +426,43 @@ pub trait Handler {
     ) {
     }
 
-    /// Store a graphic without displaying (for a=t transmit-only).
-    fn store_graphic(&mut self, _data: GraphicData) {}
+    /// Remove an explicit image ID when a new transmission starts, before
+    /// image decoding, chunk completion, or placement validation.
+    fn begin_graphic_transmission(&mut self, _image_id: u32) {}
+
+    /// Store decoded image data after transmission has begun.
+    fn store_graphic(&mut self, _data: GraphicData) -> bool {
+        true
+    }
 
     /// Transmit and display a kitty graphic as an overlay (for a=T).
     fn kitty_transmit_and_display(
         &mut self,
-        _data: GraphicData,
-        _placement: kitty_graphics_protocol::PlacementRequest,
-    ) {
+        data: GraphicData,
+        placement: kitty_graphics_protocol::PlacementRequest,
+    ) -> bool {
+        self.begin_graphic_transmission(data.id.get() as u32);
+        self.store_graphic(data)
+            && self.graphic_placement_error(&placement).is_none()
+            && self.can_place_graphic(&placement)
+            && self.place_graphic(placement)
     }
 
     /// Place an existing graphic at a specific location (for a=p).
+    fn can_place_graphic(
+        &self,
+        _placement: &kitty_graphics_protocol::PlacementRequest,
+    ) -> bool {
+        true
+    }
+
+    fn graphic_placement_error(
+        &self,
+        _: &kitty_graphics_protocol::PlacementRequest,
+    ) -> Option<&'static str> {
+        None
+    }
+
     /// Place a previously transmitted kitty graphic (for `a=p`).
     /// Returns whether the referenced image exists — the dispatcher
     /// answers ENOENT instead of OK when it does not, so clients can
@@ -414,6 +485,10 @@ pub trait Handler {
 
     /// Set progress bar report (OSC 9;4).
     fn set_progress_report(&mut self, _: crate::event::ProgressReport) {}
+
+    fn set_program_status(&mut self, _: crate::program_status::ProgramStatusRecord) {}
+
+    fn query_program_status(&mut self, _terminator: &str) {}
 
     /// Report current keyboard mode.
     fn report_keyboard_mode(&mut self) {}
@@ -478,6 +553,25 @@ pub trait Handler {
     /// writes it back to the originating pane's PTY directly.
     fn glyph_query(&mut self, _cp: u32) {}
 
+    /// Parse a Kitty command and resolve animation targets before decoding.
+    fn parse_kitty_graphics(
+        &mut self,
+        params: &[&[u8]],
+    ) -> Option<kitty_graphics_protocol::KittyGraphicsResponse> {
+        let mut state = std::mem::take(self.kitty_chunking_state_mut()?);
+        let response = kitty_graphics_protocol::parse_with_resources(
+            params,
+            &mut state,
+            |candidate| candidate,
+            |image_id, image_number| {
+                self.kitty_animation_image_identity(image_id, image_number)
+                    .map(Some)
+            },
+        );
+        *self.kitty_chunking_state_mut()? = state;
+        response
+    }
+
     /// Get mutable access to the kitty graphics chunking state
     /// Used by the APC handler to accumulate chunked image transmissions
     ///
@@ -537,6 +631,37 @@ struct ApcState {
     /// Buffer for accumulating APC data.
     /// Pre-allocated to a reasonable size for Kitty graphics chunks.
     buffer: Vec<u8>,
+    discarded: bool,
+}
+
+impl ApcState {
+    fn clear(&mut self) {
+        if self.buffer.capacity() > super::parser::MAX_CONTROL_BYTES {
+            self.buffer = Vec::new();
+        } else {
+            self.buffer.clear();
+        }
+    }
+
+    fn extend(&mut self, bytes: &[u8]) {
+        if self.discarded {
+            return;
+        }
+        let first = self.buffer.first().or_else(|| bytes.first());
+        let limit = if first == Some(&b'G') {
+            super::parser::MAX_GRAPHICS_BYTES
+        } else {
+            // Includes base64 expansion of a 64 KiB glyph plus control headers.
+            glyph_protocol::MAX_PAYLOAD_BYTES.div_ceil(3) * 4
+                + super::parser::MAX_CONTROL_BYTES
+        };
+        if bytes.len() > limit.saturating_sub(self.buffer.len()) {
+            self.discarded = true;
+            self.clear();
+            return;
+        }
+        self.buffer.extend_from_slice(bytes);
+    }
 }
 
 impl Default for SyncState {
@@ -618,6 +743,7 @@ impl Processor {
             let mut performer = Performer::new(&mut self.state, handler);
             self.parser.advance(&mut performer, bytes);
         }
+        handler.finish_input_batch();
     }
 
     /// End a synchronized update.
@@ -669,6 +795,7 @@ impl Processor {
                 self.state.sync_state.buffer.clear();
             }
         }
+        handler.finish_input_batch();
     }
 
     /// Number of bytes in the synchronization buffer.
@@ -839,15 +966,15 @@ impl<'a, H: Handler + 'a> Performer<'a, H> {
                 payload.len()
             );
 
-            // Check if handler supports Kitty graphics protocol
-            let Some(chunking_state) = self.handler.kitty_chunking_state_mut() else {
-                debug!("[process_apc_buffer] Handler does not support Kitty graphics, ignoring");
-                return;
-            };
-
-            if let Some(mut response) =
-                kitty_graphics_protocol::parse(&kitty_params, chunking_state)
-            {
+            let parsed = self.handler.parse_kitty_graphics(&kitty_params);
+            let started = self
+                .handler
+                .kitty_chunking_state_mut()
+                .and_then(|state| state.take_started_transmission());
+            if let Some(image_id) = started {
+                self.handler.begin_graphic_transmission(image_id);
+            }
+            if let Some(mut response) = parsed {
                 if response.incomplete {
                     // Chunk was accumulated, waiting for more chunks.
                     // This is normal flow for multi-part transmissions
@@ -859,7 +986,48 @@ impl<'a, H: Handler + 'a> Performer<'a, H> {
 
                 debug!("[process_apc_buffer] Kitty graphics parsed successfully");
 
-                if let Some(graphic_data) = response.graphic_data {
+                let mut resolved_image_id = 0;
+                let mut missing_number = false;
+                if response.image_number != 0 {
+                    if let Some(placement) = response.placement_request.as_mut() {
+                        if placement.image_id == 0 {
+                            if let Some(id) =
+                                self.handler.kitty_image_by_number(response.image_number)
+                            {
+                                placement.image_id = id;
+                                resolved_image_id = id;
+                            } else {
+                                missing_number = true;
+                            }
+                        }
+                    }
+                }
+                if missing_number {
+                    response.placement_request = None;
+                    response.response = response.error_response.take();
+                }
+
+                if let Some(request) = response.animation_request.take() {
+                    let mut identity = request.reply();
+                    if identity.image_id == 0 {
+                        if let Some(id) =
+                            self.handler.kitty_image_by_number(identity.image_number)
+                        {
+                            identity.image_id = id;
+                        }
+                    }
+                    let result = self.handler.kitty_animation(request);
+                    if let Some(reply) =
+                        kitty_graphics_protocol::animation_response(identity, result)
+                    {
+                        self.handler.kitty_graphics_response(reply);
+                    }
+                    return;
+                }
+
+                let mut transmitted = true;
+                if let Some(graphic_data) = response.graphic_data.take() {
+                    let image_id = graphic_data.id.get() as u32;
                     debug!(
                         "[process_apc_buffer] Graphic data present: id={}, {}x{}",
                         graphic_data.id.get(),
@@ -867,15 +1035,21 @@ impl<'a, H: Handler + 'a> Performer<'a, H> {
                         graphic_data.height
                     );
 
-                    if let Some(placement) = response.placement_request {
-                        // a=T: Transmit and display as overlay
+                    // a=T accepts image data before validating its placement.
+                    // Replacement may remove the requested parent, and a
+                    // placement failure still leaves the new image stored.
+                    transmitted = self.handler.store_graphic(graphic_data);
+                    if !transmitted {
+                        response.response = response.error_response.take();
+                    } else if response.image_number != 0 {
+                        resolved_image_id = image_id;
                         self.handler
-                            .kitty_transmit_and_display(graphic_data, placement);
-                    } else {
-                        // a=t: Transmit only
-                        self.handler.store_graphic(graphic_data);
+                            .kitty_assign_image_number(image_id, response.image_number);
                     }
-                } else if let Some(placement) = response.placement_request {
+                }
+                if let Some(placement) =
+                    response.placement_request.take().filter(|_| transmitted)
+                {
                     debug!(
                         "[process_apc_buffer] Placement request: image_id={}",
                         placement.image_id
@@ -884,7 +1058,13 @@ impl<'a, H: Handler + 'a> Performer<'a, H> {
                     // a=p: Display previously stored image. A placement
                     // of an unknown image answers ENOENT rather than OK,
                     // matching kitty, so the client knows to retransmit.
-                    if !self.handler.place_graphic(placement) {
+                    if let Some(error) = self.handler.graphic_placement_error(&placement)
+                    {
+                        response.response = response.placement_failure(error);
+                    } else if !self.handler.can_place_graphic(&placement) {
+                        response.response =
+                            response.placement_failure("ENOSPC:graphics resource limit");
+                    } else if !self.handler.place_graphic(placement) {
                         response.response = response.error_response.take();
                     }
                 }
@@ -894,7 +1074,8 @@ impl<'a, H: Handler + 'a> Performer<'a, H> {
                     self.handler.delete_graphics(delete);
                 }
 
-                if let Some(response_str) = response.response {
+                if let Some(mut response_str) = response.response {
+                    add_resolved_kitty_id(&mut response_str, resolved_image_id);
                     self.handler.kitty_graphics_response(response_str);
                 }
             } else {
@@ -973,7 +1154,19 @@ impl<'a, H: Handler + 'a> Performer<'a, H> {
     }
 }
 
+fn add_resolved_kitty_id(reply: &mut String, image_id: u32) {
+    if image_id != 0 && reply.starts_with("\x1b_GI=") {
+        reply.insert_str(3, &format!("i={image_id},"));
+    }
+}
+
 impl<U: Handler> Perform for Performer<'_, U> {
+    fn osc_discarded(&mut self, command: Option<u16>, bell: bool) {
+        if command == Some(5522) {
+            self.handler
+                .kitty_clipboard_abort(if bell { "\x07" } else { "\x1b\\" });
+        }
+    }
     fn print(&mut self, c: char) {
         self.handler.input(c);
         self.state.preceding_char = Some(c);
@@ -1003,11 +1196,17 @@ impl<U: Handler> Perform for Performer<'_, U> {
     }
 
     fn execute(&mut self, byte: u8) {
+        if (0x80..=0x9F).contains(&byte) {
+            // C1 controls reached from a non-ground parser state have the
+            // same action as their seven-bit ESC form.
+            self.esc_dispatch(&[], false, byte - 0x40);
+            return;
+        }
         match byte {
             C0::HT => self.handler.put_tab(1),
             C0::BS => self.handler.backspace(),
             C0::CR => self.handler.carriage_return(),
-            C0::LF | C0::VT | C0::FF => self.handler.linefeed(),
+            C0::LF | C0::VT | C0::FF => self.handler.newline(),
             C0::BEL => self.handler.bell(),
             C0::SUB => self.handler.substitute(),
             C0::SI => self.handler.set_active_charset(CharsetIndex::G0),
@@ -1098,6 +1297,11 @@ impl<U: Handler> Perform for Performer<'_, U> {
         let terminator = if bell_terminated { "\x07" } else { "\x1b\\" };
 
         fn unhandled(params: &[&[u8]]) {
+            // Formatting every byte allocates even when the warn event is
+            // disabled. Unknown OSCs are common in shell integration streams.
+            if !tracing::enabled!(tracing::Level::WARN) {
+                return;
+            }
             let mut buf = String::new();
             for items in params {
                 buf.push('[');
@@ -1141,11 +1345,13 @@ impl<U: Handler> Perform for Performer<'_, U> {
 
             // Inform current directory.
             b"7" => {
-                // Rejoined: the kitty-shell-cwd flavor is verbatim, so a
-                // `;` in the directory arrives as extra params.
-                if let Some(payload) = osc::join_params(params, 1) {
-                    if let Some(path) = osc::parse_current_directory(payload.as_bytes()) {
+                if let Some(payload) = params.get(1) {
+                    if let Some(path) = osc::parse_current_directory(payload) {
                         self.handler.set_current_directory(path.into());
+                    } else if let Some((host, path)) =
+                        osc::parse_remote_directory(payload)
+                    {
+                        self.handler.set_remote_directory(host, path.into());
                     }
                 }
             }
@@ -1180,8 +1386,26 @@ impl<U: Handler> Perform for Performer<'_, U> {
 
             // OSC 133 - semantic prompt zones (shell integration).
             b"133" => {
+                if params.get(1) == Some(&b"A".as_slice()) {
+                    self.handler.shell_prompt_start();
+                }
                 if let Some(mark) = osc::parse_semantic_prompt(params) {
                     self.handler.set_semantic_prompt(mark);
+                }
+            }
+
+            b"7501" if params.len() == 2 => {
+                // Include OSC, the separator, and the actual terminator.
+                if params[1].len() + 7 + terminator.len()
+                    <= crate::program_status::MAX_SEQUENCE_BYTES
+                {
+                    if params[1] == b"?" {
+                        self.handler.query_program_status(terminator);
+                    } else if let Some(report) =
+                        crate::program_status::parse_report(params[1])
+                    {
+                        self.handler.set_program_status(report);
+                    }
                 }
             }
 
@@ -1226,6 +1450,17 @@ impl<U: Handler> Perform for Performer<'_, U> {
                 Some(shape) => self.handler.set_cursor_shape(shape),
                 None => unhandled(params),
             },
+
+            b"5522" if params.len() >= 2 => {
+                let payload = match params.len() {
+                    2 => &b""[..],
+                    3 => params[2],
+                    // A semicolon cannot occur in base64. Forward an invalid
+                    // payload so the receiving transaction can abort cleanly.
+                    _ => &b"!"[..],
+                };
+                self.handler.kitty_clipboard(params[1], payload, terminator);
+            }
 
             // Clipboard load/store.
             b"52" => match osc::parse_clipboard(params) {
@@ -1308,6 +1543,7 @@ impl<U: Handler> Perform for Performer<'_, U> {
         };
 
         match (action, intermediates) {
+            ('p', [b'!']) => handler.soft_reset(),
             ('@', []) => handler.insert_blank(next_param_or(1) as usize),
             ('A', []) => handler.move_up(next_param_or(1) as usize),
             ('B', []) | ('e', []) => handler.move_down(next_param_or(1) as usize),
@@ -1370,21 +1606,26 @@ impl<U: Handler> Perform for Performer<'_, U> {
                 }
             }
             ('I', []) => handler.move_forward_tabs(next_param_or(1)),
-            ('J', []) => {
+            ('J', [] | [b'?']) => {
                 let mode = match next_param_or(0) {
                     0 => ClearMode::Below,
                     1 => ClearMode::Above,
                     2 => ClearMode::All,
                     3 => ClearMode::Saved,
+                    22 => ClearMode::Scroll,
                     _ => {
                         csi_unhandled!();
                         return;
                     }
                 };
 
-                handler.clear_screen(mode);
+                if intermediates.is_empty() {
+                    handler.clear_screen(mode);
+                } else {
+                    handler.clear_screen_selective(mode);
+                }
             }
-            ('K', []) => {
+            ('K', [] | [b'?']) => {
                 let mode = match next_param_or(0) {
                     0 => LineClearMode::Right,
                     1 => LineClearMode::Left,
@@ -1395,7 +1636,11 @@ impl<U: Handler> Perform for Performer<'_, U> {
                     }
                 };
 
-                handler.clear_line(mode);
+                if intermediates.is_empty() {
+                    handler.clear_line(mode);
+                } else {
+                    handler.clear_line_selective(mode);
+                }
             }
             ('k', [b' ']) => {
                 // SCP control.
@@ -1449,6 +1694,7 @@ impl<U: Handler> Perform for Performer<'_, U> {
                 }
             }
             ('n', []) => handler.device_status(next_param_or(0) as usize),
+            ('n', [b'?']) => handler.private_device_status(next_param_or(0) as usize),
             ('P', []) => handler.delete_chars(next_param_or(1) as usize),
             ('p', [b'$']) => {
                 let mode = next_param_or(0);
@@ -1482,6 +1728,11 @@ impl<U: Handler> Perform for Performer<'_, U> {
 
                 handler.set_cursor_style(shape, cursor_style_id % 2 == 1);
             }
+            ('q', [b'"']) => match next_param_or(0) {
+                0 | 2 => handler.set_protection(false, crate::ansi::ProtectionMode::Dec),
+                1 => handler.set_protection(true, crate::ansi::ProtectionMode::Dec),
+                _ => csi_unhandled!(),
+            },
             ('r', []) => {
                 let top = next_param_or(1) as usize;
                 let bottom = params_iter
@@ -1501,8 +1752,19 @@ impl<U: Handler> Perform for Performer<'_, U> {
                 14 => handler.text_area_size_pixels(),
                 16 => handler.cells_size_pixels(),
                 18 => handler.text_area_size_chars(),
-                22 => handler.push_title(),
-                23 => handler.pop_title(),
+                command @ (22 | 23) => {
+                    let mut args = params.iter();
+                    if matches!(
+                        (args.next(), args.next(), args.next(), args.next()),
+                        (Some(&[22 | 23]), Some(&[0 | 2]), None | Some(&[_]), None)
+                    ) {
+                        if command == 22 {
+                            handler.push_title();
+                        } else {
+                            handler.pop_title();
+                        }
+                    }
+                }
                 _ => csi_unhandled!(),
             },
             ('u', [b'?']) => handler.report_keyboard_mode(),
@@ -1580,6 +1842,16 @@ impl<U: Handler> Perform for Performer<'_, U> {
             }
             (b'H', []) => self.handler.set_horizontal_tabstop(),
             (b'M', []) => self.handler.reverse_index(),
+            (b'N', []) => self.handler.single_shift(CharsetIndex::G2),
+            (b'O', []) => self.handler.single_shift(CharsetIndex::G3),
+            (b'V', []) => self
+                .handler
+                .set_protection(true, crate::ansi::ProtectionMode::Iso),
+            (b'W', []) => self
+                .handler
+                .set_protection(false, crate::ansi::ProtectionMode::Iso),
+            (b'n', []) => self.handler.set_active_charset(CharsetIndex::G2),
+            (b'o', []) => self.handler.set_active_charset(CharsetIndex::G3),
             (b'Z', []) => self.handler.identify_terminal(None),
             (b'c', []) => self.handler.reset_state(),
             (b'0', intermediates) => {
@@ -1607,7 +1879,8 @@ impl<U: Handler> Perform for Performer<'_, U> {
     /// OSC-style parameter parsing.
     fn apc_start(&mut self) {
         debug!("[apc_start] Beginning APC accumulation");
-        self.state.apc_state.buffer.clear();
+        self.state.apc_state.clear();
+        self.state.apc_state.discarded = false;
         // Pre-allocate reasonable size for Kitty graphics chunks (typically 4KB)
         self.state.apc_state.buffer.reserve(4096);
     }
@@ -1617,11 +1890,11 @@ impl<U: Handler> Perform for Performer<'_, U> {
     /// We accumulate all bytes here to handle large sequences that exceed Copa's
     /// default OSC buffer size (1024 bytes).
     fn apc_put(&mut self, byte: u8) {
-        self.state.apc_state.buffer.push(byte);
+        self.state.apc_state.extend(&[byte]);
     }
 
     fn apc_put_slice(&mut self, bytes: &[u8]) {
-        self.state.apc_state.buffer.extend_from_slice(bytes);
+        self.state.apc_state.extend(bytes);
     }
 
     /// Called when the APC sequence ends. Processes the accumulated APC data.
@@ -1632,7 +1905,14 @@ impl<U: Handler> Perform for Performer<'_, U> {
         );
 
         // Process the accumulated buffer
-        self.process_apc_buffer();
+        if !self.state.apc_state.discarded {
+            self.process_apc_buffer();
+        }
+        self.state.apc_state.clear();
+    }
+
+    fn apc_abort(&mut self) {
+        self.state.apc_state.clear();
     }
 }
 
@@ -2239,6 +2519,56 @@ mod tests {
     use super::*;
 
     #[derive(Default)]
+    struct DirectoryHandler {
+        local: Vec<std::path::PathBuf>,
+        remote: Vec<(String, std::path::PathBuf)>,
+    }
+
+    impl Handler for DirectoryHandler {
+        fn set_current_directory(&mut self, path: std::path::PathBuf) {
+            self.local.push(path);
+        }
+
+        fn set_remote_directory(&mut self, host: String, path: std::path::PathBuf) {
+            self.remote.push((host, path));
+        }
+    }
+
+    #[test]
+    fn osc_cwd_verbatim_tails_reach_the_correct_directory_context() {
+        let tail = format!("a{};", ";;b".repeat(20));
+        let local_path = format!("C:/local/{tail}");
+        let remote_path = format!("/remote/{tail}%25?raw#path");
+        let stream = format!(
+            "\x1b]7;file:///C:/local/{tail}\x1b\\\x1b]7;kitty-shell-cwd://rio-remote.invalid{remote_path}\x07\x1b]9;9;\"C:\\work\\{tail}\"\x07"
+        );
+        let local_path = if cfg!(windows) {
+            local_path
+        } else {
+            format!("/{local_path}")
+        };
+        for split in 0..=stream.len() {
+            let mut handler = DirectoryHandler::default();
+            let mut processor = Processor::default();
+            processor.advance(&mut handler, &stream.as_bytes()[..split]);
+            processor.advance(&mut handler, &stream.as_bytes()[split..]);
+            assert_eq!(
+                handler.local,
+                vec![
+                    std::path::PathBuf::from(&local_path),
+                    format!("C:\\work\\{tail}").into()
+                ],
+                "split={split}"
+            );
+            assert_eq!(
+                handler.remote,
+                vec![("rio-remote.invalid".into(), remote_path.clone().into())],
+                "split={split}"
+            );
+        }
+    }
+
+    #[derive(Default)]
     struct SyncHandler {
         printed: String,
     }
@@ -2256,6 +2586,41 @@ mod tests {
         stored: std::collections::HashSet<u32>,
         replies: Vec<String>,
         chunking: kitty_graphics_protocol::KittyGraphicsState,
+    }
+
+    #[test]
+    fn cancelled_apc_does_not_dispatch_partial_graphics_command() {
+        for interruption in [0x18, 0x1a, 0x80, 0x90, 0x98, 0x9b, 0x9d, 0x9e, 0x9f] {
+            let input = [
+                b"\x1b_Ga=p,i=99".as_slice(),
+                &[interruption],
+                b"\x1b\\\x1b_Ga=p,i=99\x1b\\",
+            ]
+            .concat();
+            for chunk_size in [1, 17, input.len()] {
+                let mut handler = KittyReplyHandler::default();
+                let mut processor = Processor::default();
+                for chunk in input.chunks(chunk_size) {
+                    processor.advance(&mut handler, chunk);
+                }
+                assert_eq!(
+                    handler.replies.len(),
+                    1,
+                    "interrupt {interruption:02x}, chunk {chunk_size}"
+                );
+                assert!(handler.replies[0].contains("ENOENT"));
+            }
+        }
+    }
+
+    #[test]
+    fn bell_does_not_dispatch_or_end_an_apc() {
+        let mut handler = KittyReplyHandler::default();
+        let mut processor = Processor::default();
+        processor.advance(&mut handler, b"\x1b_Ga=p,i=99\x07");
+        assert!(handler.replies.is_empty());
+        processor.advance(&mut handler, b"\x18\x1b_Ga=p,i=99\x9c");
+        assert_eq!(handler.replies.len(), 1);
     }
 
     impl Handler for KittyReplyHandler {
@@ -2676,6 +3041,65 @@ mod tests {
         let state = ApcState::default();
         assert_eq!(state.buffer.len(), 0);
         assert_eq!(state.buffer.capacity(), 0);
+    }
+
+    #[test]
+    fn apc_collection_is_bounded_and_recovers_after_termination() {
+        for terminator in [b"\x9c".as_slice(), b"\x1b\\", b"\x18", b"\x1a"] {
+            for chunk_size in [1, 17, 8192] {
+                let mut state = ProcessorState::default();
+                let mut handler = DirectoryHandler::default();
+                let mut parser = Parser::new();
+                {
+                    let mut performer = Performer::new(&mut state, &mut handler);
+                    parser.advance(&mut performer, b"\x1b_unknown;");
+                    for chunk in vec![b'a'; 256 * 1024].chunks(chunk_size) {
+                        parser.advance(&mut performer, chunk);
+                    }
+                }
+                assert!(state.apc_state.discarded);
+                assert!(
+                    state.apc_state.buffer.capacity()
+                        <= super::super::parser::MAX_CONTROL_BYTES
+                );
+                {
+                    let mut performer = Performer::new(&mut state, &mut handler);
+                    parser.advance(&mut performer, terminator);
+                    parser.advance(&mut performer, b"\x1b_Ga=q,i=1;AAAA");
+                }
+                assert!(!state.apc_state.discarded);
+                assert_eq!(state.apc_state.buffer, b"Ga=q,i=1;AAAA");
+                let mut performer = Performer::new(&mut state, &mut handler);
+                parser.advance(&mut performer, b"\x1b\\");
+                assert!(state.apc_state.buffer.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn large_apc_buffers_are_released_but_small_kitty_chunks_reuse_capacity() {
+        let mut state = ProcessorState::default();
+        let mut handler = DirectoryHandler::default();
+        let mut parser = Parser::new();
+        for size in [4096, 256 * 1024] {
+            {
+                let mut performer = Performer::new(&mut state, &mut handler);
+                parser.advance(&mut performer, b"\x1b_Ginvalid;");
+                parser.advance(&mut performer, &vec![b'a'; size]);
+            }
+            assert!(!state.apc_state.discarded);
+            assert!(state.apc_state.buffer.len() > size);
+            let capacity = state.apc_state.buffer.capacity();
+            {
+                let mut performer = Performer::new(&mut state, &mut handler);
+                parser.advance(&mut performer, b"\x1b\\");
+            }
+            assert!(state.apc_state.buffer.is_empty());
+            assert_eq!(
+                state.apc_state.buffer.capacity(),
+                if size == 4096 { capacity } else { 0 }
+            );
+        }
     }
 
     #[test]

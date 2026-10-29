@@ -70,6 +70,7 @@ const MAX_LOCKED_READ: usize = READ_CHUNK * 4;
 #[derive(Debug, PartialEq, Eq)]
 enum ReadOutcome {
     Idle,
+    Progress,
     Closed,
     Budget,
 }
@@ -133,7 +134,7 @@ pub struct Machine<T: teletypewriter::EventedPty, U: EventListener> {
 #[cfg(feature = "pty")]
 #[derive(Default)]
 pub struct State {
-    write_list: VecDeque<Cow<'static, [u8]>>,
+    write_list: VecDeque<Writing>,
     writing: Option<Writing>,
     parser: handler::Processor,
 }
@@ -149,7 +150,7 @@ impl State {
 
     #[inline]
     fn goto_next(&mut self) {
-        self.writing = self.write_list.pop_front().map(Writing::new);
+        self.writing = self.write_list.pop_front();
     }
 
     #[inline]
@@ -170,8 +171,24 @@ impl State {
 
 #[cfg(feature = "pty")]
 struct Writing {
-    source: Cow<'static, [u8]>,
+    source: WriteSource,
     written: usize,
+}
+
+#[cfg(feature = "pty")]
+enum WriteSource {
+    Input(Cow<'static, [u8]>),
+    Clipboard(Arc<crate::clipboard::buffer::ResponseBuffer>),
+}
+
+#[cfg(feature = "pty")]
+impl WriteSource {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Input(bytes) => bytes,
+            Self::Clipboard(bytes) => bytes.as_slice(),
+        }
+    }
 }
 
 #[cfg(feature = "pty")]
@@ -179,7 +196,14 @@ impl Writing {
     #[inline]
     fn new(c: Cow<'static, [u8]>) -> Writing {
         Writing {
-            source: c,
+            source: WriteSource::Input(c),
+            written: 0,
+        }
+    }
+
+    fn clipboard(response: Arc<crate::clipboard::buffer::ResponseBuffer>) -> Self {
+        Self {
+            source: WriteSource::Clipboard(response),
             written: 0,
         }
     }
@@ -191,12 +215,12 @@ impl Writing {
 
     #[inline]
     fn remaining_bytes(&self) -> &[u8] {
-        &self.source[self.written..]
+        &self.source.bytes()[self.written..]
     }
 
     #[inline]
     fn finished(&self) -> bool {
-        self.written >= self.source.len()
+        self.written >= self.source.bytes().len()
     }
 }
 
@@ -312,7 +336,14 @@ where
             }
         }
 
-        result
+        // A short burst followed by WouldBlock still made progress. The exit
+        // drain must renew its quiet window for this case, not just for full
+        // parse budgets, since ConPTY can publish final output in small bursts.
+        if processed != 0 && matches!(result, Ok(ReadOutcome::Idle)) {
+            Ok(ReadOutcome::Progress)
+        } else {
+            result
+        }
     }
 
     /// Drain the channel.
@@ -321,7 +352,16 @@ where
     fn drain_recv_channel(&mut self, state: &mut State) -> bool {
         while let Some(msg) = self.receiver.recv() {
             match msg {
-                Msg::Input(input) => state.write_list.push_back(input),
+                Msg::Input(input) => {
+                    if !input.is_empty() {
+                        state.write_list.push_back(Writing::new(input));
+                    }
+                }
+                Msg::ClipboardInput(input) => {
+                    if !input.is_empty() {
+                        state.write_list.push_back(Writing::clipboard(input));
+                    }
+                }
                 Msg::Resize(window_size) => {
                     let _ = self.pty.set_winsize(window_size.into());
                 }
@@ -504,6 +544,38 @@ where
         }
     }
 
+    fn drain_after_exit(
+        &mut self,
+        state: &mut State,
+        buf: &mut [u8],
+        quiet: std::time::Duration,
+    ) {
+        // ConPTY's pump can publish after the child-exit event. Retry its live
+        // empty queue, but stop at real EOF. Unix supplies a zero quiet window
+        // so descendants retaining the slave cannot delay exit.
+        let deadline = Instant::now() + std::time::Duration::from_millis(100);
+        let mut quiet_deadline = Instant::now() + quiet;
+        loop {
+            match self.pty_read(state, buf) {
+                Ok(ReadOutcome::Budget | ReadOutcome::Progress)
+                    if Instant::now() < deadline =>
+                {
+                    quiet_deadline = Instant::now() + quiet;
+                    continue;
+                }
+                Ok(ReadOutcome::Idle)
+                    if Instant::now() < deadline && Instant::now() < quiet_deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    continue;
+                }
+                Err(err) => tracing::debug!("PTY final drain: {err}"),
+                _ => (),
+            }
+            break;
+        }
+    }
+
     /// All reader exits, including partial registration failures, finalize here.
     fn finish(
         &mut self,
@@ -512,38 +584,12 @@ where
         reason: io::Result<ExitReason>,
     ) {
         if matches!(reason, Ok(ExitReason::ChildExited(_))) {
-            // Do not wait for descendants to close the slave. Drain across
-            // parsing budgets, limiting continuously available output to 100 ms
-            // between batches (terminal lock waits can extend this interval).
-            let deadline = Instant::now() + std::time::Duration::from_millis(100);
-            // Windows Closed means the ConPTY ring is momentarily empty
-            // (never WouldBlock, and no real EOF exists until the drain's
-            // own shutdown closes the pseudoconsole), while the pump
-            // thread delivers final output after the exit event. Retry it
-            // through a short quiet window, refreshed by each batch of
-            // data, so a close is not taxed the full deadline. Unix
-            // Closed is a real EOF and ends the drain at once.
-            let quiet = std::time::Duration::from_millis(25);
-            let mut quiet_deadline = Instant::now() + quiet;
-            loop {
-                match self.pty_read(state, buf) {
-                    Ok(ReadOutcome::Budget) if Instant::now() < deadline => {
-                        quiet_deadline = Instant::now() + quiet;
-                        continue;
-                    }
-                    Ok(ReadOutcome::Closed)
-                        if cfg!(windows)
-                            && Instant::now() < deadline
-                            && Instant::now() < quiet_deadline =>
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(2));
-                        continue;
-                    }
-                    Err(err) => tracing::debug!("PTY final drain: {err}"),
-                    _ => (),
-                }
-                break;
-            }
+            let quiet = if cfg!(windows) {
+                std::time::Duration::from_millis(25)
+            } else {
+                std::time::Duration::ZERO
+            };
+            self.drain_after_exit(state, buf, quiet);
         }
 
         // Flush exactly once before publishing any exit notification.
@@ -583,5 +629,12 @@ where
         // best effort because setup may have failed before registering them.
         let _ = self.poll.deregister(&self.receiver.rx);
         let _ = self.pty.deregister(&self.poll);
+        // Returned Machine/State values may outlive the worker. Discard writes
+        // and disconnect its channel now, releasing queued response credits.
+        state.writing = None;
+        state.write_list.clear();
+        let (closed_sender, closed_receiver) = channel::channel();
+        drop(closed_sender);
+        self.receiver = PeekableReceiver::new(closed_receiver);
     }
 }

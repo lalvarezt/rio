@@ -13,7 +13,7 @@ use crate::crosswords::pos::Pos;
 use crate::crosswords::Cursor;
 use crate::crosswords::{Column, Line};
 use row::Row;
-use std::cmp::{max, min};
+use std::cmp::min;
 use std::ops::{Bound, Deref, Index, IndexMut, Range, RangeBounds};
 use storage::Storage;
 
@@ -26,9 +26,17 @@ pub enum Scroll {
     Bottom,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewportAnchor {
+    Active,
+    Top,
+    Cell(usize),
+}
+
 pub trait GridSquare: Sized {
     fn is_empty(&self) -> bool;
-    fn reset(&mut self, template: &Self);
+    /// Erase using the template background, with all other attributes reset.
+    fn reset(&mut self, template: &Self, styles: &mut crate::crosswords::style::StyleSet);
     /// True when the value carries a non-default style id; drives the
     /// per-row `has_styles` hint.
     fn carries_style(&self) -> bool {
@@ -43,6 +51,11 @@ pub struct Grid<T> {
 
     /// Last saved cursor.
     pub saved_cursor: Cursor<T>,
+    /// Origin mode and active GL selector saved with the cursor.
+    pub saved_origin: bool,
+    pub saved_charset: crate::crosswords::CharsetIndex,
+    pub saved_single_shift: Option<crate::crosswords::CharsetIndex>,
+    pub protection_mode: Option<crate::ansi::ProtectionMode>,
 
     /// Lines in the grid. Each row holds a list of cells corresponding to the
     /// columns in that row.
@@ -61,8 +74,13 @@ pub struct Grid<T> {
     /// updates this offset accordingly.
     display_offset: usize,
 
+    /// Reflow follows this cell's column, the oldest row, or the active area.
+    display_anchor: ViewportAnchor,
+
     /// Maximum number of lines in history.
     max_scroll_limit: usize,
+    history_line_limit: usize,
+    history_byte_limit: Option<usize>,
 
     /// Total lines ever evicted off the scrollback ring (dropped from
     /// history at the cap, shrunk by a config change, or purged by
@@ -93,6 +111,13 @@ pub struct Grid<T> {
     /// placements exist.
     pub track_reflow_remap: bool,
 
+    /// Absolute image-anchor rows which must survive blank-row trimming.
+    /// Populated only for a resize and consumed alongside the row remap.
+    pub reflow_protected_rows: Vec<i64>,
+
+    /// Kitty anchor cells, tracked independently of the live cursor.
+    pub reflow_protected_cells: Vec<(i64, usize)>,
+
     /// Output of the last tracked column reflow; `None` when tracking
     /// was off or the column count did not change.
     pub reflow_remap: Option<ReflowRemap>,
@@ -109,9 +134,15 @@ pub struct ReflowRemap {
     /// For each old position, the position where that row's first
     /// cell landed, or `-1` if the row's content was dropped.
     pub new_pos: Vec<i64>,
+    /// Old absolute anchor cells and their new absolute positions.
+    pub cells: std::collections::HashMap<(i64, usize), (i64, usize)>,
 }
 
 impl ReflowRemap {
+    pub fn remap_cell(&self, row: i64, col: usize) -> Option<(i64, usize)> {
+        self.cells.get(&(row, col)).copied()
+    }
+
     /// Remap an absolute row through the reflow. `None` means the row
     /// was dropped. Rows already off the ring pass through unchanged;
     /// scrollback expiry owns those.
@@ -137,7 +168,10 @@ pub(crate) const ID_BITSET_WORDS: usize = (u16::MAX as usize + 1).div_ceil(64);
 /// reused via a free list when cells are cleared.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ExtrasTable {
-    slots: Vec<Option<crate::crosswords::square::Extras>>,
+    payload_bytes: usize,
+    // Snapshots and the interning key share immutable payloads instead of
+    // cloning hyperlink targets and combining characters for each visible cell.
+    slots: Vec<Option<std::sync::Arc<crate::crosswords::square::Extras>>>,
     free: Vec<u16>,
     /// Content-hash interning: identical extras share one slot.
     /// Emoji and combining sequences repeat constantly, and every
@@ -148,7 +182,7 @@ pub struct ExtrasTable {
     /// means slots are shared — mutating one in place would edit
     /// every referencing cell, so writers must copy-on-write
     /// (clone, modify, re-alloc).
-    lookup: rustc_hash::FxHashMap<crate::crosswords::square::Extras, u16>,
+    lookup: rustc_hash::FxHashMap<std::sync::Arc<crate::crosswords::square::Extras>, u16>,
     /// Allocations since the last mark-and-sweep. The table holds
     /// hyperlink and zero-width data whose slots stay referenced by
     /// cells until their rows scroll off the ring; without a periodic
@@ -156,6 +190,10 @@ pub struct ExtrasTable {
     /// new hyperlinks silently drop. (Images no longer live here;
     /// placements own them with deterministic cleanup.)
     allocs_since_reclaim: usize,
+    // Repeated cluster/link payloads can reuse their last slot without
+    // hashing the same URI or combining sequence again. Validate the slot
+    // contents each time because sweeps may recycle its id.
+    last_alloc: u16,
 }
 
 /// One `reclaim_extras` mark-and-sweep per this many allocations. The
@@ -170,9 +208,11 @@ impl ExtrasTable {
         // to mean "has extras".
         Self {
             slots: vec![None],
+            payload_bytes: 0,
             free: Vec::new(),
             lookup: rustc_hash::FxHashMap::default(),
             allocs_since_reclaim: 0,
+            last_alloc: 0,
         }
     }
 
@@ -180,6 +220,13 @@ impl ExtrasTable {
         &self,
         id: crate::crosswords::square::ExtrasId,
     ) -> Option<&crate::crosswords::square::Extras> {
+        self.slots.get(id as usize)?.as_deref()
+    }
+
+    pub(super) fn shared(
+        &self,
+        id: crate::crosswords::square::ExtrasId,
+    ) -> Option<&std::sync::Arc<crate::crosswords::square::Extras>> {
         self.slots.get(id as usize)?.as_ref()
     }
 
@@ -191,17 +238,61 @@ impl ExtrasTable {
     /// Return the slot holding `extras`, interning by content: repeat
     /// content reuses its existing slot, new content allocates one.
     /// The returned id is always non-zero (0 on slot exhaustion).
+    #[inline]
     pub fn alloc(
         &mut self,
         extras: crate::crosswords::square::Extras,
     ) -> crate::crosswords::square::ExtrasId {
-        if let Some(&id) = self.lookup.get(&extras) {
+        if let Some(id) = self.find(&extras) {
             return id;
         }
+        self.insert(extras)
+    }
+
+    /// Intern a reusable payload, cloning only when its content is new.
+    /// Repeated assignments avoid cloning and dropping hyperlink Arcs or
+    /// combining-character vectors just to discover an existing slot.
+    #[inline]
+    pub fn intern(
+        &mut self,
+        extras: &crate::crosswords::square::Extras,
+    ) -> crate::crosswords::square::ExtrasId {
+        if let Some(id) = self.find(extras) {
+            return id;
+        }
+        self.insert(extras.clone())
+    }
+
+    #[inline]
+    fn find(&mut self, extras: &crate::crosswords::square::Extras) -> Option<u16> {
+        let cached = self.slots[self.last_alloc as usize].as_deref();
+        if cached.is_some_and(|cached| {
+            // Hyperlink-only payloads need no combining-character comparison.
+            if cached.zerowidth.is_empty() && extras.zerowidth.is_empty() {
+                cached.hyperlink == extras.hyperlink
+            } else {
+                cached == extras
+            }
+        }) {
+            return Some(self.last_alloc);
+        }
+        let id = *self.lookup.get(extras)?;
+        self.last_alloc = id;
+        Some(id)
+    }
+
+    fn insert(
+        &mut self,
+        extras: crate::crosswords::square::Extras,
+    ) -> crate::crosswords::square::ExtrasId {
         self.allocs_since_reclaim += 1;
+        let bytes = extras.logical_bytes();
+        let extras = std::sync::Arc::new(extras);
         if let Some(id) = self.free.pop() {
             self.lookup.insert(extras.clone(), id);
             self.slots[id as usize] = Some(extras);
+            self.last_alloc = id;
+            self.payload_bytes = self.payload_bytes.saturating_add(bytes);
             return id;
         }
         if self.slots.len() >= u16::MAX as usize {
@@ -211,6 +302,8 @@ impl ExtrasTable {
         let id = self.slots.len() as u16;
         self.lookup.insert(extras.clone(), id);
         self.slots.push(Some(extras));
+        self.payload_bytes = self.payload_bytes.saturating_add(bytes);
+        self.last_alloc = id;
         id
     }
 
@@ -233,6 +326,8 @@ impl ExtrasTable {
             let marked = live[id / 64] & (1 << (id % 64)) != 0;
             if !marked && self.slots[id].is_some() {
                 if let Some(extras) = self.slots[id].take() {
+                    self.payload_bytes =
+                        self.payload_bytes.saturating_sub(extras.logical_bytes());
                     self.lookup.remove(&extras);
                 }
                 self.free.push(id as u16);
@@ -251,11 +346,20 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
         Grid {
             raw: Storage::with_capacity(lines, columns),
             max_scroll_limit,
+            history_line_limit: max_scroll_limit,
+            history_byte_limit: None,
             total_lines_scrolled: 0,
             track_reflow_remap: false,
+            reflow_protected_rows: Vec::new(),
+            reflow_protected_cells: Vec::new(),
             reflow_remap: None,
             display_offset: 0,
+            display_anchor: ViewportAnchor::Active,
             saved_cursor: Cursor::default(),
+            saved_origin: false,
+            saved_charset: Default::default(),
+            saved_single_shift: None,
+            protection_mode: None,
             cursor: Cursor::default(),
             lines,
             columns,
@@ -266,33 +370,129 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
 
     /// Update the size of the scrollback history.
     pub fn update_history(&mut self, history_size: usize) {
+        self.history_line_limit = history_size;
+        self.apply_history_byte_limit(self.columns);
+    }
+
+    /// Budget logical uncompressed rows plus shared style/extras payloads once.
+    /// Visible rows, spare capacity, allocator and graphics overhead are separate.
+    pub fn set_history_byte_limit(&mut self, limit: Option<usize>) {
+        self.history_byte_limit = limit;
+        self.apply_history_byte_limit(self.columns);
+        if limit == Some(0) {
+            self.scroll_display(Scroll::Bottom);
+        }
+    }
+
+    pub(crate) fn history_is_disabled(&self) -> bool {
+        self.history_line_limit == 0 || self.history_byte_limit == Some(0)
+    }
+
+    pub fn enforce_history_byte_limit(&mut self) {
+        if self.history_byte_limit.is_some() {
+            self.apply_history_byte_limit(self.columns);
+        }
+    }
+
+    pub fn history_budget_charge(&self) -> usize {
+        if self.history_size() == 0 {
+            return 0;
+        }
+        self.history_size()
+            .saturating_mul(Self::logical_row_bytes(self.columns))
+            .saturating_add(self.style_set.logical_bytes())
+            .saturating_add(self.extras_table.payload_bytes)
+    }
+
+    fn logical_row_bytes(columns: usize) -> usize {
+        columns
+            .saturating_mul(std::mem::size_of::<T>())
+            .saturating_add(std::mem::size_of::<Row<T>>())
+    }
+
+    fn apply_history_byte_limit(&mut self, columns: usize) {
+        let limit = self
+            .history_byte_limit
+            .map_or(self.history_line_limit, |bytes| {
+                let shared = self
+                    .style_set
+                    .logical_bytes()
+                    .saturating_add(self.extras_table.payload_bytes);
+                self.history_line_limit.min(
+                    bytes.saturating_sub(shared)
+                        / Self::logical_row_bytes(columns).max(1),
+                )
+            });
+        self.trim_history(limit);
+    }
+
+    fn trim_history(&mut self, history_size: usize) {
         let current_history_size = self.history_size();
         if current_history_size > history_size {
             let dropped = current_history_size - history_size;
             self.total_lines_scrolled += dropped as u64;
             self.raw.shrink_lines(dropped);
+            if self.history_byte_limit.is_some() {
+                self.raw.truncate();
+            }
+        }
+        if self.display_offset > history_size {
+            self.display_anchor = ViewportAnchor::Top;
         }
         self.display_offset = min(self.display_offset, history_size);
         self.max_scroll_limit = history_size;
     }
 
     pub fn scroll_display(&mut self, scroll: Scroll) {
+        let delta = match scroll {
+            Scroll::Delta(count) => i64::from(count),
+            Scroll::PageUp => self.lines as i64,
+            Scroll::PageDown => -(self.lines as i64),
+            Scroll::Top | Scroll::Bottom => 0,
+        };
+        let requested = self.display_offset as i64 + delta;
+        let anchor = self.display_anchor;
         self.display_offset = match scroll {
-            Scroll::Delta(count) => min(
-                max((self.display_offset as i32) + count, 0) as usize,
-                self.history_size(),
-            ),
-            Scroll::PageUp => min(self.display_offset + self.lines, self.history_size()),
-            Scroll::PageDown => self.display_offset.saturating_sub(self.lines),
+            Scroll::Delta(_) | Scroll::PageUp | Scroll::PageDown => {
+                (requested.max(0) as usize).min(self.history_size())
+            }
             Scroll::Top => self.history_size(),
             Scroll::Bottom => 0,
+        };
+        self.display_anchor = if matches!(scroll, Scroll::Top)
+            || (anchor == ViewportAnchor::Top
+                && requested >= self.history_size() as i64
+                && !matches!(scroll, Scroll::Bottom))
+        {
+            ViewportAnchor::Top
+        } else if self.display_offset == 0 {
+            ViewportAnchor::Active
+        } else if matches!(scroll, Scroll::Bottom)
+            || requested > self.history_size() as i64
+            || (!matches!(anchor, ViewportAnchor::Cell(_))
+                && requested == self.history_size() as i64)
+        {
+            ViewportAnchor::Top
+        } else {
+            ViewportAnchor::Cell(match anchor {
+                ViewportAnchor::Cell(col) => col,
+                _ => 0,
+            })
         };
     }
 
     fn increase_scroll_limit(&mut self, count: usize) {
         let count = min(count, self.max_scroll_limit - self.history_size());
         if count != 0 {
-            self.raw.initialize(count, self.columns);
+            if self.history_byte_limit.is_some() {
+                self.raw.initialize_bounded(
+                    count,
+                    self.columns,
+                    self.lines.saturating_add(self.max_scroll_limit),
+                );
+            } else {
+                self.raw.initialize(count, self.columns);
+            }
         }
     }
 
@@ -303,6 +503,9 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
         let count = min(count, self.history_size());
         if count != 0 {
             self.raw.shrink_lines(min(count, self.history_size()));
+            if self.display_offset > self.history_size() {
+                self.display_anchor = ViewportAnchor::Top;
+            }
             self.display_offset = min(self.display_offset, self.history_size());
         }
     }
@@ -311,10 +514,7 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
     pub fn scroll_down(&mut self, region: &Range<Line>, positions: usize) {
         // When rotating the entire region, just reset everything.
         if region.end - region.start <= positions {
-            for i in (region.start.0..region.end.0).map(Line::from) {
-                self.raw[i].reset(&self.cursor.template);
-            }
-
+            self.reset_rows(region.clone());
             return;
         }
 
@@ -340,9 +540,7 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
             self.raw.rotate_down(positions);
 
             // Ensure all new lines are fully cleared.
-            for i in (0..positions).map(Line::from) {
-                self.raw[i].reset(&self.cursor.template);
-            }
+            self.reset_rows(Line(0)..Line(positions as i32));
 
             // Swap the fixed lines at the top back into position.
             for i in (0..region.start.0).map(Line::from) {
@@ -355,10 +553,7 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
                 self.raw.swap(line, line - positions);
             }
 
-            let range = region.start.0..(region.start + positions).0;
-            for line in range.rev().map(Line::from) {
-                self.raw[line].reset(&self.cursor.template);
-            }
+            self.reset_rows(region.start..region.start + positions);
         }
 
         // See `scroll_up` for the rationale — `raw.swap` / `raw.rotate`
@@ -378,6 +573,16 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
     ///
     /// This is the performance-sensitive part of scrolling.
     pub fn scroll_up(&mut self, region: &Range<Line>, positions: usize) {
+        self.scroll_up_inner(region, positions, true);
+    }
+
+    /// Delete rows in place, including when the region starts at row zero.
+    pub fn delete_lines(&mut self, region: &Range<Line>, positions: usize) {
+        self.scroll_up_inner(region, positions, false);
+    }
+
+    fn scroll_up_inner(&mut self, region: &Range<Line>, positions: usize, history: bool) {
+        self.enforce_history_byte_limit();
         // Storage-level shifts below (`raw.swap`, `raw.rotate`) move
         // row content between line indices without going through
         // `IndexMut`, so the moved Row's `dirty` bit travels with the
@@ -385,16 +590,13 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
         // the whole region dirty at the end so the snapshot picks up
         // the post-scroll layout. Same fix for `scroll_down` below.
         // When rotating the entire region with fixed lines at the top, just reset everything.
-        if region.end - region.start <= positions && region.start != 0 {
-            for i in (region.start.0..region.end.0).map(Line::from) {
-                self.raw[i].reset(&self.cursor.template);
-            }
-
+        if region.end - region.start <= positions && (region.start != 0 || !history) {
+            self.reset_rows(region.clone());
             return;
         }
 
         // Only rotate the entire history if the active region starts at the top.
-        if region.start == 0 {
+        if region.start == 0 && history {
             // A viewport scrolled into history stays pinned to the same
             // absolute rows by growing the offset alongside history.
             // This belongs to this branch only: a sub-region scroll
@@ -402,7 +604,10 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
             // and bumping the offset for it drifts the offset past the
             // rows that exist; `compute_index` then resolves visible
             // lines to the wrong storage slots.
-            if self.display_offset != 0 {
+            if self.display_anchor != ViewportAnchor::Active {
+                if self.display_offset.saturating_add(positions) > self.max_scroll_limit {
+                    self.display_anchor = ViewportAnchor::Top;
+                }
                 self.display_offset =
                     min(self.display_offset + positions, self.max_scroll_limit);
             }
@@ -440,9 +645,7 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
         }
 
         // Ensure all new lines are fully cleared.
-        for i in (region.end.0 - positions as i32..region.end.0).map(Line::from) {
-            self.raw[i].reset(&self.cursor.template);
-        }
+        self.reset_rows(region.end - positions..region.end);
 
         // Mark every row in the region dirty. Reset rows above already
         // got `dirty = true` from `Row::reset`; the swap/rotate'd ones
@@ -459,13 +662,17 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
         // Determine how many lines to scroll up by.
         let end = Pos::new(Line(self.lines as i32 - 1), Column(self.columns()));
         let mut iter = self.iter_from(end);
+        let mut positions = 0;
         while let Some(square) = iter.prev() {
-            if !square.is_empty() || square.pos.row < 0 {
+            if square.pos.row < 0 {
+                break;
+            }
+            if !square.is_empty() {
+                positions = square.pos.row.0 as usize + 1;
                 break;
             }
         }
         debug_assert!(iter.current.row >= -1);
-        let positions = (iter.current.row.0 + 1) as usize;
         let region = Line(0)..Line(self.lines as i32);
 
         // Clear the viewport.
@@ -473,7 +680,7 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
 
         // Reset rotated lines.
         for line in (0..(self.lines - positions)).map(Line::from) {
-            self.raw[line].reset(&self.cursor.template);
+            self.raw[line].reset(&self.cursor.template, &mut self.style_set);
         }
     }
 
@@ -482,13 +689,18 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
         self.clear_history();
 
         self.saved_cursor = Cursor::default();
+        self.saved_origin = false;
+        self.saved_charset = Default::default();
+        self.saved_single_shift = None;
+        self.protection_mode = None;
         self.cursor = Cursor::default();
         self.display_offset = 0;
+        self.display_anchor = ViewportAnchor::Active;
 
         // Reset all visible lines.
         let range = self.topmost_line().0..(self.screen_lines() as i32);
         for line in range.map(Line::from) {
-            self.raw[line].reset(&self.cursor.template);
+            self.raw[line].reset(&self.cursor.template, &mut self.style_set);
         }
     }
 }
@@ -514,8 +726,20 @@ impl<T> Grid<T> {
         debug_assert!(start < self.screen_lines() as i32);
         debug_assert!(end <= self.screen_lines() as i32);
 
-        for line in (start.0..end.0).map(Line::from) {
-            self.raw[line].reset(&self.cursor.template);
+        self.reset_rows(start..end);
+    }
+
+    fn reset_rows(&mut self, range: Range<Line>)
+    where
+        T: GridSquare + Clone + Default + PartialEq,
+    {
+        if range.is_empty() {
+            return;
+        }
+        let mut fill = T::default();
+        fill.reset(&self.cursor.template, &mut self.style_set);
+        for line in (range.start.0..range.end.0).map(Line::from) {
+            self.raw[line].reset_to(fill.clone());
         }
     }
 
@@ -529,10 +753,11 @@ impl<T> Grid<T> {
     pub fn clear_history(&mut self) {
         // Explicitly purge all lines from history.
         self.total_lines_scrolled += self.history_size() as u64;
-        self.raw.shrink_lines(self.history_size());
+        self.raw.clear_history();
 
         // Reset display offset.
         self.display_offset = 0;
+        self.display_anchor = ViewportAnchor::Active;
     }
 
     /// This is used only for initializing after loading ref-tests.
@@ -722,17 +947,13 @@ impl Grid<Square> {
     /// style; their color travels inline in the cell itself. Snapshots
     /// carry these resolved values instead of ids, so id reuse by the
     /// sweep can never affect rows copied on earlier frames.
-    pub fn resolve_row_styles(&self, src: &Row<Square>, out: &mut Vec<Style>) {
-        out.clear();
-        if !src.has_styles {
-            out.resize(src.inner.len(), Style::default());
-            return;
-        }
-        out.extend(src.inner.iter().map(|sq| {
-            sq.style_id_checked()
-                .map(|id| self.style_set.get(id))
-                .unwrap_or_default()
-        }));
+    /// Uniform rows resolve once and retain no per-cell style values.
+    pub fn resolve_row_styles(
+        &self,
+        src: &Row<Square>,
+        out: &mut super::snapshot::RowStyles,
+    ) {
+        out.resolve(src, self.styles());
     }
 
     /// Read the style id of the current cursor template.
@@ -841,46 +1062,7 @@ impl Grid<Square> {
     /// after `clear`, color block fills) essentially free to render.
     #[inline]
     pub fn blank_with_bg(&mut self, bg: crate::config::colors::AnsiColor) -> Square {
-        use crate::config::colors::{AnsiColor, NamedColor};
-
-        let mut cell = Square::default();
-        match bg {
-            // Default background → fully default cell, no encoding needed.
-            AnsiColor::Named(NamedColor::Background) => return cell,
-
-            // Palette index → bg-only cell, inline encoding.
-            AnsiColor::Indexed(idx) => {
-                cell.set_bg_palette(idx);
-                return cell;
-            }
-
-            // RGB spec → bg-only cell, inline encoding.
-            AnsiColor::Spec(rgb) => {
-                cell.set_bg_rgb(rgb.r, rgb.g, rgb.b);
-                return cell;
-            }
-
-            // Named palette colors 0..15 → encode as palette index.
-            AnsiColor::Named(named) => {
-                let n = named as u16;
-                if n < 16 {
-                    cell.set_bg_palette(n as u8);
-                    return cell;
-                }
-                // Special named colors (Foreground, Cursor, Dim*, Light*)
-                // fall through to the style table because their meaning
-                // depends on the active palette and would require lookup
-                // anyway.
-            }
-        }
-
-        // Fallback: intern a regular style. Should be rare in practice.
-        let style = Style {
-            bg,
-            ..Style::default()
-        };
-        let id = self.intern_style(style);
-        Square::default().with_style_id(id)
+        Square::blank_with_bg(bg, |style| self.intern_style(style))
     }
 }
 
