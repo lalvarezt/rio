@@ -950,6 +950,7 @@ impl Renderer {
             &overlay_theme,
         );
 
+        self.search.set_top_inset(self.island.content_top());
         self.search.render(
             sugarloaf,
             (window_size.width, window_size.height, scale_factor),

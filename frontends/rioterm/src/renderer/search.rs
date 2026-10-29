@@ -54,6 +54,7 @@ pub struct SearchOverlay {
     active_search: Option<String>,
     caret_blink_start: Instant,
     hovered_button: Option<SearchOverlayAction>,
+    top_inset: f32,
 }
 
 impl Default for SearchOverlay {
@@ -64,11 +65,16 @@ impl Default for SearchOverlay {
             active_search: None,
             caret_blink_start: Instant::now(),
             hovered_button: None,
+            top_inset: 0.0,
         }
     }
 }
 
 impl SearchOverlay {
+    pub fn set_top_inset(&mut self, top_inset: f32) {
+        self.top_inset = top_inset;
+    }
+
     #[inline]
     pub fn is_active(&self) -> bool {
         self.active_search.is_some()
@@ -96,7 +102,7 @@ impl SearchOverlay {
     fn overlay_rect(&self, window_width: f32, scale_factor: f32) -> (f32, f32, f32, f32) {
         let logical_width = window_width / scale_factor;
         let x = logical_width - OVERLAY_WIDTH - OVERLAY_MARGIN_RIGHT;
-        let y = OVERLAY_MARGIN_TOP;
+        let y = self.top_inset + OVERLAY_MARGIN_TOP;
         (x, y, OVERLAY_WIDTH, OVERLAY_HEIGHT)
     }
 
@@ -395,5 +401,31 @@ impl SearchOverlay {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_controls_stay_below_window_chrome() {
+        let mut overlay = SearchOverlay::default();
+        overlay.set_active_search(Some("target"));
+        overlay.set_top_inset(48.0);
+
+        for scale in [1.0, 1.5, 2.0] {
+            let (x, y, width, height) = overlay.overlay_rect(1500.0 * scale, scale);
+            assert_eq!(y, 48.0 + OVERLAY_MARGIN_TOP);
+            let (bx, by, bw, bh) = overlay.button_rects(x, y, width, height)[2];
+            assert_eq!(
+                overlay.hit_test(bx + bw / 2.0, by + bh / 2.0, 1500.0 * scale, scale),
+                Ok(Some(SearchOverlayAction::Close))
+            );
+            assert_eq!(overlay.hit_test(bx, 20.0, 1500.0 * scale, scale), Err(()));
+        }
+
+        overlay.set_top_inset(0.0);
+        assert_eq!(overlay.overlay_rect(1500.0, 1.0).1, OVERLAY_MARGIN_TOP);
     }
 }
