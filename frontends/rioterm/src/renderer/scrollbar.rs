@@ -118,7 +118,7 @@ pub fn draw_thumb(
         SCROLLBAR_COLOR
     };
     let color = [base[0], base[1], base[2], base[3] * opacity];
-    sugarloaf.rect(None, x, y, SCROLLBAR_WIDTH, height, color, depth, order);
+    sugarloaf.rect(x, y, SCROLLBAR_WIDTH, height, color, depth, order);
 }
 
 /// Computed geometry of a scrollbar track and thumb in logical pixels.
@@ -239,12 +239,11 @@ impl Scrollbar {
         display_offset: usize,
         history_size: usize,
         screen_lines: usize,
-        grid_margin: (f32, f32),
     ) -> ThumbGeometry {
         let total_lines = history_size + screen_lines;
 
-        let panel_x = (panel_rect[0] + grid_margin.0) / scale_factor;
-        let panel_y = (panel_rect[1] + grid_margin.1) / scale_factor;
+        let panel_x = panel_rect[0] / scale_factor;
+        let panel_y = panel_rect[1] / scale_factor;
         let panel_width = panel_rect[2] / scale_factor;
         let panel_height = panel_rect[3] / scale_factor;
 
@@ -286,7 +285,6 @@ impl Scrollbar {
         display_offset: usize,
         history_size: usize,
         screen_lines: usize,
-        grid_margin: (f32, f32),
     ) -> Option<(Option<f32>, ThumbGeometry)> {
         if !self.enabled || history_size == 0 {
             return None;
@@ -298,7 +296,6 @@ impl Scrollbar {
             display_offset,
             history_size,
             screen_lines,
-            grid_margin,
         );
 
         // Use wider hit area for easier grabbing
@@ -380,7 +377,6 @@ impl Scrollbar {
         history_size: usize,
         screen_lines: usize,
         rich_text_id: usize,
-        grid_margin: (f32, f32),
     ) {
         if !self.enabled || history_size == 0 {
             return;
@@ -397,7 +393,6 @@ impl Scrollbar {
             display_offset,
             history_size,
             screen_lines,
-            grid_margin,
         );
 
         let is_dragging = self

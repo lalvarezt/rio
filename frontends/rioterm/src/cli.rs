@@ -61,20 +61,4 @@ impl TerminalOptions {
             args: args.to_vec(),
         })
     }
-
-    // pub fn override_pty_config(&self, pty_config: &mut PtyConfig) {
-    //     if let Some(working_directory) = &self.working_directory {
-    //         if working_directory.is_dir() {
-    //             pty_config.working_directory = Some(working_directory.to_owned());
-    //         } else {
-    //             error!("Invalid working directory: {:?}", working_directory);
-    //         }
-    //     }
-
-    //     if let Some(command) = self.command() {
-    //         pty_config.shell = Some(command);
-    //     }
-
-    //     pty_config.hold |= self.hold;
-    // }
 }

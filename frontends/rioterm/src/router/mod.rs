@@ -163,6 +163,7 @@ impl Route<'_> {
             .renderer
             .assistant
             .set_error(error.to_owned());
+        self.request_overlay_redraw();
     }
 
     #[inline]
@@ -174,6 +175,7 @@ impl Route<'_> {
 
     #[inline]
     pub fn confirm_quit(&mut self) {
+        self.window.screen.cancel_confirmation();
         self.window.screen.renderer.confirm_quit.set_active(true);
         self.request_overlay_redraw();
     }
@@ -186,21 +188,14 @@ impl Route<'_> {
     /// hover/click, the application.rs pointer handlers) still walk
     /// their own overlay checks and need separate wiring.
     pub fn active_modal(&self) -> Option<Modal> {
-        if self
-            .window
-            .screen
-            .renderer
-            .island
-            .as_ref()
-            .is_some_and(|island| island.is_color_picker_open())
-        {
+        if self.window.screen.renderer.confirm_quit.is_active() {
+            return Some(Modal::ConfirmQuit);
+        }
+        if self.window.screen.renderer.island.is_color_picker_open() {
             return Some(Modal::IslandRename);
         }
         if self.window.screen.renderer.command_palette.is_enabled() {
             return Some(Modal::CommandPalette);
-        }
-        if self.window.screen.renderer.confirm_quit.is_active() {
-            return Some(Modal::ConfirmQuit);
         }
         // Only hard errors are modal: a warning toast (font not
         // found on live reload, say) renders over a WORKING terminal
@@ -223,7 +218,8 @@ impl Route<'_> {
     pub fn overlay_commit_text(&mut self, text: &str) -> bool {
         match self.active_modal() {
             Some(Modal::IslandRename) => {
-                if let Some(ref mut island) = self.window.screen.renderer.island {
+                {
+                    let island = &mut self.window.screen.renderer.island;
                     if island.append_rename_text(text) {
                         self.request_overlay_redraw();
                     }
@@ -264,6 +260,23 @@ impl Route<'_> {
         self.quit_requested = true;
     }
 
+    pub fn confirm_close(&mut self, clipboard: &mut Clipboard) {
+        if self
+            .window
+            .screen
+            .resolve_clipboard_prompt(true, Some(clipboard))
+        {
+            self.request_overlay_redraw();
+            return;
+        }
+        if let Some(tab_id) = self.window.screen.renderer.confirm_quit.tab_id() {
+            self.window.screen.confirm_close_tab(tab_id, clipboard);
+            self.request_overlay_redraw();
+        } else {
+            self.quit();
+        }
+    }
+
     #[inline]
     pub fn has_key_wait(
         &mut self,
@@ -280,12 +293,10 @@ impl Route<'_> {
         };
         match modal {
             Modal::IslandRename => {
-                if let Some(ref mut island) = self.window.screen.renderer.island {
-                    island.handle_rename_input(
-                        key_event,
-                        &mut self.window.screen.context_manager,
-                    );
-                }
+                self.window.screen.renderer.island.handle_rename_input(
+                    key_event,
+                    &mut self.window.screen.context_manager,
+                );
                 self.request_overlay_redraw();
                 true
             }
@@ -326,90 +337,11 @@ impl Route<'_> {
                             self.request_overlay_redraw();
                         }
                         Key::Named(NamedKey::Enter) => {
-                            // Snapshot what the palette wants to do FIRST,
-                            // before taking a mut-borrow on it, so we can
-                            // freely call other `self.window.screen.*`
-                            // methods in the match arms without tripping
-                            // the borrow checker on nested disjoint borrows.
-                            let selected_font = self
-                                .window
-                                .screen
-                                .renderer
-                                .command_palette
-                                .get_selected_font();
-                            let selected_action = self
-                                .window
-                                .screen
-                                .renderer
-                                .command_palette
-                                .get_selected_action();
-                            use crate::renderer::command_palette::PaletteAction;
-
-                            // Fonts-mode Enter: copy the family name to
-                            // the system clipboard and close. The copy
-                            // icon on each row advertises this.
-                            if let Some(font) = selected_font {
-                                clipboard.set(
-                                    rio_backend::clipboard::ClipboardType::Clipboard,
-                                    font,
-                                );
-                                self.window
-                                    .screen
-                                    .renderer
-                                    .command_palette
-                                    .set_enabled(false);
-                                self.request_overlay_redraw();
-                                return true;
-                            }
-
-                            match selected_action {
-                                // `ListFonts` stays inside the palette:
-                                // swap the palette's contents from the
-                                // command list to the registered font
-                                // family names and keep it open.
-                                Some(PaletteAction::ListFonts) => {
-                                    let fonts =
-                                        self.window.screen.sugarloaf.font_family_names();
-                                    self.window
-                                        .screen
-                                        .renderer
-                                        .command_palette
-                                        .enter_fonts_mode(fonts);
-                                }
-                                // Any other command is a one-shot: close
-                                // the palette first, then dispatch.
-                                Some(action) => {
-                                    self.window
-                                        .screen
-                                        .renderer
-                                        .command_palette
-                                        .set_enabled(false);
-                                    self.window
-                                        .screen
-                                        .execute_palette_action(action, clipboard);
-                                }
-                                // No match at all: Enter just closes.
-                                None => {
-                                    self.window
-                                        .screen
-                                        .renderer
-                                        .command_palette
-                                        .set_enabled(false);
-                                }
-                            }
+                            self.window.screen.activate_palette_selection(clipboard);
                             self.request_overlay_redraw();
                         }
                         Key::Named(NamedKey::Backspace) => {
-                            let current_query =
-                                self.window.screen.renderer.command_palette.query.clone();
-                            if !current_query.is_empty() {
-                                let mut chars = current_query.chars().collect::<Vec<_>>();
-                                chars.pop();
-                                self.window
-                                    .screen
-                                    .renderer
-                                    .command_palette
-                                    .set_query(chars.into_iter().collect());
+                            if self.window.screen.renderer.command_palette.backspace() {
                                 self.request_overlay_redraw();
                             }
                         }
@@ -432,18 +364,40 @@ impl Route<'_> {
             }
 
             Modal::ConfirmQuit => {
+                use crate::renderer::confirm_quit::ConfirmQuitAction;
                 if key_event.state == rio_window::event::ElementState::Pressed {
                     match &key_event.logical_key {
+                        Key::Named(
+                            NamedKey::Tab | NamedKey::ArrowLeft | NamedKey::ArrowRight,
+                        ) => {
+                            self.window.screen.renderer.confirm_quit.toggle_focus();
+                            self.request_overlay_redraw();
+                        }
+                        Key::Named(NamedKey::Enter | NamedKey::Space) => {
+                            match self
+                                .window
+                                .screen
+                                .renderer
+                                .confirm_quit
+                                .focused_button()
+                            {
+                                ConfirmQuitAction::Close => self.confirm_close(clipboard),
+                                ConfirmQuitAction::Cancel => {
+                                    self.window.screen.cancel_confirmation();
+                                    self.request_overlay_redraw();
+                                }
+                            }
+                        }
                         Key::Character(c) if c.as_str() == "n" || c.as_str() == "N" => {
-                            self.window.screen.renderer.confirm_quit.set_active(false);
+                            self.window.screen.cancel_confirmation();
                             self.request_overlay_redraw();
                         }
                         Key::Named(NamedKey::Escape) => {
-                            self.window.screen.renderer.confirm_quit.set_active(false);
+                            self.window.screen.cancel_confirmation();
                             self.request_overlay_redraw();
                         }
                         Key::Character(c) if c.as_str() == "y" || c.as_str() == "Y" => {
-                            self.quit();
+                            self.confirm_close(clipboard);
                             return true;
                         }
                         _ => {}
@@ -494,7 +448,6 @@ pub struct Router<'a> {
     pub config_route: Option<WindowId>,
     pub quake_window_id: Option<WindowId>,
     pub clipboard: Clipboard,
-    current_tab_id: u64,
 }
 
 impl Router<'_> {
@@ -502,6 +455,8 @@ impl Router<'_> {
         fonts: rio_backend::sugarloaf::font::SugarloafFonts,
         clipboard: Clipboard,
     ) -> Router<'b> {
+        #[cfg(feature = "profiling")]
+        let _timing = crate::profiling::span("startup.font_library");
         let (font_library, fonts_not_found) =
             rio_backend::sugarloaf::font::FontLibrary::new(fonts);
 
@@ -521,7 +476,6 @@ impl Router<'_> {
             quake_window_id: None,
             font_library: Box::new(font_library),
             clipboard,
-            current_tab_id: 0,
         }
     }
 
@@ -594,7 +548,6 @@ impl Router<'_> {
             "Rio Settings",
             None,
             None,
-            None,
             false,
         );
         let id: WindowId = window.winit_window.id().into();
@@ -642,21 +595,12 @@ impl Router<'_> {
         open_url: Option<String>,
         app_id: Option<&str>,
     ) {
-        let tab_id = if config.navigation.is_native() {
-            let id = self.current_tab_id;
-            self.current_tab_id = self.current_tab_id.wrapping_add(1);
-            Some(id.to_string())
-        } else {
-            None
-        };
-
         let window = RouteWindow::from_target(
             event_loop,
             event_proxy,
             config,
             &self.font_library,
             RIO_TITLE,
-            tab_id.as_deref(),
             open_url,
             app_id,
             false,
@@ -695,7 +639,6 @@ impl Router<'_> {
             RIO_TITLE,
             None,
             None,
-            None,
             true,
         );
         let id: WindowId = window.winit_window.id().into();
@@ -710,41 +653,10 @@ impl Router<'_> {
         );
         self.quake_window_id = Some(id);
     }
-
-    #[cfg(target_os = "macos")]
-    #[inline]
-    pub fn create_native_tab<'a>(
-        &'a mut self,
-        event_loop: &'a ActiveEventLoop,
-        event_proxy: EventProxy,
-        config: &'a rio_backend::config::Config,
-        tab_id: Option<&str>,
-        open_url: Option<String>,
-    ) {
-        let window = RouteWindow::from_target(
-            event_loop,
-            event_proxy,
-            config,
-            &self.font_library,
-            RIO_TITLE,
-            tab_id,
-            open_url,
-            None,
-            false,
-        );
-        self.routes.insert(
-            window.winit_window.id().into(),
-            Route {
-                window,
-                path: RoutePath::Terminal,
-                assistant: Assistant::new(),
-                quit_requested: false,
-            },
-        );
-    }
 }
 
 pub struct RouteWindow<'a> {
+    quake: bool,
     pub is_focused: bool,
     /// Whether a real Focused event has ever arrived. A window created
     /// in the background starts `is_focused: false` and may never get
@@ -758,15 +670,23 @@ pub struct RouteWindow<'a> {
     #[cfg(target_os = "windows")]
     pub initial_frame_rendered: bool,
     pub render_timestamp: Instant,
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub vblank_interval: Duration,
     pub winit_window: Window,
     pub screen: Screen<'a>,
 }
 
+fn monitor_frame_interval(window: &Window) -> Duration {
+    let rate = window
+        .current_monitor()
+        .and_then(|monitor| monitor.refresh_rate_millihertz())
+        .filter(|rate| *rate != 0)
+        .unwrap_or(60_000);
+    Duration::from_micros(1_000_000_000 / u64::from(rate))
+}
+
 impl<'a> RouteWindow<'a> {
     pub fn configure_window(&mut self, config: &rio_backend::config::Config) {
-        configure_window(&self.winit_window, config);
+        configure_window(&self.winit_window, config, self.quake);
     }
 
     pub fn wait_until(&self) -> Option<Duration> {
@@ -784,26 +704,11 @@ impl<'a> RouteWindow<'a> {
 
         #[cfg(not(target_os = "macos"))]
         {
-            let now = Instant::now();
-            let elapsed = now.duration_since(self.render_timestamp);
-            let vblank = self.vblank_interval;
-
-            // Calculate how many complete frames have elapsed
-            let frames_elapsed = elapsed.as_nanos() / vblank.as_nanos();
-
-            // Calculate when the next frame should occur
-            let next_frame_time = self.render_timestamp
-                + Duration::from_nanos(
-                    (frames_elapsed + 1) as u64 * vblank.as_nanos() as u64,
-                );
-
-            if next_frame_time > now {
-                // Return the time to wait until the next ideal frame time
-                Some(next_frame_time.duration_since(now))
-            } else {
-                // We've missed the target frame time, render immediately
-                None
-            }
+            // An overdue frame should render immediately, rather than waiting
+            // for another refresh boundary after an idle period.
+            self.vblank_interval
+                .checked_sub(self.render_timestamp.elapsed())
+                .filter(|remaining| !remaining.is_zero())
         }
     }
 
@@ -828,23 +733,7 @@ impl<'a> RouteWindow<'a> {
 
     #[inline]
     pub fn update_vblank_interval(&mut self) {
-        // On macOS, CVDisplayLink handles VSync synchronization automatically,
-        // so we don't need to calculate vblank intervals
-        #[cfg(not(target_os = "macos"))]
-        {
-            // Always update vblank interval based on monitor refresh rate
-            // Get the display refresh rate, default to 60Hz if unavailable
-            let refresh_rate_hz = self
-                .winit_window
-                .current_monitor()
-                .and_then(|monitor| monitor.refresh_rate_millihertz())
-                .unwrap_or(60_000) as f64
-                / 1000.0; // Convert millihertz to Hz
-
-            // Calculate frame time in microseconds (1,000,000 µs / refresh_rate)
-            let frame_time_us = (1_000_000.0 / refresh_rate_hz) as u64;
-            self.vblank_interval = Duration::from_micros(frame_time_us);
-        }
+        self.vblank_interval = monitor_frame_interval(&self.winit_window);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -854,14 +743,13 @@ impl<'a> RouteWindow<'a> {
         config: &'b RioConfig,
         font_library: &rio_backend::sugarloaf::font::FontLibrary,
         window_name: &str,
-        tab_id: Option<&str>,
         open_url: Option<String>,
         app_id: Option<&str>,
         quake: bool,
     ) -> RouteWindow<'a> {
         #[allow(unused_mut)]
         let mut window_builder =
-            create_window_builder(window_name, config, tab_id, app_id, quake);
+            create_window_builder(window_name, config, app_id, quake);
 
         // The quake window starts hidden; the caller anchors it to the
         // monitor under the cursor and shows it (position changes on
@@ -879,8 +767,12 @@ impl<'a> RouteWindow<'a> {
             startup_notify::reset_activation_token_env();
         }
 
+        #[cfg(feature = "profiling")]
+        let window_timing = crate::profiling::span("startup.native_window");
         let winit_window = event_loop.create_window(window_builder).unwrap();
-        configure_window(&winit_window, config);
+        configure_window(&winit_window, config, quake);
+        #[cfg(feature = "profiling")]
+        drop(window_timing);
 
         let properties = ScreenWindowProperties {
             size: winit_window.inner_size(),
@@ -898,8 +790,8 @@ impl<'a> RouteWindow<'a> {
             let (physical_width, physical_height) = compute_window_size_from_grid(
                 config.window.columns,
                 config.window.rows,
-                &config.panel,
-                &screen.ctx().current().dimension,
+                &config.panel(),
+                &screen.ctx().current_grid().grid_dimension(),
                 winit_window.inner_size(),
             );
             let _ = winit_window.request_inner_size(PhysicalSize {
@@ -913,24 +805,7 @@ impl<'a> RouteWindow<'a> {
             }
         }
 
-        // Get the display refresh rate and convert to frame interval
-        // On macOS, CVDisplayLink handles VSync synchronization automatically,
-        // so we don't need to calculate vblank intervals
-        #[cfg(target_os = "macos")]
-        let monitor_vblank_interval = Duration::from_micros(16667); // Placeholder value, not used
-
-        #[cfg(not(target_os = "macos"))]
-        let monitor_vblank_interval = {
-            let monitor_refresh_rate_hz = winit_window
-                .current_monitor()
-                .and_then(|monitor| monitor.refresh_rate_millihertz())
-                .unwrap_or(60_000) as f64
-                / 1000.0;
-
-            // Convert to microseconds for precise frame timing
-            let frame_time_us = (1_000_000.0 / monitor_refresh_rate_hz) as u64;
-            Duration::from_micros(frame_time_us)
-        };
+        let monitor_vblank_interval = monitor_frame_interval(&winit_window);
 
         // A window can be created without focus (`open -g`, spawned
         // behind another app) and may never receive a Focused(false)
@@ -942,6 +817,7 @@ impl<'a> RouteWindow<'a> {
 
         Self {
             vblank_interval: monitor_vblank_interval,
+            quake,
             render_timestamp: Instant::now(),
             is_focused,
             focus_seen: false,

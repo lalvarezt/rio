@@ -43,7 +43,6 @@ pub fn screen(sugarloaf: &mut Sugarloaf, context_dimension: &ContextDimension) {
 
     // Black background
     sugarloaf.rect(
-        None,
         0.0,
         0.0,
         layout.width / scale,

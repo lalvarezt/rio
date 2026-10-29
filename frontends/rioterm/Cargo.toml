@@ -1,5 +1,6 @@
 [package]
 name = "rioterm"
+autobins = false
 description = "Rio terminal is a hardware-accelerated GPU terminal emulator, focusing to run in desktops and browsers."
 version.workspace = true
 authors.workspace = true
@@ -14,7 +15,12 @@ readme.workspace = true
 
 [[bin]]
 name = "rio"
-path = "src/main.rs"
+path = "src/bin/rio.rs"
+
+[[bin]]
+name = "rio-profile"
+path = "src/bin/rio-profile.rs"
+required-features = ["profiling"]
 
 [dependencies]
 global-hotkey = "0.8.0"
@@ -52,8 +58,10 @@ rio-unicode = { workspace = true }
 url = { workspace = true }
 smallvec = { workspace = true }
 rio-window = { workspace = true }
-lru = "0.16.0"
 rio-notifier = { workspace = true }
+resvg = { version = "0.48.1", default-features = false }
+toml = "0.9.2"
+rio-fonts = { workspace = true, features = ["symbols-nerd-font"] }
 
 [target.'cfg(all(not(target_os = "macos"), not(target_os = "windows")))'.dependencies]
 cpal = { version = "0.15", optional = true }
@@ -102,6 +110,7 @@ workspace = true
 features = ["wgpu"]
 
 [features]
+profiling = []
 default = ["wayland", "x11"]
 audio = ["cpal"]
 x11 = [

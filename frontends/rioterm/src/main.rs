@@ -1,9 +1,3 @@
-// With the default subsystem, 'console', windows creates an additional console
-// window for the program.
-// This is silently ignored on non-windows systems.
-// See https://msdn.microsoft.com/en-us/library/4cc7ya5b.aspx for more details.
-#![windows_subsystem = "windows"]
-
 mod application;
 mod bindings;
 mod cli;
@@ -15,14 +9,17 @@ mod ime;
 mod layout;
 mod messenger;
 mod mouse;
-#[cfg(windows)]
+#[cfg(all(windows, not(feature = "profiling")))]
 mod panic;
 mod platform;
+#[cfg(feature = "profiling")]
+mod profiling;
 mod renderer;
 mod router;
 mod scheduler;
 mod screen;
 mod shell_integration;
+mod ssh;
 mod watcher;
 
 use clap::Parser;
@@ -105,6 +102,10 @@ fn setup_logs_by_filter_level(
         .with_ansi(true)
         .with_filter(env_filter.parse("")?);
     let subscriber = tracing_subscriber::registry().with(stdout_subscriber);
+    #[cfg(feature = "profiling")]
+    let subscriber = subscriber.with(profiling::TimingLayer.with_filter(
+        tracing_subscriber::filter::filter_fn(|meta| meta.target() == "rio_profile"),
+    ));
 
     let mut log_file_path = PathBuf::new();
     if log_file {
@@ -134,7 +135,9 @@ fn setup_logs_by_filter_level(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(windows)]
+    #[cfg(feature = "profiling")]
+    profiling::init();
+    #[cfg(all(windows, not(feature = "profiling")))]
     panic::attach_handler();
 
     // When linked with the windows subsystem windows won't automatically attach
@@ -156,7 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let (mut config, config_error) = match rio_backend::config::Config::try_load() {
-        Ok(config) => (config, None),
+        Ok(loaded) => loaded,
         Err(err) => (rio_backend::config::Config::default(), Some(err)),
     };
 
@@ -234,8 +237,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     setup_environment_variables(&config);
 
+    #[cfg(all(feature = "profiling", windows))]
+    if std::env::var_os("RIO_PROFILE_USE_CONFIG_SHELL").is_none() {
+        config.shell.program = Some("cmd.exe".to_owned());
+        config.shell.args = vec![
+            "/d".into(),
+            "/q".into(),
+            "/k".into(),
+            if profiling::full_redraw() {
+                "(for /l %i in (1,1,100) do @echo 0123456789 abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ) & title RIO_PROFILE_READY".into()
+            } else {
+                "title RIO_PROFILE_READY".into()
+            },
+        ];
+        config.navigation.hide_if_single = false;
+        config.confirm_before_quit = false;
+    }
+
+    #[cfg(feature = "profiling")]
+    let event_loop_timing = profiling::span("startup.event_loop");
     let window_event_loop =
         rio_window::event_loop::EventLoop::<EventPayload>::with_user_event().build()?;
+    #[cfg(feature = "profiling")]
+    drop(event_loop_timing);
 
     let app_id = args.window_options.terminal_options.app_id;
 

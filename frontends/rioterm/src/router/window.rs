@@ -18,7 +18,6 @@ pub const APPLICATION_ID: &str = "Rio";
 pub fn create_window_builder(
     title: &str,
     config: &Config,
-    #[allow(unused_variables)] tab_id: Option<&str>,
     #[allow(unused_variables)] app_id: Option<&str>,
     quake: bool,
 ) -> WindowAttributes {
@@ -86,19 +85,31 @@ pub fn create_window_builder(
     #[cfg(target_os = "windows")]
     {
         use rio_window::platform::windows::WindowAttributesExtWindows;
+        window_builder = window_builder.with_decorations(false);
+        if config.window.windows_use_undecorated_shadow.is_none() {
+            window_builder = window_builder.with_undecorated_shadow(true);
+        }
         if let Some(use_undecorated_shadow) = config.window.windows_use_undecorated_shadow
         {
             window_builder =
                 window_builder.with_undecorated_shadow(use_undecorated_shadow);
         }
 
-        if let Some(use_no_redirection_bitmap) =
-            config.window.windows_use_no_redirection_bitmap
-        {
-            // This sets WS_EX_NOREDIRECTIONBITMAP.
-            window_builder =
-                window_builder.with_no_redirection_bitmap(use_no_redirection_bitmap);
-        }
+        use rio_backend::sugarloaf::wgpu::Backends;
+
+        // Vulkan/DX12 present independently of GDI. Its backing bitmap can
+        // remain opaque beneath their surface and flash during teardown.
+        // CPU and OpenGL presentation still need that bitmap.
+        let native_gpu = !config.renderer.use_cpu
+            && Backends::from_env().map_or(true, |backends| {
+                backends.intersects(Backends::VULKAN | Backends::DX12)
+            });
+        window_builder = window_builder.with_no_redirection_bitmap(
+            config
+                .window
+                .windows_use_no_redirection_bitmap
+                .unwrap_or(native_gpu),
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -111,35 +122,17 @@ pub fn create_window_builder(
         window_builder = window_builder
             .with_colorspace(config.window.colorspace.to_rio_window_colorspace());
 
-        if let (Some(x), Some(y)) = (
-            config.window.macos_traffic_light_position_x,
-            config.window.macos_traffic_light_position_y,
-        ) {
-            window_builder = window_builder.with_traffic_light_position(x, y);
-        }
-
-        if config.navigation.is_native() {
-            if let Some(identifier) = tab_id {
-                window_builder = window_builder
-                    .with_tabbing_identifier(identifier)
-                    .with_unified_titlebar(config.window.macos_use_unified_titlebar);
-            }
-        } else {
-            use crate::constants::TRAFFIC_LIGHT_PADDING;
-            window_builder = window_builder
-                .with_title_hidden(true)
-                .with_titlebar_transparent(true)
-                .with_fullsize_content_view(true);
-
-            if config.navigation.is_enabled() {
-                window_builder = window_builder
-                    .with_traffic_light_position(
-                        TRAFFIC_LIGHT_PADDING,
-                        TRAFFIC_LIGHT_PADDING,
-                    )
-                    .with_mouse_down_can_move_window(false);
-            }
-        }
+        window_builder = window_builder
+            .with_title_hidden(true)
+            .with_titlebar_transparent(true)
+            .with_fullsize_content_view(true)
+            .with_traffic_light_position(
+                config.window.macos_traffic_light_position_x.unwrap_or(12.0),
+                config.window.macos_traffic_light_position_y.unwrap_or(
+                    (config.navigation.tab_geometry().height as f64 - 14.0) / 2.0,
+                ),
+            )
+            .with_mouse_down_can_move_window(false);
     }
 
     #[cfg(target_os = "windows")]
@@ -175,7 +168,11 @@ pub fn create_window_builder(
     window_builder
 }
 
-pub fn configure_window(winit_window: &Window, config: &Config) {
+pub fn configure_window(
+    winit_window: &Window,
+    config: &Config,
+    #[allow(unused_variables)] quake: bool,
+) {
     if config.effects.custom_mouse_cursor {
         winit_window.set_cursor_visible(false);
     } else {
@@ -248,7 +245,28 @@ pub fn configure_window(winit_window: &Window, config: &Config) {
     #[cfg(target_os = "windows")]
     {
         use rio_backend::config::window::WindowsCornerPreference;
-        use rio_window::platform::windows::WindowExtWindows;
+        use rio_window::platform::windows::{Color, WindowExtWindows};
+
+        winit_window.set_decorations(false);
+        if config.window.windows_use_undecorated_shadow.is_none() {
+            winit_window.set_undecorated_shadow(true);
+        }
+
+        let background = config.colors.background.0;
+        let foreground = config.colors.tabs_active;
+        let native_color = |color: [f32; 4]| {
+            Color::from_rgb(
+                (color[0] * 255.0).round() as u8,
+                (color[1] * 255.0).round() as u8,
+                (color[2] * 255.0).round() as u8,
+            )
+        };
+        winit_window.set_title_background_color(Some(native_color(background)));
+        winit_window.set_title_text_color(native_color(foreground));
+        let border = std::array::from_fn(|i| {
+            background[i] + (foreground[i] - background[i]) * 0.12
+        });
+        winit_window.set_border_color(Some(native_color(border)));
 
         if let Some(with_corner_preference) = &config.window.windows_corner_preference {
             let preference = match with_corner_preference {

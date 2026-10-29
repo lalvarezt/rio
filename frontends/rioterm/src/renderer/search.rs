@@ -22,29 +22,18 @@ fn color_u8(c: [f32; 4]) -> [u8; 4] {
 // Layout
 const OVERLAY_WIDTH: f32 = 320.0;
 const OVERLAY_HEIGHT: f32 = 36.0;
-const OVERLAY_CORNER_RADIUS: f32 = 8.0;
 const OVERLAY_MARGIN_TOP: f32 = 8.0;
 const OVERLAY_MARGIN_RIGHT: f32 = 8.0;
 const OVERLAY_PADDING_X: f32 = 10.0;
 
 const INPUT_FONT_SIZE: f32 = 13.0;
-const BUTTON_FONT_SIZE: f32 = 14.0;
 
 const BUTTON_SIZE: f32 = 24.0;
-const BUTTON_CORNER_RADIUS: f32 = 4.0;
 const BUTTON_GAP: f32 = 2.0;
 const BUTTONS_AREA_WIDTH: f32 = BUTTON_SIZE * 3.0 + BUTTON_GAP * 2.0;
 
 const CARET_WIDTH: f32 = 1.5;
 const CARET_BLINK_MS: u128 = 500;
-
-// Colors
-const BG_COLOR: [f32; 4] = [0.12, 0.12, 0.12, 0.98];
-const INPUT_BG_COLOR: [f32; 4] = [0.16, 0.16, 0.16, 1.0];
-const TEXT_COLOR: [f32; 4] = [0.93, 0.93, 0.93, 1.0];
-const DIM_TEXT_COLOR: [f32; 4] = [0.50, 0.50, 0.50, 1.0];
-const BUTTON_TEXT_COLOR: [f32; 4] = [0.70, 0.70, 0.70, 1.0];
-const BUTTON_HOVER_BG: [f32; 4] = [0.25, 0.25, 0.28, 1.0];
 
 // Depth / order
 const DEPTH_BG: f32 = 0.1;
@@ -60,6 +49,8 @@ pub enum SearchOverlayAction {
 }
 
 pub struct SearchOverlay {
+    font_library: Option<rio_backend::sugarloaf::font::FontLibrary>,
+    font_id: Option<usize>,
     active_search: Option<String>,
     caret_blink_start: Instant,
     hovered_button: Option<SearchOverlayAction>,
@@ -68,6 +59,8 @@ pub struct SearchOverlay {
 impl Default for SearchOverlay {
     fn default() -> Self {
         Self {
+            font_library: None,
+            font_id: None,
             active_search: None,
             caret_blink_start: Instant::now(),
             hovered_button: None,
@@ -81,13 +74,22 @@ impl SearchOverlay {
         self.active_search.is_some()
     }
 
+    pub fn clear_hover(&mut self) -> bool {
+        self.hovered_button.take().is_some()
+    }
+
     #[inline]
-    pub fn set_active_search(&mut self, active_search: Option<String>) {
+    pub fn set_active_search(&mut self, active_search: Option<&str>) -> bool {
+        // Frame synchronization must not allocate another copy of an unchanged query.
+        if self.active_search.as_deref() == active_search {
+            return false;
+        }
         let was_active = self.active_search.is_some();
-        self.active_search = active_search;
+        self.active_search = active_search.map(str::to_owned);
         if !was_active && self.active_search.is_some() {
             self.caret_blink_start = Instant::now();
         }
+        true
     }
 
     /// Returns (overlay_x, overlay_y, overlay_width, overlay_height) in logical coords.
@@ -199,7 +201,12 @@ impl SearchOverlay {
         false
     }
 
-    pub fn render(&mut self, sugarloaf: &mut Sugarloaf, dimensions: (f32, f32, f32)) {
+    pub fn render(
+        &mut self,
+        sugarloaf: &mut Sugarloaf,
+        dimensions: (f32, f32, f32),
+        theme: &super::window_chrome::Theme,
+    ) {
         if !self.is_active() {
             // Immediate mode: not drawing == not visible. No cleanup
             // needed — previous frame's instances were cleared at
@@ -208,19 +215,38 @@ impl SearchOverlay {
         }
 
         let (window_width, _window_height, scale_factor) = dimensions;
+        let library = sugarloaf.font_library();
+        if self
+            .font_library
+            .as_ref()
+            .is_none_or(|old| !std::sync::Arc::ptr_eq(&old.inner, &library.inner))
+        {
+            self.font_id = super::window_chrome::load_ui_font(library);
+            self.font_library = Some(library.clone());
+        }
 
         let (ox, oy, ow, oh) = self.overlay_rect(window_width, scale_factor);
 
         // Background
         sugarloaf.rounded_rect(
-            None,
             ox,
             oy,
             ow,
             oh,
-            BG_COLOR,
+            theme.border,
             DEPTH_BG,
-            OVERLAY_CORNER_RADIUS,
+            theme.radius,
+            ORDER,
+        );
+        let pixel = 1.0 / scale_factor;
+        sugarloaf.rounded_rect(
+            ox + pixel,
+            oy + pixel,
+            ow - pixel * 2.0,
+            oh - pixel * 2.0,
+            theme.surface,
+            DEPTH_BG + 0.01,
+            (theme.radius - pixel).max(0.0),
             ORDER,
         );
 
@@ -231,14 +257,13 @@ impl SearchOverlay {
         let input_height = oh - 12.0;
 
         sugarloaf.rounded_rect(
-            None,
             input_x,
             input_y,
             input_width,
             input_height,
-            INPUT_BG_COLOR,
+            theme.hover,
             DEPTH_ELEMENT,
-            4.0,
+            theme.control_radius(),
             ORDER,
         );
 
@@ -249,12 +274,13 @@ impl SearchOverlay {
         let max_text_width = input_width - 12.0;
 
         let text_color = if active_search.is_empty() {
-            DIM_TEXT_COLOR
+            theme.muted
         } else {
-            TEXT_COLOR
+            theme.foreground
         };
 
         let input_opts = DrawOpts {
+            font_id: self.font_id,
             font_size: INPUT_FONT_SIZE,
             color: color_u8(text_color),
             ..DrawOpts::default()
@@ -305,12 +331,11 @@ impl SearchOverlay {
             let caret_y = input_y + (input_height - INPUT_FONT_SIZE) / 2.0 + 1.0;
 
             sugarloaf.rect(
-                None,
                 caret_x,
                 caret_y,
                 CARET_WIDTH,
                 INPUT_FONT_SIZE,
-                TEXT_COLOR,
+                theme.foreground,
                 DEPTH_ELEMENT,
                 ORDER,
             );
@@ -318,44 +343,57 @@ impl SearchOverlay {
 
         // Buttons: prev (↑), next (↓), close (✕)
         let button_rects = self.button_rects(ox, oy, ow, oh);
-        let labels = ["\u{2191}", "\u{2193}", "\u{2022}"];
         let actions = [
             SearchOverlayAction::Previous,
             SearchOverlayAction::Next,
             SearchOverlayAction::Close,
         ];
 
-        let btn_opts = DrawOpts {
-            font_size: BUTTON_FONT_SIZE,
-            color: color_u8(BUTTON_TEXT_COLOR),
-            ..DrawOpts::default()
-        };
-
         for (i, (bx, by, bw, bh)) in button_rects.iter().enumerate() {
             let is_hovered = self.hovered_button == Some(actions[i]);
 
             if is_hovered {
                 sugarloaf.rounded_rect(
-                    None,
                     *bx,
                     *by,
                     *bw,
                     *bh,
-                    BUTTON_HOVER_BG,
+                    theme.hover,
                     DEPTH_ELEMENT,
-                    BUTTON_CORNER_RADIUS,
+                    theme.control_radius(),
                     ORDER,
                 );
             }
 
-            // Measure first so we can centre horizontally — the
-            // labels are single glyphs of varying width (arrows vs
-            // bullet).
-            let ui = sugarloaf.text_mut();
-            let label_w = ui.measure(labels[i], &btn_opts);
-            let label_x = bx + (bw - label_w) / 2.0;
-            let label_y = by + (bh - BUTTON_FONT_SIZE) / 2.0;
-            ui.draw(label_x, label_y, labels[i], &btn_opts);
+            let cx = bx + bw / 2.0;
+            let cy = by + bh / 2.0;
+            let segments: &[[f32; 4]] = match actions[i] {
+                SearchOverlayAction::Close => {
+                    &[[-3.0, -3.0, 3.0, 3.0], [-3.0, 3.0, 3.0, -3.0]]
+                }
+                SearchOverlayAction::Previous => &[
+                    [0.0, -4.0, 0.0, 4.0],
+                    [-3.0, -1.0, 0.0, -4.0],
+                    [3.0, -1.0, 0.0, -4.0],
+                ],
+                SearchOverlayAction::Next => &[
+                    [0.0, -4.0, 0.0, 4.0],
+                    [-3.0, 1.0, 0.0, 4.0],
+                    [3.0, 1.0, 0.0, 4.0],
+                ],
+            };
+            for [x1, y1, x2, y2] in segments {
+                sugarloaf.line(
+                    cx + x1,
+                    cy + y1,
+                    cx + x2,
+                    cy + y2,
+                    1.0,
+                    DEPTH_ELEMENT + 0.01,
+                    theme.foreground,
+                    ORDER,
+                );
+            }
         }
     }
 }

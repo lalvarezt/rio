@@ -14,3 +14,32 @@ builtin autoload -Uz add-zsh-hook
 add-zsh-hook chpwd _rio_report_pwd
 add-zsh-hook precmd _rio_report_pwd
 _rio_report_pwd
+
+# Shell reports identify remote apps that local process inspection cannot see.
+_rio_report_app() {
+    local app="${1:t}" transport=MA==
+    [[ -n "${SSH_CONNECTION-}${SSH_CLIENT-}${SSH_TTY-}" ]] && transport=MQ==
+    local encoded="$(builtin printf '%s' "$app" | base64)"
+    encoded=${encoded//$'\n'/}
+    builtin printf '\e]1337;SetUserVar=RIO_SSH=%s\a\e]1337;SetUserVar=RIO_APP=%s\a' "$transport" "$encoded"
+}
+_rio_preexec() {
+    local -a words
+    words=( ${(z)1} )
+    while (( ${#words} > 1 )); do
+        case "${words[1]}" in
+            command|exec|env|sudo|doas|*=*) shift words ;;
+            *) break ;;
+        esac
+    done
+    _rio_report_app "${(Q)words[1]}"
+}
+_rio_prompt_app() {
+    local previous_status=$?
+    builtin printf '\e]133;A\a'
+    _rio_report_app zsh
+    return "$previous_status"
+}
+add-zsh-hook preexec _rio_preexec
+add-zsh-hook precmd _rio_prompt_app
+_rio_prompt_app

@@ -106,6 +106,25 @@ impl Scheduler {
         );
     }
 
+    /// Keep the earliest wakeup when several UI effects share a timer.
+    pub fn schedule_once(
+        &mut self,
+        event: EventPayload,
+        interval: Duration,
+        id: TimerId,
+    ) {
+        let deadline = Instant::now() + interval;
+        if self
+            .timers
+            .iter()
+            .any(|timer| timer.id == id && timer.deadline <= deadline)
+        {
+            return;
+        }
+        self.unschedule(id);
+        self.schedule(event, interval, false, id);
+    }
+
     /// Cancel a scheduled event.
     pub fn unschedule(&mut self, id: TimerId) -> Option<Timer> {
         let index = self.timers.iter().position(|timer| timer.id == id)?;

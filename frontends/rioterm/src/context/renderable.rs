@@ -12,6 +12,12 @@ use rustc_hash::FxHashMap;
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug)]
+pub struct KittyImageDimensions {
+    pub width: usize,
+    pub height: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub enum BackgroundState {
     Set(rio_backend::sugarloaf::Color),
     Reset,
@@ -50,14 +56,16 @@ pub struct RenderableContent {
     pub hint_labels: Option<Vec<HintLabel>>,
     pub highlighted_hint: Option<crate::hints::HintMatch>,
     pub hint_matches: Option<Vec<rio_backend::crosswords::search::Match>>,
+    /// Focus last painted into the grid, independent of the visible match list.
+    pub focused_search_match: Option<rio_backend::crosswords::search::Match>,
     pub last_typing: Option<Instant>,
     pub last_blink_toggle: Option<Instant>,
     pub pending_update: PendingUpdate,
     pub background: Option<BackgroundState>,
     /// Damage hint for the in-progress frame. Set by `Renderer::run`
     /// from PTY + UI damage merging, consumed by `Screen::render`'s
-    /// grid emit to choose `RowsToRebuild::{None,Dirty,All}`. The
-    /// per-row decision under `Dirty` reads `visible_rows[y].dirty`
+    /// grid emit to choose a full, partial, or uniform-only update. The
+    /// per-row decision for partial updates reads `visible_rows[y].dirty`
     /// rather than this hint, so this is just a coarse gate.
     ///
     /// `Full` on construction so the first frame's emission rebuilds
@@ -66,6 +74,9 @@ pub struct RenderableContent {
     /// after consumption so next frame only re-emits if damage
     /// actually arrived.
     pub frame_damage: TerminalDamage,
+    /// Content changes across the whole viewport, independent of full damage
+    /// from scrolling or switching tabs. Derived while copying the snapshot.
+    pub all_rows_modified: bool,
 
     /// Per-context viewport row buffer. Populated once per frame by
     /// `Renderer::run` via `Crosswords::snapshot_visible` (which
@@ -77,14 +88,16 @@ pub struct RenderableContent {
     /// Per-row resolved cell styles, index-parallel to `visible_rows`.
     /// Values, not ids: rows copied on earlier frames can't be
     /// retinted by later style-table mutations.
-    pub row_styles: Vec<Vec<rio_backend::crosswords::style::Style>>,
+    /// Uniform rows keep one value; mixed rows keep per-cell values.
+    pub row_styles: Vec<rio_backend::crosswords::snapshot::RowStyles>,
+    pub deferred_styles: rio_backend::crosswords::snapshot::DeferredStyles,
     /// Per-frame snapshot of extras (zero-width chars, hyperlinks,
     /// sixel/iterm graphics) actually referenced by visible cells —
     /// keyed by the cell's `extras_id`. Refreshed per-dirty-row by
     /// `snapshot_visible`. Bounded by visible-cells-with-extras, not
     /// by total session-lifetime allocations on the live grid's
     /// `ExtrasTable`.
-    pub extras: rustc_hash::FxHashMap<u16, rio_backend::crosswords::square::Extras>,
+    pub extras: rio_backend::crosswords::snapshot::SnapshotExtras,
     /// Per-context palette + named-color overrides as of the snapshot.
     /// `Copy` — captured by value alongside the row data.
     pub term_colors: TermColors,
@@ -103,15 +116,54 @@ pub struct RenderableContent {
     pub atlas_placements: Vec<AtlasPlacement>,
     /// `true` when the terminal has cursor blink enabled this frame.
     pub blinking_cursor: bool,
+    /// `true` when the terminal was in Vi mode at snapshot time, so
+    /// the cursor is drawn with the `vi-cursor` color.
+    pub is_vi_mode: bool,
     /// Kitty graphics state captured under the snapshot lock. Owned
     /// here so the kitty overlay path doesn't need to lock again.
-    pub kitty_virtual_placements: FxHashMap<(u32, u32), VirtualPlacement>,
-    pub kitty_images: FxHashMap<u32, StoredImage>,
+    pub kitty_virtual_placements: FxHashMap<(u32, u64), VirtualPlacement>,
+    pub kitty_images: FxHashMap<u32, KittyImageDimensions>,
     pub kitty_placements: Vec<KittyPlacement>,
     pub kitty_graphics_dirty: bool,
+    pub graphics_snapshot_invalid: bool,
 }
 
 impl RenderableContent {
+    /// Pixel ownership stays in the terminal and upload queue. Geometry only
+    /// needs dimensions; retain the metadata map allocation between frames.
+    pub fn capture_kitty_dimensions(
+        target: &mut FxHashMap<u32, KittyImageDimensions>,
+        images: &FxHashMap<u32, StoredImage>,
+    ) {
+        target.clear();
+        target.extend(images.iter().map(|(&id, image)| {
+            (
+                id,
+                KittyImageDimensions {
+                    width: image.data.width,
+                    height: image.data.height,
+                },
+            )
+        }));
+    }
+    /// Terminal state owns the source data. A released snapshot must be rebuilt
+    /// in full before the pane is drawn again.
+    pub fn release_snapshot(&mut self) {
+        self.visible_rows = Vec::new();
+        self.row_styles = Vec::new();
+        self.deferred_styles = Default::default();
+        self.extras = Default::default();
+        self.atlas_placements = Vec::new();
+        self.kitty_images = Default::default();
+        self.kitty_placements = Vec::new();
+        self.kitty_virtual_placements = Default::default();
+        self.graphics_snapshot_invalid = true;
+        self.hint_matches = None;
+        self.last_blink_toggle = None;
+        self.pending_update
+            .set_terminal_damage(TerminalDamage::Full);
+    }
+
     pub fn new(cursor: Cursor) -> Self {
         RenderableContent {
             cursor,
@@ -120,15 +172,18 @@ impl RenderableContent {
             hint_labels: None,
             highlighted_hint: None,
             hint_matches: None,
+            focused_search_match: None,
             last_typing: None,
             last_blink_toggle: None,
             pending_update: PendingUpdate::default(),
             is_blinking_cursor_visible: false,
             background: None,
             frame_damage: TerminalDamage::Full,
+            all_rows_modified: true,
             visible_rows: Vec::new(),
             row_styles: Vec::new(),
-            extras: rustc_hash::FxHashMap::default(),
+            deferred_styles: Default::default(),
+            extras: Default::default(),
             term_colors: TermColors::default(),
             display_offset: 0,
             columns: 0,
@@ -137,10 +192,12 @@ impl RenderableContent {
             lines_evicted: 0,
             atlas_placements: Vec::new(),
             blinking_cursor: false,
+            is_vi_mode: false,
             kitty_virtual_placements: FxHashMap::default(),
             kitty_images: FxHashMap::default(),
             kitty_placements: Vec::new(),
             kitty_graphics_dirty: false,
+            graphics_snapshot_invalid: true,
         }
     }
 
@@ -159,6 +216,25 @@ pub struct PendingUpdate {
     dirty: bool,
     /// Terminal content damage (lines, text)
     terminal_damage: Option<TerminalDamage>,
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+
+    #[test]
+    fn releasing_a_snapshot_frees_rows_and_requires_full_damage() {
+        let mut content = RenderableContent::new(Cursor::default());
+        content.visible_rows = (0..24).map(|_| Row::new(160)).collect();
+        let cursor = content.cursor.state.pos;
+        content.release_snapshot();
+        assert_eq!(content.visible_rows.capacity(), 0);
+        assert_eq!(content.cursor.state.pos, cursor);
+        assert_eq!(
+            content.pending_update.terminal_damage,
+            Some(TerminalDamage::Full)
+        );
+    }
 }
 
 impl PendingUpdate {
@@ -233,11 +309,10 @@ mod pipeline_tests {
     use rio_backend::ansi::CursorShape;
     use rio_backend::crosswords::grid::row::Row;
     use rio_backend::crosswords::pos::{Column, Line};
-    use rio_backend::crosswords::square::{Extras, Square};
+    use rio_backend::crosswords::square::Square;
     use rio_backend::crosswords::{Crosswords, CrosswordsSize};
     use rio_backend::event::{TerminalDamage, VoidListener, WindowId};
     use rio_backend::performer::handler::Processor;
-    use rustc_hash::FxHashMap;
 
     const COLS: usize = 40;
     const ROWS: usize = 12;
@@ -288,8 +363,8 @@ mod pipeline_tests {
     /// painted mirror standing in for the GPU grid.
     struct Frame {
         visible_rows: Vec<Row<Square>>,
-        row_styles: Vec<Vec<rio_backend::crosswords::style::Style>>,
-        extras: FxHashMap<u16, Extras>,
+        row_styles: Vec<rio_backend::crosswords::snapshot::RowStyles>,
+        extras: rio_backend::crosswords::snapshot::SnapshotExtras,
         painted: Vec<String>,
     }
 
@@ -298,7 +373,7 @@ mod pipeline_tests {
             Self {
                 visible_rows: Vec::new(),
                 row_styles: Vec::new(),
-                extras: FxHashMap::default(),
+                extras: Default::default(),
                 painted: vec![String::new(); ROWS],
             }
         }
@@ -330,10 +405,9 @@ mod pipeline_tests {
             );
             self.painted.resize(rows, String::new());
             if needs_full {
-                // RowsToRebuild::All: rebuild everything, bits not
-                // cleared (matches screen::render).
                 for y in 0..self.visible_rows.len() {
                     self.painted[y] = row_text(&self.visible_rows[y], cols);
+                    self.visible_rows[y].dirty = false;
                 }
                 return;
             }

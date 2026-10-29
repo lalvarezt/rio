@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root directory of this source tree.
 
-use rio_backend::error::{RioError, RioErrorLevel};
+use rio_backend::error::{RioError, RioErrorLevel, RioErrorType};
 use rio_backend::sugarloaf::text::DrawOpts;
 use rio_backend::sugarloaf::Sugarloaf;
 
@@ -21,35 +21,23 @@ fn color_u8(c: [f32; 4]) -> [u8; 4] {
 
 // Layout
 const OVERLAY_WIDTH: f32 = 480.0;
-const OVERLAY_CORNER_RADIUS: f32 = 10.0;
 const OVERLAY_MARGIN_TOP: f32 = 8.0;
 const OVERLAY_MARGIN_RIGHT: f32 = 8.0;
 const OVERLAY_PADDING: f32 = 16.0;
 
 const HEADING_FONT_SIZE: f32 = 16.0;
 const BODY_FONT_SIZE: f32 = 12.0;
-const BUTTON_FONT_SIZE: f32 = 14.0;
-const LINK_FONT_SIZE: f32 = 12.0;
-
-const BUTTON_SIZE: f32 = 24.0;
-const BUTTON_CORNER_RADIUS: f32 = 4.0;
+const BUTTON_FONT_SIZE: f32 = 13.0;
 
 const LINE_HEIGHT: f32 = 18.0;
 const HEADING_HEIGHT: f32 = 28.0;
-const LINK_ROW_HEIGHT: f32 = 24.0;
+const ACTION_ROW_HEIGHT: f32 = 32.0;
+const ACTION_GAP: f32 = 8.0;
+const BODY_ACTION_GAP: f32 = 12.0;
 const MAX_VISIBLE_LINES: usize = 16;
 
-const DOCS_URL: &str = "rioterm.com/docs/config";
-
 // Colors
-const BACKDROP_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.35];
-const BG_COLOR: [f32; 4] = [0.12, 0.12, 0.12, 0.98];
-const HEADING_COLOR_ERROR: [f32; 4] = [1.0, 0.07, 0.38, 1.0];
-const HEADING_COLOR_WARNING: [f32; 4] = [0.99, 0.73, 0.16, 1.0];
-const TEXT_COLOR: [f32; 4] = [0.85, 0.85, 0.85, 1.0];
-const LINK_COLOR: [f32; 4] = [0.40, 0.60, 1.0, 1.0];
-const BUTTON_TEXT_COLOR: [f32; 4] = [0.70, 0.70, 0.70, 1.0];
-const BUTTON_HOVER_BG: [f32; 4] = [0.25, 0.25, 0.28, 1.0];
+const BACKDROP_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.2];
 
 // Depth / order
 const DEPTH_BACKDROP: f32 = 0.0;
@@ -66,23 +54,31 @@ pub enum AssistantOverlayAction {
 
 pub struct AssistantOverlay {
     error: Option<RioError>,
+    top_inset: f32,
     hovered_button: Option<AssistantOverlayAction>,
-    /// Latest rendered width of the docs-link button text — used by
-    /// `docs_button_rect` to size the hit target. Updated by `render`.
-    link_button_width: f32,
+    lines: Vec<String>,
+    font_library: Option<rio_backend::sugarloaf::font::FontLibrary>,
+    font_id: Option<usize>,
 }
 
 impl Default for AssistantOverlay {
     fn default() -> Self {
         Self {
             error: None,
+            top_inset: 0.0,
             hovered_button: None,
-            link_button_width: 0.0,
+            lines: Vec::new(),
+            font_library: None,
+            font_id: None,
         }
     }
 }
 
 impl AssistantOverlay {
+    pub fn set_top_inset(&mut self, top_inset: f32) {
+        self.top_inset = top_inset;
+    }
+
     #[inline]
     pub fn is_active(&self) -> bool {
         self.error.is_some()
@@ -100,34 +96,45 @@ impl AssistantOverlay {
 
     #[inline]
     pub fn set_error(&mut self, error: RioError) {
+        self.lines = error
+            .report
+            .to_string()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        self.hovered_button = None;
         self.error = Some(error);
     }
 
     #[inline]
     pub fn clear(&mut self) {
         self.error = None;
+        self.hovered_button = None;
+    }
+
+    pub fn clear_hover(&mut self) -> bool {
+        self.hovered_button.take().is_some()
     }
 
     /// Returns (overlay_x, overlay_y, overlay_width, overlay_height) in logical coords.
     fn overlay_rect(&self, window_width: f32, scale_factor: f32) -> (f32, f32, f32, f32) {
         let logical_width = window_width / scale_factor;
-        let x = logical_width - OVERLAY_WIDTH - OVERLAY_MARGIN_RIGHT;
-        let y = OVERLAY_MARGIN_TOP;
+        let width =
+            OVERLAY_WIDTH.min((logical_width - OVERLAY_MARGIN_RIGHT * 2.0).max(1.0));
+        let x = logical_width - width - OVERLAY_MARGIN_RIGHT;
+        let y = self.top_inset + OVERLAY_MARGIN_TOP;
         let line_count = self.body_line_count().min(MAX_VISIBLE_LINES);
         let h = OVERLAY_PADDING
             + HEADING_HEIGHT
             + (line_count as f32 * LINE_HEIGHT)
-            + LINK_ROW_HEIGHT
+            + BODY_ACTION_GAP
+            + ACTION_ROW_HEIGHT
             + OVERLAY_PADDING;
-        (x, y, OVERLAY_WIDTH, h)
+        (x, y, width, h)
     }
 
     fn body_line_count(&self) -> usize {
-        if let Some(error) = &self.error {
-            error.report.to_string().lines().count().max(1)
-        } else {
-            0
-        }
+        self.lines.len()
     }
 
     /// Returns the close button rect.
@@ -137,21 +144,24 @@ impl AssistantOverlay {
         overlay_y: f32,
         overlay_width: f32,
     ) -> (f32, f32, f32, f32) {
-        let bx = overlay_x + overlay_width - OVERLAY_PADDING - BUTTON_SIZE;
-        let by = overlay_y + OVERLAY_PADDING / 2.0;
-        (bx, by, BUTTON_SIZE, BUTTON_SIZE)
-    }
-
-    /// Returns the docs link button rect (covers the link text area).
-    fn docs_button_rect(&self, overlay_x: f32, overlay_y: f32) -> (f32, f32, f32, f32) {
-        let line_count = self.body_line_count().min(MAX_VISIBLE_LINES);
+        let width = (overlay_width - OVERLAY_PADDING * 2.0 - ACTION_GAP) / 2.0;
+        let bx = overlay_x + overlay_width - OVERLAY_PADDING - width;
         let by = overlay_y
             + OVERLAY_PADDING
             + HEADING_HEIGHT
-            + (line_count as f32 * LINE_HEIGHT);
-        let bx = overlay_x + OVERLAY_PADDING - 4.0;
-        let bw = self.link_button_width + 8.0;
-        (bx, by, bw, LINK_ROW_HEIGHT)
+            + self.body_line_count().min(MAX_VISIBLE_LINES) as f32 * LINE_HEIGHT
+            + BODY_ACTION_GAP;
+        (bx, by, width, ACTION_ROW_HEIGHT)
+    }
+
+    fn docs_button_rect(
+        &self,
+        overlay_x: f32,
+        overlay_y: f32,
+        overlay_width: f32,
+    ) -> (f32, f32, f32, f32) {
+        let (_, by, bw, bh) = self.close_button_rect(overlay_x, overlay_y, overlay_width);
+        (overlay_x + OVERLAY_PADDING, by, bw, bh)
     }
 
     #[inline]
@@ -194,12 +204,17 @@ impl AssistantOverlay {
             return Ok(Some(AssistantOverlayAction::Close));
         }
 
-        let (bx, by, bw, bh) = self.docs_button_rect(ox, oy);
+        let (bx, by, bw, bh) = self.docs_button_rect(ox, oy, ow);
         if Self::hit_test_button(mouse_x, mouse_y, bx, by, bw, bh) {
             return Ok(Some(AssistantOverlayAction::OpenDocs));
         }
 
         Ok(None)
+    }
+
+    /// Warnings own only their panel; hard errors also own the backdrop.
+    pub fn captures_pointer(&self, x: f32, y: f32, width: f32, scale: f32) -> bool {
+        self.is_error() || self.hit_test(x, y, width, scale).is_ok()
     }
 
     /// Update hover state based on mouse position. Returns true if changed.
@@ -224,7 +239,7 @@ impl AssistantOverlay {
         };
 
         if new_hover.is_none() {
-            let (bx, by, bw, bh) = self.docs_button_rect(ox, oy);
+            let (bx, by, bw, bh) = self.docs_button_rect(ox, oy, ow);
             if Self::hit_test_button(mouse_x, mouse_y, bx, by, bw, bh) {
                 new_hover = Some(AssistantOverlayAction::OpenDocs);
             }
@@ -237,55 +252,106 @@ impl AssistantOverlay {
         false
     }
 
-    pub fn render(&mut self, sugarloaf: &mut Sugarloaf, dimensions: (f32, f32, f32)) {
+    pub fn render(
+        &mut self,
+        sugarloaf: &mut Sugarloaf,
+        dimensions: (f32, f32, f32),
+        theme: &super::window_chrome::Theme,
+    ) {
         if !self.is_active() {
             // Immediate mode: not drawing == not visible.
             return;
         }
 
         let (window_width, window_height, scale_factor) = dimensions;
+        let library = sugarloaf.font_library();
+        if self
+            .font_library
+            .as_ref()
+            .is_none_or(|old| !std::sync::Arc::ptr_eq(&old.inner, &library.inner))
+        {
+            self.font_id = super::window_chrome::load_ui_font(library);
+            self.font_library = Some(library.clone());
+        }
+        let body_opts = DrawOpts {
+            font_size: BODY_FONT_SIZE,
+            font_id: self.font_id,
+            color: color_u8(theme.foreground),
+            ..DrawOpts::default()
+        };
+        let (_, _, width, _) = self.overlay_rect(window_width, scale_factor);
+        self.lines = super::text_layout::wrap_text(
+            &self.error.as_ref().unwrap().report.to_string(),
+            (width - OVERLAY_PADDING * 2.0).max(1.0),
+            |text| sugarloaf.text_mut().measure(text, &body_opts),
+        );
+        let available = ((window_height / scale_factor
+            - self.top_inset
+            - OVERLAY_MARGIN_TOP * 2.0
+            - OVERLAY_PADDING * 2.0
+            - HEADING_HEIGHT
+            - BODY_ACTION_GAP
+            - ACTION_ROW_HEIGHT)
+            / LINE_HEIGHT)
+            .max(1.0) as usize;
+        self.lines.truncate(available.min(MAX_VISIBLE_LINES));
 
         let (ox, oy, ow, oh) = self.overlay_rect(window_width, scale_factor);
 
         // Backdrop
-        sugarloaf.rect(
-            None,
-            0.0,
-            0.0,
-            window_width / scale_factor,
-            window_height / scale_factor,
-            BACKDROP_COLOR,
-            DEPTH_BACKDROP,
-            ORDER,
-        );
+        if self.is_error() {
+            sugarloaf.rect(
+                0.0,
+                0.0,
+                window_width / scale_factor,
+                window_height / scale_factor,
+                BACKDROP_COLOR,
+                DEPTH_BACKDROP,
+                ORDER,
+            );
+        }
 
         // Background
         sugarloaf.rounded_rect(
-            None,
             ox,
             oy,
             ow,
             oh,
-            BG_COLOR,
+            theme.border,
             DEPTH_BG,
-            OVERLAY_CORNER_RADIUS,
+            theme.radius,
+            ORDER,
+        );
+        let pixel = (1.0 / scale_factor).min(ow / 2.0).min(oh / 2.0);
+        sugarloaf.rounded_rect(
+            ox + pixel,
+            oy + pixel,
+            ow - pixel * 2.0,
+            oh - pixel * 2.0,
+            theme.surface,
+            DEPTH_BG + 0.01,
+            (theme.radius - pixel).max(0.0),
             ORDER,
         );
 
         let error = self.error.clone().unwrap();
         let is_error = error.level == RioErrorLevel::Error;
-        let heading_color = if is_error {
-            HEADING_COLOR_ERROR
-        } else {
-            HEADING_COLOR_WARNING
-        };
+        let heading_color = theme.foreground;
 
         // Heading
-        let heading_text = if is_error { "Error" } else { "Warning" };
+        let heading_text =
+            if matches!(error.report, RioErrorType::InvalidConfigurationTheme(_)) {
+                "Theme unavailable"
+            } else if is_error {
+                "Error"
+            } else {
+                "Warning"
+            };
         let text_x = ox + OVERLAY_PADDING;
         let heading_y = oy + OVERLAY_PADDING;
         let heading_opts = DrawOpts {
             font_size: HEADING_FONT_SIZE,
+            font_id: self.font_id,
             color: color_u8(heading_color),
             ..DrawOpts::default()
         };
@@ -295,81 +361,132 @@ impl AssistantOverlay {
 
         // Body lines
         let body_y_start = heading_y + HEADING_HEIGHT;
-        let report_text = error.report.to_string();
-        let lines: Vec<&str> = report_text.lines().collect();
-        let visible_count = lines.len().min(MAX_VISIBLE_LINES);
-        let body_opts = DrawOpts {
-            font_size: BODY_FONT_SIZE,
-            color: color_u8(TEXT_COLOR),
-            ..DrawOpts::default()
-        };
-        for (i, line_text) in lines.iter().take(visible_count).enumerate() {
+        for (i, line_text) in self.lines.iter().enumerate() {
             let line_y = body_y_start + (i as f32 * LINE_HEIGHT);
             sugarloaf
                 .text_mut()
                 .draw(text_x, line_y, line_text, &body_opts);
         }
 
-        // Docs link button
-        let line_count = visible_count;
-        let link_area_y =
-            oy + OVERLAY_PADDING + HEADING_HEIGHT + (line_count as f32 * LINE_HEIGHT);
-        let link_x = ox + OVERLAY_PADDING;
-        let link_y = link_area_y + (LINK_ROW_HEIGHT - LINK_FONT_SIZE) / 2.0;
-        let link_opts = DrawOpts {
-            font_size: LINK_FONT_SIZE,
-            color: color_u8(LINK_COLOR),
-            ..DrawOpts::default()
-        };
-        let rendered_width = sugarloaf
-            .text_mut()
-            .draw(link_x, link_y, DOCS_URL, &link_opts);
-        self.link_button_width = rendered_width;
-
-        let (dbx, dby, dbw, dbh) = self.docs_button_rect(ox, oy);
-        let docs_hovered = self.hovered_button == Some(AssistantOverlayAction::OpenDocs);
-
-        if docs_hovered {
+        for (action, label, rect) in [
+            (
+                AssistantOverlayAction::OpenDocs,
+                "Documentation",
+                self.docs_button_rect(ox, oy, ow),
+            ),
+            (
+                AssistantOverlayAction::Close,
+                "Dismiss",
+                self.close_button_rect(ox, oy, ow),
+            ),
+        ] {
+            let (bx, by, bw, bh) = rect;
             sugarloaf.rounded_rect(
-                None,
-                dbx,
-                dby,
-                dbw,
-                dbh,
-                BUTTON_HOVER_BG,
-                DEPTH_ELEMENT,
-                BUTTON_CORNER_RADIUS,
-                ORDER,
-            );
-        }
-
-        // Close button
-        let (bx, by, bw, bh) = self.close_button_rect(ox, oy, ow);
-        let is_hovered = self.hovered_button == Some(AssistantOverlayAction::Close);
-
-        if is_hovered {
-            sugarloaf.rounded_rect(
-                None,
                 bx,
                 by,
                 bw,
                 bh,
-                BUTTON_HOVER_BG,
+                theme.border,
                 DEPTH_ELEMENT,
-                BUTTON_CORNER_RADIUS,
+                theme.control_radius(),
                 ORDER,
             );
+            sugarloaf.rounded_rect(
+                bx + pixel,
+                by + pixel,
+                (bw - pixel * 2.0).max(0.0),
+                (bh - pixel * 2.0).max(0.0),
+                if self.hovered_button == Some(action) {
+                    theme.hover
+                } else {
+                    theme.surface
+                },
+                DEPTH_ELEMENT + 0.01,
+                (theme.control_radius() - pixel).max(0.0),
+                ORDER,
+            );
+            let opts = DrawOpts {
+                font_size: BUTTON_FONT_SIZE,
+                font_id: self.font_id,
+                color: color_u8(theme.foreground),
+                ..DrawOpts::default()
+            };
+            let label = super::window_chrome::fit_text(
+                sugarloaf,
+                label,
+                (bw - 12.0).max(0.0),
+                &opts,
+            );
+            let label_y = super::window_chrome::centered_text_y(
+                sugarloaf,
+                &label,
+                by + bh / 2.0,
+                &opts,
+            );
+            let ui = sugarloaf.text_mut();
+            let label_w = ui.measure(&label, &opts);
+            ui.draw(bx + (bw - label_w) / 2.0, label_y, &label, &opts);
         }
+    }
+}
 
-        let close_opts = DrawOpts {
-            font_size: BUTTON_FONT_SIZE,
-            color: color_u8(BUTTON_TEXT_COLOR),
-            ..DrawOpts::default()
-        };
-        let ui = sugarloaf.text_mut();
-        let label_w = ui.measure("\u{2022}", &close_opts);
-        let label_x = bx + (bw - label_w) / 2.0;
-        let label_y = by + (bh - BUTTON_FONT_SIZE) / 2.0;
-        ui.draw(label_x, label_y, "\u{2022}", &close_opts);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rio_backend::error::RioErrorType;
+
+    #[test]
+    fn diagnostic_panel_stays_below_window_chrome() {
+        let mut overlay = AssistantOverlay::default();
+        overlay.set_error(RioError {
+            report: RioErrorType::InvalidConfigurationTheme("missing theme".into()),
+            level: RioErrorLevel::Warning,
+        });
+        overlay.set_top_inset(48.0);
+        for scale in [1.0, 1.5, 2.0] {
+            let (_, top, _, _) = overlay.overlay_rect(1200.0 * scale, scale);
+            assert!(
+                top >= 56.0,
+                "diagnostic covers window chrome at scale {scale}"
+            );
+            assert_eq!(
+                overlay.hit_test(1190.0, 16.0, 1200.0 * scale, scale),
+                Err(())
+            );
+        }
+    }
+
+    #[test]
+    fn warnings_leave_pointer_input_outside_the_panel_available() {
+        let mut overlay = AssistantOverlay::default();
+        overlay.set_top_inset(48.0);
+        overlay.set_error(RioError {
+            report: RioErrorType::InvalidConfigurationTheme("missing theme".into()),
+            level: RioErrorLevel::Warning,
+        });
+        assert!(!overlay.captures_pointer(1190.0, 16.0, 1200.0, 1.0));
+        let (x, y, width, _) = overlay.overlay_rect(1200.0, 1.0);
+        for (action, rect) in [
+            (
+                AssistantOverlayAction::Close,
+                overlay.close_button_rect(x, y, width),
+            ),
+            (
+                AssistantOverlayAction::OpenDocs,
+                overlay.docs_button_rect(x, y, width),
+            ),
+        ] {
+            let (bx, by, bw, bh) = rect;
+            assert_eq!(
+                overlay.hit_test(bx + bw / 2.0, by + bh / 2.0, 1200.0, 1.0),
+                Ok(Some(action))
+            );
+            assert!(overlay.captures_pointer(bx + bw / 2.0, by + bh / 2.0, 1200.0, 1.0));
+        }
+        overlay.set_error(RioError {
+            report: RioErrorType::InitializationError("failed".into()),
+            level: RioErrorLevel::Error,
+        });
+        assert!(overlay.captures_pointer(1190.0, 16.0, 1200.0, 1.0));
     }
 }

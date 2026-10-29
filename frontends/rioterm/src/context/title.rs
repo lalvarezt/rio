@@ -1,4 +1,5 @@
 use crate::context::Context;
+#[cfg(unix)]
 use std::path::Path;
 
 #[derive(PartialEq)]
@@ -19,19 +20,16 @@ impl Default for ContextTitle {
 // - `TITLE`: terminal title via OSC sequences for setting terminal title
 // - `PROGRAM`: the command the pane spawned (e.g `fish`, `zsh`, `bash`)
 // - `ABSOLUTE_PATH`: working directory via OSC 7 (e.g `/Users/rapha/Documents/a/rio`)
-// - `RELATIVE_PATH`: OSC 7 directory, home-relative (e.g `~/Documents/a/rio` or `…/a/psone/starpsx`)
+// - `RELATIVE_PATH`: OSC 7 directory, home-relative (e.g `~/Documents/a/rio`)
 // - `COLUMNS`: current columns
 // - `LINES`: current lines
 
-/// Shorten an absolute path for display:
-/// - Replace home directory prefix with `~`
-/// - If 4+ components deep, show `…/last/three/components`
+/// Replace the home prefix only; character-count truncation here would hide
+/// paths that still fit after the renderer measures the title and its icons.
 fn shorten_path(absolute: &str) -> String {
-    let path = Path::new(absolute);
-
-    // Replace home prefix with ~
     #[cfg(unix)]
     let display_path = {
+        let path = Path::new(absolute);
         if let Some(home) = dirs::home_dir() {
             if let Ok(stripped) = path.strip_prefix(&home) {
                 let s = stripped.to_string_lossy();
@@ -51,26 +49,12 @@ fn shorten_path(absolute: &str) -> String {
     #[cfg(not(unix))]
     let display_path = absolute.to_string();
 
-    // If 4+ components, show …/last3
-    let components: Vec<&str> =
-        display_path.split('/').filter(|s| !s.is_empty()).collect();
-    if components.len() >= 4 {
-        format!("…/{}", components[components.len() - 3..].join("/"))
-    } else {
-        display_path
-    }
+    display_path
 }
 
+/// Use event-known metadata instead of polling foreground processes. A supplied
+/// OSC title avoids locking; templates needing the directory take one shared lock.
 #[inline]
-/// Render the title template. Every variable is event-known, so this
-/// NEVER inspects the foreground process: `{{ title }}` is OSC 0/2,
-/// the path variables are OSC 7 (empty for shells without
-/// integration), `{{ program }}` is the name of the command the pane
-/// spawned, and columns/lines are the pane's own dimensions.
-/// `prefetched_title` reuses the OSC title string the caller already
-/// holds (a `Title` event carries it), so a `{{ title }}` render off
-/// an event never locks the terminal; otherwise one lock fetches
-/// title and cwd together.
 pub fn update_title<T: rio_backend::event::EventListener>(
     template: &str,
     context: &Context<T>,
@@ -84,7 +68,7 @@ pub fn update_title<T: rio_backend::event::EventListener>(
     let lowered = template.to_lowercase();
     let needs_title = lowered.contains("title");
     let needs_path = lowered.contains("path");
-    let (terminal_title, current_directory) =
+    let (mut terminal_title, current_directory, remote_directory) =
         if (needs_title && prefetched_title.is_none()) || needs_path {
             let terminal = context.terminal.lock();
             (
@@ -93,10 +77,18 @@ pub fn update_title<T: rio_backend::event::EventListener>(
                     None => terminal.title.to_string(),
                 },
                 terminal.current_directory.clone(),
+                terminal.remote_directory.clone(),
             )
         } else {
-            (prefetched_title.unwrap_or_default().to_string(), None)
+            (prefetched_title.unwrap_or_default().to_string(), None, None)
         };
+    // Shells and ConPTY can report only the spawned executable as the title.
+    // Let the directory fallback run when the title adds no information.
+    if terminal_title == context.spawned_program {
+        terminal_title.clear();
+    }
+    let is_remote = remote_directory.is_some();
+    let current_directory = remote_directory.map(|(_, path)| path).or(current_directory);
     // Compiled once: titles are now rendered per OSC title change, not on
     // a 2s poll, so a per-call `Regex::new` would sit in the hot path.
     static RE: std::sync::LazyLock<regex::Regex> =
@@ -171,7 +163,8 @@ pub fn update_title<T: rio_backend::event::EventListener>(
                     let path = current_directory
                         .as_ref()
                         .and_then(|d| d.clone().into_os_string().into_string().ok())
-                        .map(|d| shorten_path(&d))
+                        // The remote home directory need not match ours.
+                        .map(|d| if is_remote { d } else { shorten_path(&d) })
                         .unwrap_or_default();
 
                     let is_only_one = variables.len() == 1;
@@ -417,9 +410,9 @@ pub mod test {
             "/rio-sandbox-test-dir/sub",
         );
 
-        // Deep paths get truncated to last 3 components
-        assert_eq!(shorten_path("/a/b/c/d/e"), "…/c/d/e");
-        assert_eq!(shorten_path("/a/b/c/d"), "…/b/c/d");
+        // Shared tabs leave truncation to the measured text budget.
+        assert_eq!(shorten_path("/a/b/c/d/e"), "/a/b/c/d/e");
+        assert_eq!(shorten_path("/a/b/c/d"), "/a/b/c/d");
 
         // 3 components stays as-is
         assert_eq!(shorten_path("/a/b/c"), "/a/b/c");

@@ -6,6 +6,7 @@ pub(crate) fn is_printable_text(text: &str) -> bool {
     !text.is_empty() && text.chars().all(|c| !c.is_control())
 }
 
+mod app_icons;
 pub mod assistant;
 pub mod command_palette;
 pub mod confirm_quit;
@@ -14,14 +15,40 @@ pub mod helpers;
 pub mod island;
 pub mod scrollbar;
 pub mod search;
+mod tab_glass;
+mod text_layout;
 pub mod trail_cursor;
 pub mod utils;
+pub mod window_chrome;
 
 use rio_backend::event::TerminalDamage;
+
+type VirtualAnchors = rustc_hash::FxHashMap<(u32, u64), (usize, usize)>;
+
+fn positioned_kitty_placement<'a>(
+    placement: &'a rio_backend::ansi::graphics::KittyPlacement,
+    content: &RenderableContent,
+    anchors: &VirtualAnchors,
+    viewport: &rio_backend::ansi::graphics::OverlayViewport,
+) -> Option<std::borrow::Cow<'a, rio_backend::ansi::graphics::KittyPlacement>> {
+    let Some(relative) = placement.relative.filter(|relative| {
+        content
+            .kitty_virtual_placements
+            .contains_key(&(relative.image_id, relative.placement_id))
+    }) else {
+        return Some(std::borrow::Cow::Borrowed(placement));
+    };
+    let &(col, row) = anchors.get(&(relative.image_id, relative.placement_id))?;
+    let mut anchored = placement.clone();
+    anchored.dest_col = col;
+    anchored.dest_row = viewport.history_size - viewport.display_offset + row as i64;
+    Some(std::borrow::Cow::Owned(anchored))
+}
 
 use crate::context::renderable::{PendingUpdate, RenderableContent};
 use crate::context::ContextManager;
 use crate::crosswords::style::{Style as CellStyle, StyleFlags};
+use crate::crosswords::Mode;
 use rio_backend::config::colors::term::TermColors;
 use rio_backend::config::colors::{
     term::{List, DIM_FACTOR},
@@ -39,10 +66,7 @@ const TOOLTIP_FONT_SIZE: f32 = 12.0;
 const TOOLTIP_PADDING_X: f32 = 9.0;
 const TOOLTIP_PADDING_Y: f32 = 5.0;
 const TOOLTIP_MARGIN: f32 = 6.0;
-const TOOLTIP_CORNER_RADIUS: f32 = 5.0;
 const TOOLTIP_MAX_WIDTH_RATIO: f32 = 0.6;
-const TOOLTIP_BG_COLOR: [f32; 4] = [0.12, 0.12, 0.12, 0.96];
-const TOOLTIP_TEXT_COLOR: [u8; 4] = [237, 237, 237, 255];
 const TOOLTIP_DEPTH_BG: f32 = 0.1;
 const TOOLTIP_ORDER: u8 = 20;
 
@@ -89,13 +113,14 @@ fn draw_hint_tooltip(
     text: &str,
     window_size: (f32, f32),
     scale_factor: f32,
+    theme: &window_chrome::Theme,
 ) {
     let logical_width = window_size.0 / scale_factor;
     let logical_height = window_size.1 / scale_factor;
 
     let opts = DrawOpts {
         font_size: TOOLTIP_FONT_SIZE,
-        color: TOOLTIP_TEXT_COLOR,
+        color: theme.foreground.map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8),
         ..DrawOpts::default()
     };
 
@@ -112,14 +137,24 @@ fn draw_hint_tooltip(
     let y = (logical_height - height - TOOLTIP_MARGIN).max(0.0);
 
     sugarloaf.rounded_rect(
-        None,
         x,
         y,
         width,
         height,
-        TOOLTIP_BG_COLOR,
+        theme.border,
         TOOLTIP_DEPTH_BG,
-        TOOLTIP_CORNER_RADIUS,
+        theme.control_radius(),
+        TOOLTIP_ORDER,
+    );
+    let pixel = 1.0 / scale_factor;
+    sugarloaf.rounded_rect(
+        x + pixel,
+        y + pixel,
+        width - pixel * 2.0,
+        height - pixel * 2.0,
+        theme.surface,
+        TOOLTIP_DEPTH_BG + 0.01,
+        (theme.control_radius() - pixel).max(0.0),
         TOOLTIP_ORDER,
     );
     sugarloaf.text_mut().draw(
@@ -151,6 +186,9 @@ fn window_bg_alpha(config: &Config) -> f32 {
 pub use rio_backend::sugarloaf::{atlas_image_key, kitty_image_key, route_image_key};
 
 pub struct Renderer {
+    kitty_animation_routes: rustc_hash::FxHashSet<usize>,
+    kitty_animation_deadline: Option<std::time::Instant>,
+    kitty_animations_visible: bool,
     is_vi_mode_enabled: bool,
     is_game_mode_enabled: bool,
     pub is_window_focused: bool,
@@ -160,7 +198,7 @@ pub struct Renderer {
     pub colors: List,
     pub navigation: Navigation,
     pub margin: rio_backend::config::layout::Margin,
-    pub island: Option<island::Island>,
+    pub island: island::Island,
     pub command_palette: command_palette::CommandPalette,
     unfocused_split_opacity: f32,
     unfocused_split_fill: Option<ColorArray>,
@@ -180,11 +218,11 @@ pub struct Renderer {
     pub search: search::SearchOverlay,
     pub assistant: assistant::AssistantOverlay,
     pub confirm_quit: confirm_quit::ConfirmQuit,
+    pub confirm_before_close_tab: bool,
     pub scrollbar: scrollbar::Scrollbar,
     #[allow(unused)]
     pub option_as_alt: String,
     #[allow(unused)]
-    pub macos_use_unified_titlebar: bool,
     // Dynamic background keep track of the original bg color and
     // the same r,g,b with the mutated alpha channel.
     pub dynamic_background: ([f32; 4], rio_backend::sugarloaf::Color, bool),
@@ -227,25 +265,25 @@ impl Renderer {
             dynamic_background.2 = true;
         }
 
-        let island = if config.navigation.is_enabled() {
-            Some(island::Island::new(
-                named_colors.tabs,
-                named_colors.tabs_active,
-                config.navigation.hide_if_single,
-                config.navigation.max_tab_width,
-            ))
-        } else {
-            None
-        };
+        let mut island = island::Island::new(
+            named_colors.tabs,
+            named_colors.tabs_active,
+            config.navigation.hide_if_single,
+            config.navigation.max_tab_width,
+        );
+        island.update_colors(&named_colors);
+        island.configure(&config.navigation);
 
         Renderer {
+            kitty_animation_routes: Default::default(),
+            kitty_animation_deadline: None,
+            kitty_animations_visible: true,
             unfocused_split_opacity: config.navigation.unfocused_split_opacity,
             unfocused_split_fill: config.navigation.unfocused_split_fill,
             last_active: None,
             last_window_bg: None,
             use_drawable_chars: config.fonts.use_drawable_chars,
             draw_bold_text_with_light_colors: config.draw_bold_text_with_light_colors,
-            macos_use_unified_titlebar: config.window.macos_use_unified_titlebar,
             config_blinking_interval: config.cursor.blinking_interval.clamp(350, 1200),
             option_as_alt: config.option_as_alt.to_lowercase(),
             is_vi_mode_enabled: false,
@@ -258,7 +296,15 @@ impl Renderer {
             island,
             command_palette: {
                 let mut palette = command_palette::CommandPalette::new();
-                palette.has_adaptive_theme = config.adaptive_colors.is_some();
+                palette.configure(
+                    &named_colors,
+                    config.adaptive_colors.is_some(),
+                    config.cursor.blinking.then(|| {
+                        std::time::Duration::from_millis(
+                            config.cursor.blinking_interval.clamp(350, 1200),
+                        )
+                    }),
+                );
                 palette
             },
             named_colors,
@@ -269,6 +315,7 @@ impl Renderer {
             search: search::SearchOverlay::default(),
             assistant: assistant::AssistantOverlay::default(),
             confirm_quit: confirm_quit::ConfirmQuit::default(),
+            confirm_before_close_tab: config.confirm_before_close_tab,
             scrollbar: scrollbar::Scrollbar::new(config.enable_scroll_bar),
             is_game_mode_enabled: config.renderer.strategy.is_game(),
             custom_mouse_cursor: config.effects.custom_mouse_cursor,
@@ -293,8 +340,12 @@ impl Renderer {
     }
 
     #[inline]
-    pub fn set_active_search(&mut self, active_search: Option<String>) {
-        self.search.set_active_search(active_search);
+    pub fn set_active_search(&mut self, active_search: Option<&str>) -> bool {
+        self.search.set_active_search(active_search)
+    }
+
+    pub(crate) fn active_route_changed(&self, route_id: usize) -> bool {
+        self.last_active != Some(route_id)
     }
 
     #[inline]
@@ -405,6 +456,18 @@ impl Renderer {
         }
     }
 
+    /// Cursor color for a panel. In Vi mode the configured `vi-cursor`
+    /// color is used; otherwise OSC 12 wins over the theme `cursor`.
+    /// `List::fill_named` skips the Cursor slot, so the named colors
+    /// are read directly instead of going through `Renderer::color`.
+    #[inline]
+    pub fn cursor_color(&self, term_colors: &TermColors, is_vi_mode: bool) -> ColorArray {
+        if is_vi_mode {
+            return self.named_colors.vi_cursor;
+        }
+        term_colors[NamedColor::Cursor as usize].unwrap_or(self.named_colors.cursor)
+    }
+
     #[inline]
     pub fn set_vi_mode(&mut self, is_vi_mode_enabled: bool) {
         self.is_vi_mode_enabled = is_vi_mode_enabled;
@@ -448,23 +511,71 @@ impl Renderer {
         sugarloaf: &mut Sugarloaf,
         context_manager: &mut ContextManager<EventProxy>,
     ) -> (Option<crate::context::renderable::WindowUpdate>, bool) {
+        #[cfg(feature = "profiling")]
+        let _timing = crate::profiling::span("frame.renderer");
+        let now = std::time::Instant::now();
+        if self.confirm_quit.clipboard_route().is_some_and(|route| {
+            context_manager.get_by_route_id(route).is_none_or(|item| {
+                self.confirm_quit.clipboard_request().is_none_or(|request| {
+                    !item.val.terminal.lock().clipboard_request_current(request)
+                })
+            })
+        }) {
+            self.confirm_quit.set_active(false);
+        }
+        self.kitty_animation_deadline = None;
+        let hidden: Vec<_> = self
+            .kitty_animation_routes
+            .iter()
+            .copied()
+            .filter(|id| !context_manager.is_route_visible(*id))
+            .collect();
+        for id in hidden {
+            if let Some(item) = context_manager.get_by_route_id(id) {
+                item.val
+                    .terminal
+                    .lock()
+                    .graphics
+                    .pause_kitty_animations(now);
+            }
+            self.kitty_animation_routes.remove(&id);
+        }
         let mut any_panel_dirty = false;
         let grid = context_manager.current_grid_mut();
         let active_route = grid.current().route_id;
-        let grid_scaled_margin = grid.get_scaled_margin();
-        let mut has_active_changed = false;
-        if self.last_active != Some(active_route) {
-            has_active_changed = true;
-            self.last_active = Some(active_route);
-        }
+        let has_active_changed = self.active_route_changed(active_route);
+        self.last_active = Some(active_route);
 
         for (_key, grid_context) in grid.contexts_mut().iter_mut() {
-            let panel_rect = grid_context.layout_rect;
+            let panel_rect = grid_context.geometry.content;
             let context = grid_context.context_mut();
 
             let force_full_damage = has_active_changed || self.is_game_mode_enabled;
 
-            let is_dirty = context.renderable_content.pending_update.is_dirty();
+            let mut is_dirty = context.renderable_content.pending_update.is_dirty();
+            if is_dirty
+                || force_full_damage
+                || self.kitty_animation_routes.contains(&context.route_id)
+            {
+                let mut terminal = context.terminal.lock();
+                if self.kitty_animations_visible {
+                    if let Some(delay) = terminal.graphics.tick_kitty_animations(now) {
+                        self.kitty_animation_routes.insert(context.route_id);
+                        if let Some(deadline) = now.checked_add(delay) {
+                            self.kitty_animation_deadline = Some(
+                                self.kitty_animation_deadline
+                                    .map_or(deadline, |old| old.min(deadline)),
+                            );
+                        }
+                    } else {
+                        self.kitty_animation_routes.remove(&context.route_id);
+                    }
+                } else {
+                    terminal.graphics.pause_kitty_animations(now);
+                }
+                is_dirty |= terminal.graphics.kitty_graphics_dirty;
+                terminal.send_graphics_updates();
+            }
 
             // Check if we need to render
             if !is_dirty && !force_full_damage {
@@ -480,7 +591,7 @@ impl Renderer {
                 .take_terminal_damage();
             context.renderable_content.pending_update.reset();
 
-            {
+            let captured_styles = {
                 let mut terminal = context.terminal.lock();
 
                 // Clear in-flight flag so PTY thread can notify again
@@ -500,7 +611,7 @@ impl Renderer {
                         // input, etc.): cells didn't change, but the
                         // panel still has to go through the render path
                         // so UI overlays paint on top of a fresh frame.
-                        // Noop propagates to `RowsToRebuild::None` in
+                        // Noop skips row emission in
                         // `screen::render`'s emit loop — grid keeps its
                         // resident CPU bg/fg buffers, zero row work.
                         (None, None) => TerminalDamage::Noop,
@@ -509,11 +620,12 @@ impl Renderer {
 
                 terminal.reset_damage();
 
-                terminal.snapshot_visible(
+                let captured_styles = terminal.snapshot_visible_deferred(
                     &damage,
                     &mut context.renderable_content.visible_rows,
                     &mut context.renderable_content.row_styles,
                     &mut context.renderable_content.extras,
+                    &mut context.renderable_content.deferred_styles,
                 );
                 context.renderable_content.term_colors = terminal.colors;
                 context.renderable_content.display_offset = terminal.display_offset();
@@ -523,21 +635,21 @@ impl Renderer {
                 context.renderable_content.lines_evicted = terminal.lines_evicted();
                 context.renderable_content.blinking_cursor = terminal.blinking_cursor;
                 context.renderable_content.cursor.state = terminal.cursor();
-                if terminal.graphics.kitty_graphics_dirty {
+                context.renderable_content.is_vi_mode =
+                    terminal.mode().contains(Mode::VI);
+                if terminal.graphics.kitty_graphics_dirty
+                    || context.renderable_content.graphics_snapshot_invalid
+                {
+                    context.renderable_content.graphics_snapshot_invalid = false;
                     context.renderable_content.kitty_virtual_placements =
                         terminal.graphics.kitty_virtual_placements.clone();
-                    context.renderable_content.kitty_images =
-                        terminal.graphics.kitty_images.clone();
+                    RenderableContent::capture_kitty_dimensions(
+                        &mut context.renderable_content.kitty_images,
+                        &terminal.graphics.kitty_images,
+                    );
                     context.renderable_content.kitty_placements = {
-                        let mut placements: Vec<_> = terminal
-                            .graphics
-                            .kitty_placements
-                            .values()
-                            .filter(|p| {
-                                terminal.graphics.kitty_images.contains_key(&p.image_id)
-                            })
-                            .cloned()
-                            .collect();
+                        let mut placements =
+                            terminal.graphics.resolved_kitty_placements();
                         // Tie-break on the unique key so equal
                         // z-indexes keep a stable paint order across
                         // frames (map iteration order is not).
@@ -554,7 +666,13 @@ impl Renderer {
                 }
                 context.renderable_content.frame_damage = damage;
                 drop(terminal);
-            }
+                captured_styles
+            };
+
+            // Only owned cells and palette values cross the lock boundary:
+            // expanding mixed rows here lets PTY parsing resume sooner, without
+            // exposing the snapshot to style-ID reuse on the terminal thread.
+            context.renderable_content.all_rows_modified = captured_styles.resolve();
 
             // Recalculate image overlay positions every frame when placements
             // exist. Positions depend on display_offset and history_size which
@@ -575,8 +693,8 @@ impl Renderer {
                 // (screen/mod.rs panel_left/panel_top), so image quads
                 // and the clip rect sit exactly on the painted cell
                 // grid instead of up to half a pixel off.
-                let origin_x = (panel_rect[0] + grid_scaled_margin.left).round();
-                let origin_y = (panel_rect[1] + grid_scaled_margin.top).round();
+                let origin_x = panel_rect[0];
+                let origin_y = panel_rect[1];
 
                 // Images clip to the panel's cell grid, exactly like
                 // text: without this a wide image paints across split
@@ -619,8 +737,8 @@ impl Renderer {
                             image_id: route_image_key(route_id, p.image_key),
                             x: geometry.x,
                             y: geometry.y,
-                            width: geometry.width,
-                            height: geometry.height,
+                            width: geometry.width as f32,
+                            height: geometry.height as f32,
                             z_index: -1,
                             source_rect: geometry.source_rect,
                         };
@@ -636,16 +754,39 @@ impl Renderer {
                     }
                 }
 
+                let virtual_anchors = if has_virtual {
+                    Self::push_virtual_placeholder_overlays(
+                        overlays,
+                        rc,
+                        route_id,
+                        origin_x,
+                        origin_y,
+                        cell_width,
+                        cell_height,
+                        (clip_x0, clip_y0, clip_x1, clip_y1),
+                    )
+                } else {
+                    VirtualAnchors::default()
+                };
+
                 if has_overlays {
                     for p in &rc.kitty_placements {
+                        let Some(p) = positioned_kitty_placement(
+                            p,
+                            rc,
+                            &virtual_anchors,
+                            &viewport,
+                        ) else {
+                            continue;
+                        };
                         let (image_width, image_height) = rc
                             .kitty_images
                             .get(&p.image_id)
-                            .map(|stored| (stored.data.width, stored.data.height))
+                            .map(|stored| (stored.width, stored.height))
                             .unwrap_or((0, 0));
                         let Some(geometry) =
                             rio_backend::ansi::graphics::kitty_overlay_geometry(
-                                p,
+                                &p,
                                 image_width,
                                 image_height,
                                 &viewport,
@@ -660,8 +801,8 @@ impl Renderer {
                             ),
                             x: geometry.x,
                             y: geometry.y,
-                            width: geometry.width,
-                            height: geometry.height,
+                            width: geometry.width as f32,
+                            height: geometry.height as f32,
                             z_index: p.z_index,
                             source_rect: geometry.source_rect,
                         };
@@ -675,19 +816,6 @@ impl Renderer {
                             overlays.push(overlay);
                         }
                     }
-                }
-
-                if has_virtual {
-                    Self::push_virtual_placeholder_overlays(
-                        overlays,
-                        rc,
-                        route_id,
-                        origin_x,
-                        origin_y,
-                        cell_width,
-                        cell_height,
-                        (clip_x0, clip_y0, clip_x1, clip_y1),
-                    );
                 }
             } else if rc.kitty_graphics_dirty {
                 // All placements (kitty and atlas) were removed, so drop
@@ -746,7 +874,7 @@ impl Renderer {
         if self.scrollbar.is_enabled() {
             self.scrollbar.clear_panel_states();
             for grid_context in grid.contexts_mut().values() {
-                let panel_rect = grid_context.layout_rect;
+                let panel_rect = grid_context.geometry.content;
                 let ctx = grid_context.context();
                 let rc = &ctx.renderable_content;
                 self.scrollbar
@@ -785,33 +913,22 @@ impl Renderer {
                 if &active_key == key {
                     continue;
                 }
-                // Match the grid renderer's actual paint region —
-                // `.round()`ed integer-pixel origin +
-                // `cols * round(cell_w)` × `rows * round(cell_h)`
-                // content size (same math as `GridUniforms.grid_padding`
-                // / `cell_size` in `screen/mod.rs:~3717`). Using raw
-                // `layout_rect` leaves a sub-pixel un-dimmed fringe at
-                // the right/bottom edges of inactive splits because
-                // taffy allocates fractional sizes while the grid
-                // snaps to whole cells.
-                let dim = grid_context.val.dimension;
-                let cell_w = dim.cell.cell_width as f32;
-                let cell_h = dim.cell.cell_height as f32;
-                let cols = dim.columns.max(1) as f32;
-                let rows = dim.lines.max(1) as f32;
-                let panel_left =
-                    (grid_context.layout_rect[0] + grid_scaled_margin.left).round();
-                let panel_top =
-                    (grid_context.layout_rect[1] + grid_scaled_margin.top).round();
-                let x = panel_left / scale_factor;
-                let y = panel_top / scale_factor;
-                let w = (cols * cell_w) / scale_factor;
-                let h = (rows * cell_h) / scale_factor;
-                sugarloaf.rect(None, x, y, w, h, dim_color, 0.0, 3);
+                let [left, top, width, height] = grid_context.geometry.frame;
+                sugarloaf.rounded_rect(
+                    left / scale_factor,
+                    top / scale_factor,
+                    width / scale_factor,
+                    height / scale_factor,
+                    dim_color,
+                    0.0,
+                    grid_context.geometry.radius / scale_factor,
+                    3,
+                );
             }
         }
 
-        if let Some(island) = &mut self.island {
+        {
+            let island = &mut self.island;
             let island_bg = self
                 .last_window_bg
                 .map(|c| [c.r as f32, c.g as f32, c.b as f32, c.a as f32])
@@ -824,14 +941,19 @@ impl Renderer {
             );
         }
 
+        let overlay_theme = window_chrome::Theme::new(&self.named_colors)
+            .with_style(self.navigation.tab_style);
+        self.assistant.set_top_inset(self.island.content_top());
         self.assistant.render(
             sugarloaf,
             (window_size.width, window_size.height, scale_factor),
+            &overlay_theme,
         );
 
         self.search.render(
             sugarloaf,
             (window_size.width, window_size.height, scale_factor),
+            &overlay_theme,
         );
 
         // The hint borrow (context_manager) and the draw target
@@ -849,22 +971,23 @@ impl Renderer {
                 &hint.text,
                 (window_size.width, window_size.height),
                 scale_factor,
+                &overlay_theme,
             );
         }
 
         self.command_palette.render(
             sugarloaf,
             (window_size.width, window_size.height, scale_factor),
+            self.navigation.tab_style,
         );
 
         self.confirm_quit.render(
             sugarloaf,
             (window_size.width, window_size.height, scale_factor),
+            &overlay_theme,
         );
 
         // Render scrollbars for each panel
-        let grid_scaled_margin_sb = context_manager.get_current_grid_scaled_margin();
-        let grid_margin_sb = (grid_scaled_margin_sb.left, grid_scaled_margin_sb.top);
         let panel_count = self.scrollbar.panel_states().len();
         for i in 0..panel_count {
             let state = self.scrollbar.panel_states()[i];
@@ -876,22 +999,50 @@ impl Renderer {
                 state.history_size,
                 state.screen_lines,
                 state.rich_text_id,
-                grid_margin_sb,
             );
         }
 
-        // Render panel borders (on top of terminal content). Borders
-        // are flat rects today — the previous `Object` enum
-        // (Rect / Quad / RichText) was only ever populated with the
-        // Rect variant, so the dispatch is direct now.
-        let grid_scaled_margin = context_manager.get_current_grid_scaled_margin();
-        for rect in context_manager.get_panel_borders() {
-            let x = (rect.x + grid_scaled_margin.left) / scale_factor;
-            let y = (rect.y + grid_scaled_margin.top) / scale_factor;
-            let width = rect.width / scale_factor;
-            let height = rect.height / scale_factor;
-            sugarloaf.rect(None, x, y, width, height, rect.color, 0.0, 1);
+        // Pane frames share the tabs' reflective border and the palette theme.
+        // The frame and grid clip share the same resolved pane bounds.
+        let grid = context_manager.current_grid();
+        let theme = window_chrome::Theme::new(&self.named_colors);
+        for (key, item) in grid.contexts() {
+            if item.geometry.border_width > 0.0 {
+                let [x, y, width, height] = item.geometry.frame;
+                tab_glass::draw(
+                    sugarloaf,
+                    [
+                        x / scale_factor,
+                        y / scale_factor,
+                        width / scale_factor,
+                        height / scale_factor,
+                    ],
+                    item.geometry.radius / scale_factor,
+                    self.navigation.tab_glass_intensity,
+                    Some(tab_glass::Status {
+                        color: if *key == grid.current {
+                            theme.accent
+                        } else {
+                            theme.border
+                        },
+                        progress: None,
+                        width: item.geometry.border_width,
+                    }),
+                    4,
+                );
+            }
         }
+        grid.for_each_divider(|[x, y, width, height]| {
+            sugarloaf.rect(
+                x / scale_factor,
+                y / scale_factor,
+                width / scale_factor,
+                height / scale_factor,
+                theme.border,
+                0.0,
+                4,
+            );
+        });
 
         // Derive the window bg color from the currently-active panel's
         // OSC 11 state (sticky on `renderable_content.background`) on
@@ -932,20 +1083,49 @@ impl Renderer {
         (window_update, any_panel_dirty)
     }
 
-    /// Check if the renderer needs continuous redraw (for animations)
+    /// Preserve frame delays while window rendering is suspended.
+    pub fn set_kitty_animation_visibility(
+        &mut self,
+        visible: bool,
+        contexts: &mut ContextManager<EventProxy>,
+    ) {
+        self.kitty_animations_visible = visible;
+        if !visible {
+            self.kitty_animation_deadline = None;
+            let now = std::time::Instant::now();
+            for id in &self.kitty_animation_routes {
+                if let Some(item) = contexts.get_by_route_id(*id) {
+                    item.val
+                        .terminal
+                        .lock()
+                        .graphics
+                        .pause_kitty_animations(now);
+                }
+            }
+        }
+    }
+
+    /// Time until the next animation frame. Terminal input redraws independently.
     #[inline]
-    pub fn needs_redraw(&mut self) -> bool {
+    pub fn next_frame_in(
+        &mut self,
+        scale: f32,
+        frame_interval: std::time::Duration,
+    ) -> Option<std::time::Duration> {
         if self.trail_cursor_enabled && self.trail_cursor.is_animating() {
-            return true;
+            return Some(std::time::Duration::ZERO);
         }
         if self.scrollbar.needs_redraw() {
-            return true;
+            return Some(std::time::Duration::ZERO);
         }
-        if let Some(island) = &self.island {
-            island.needs_redraw()
-        } else {
-            false
-        }
+        let chrome = self.island.next_frame_in(scale, frame_interval);
+        let kitty = self
+            .kitty_animation_deadline
+            .map(|at| at.saturating_duration_since(std::time::Instant::now()));
+        [chrome, self.command_palette.next_frame_in(), kitty]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// Scan visible rows for kitty Unicode-placeholder cells (U+10EEEE) and
@@ -973,7 +1153,7 @@ impl Renderer {
         cell_width: f32,
         cell_height: f32,
         clip: (f32, f32, f32, f32),
-    ) {
+    ) -> VirtualAnchors {
         use rio_backend::ansi::kitty_virtual::{
             IncompletePlacement, PlaceholderRun, PLACEHOLDER,
         };
@@ -982,6 +1162,8 @@ impl Renderer {
         // want them above the glyphs set z-index explicitly via the
         // graphics protocol.
         const VIRTUAL_Z_INDEX: i32 = -1;
+
+        let mut anchors = VirtualAnchors::default();
 
         for (line_idx, row) in rc.visible_rows.iter().enumerate() {
             // Per-row dirty flag: skip rows that never had a placeholder
@@ -995,17 +1177,14 @@ impl Renderer {
             // discontinuity, etc.) we flush the run as one overlay and
             // start a new one. Mirrors `PlacementIterator.next`.
             let mut run: Option<(IncompletePlacement, usize)> = None;
-            let row_styles = rc
-                .row_styles
-                .get(line_idx)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
+            let row_styles = &rc.row_styles[line_idx];
 
             for (col_idx, square) in row.inner.iter().enumerate() {
                 if square.c() != PLACEHOLDER {
                     if let Some((p, start_col)) = run.take() {
                         flush_run(
                             overlays,
+                            &mut anchors,
                             rc,
                             route_id,
                             p.complete(),
@@ -1022,7 +1201,7 @@ impl Renderer {
                     continue;
                 }
 
-                let style = rio_grid::resolve_style(row_styles, col_idx);
+                let style = row_styles.at(col_idx);
                 let combining: &[char] = square
                     .extras_id()
                     .and_then(|eid| rc.extras.get(&eid))
@@ -1043,6 +1222,7 @@ impl Renderer {
                         if let Some((p, start_col)) = run.take() {
                             flush_run(
                                 overlays,
+                                &mut anchors,
                                 rc,
                                 route_id,
                                 p.complete(),
@@ -1074,6 +1254,7 @@ impl Renderer {
             if let Some((p, start_col)) = run {
                 flush_run(
                     overlays,
+                    &mut anchors,
                     rc,
                     route_id,
                     p.complete(),
@@ -1089,6 +1270,8 @@ impl Renderer {
             }
         }
 
+        return anchors;
+
         /// Look up metadata + image for a completed `PlaceholderRun`,
         /// compute its on-screen geometry via
         /// `kitty_virtual::compute_run_geometry`, and push one
@@ -1098,6 +1281,7 @@ impl Renderer {
         #[allow(clippy::too_many_arguments)]
         fn flush_run(
             overlays: &mut Vec<rio_backend::sugarloaf::GraphicOverlay>,
+            anchors: &mut VirtualAnchors,
             rc: &RenderableContent,
             route_id: usize,
             run: PlaceholderRun,
@@ -1119,6 +1303,15 @@ impl Renderer {
                 Some(v) => v,
                 None => return,
             };
+            // Relative children use the smallest captured column and row,
+            // independently, across every run targeting this virtual root.
+            anchors
+                .entry((vp.image_id, vp.placement_id))
+                .and_modify(|(col, row)| {
+                    *col = (*col).min(start_screen_col);
+                    *row = (*row).min(screen_line);
+                })
+                .or_insert((start_screen_col, screen_line));
             let img = match rc.kitty_images.get(&run.image_id) {
                 Some(i) => i,
                 None => return,
@@ -1128,8 +1321,8 @@ impl Renderer {
                 &run,
                 vp.columns,
                 vp.rows,
-                img.data.width as u32,
-                img.data.height as u32,
+                img.width as u32,
+                img.height as u32,
                 (vp.x, vp.y, vp.width, vp.height),
                 cell_width,
                 cell_height,
@@ -1214,6 +1407,186 @@ impl rio_grid::GridPalette for Renderer {
     #[inline]
     fn ignore_selection_fg_color(&self) -> bool {
         self.ignore_selection_fg_color
+    }
+}
+
+#[cfg(test)]
+mod virtual_relative_tests {
+    use super::*;
+    use rio_backend::ansi::graphics::{kitty_overlay_geometry, OverlayViewport};
+    use rio_backend::crosswords::{Crosswords, CrosswordsSize};
+    use rio_backend::event::{VoidListener, WindowId};
+    use rio_backend::performer::handler::Processor;
+
+    #[test]
+    fn virtual_overlays_from_retained_rows_match_fresh_snapshots_after_edits() {
+        let mut terminal = Crosswords::new(
+            CrosswordsSize::new_with_dimensions(8, 6, 80, 120, 10, 20),
+            rio_backend::ansi::CursorShape::Block,
+            VoidListener {},
+            WindowId::from(0),
+            0,
+            100,
+        );
+        let mut processor = Processor::default();
+        processor.advance(&mut terminal, b"\x1b_Ga=T,i=1,p=1,f=32,s=1,v=1,c=4,r=2,U=1;AQIDBA==\x1b\\\x1b_Ga=T,i=2,p=1,f=32,s=1,v=1,c=4,r=2,U=1;AQIDBA==\x1b\\");
+        let mut retained =
+            RenderableContent::from_cursor_config(&Config::default().cursor);
+        let cells = "\x1b[31;58;5;1m\x1b[2;3H\u{10eeee}\u{305}\u{305}\u{10eeee}\u{10eeee}\u{10eeee}\x1b[3;3H\u{10eeee}\u{30d}\u{305}\u{10eeee}\u{10eeee}\u{10eeee}\x1b[0m";
+        for text in [
+            cells,
+            "\x1b[0m",
+            "\x1b[H",
+            "\x1b[2;3H\x1b[32;58;5;1m\u{10eeee}\u{305}\u{305}",
+            "\x1b[31m\x1b[2;4H\x1b[P",
+            "\x1b[2;4H\x1b[@",
+            "\x1b[3;3H\x1b[K",
+            "\x1b[S",
+            "\x1b[T",
+            "\x1b[2;1H\x1b[L",
+            "\x1b[2;1H\x1b[M",
+            "\x1b[H\x1b[2J",
+            cells,
+        ] {
+            processor.advance(&mut terminal, text.as_bytes());
+            let damage = terminal.peek_damage_event().unwrap_or(TerminalDamage::Noop);
+            terminal.reset_damage();
+            terminal
+                .snapshot_visible_deferred(
+                    &damage,
+                    &mut retained.visible_rows,
+                    &mut retained.row_styles,
+                    &mut retained.extras,
+                    &mut retained.deferred_styles,
+                )
+                .resolve();
+            retained.kitty_virtual_placements =
+                terminal.graphics.kitty_virtual_placements.clone();
+            RenderableContent::capture_kitty_dimensions(
+                &mut retained.kitty_images,
+                &terminal.graphics.kitty_images,
+            );
+            let mut fresh =
+                RenderableContent::from_cursor_config(&Config::default().cursor);
+            terminal.snapshot_visible(
+                &TerminalDamage::Full,
+                &mut fresh.visible_rows,
+                &mut fresh.row_styles,
+                &mut fresh.extras,
+            );
+            fresh.kitty_virtual_placements = retained.kitty_virtual_placements.clone();
+            RenderableContent::capture_kitty_dimensions(
+                &mut fresh.kitty_images,
+                &terminal.graphics.kitty_images,
+            );
+            let draw = |content: &RenderableContent| {
+                let mut overlays = Vec::new();
+                let anchors = Renderer::push_virtual_placeholder_overlays(
+                    &mut overlays,
+                    content,
+                    1,
+                    0.0,
+                    0.0,
+                    10.0,
+                    20.0,
+                    (0.0, 0.0, 80.0, 120.0),
+                );
+                let rectangles: Vec<_> = overlays
+                    .iter()
+                    .map(|p| {
+                        (
+                            p.image_id,
+                            p.x,
+                            p.y,
+                            p.width,
+                            p.height,
+                            p.z_index,
+                            p.source_rect,
+                        )
+                    })
+                    .collect();
+                (anchors, rectangles)
+            };
+            assert_eq!(draw(&retained), draw(&fresh), "after {text:?}");
+            for row in &mut retained.visible_rows {
+                row.dirty = false;
+            }
+        }
+    }
+
+    #[test]
+    fn virtual_parent_anchor_tracks_owned_placeholder_rows() {
+        let mut terminal = Crosswords::new(
+            CrosswordsSize::new(12, 6),
+            rio_backend::ansi::CursorShape::Block,
+            VoidListener {},
+            WindowId::from(0),
+            0,
+            10,
+        );
+        terminal.graphics.cell_width = 10.0;
+        terminal.graphics.cell_height = 20.0;
+        let mut processor = Processor::default();
+        processor.advance(&mut terminal, b"\x1b_Ga=T,i=1,p=9,f=32,s=1,v=1,c=2,r=2,U=1;AQIDBA==\x1b\\\x1b_Ga=T,i=2,p=1,f=32,s=1,v=1,c=1,r=1,P=1,Q=9,H=1,V=2;AQIDBA==\x1b\\");
+        let mut content =
+            RenderableContent::from_cursor_config(&Config::default().cursor);
+        content.kitty_virtual_placements =
+            terminal.graphics.kitty_virtual_placements.clone();
+        RenderableContent::capture_kitty_dimensions(
+            &mut content.kitty_images,
+            &terminal.graphics.kitty_images,
+        );
+        content.kitty_placements = terminal.graphics.resolved_kitty_placements();
+        let viewport = OverlayViewport {
+            cell_width: 10.0,
+            cell_height: 20.0,
+            origin_x: 3.0,
+            origin_y: 7.0,
+            history_size: 0,
+            display_offset: 0,
+            screen_lines: 6,
+        };
+        let mut overlays = Vec::new();
+        for (text, anchor) in [
+            ("\x1b[2;5H\x1b[38;2;0;0;1;58;2;0;0;9m\u{10eeee}\u{305}\u{305}\x1b[4;2H\u{10eeee}\u{305}\u{305}", Some((1,1))),
+            ("\x1b[2J\x1b[3;4H\u{10eeee}\u{305}\u{305}", Some((3,2))),
+            ("\x1b[2J", None),
+        ] {
+            processor.advance(&mut terminal, text.as_bytes());
+            terminal.snapshot_visible(&TerminalDamage::Full, &mut content.visible_rows,
+                &mut content.row_styles, &mut content.extras);
+            overlays.clear();
+            let anchors = Renderer::push_virtual_placeholder_overlays(&mut overlays, &content,
+                1,3.0,7.0,10.0,20.0,(3.0,7.0,123.0,127.0));
+            assert_eq!(anchors.get(&(1,9)).copied(), anchor);
+            let placed = positioned_kitty_placement(&content.kitty_placements[0], &content, &anchors, &viewport);
+            if let Some((x,y)) = anchor {
+                let geometry = kitty_overlay_geometry(&placed.unwrap(),1,1,&viewport).unwrap();
+                assert_eq!((geometry.x,geometry.y),(3.0+(x+1) as f32*10.0,7.0+(y+2) as f32*20.0));
+            } else { assert!(placed.is_none()); }
+        }
+        // Removing cells hides children but does not remove their placements.
+        assert!(terminal.graphics.kitty_placements.contains_key(&(2, 1)));
+    }
+}
+
+#[cfg(test)]
+mod animation_deadline_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn kitty_deadline_wakes_an_otherwise_idle_renderer() {
+        let mut renderer = Renderer::new(&Config::default());
+        let interval = Duration::from_millis(16);
+        assert_eq!(renderer.next_frame_in(1.0, interval), None);
+
+        renderer.kitty_animation_deadline = Some(Instant::now() + Duration::from_secs(1));
+        let delay = renderer.next_frame_in(1.0, interval).unwrap();
+        assert!(delay > Duration::ZERO && delay <= Duration::from_secs(1));
+
+        renderer.kitty_animation_deadline = Some(Instant::now() - interval);
+        assert_eq!(renderer.next_frame_in(1.0, interval), Some(Duration::ZERO));
     }
 }
 
@@ -1462,5 +1835,49 @@ mod grid_cell_bg_tests {
             rio_grid::cell_bg(Square::from_char('x'), style, &renderer, &colors),
             [0, 0, 0, 0]
         );
+    }
+}
+
+#[cfg(test)]
+mod cursor_color_tests {
+    use super::*;
+
+    const CURSOR: ColorArray = [1.0, 0.4, 0.0, 1.0];
+    const VI_CURSOR: ColorArray = [1.0, 1.0, 0.0, 1.0];
+    const OSC_12: ColorArray = [0.0, 0.5, 1.0, 1.0];
+
+    fn renderer() -> Renderer {
+        Renderer::new(&Config {
+            colors: Colors {
+                cursor: CURSOR,
+                vi_cursor: VI_CURSOR,
+                ..Colors::default()
+            },
+            ..Config::default()
+        })
+    }
+
+    #[test]
+    fn uses_cursor_color_outside_vi_mode() {
+        let r = renderer();
+        assert_eq!(r.cursor_color(&TermColors::default(), false), CURSOR);
+    }
+
+    /// The reported bug: `vi-cursor` was parsed but the cursor kept
+    /// the `cursor` color after entering Vi mode.
+    #[test]
+    fn uses_vi_cursor_color_in_vi_mode() {
+        let r = renderer();
+        assert_eq!(r.cursor_color(&TermColors::default(), true), VI_CURSOR);
+    }
+
+    #[test]
+    fn osc_12_overrides_cursor_color_only_outside_vi_mode() {
+        let r = renderer();
+        let mut colors = TermColors::default();
+        colors[NamedColor::Cursor as usize] = Some(OSC_12);
+
+        assert_eq!(r.cursor_color(&colors, false), OSC_12);
+        assert_eq!(r.cursor_color(&colors, true), VI_CURSOR);
     }
 }

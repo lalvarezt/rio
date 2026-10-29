@@ -747,7 +747,6 @@ pub fn default_key_bindings(config: &rio_backend::config::Config) -> Vec<KeyBind
     ));
 
     bindings.extend(platform_key_bindings(
-        config.navigation.has_navigation_key_bindings(),
         config.navigation.use_split,
         config.keyboard.clone(),
     ));
@@ -917,6 +916,46 @@ fn convert(config_key_binding: ConfigKeyBinding) -> Result<KeyBinding, String> {
         mode: res_mode.mode,
         notmode: res_mode.not_mode,
     })
+}
+
+pub(crate) fn key_for_binding(
+    logical_key: &Key,
+    unmodified_key: Key,
+    text: Option<&str>,
+    mods: ModifiersState,
+) -> Key {
+    if cfg!(windows) && matches!(logical_key, Key::Unidentified(_)) {
+        return windows_unidentified_binding_key(logical_key, unmodified_key, text, mods);
+    }
+
+    if let Key::Character(ch) = logical_key {
+        // Shift/Alt bindings use the base character, not composed text.
+        if mods.shift_key() || mods.alt_key() {
+            unmodified_key
+        } else {
+            Key::Character(ch.to_lowercase().into())
+        }
+    } else {
+        logical_key.clone()
+    }
+}
+
+fn windows_unidentified_binding_key(
+    logical_key: &Key,
+    unmodified_key: Key,
+    text: Option<&str>,
+    mods: ModifiersState,
+) -> Key {
+    // Ctrl+Alt can lose its logical key on Windows (winit issue #2945).
+    if mods.control_key() && mods.alt_key() && matches!(unmodified_key, Key::Character(_))
+    {
+        return unmodified_key;
+    }
+
+    // VK_PACKET supplies text without a layout-derived logical key.
+    text.filter(|text| text.chars().count() == 1)
+        .map(|text| Key::Character(text.to_lowercase().into()))
+        .unwrap_or_else(|| logical_key.clone())
 }
 
 /// Legacy (non-kitty) C0 byte for a ctrl+character combo, using the
@@ -1099,9 +1138,8 @@ pub fn create_hint_bindings(
 }
 
 // Macos
-#[cfg(all(target_os = "macos", not(test)))]
+#[cfg(target_os = "macos")]
 pub fn platform_key_bindings(
-    use_navigation_key_bindings: bool,
     use_splits: bool,
     config_keyboard: ConfigKeyboard,
 ) -> Vec<KeyBinding> {
@@ -1141,26 +1179,24 @@ pub fn platform_key_bindings(
         Key::Named(ArrowDown), +BindingMode::SEARCH; SearchAction::SearchHistoryNext;
     );
 
-    if use_navigation_key_bindings {
-        key_bindings.extend(bindings!(
-            KeyBinding;
-            "t", ModifiersState::SUPER; Action::TabCreateNew;
-            Key::Named(Tab), ModifiersState::CONTROL; Action::SelectNextTab;
-            Key::Named(Tab), ModifiersState::CONTROL | ModifiersState::SHIFT; Action::SelectPrevTab;
-            "w", ModifiersState::SUPER; Action::CloseCurrentSplitOrTab;
-            "[", ModifiersState::SUPER | ModifiersState::SHIFT; Action::SelectPrevTab;
-            "]", ModifiersState::SUPER | ModifiersState::SHIFT; Action::SelectNextTab;
-            "1", ModifiersState::SUPER; Action::SelectTab(0);
-            "2", ModifiersState::SUPER; Action::SelectTab(1);
-            "3", ModifiersState::SUPER; Action::SelectTab(2);
-            "4", ModifiersState::SUPER; Action::SelectTab(3);
-            "5", ModifiersState::SUPER; Action::SelectTab(4);
-            "6", ModifiersState::SUPER; Action::SelectTab(5);
-            "7", ModifiersState::SUPER; Action::SelectTab(6);
-            "8", ModifiersState::SUPER; Action::SelectTab(7);
-            "9", ModifiersState::SUPER; Action::SelectLastTab;
-        ));
-    }
+    key_bindings.extend(bindings!(
+        KeyBinding;
+        "t", ModifiersState::SUPER; Action::TabCreateNew;
+        Key::Named(Tab), ModifiersState::CONTROL; Action::SelectNextTab;
+        Key::Named(Tab), ModifiersState::CONTROL | ModifiersState::SHIFT; Action::SelectPrevTab;
+        "w", ModifiersState::SUPER; Action::CloseCurrentSplitOrTab;
+        "[", ModifiersState::SUPER | ModifiersState::SHIFT; Action::SelectPrevTab;
+        "]", ModifiersState::SUPER | ModifiersState::SHIFT; Action::SelectNextTab;
+        "1", ModifiersState::SUPER; Action::SelectTab(0);
+        "2", ModifiersState::SUPER; Action::SelectTab(1);
+        "3", ModifiersState::SUPER; Action::SelectTab(2);
+        "4", ModifiersState::SUPER; Action::SelectTab(3);
+        "5", ModifiersState::SUPER; Action::SelectTab(4);
+        "6", ModifiersState::SUPER; Action::SelectTab(5);
+        "7", ModifiersState::SUPER; Action::SelectTab(6);
+        "8", ModifiersState::SUPER; Action::SelectTab(7);
+        "9", ModifiersState::SUPER; Action::SelectLastTab;
+    ));
 
     if config_keyboard.disable_ctlseqs_alt {
         key_bindings.extend(bindings!(
@@ -1190,12 +1226,8 @@ pub fn platform_key_bindings(
 }
 
 // Not Windows, Macos
-#[cfg(not(any(target_os = "macos", target_os = "windows", test)))]
-pub fn platform_key_bindings(
-    use_navigation_key_bindings: bool,
-    use_splits: bool,
-    _: ConfigKeyboard,
-) -> Vec<KeyBinding> {
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn platform_key_bindings(use_splits: bool, _: ConfigKeyboard) -> Vec<KeyBinding> {
     let mut key_bindings = bindings!(
         KeyBinding;
         "v", ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::VI; Action::Paste;
@@ -1223,25 +1255,23 @@ pub fn platform_key_bindings(
         Key::Named(ArrowDown), +BindingMode::SEARCH; SearchAction::SearchHistoryNext;
     );
 
-    if use_navigation_key_bindings {
-        key_bindings.extend(bindings!(
-            KeyBinding;
-            "t", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::TabCreateNew;
-            Key::Named(Tab), ModifiersState::CONTROL; Action::SelectNextTab;
-            Key::Named(Tab), ModifiersState::CONTROL | ModifiersState::SHIFT; Action::SelectPrevTab;
-            "[", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::SelectPrevTab;
-            "]", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::SelectNextTab;
-            "w", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::CloseCurrentSplitOrTab;
-        ));
-    }
+    key_bindings.extend(bindings!(
+        KeyBinding;
+        "t", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::TabCreateNew;
+        Key::Named(Tab), ModifiersState::CONTROL; Action::SelectNextTab;
+        Key::Named(Tab), ModifiersState::CONTROL | ModifiersState::SHIFT; Action::SelectPrevTab;
+        "[", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::SelectPrevTab;
+        "]", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::SelectNextTab;
+        "w", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::CloseCurrentSplitOrTab;
+    ));
 
     if use_splits {
         key_bindings.extend(bindings!(
             KeyBinding;
             "r", ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::SEARCH, ~BindingMode::VI; Action::SplitRight;
             "d", ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::SEARCH, ~BindingMode::VI; Action::SplitDown;
-            "]", ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::SEARCH, ~BindingMode::VI; Action::SelectNextSplit;
-            "[", ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::SEARCH, ~BindingMode::VI; Action::SelectPrevSplit;
+            "]", ModifiersState::CONTROL | ModifiersState::ALT, ~BindingMode::SEARCH, ~BindingMode::VI; Action::SelectNextSplit;
+            "[", ModifiersState::CONTROL | ModifiersState::ALT, ~BindingMode::SEARCH, ~BindingMode::VI; Action::SelectPrevSplit;
             Key::Named(ArrowUp), ModifiersState::CONTROL | ModifiersState::SHIFT | ModifiersState::ALT, ~BindingMode::SEARCH, ~BindingMode::VI; Action::MoveDividerUp;
             Key::Named(ArrowDown), ModifiersState::CONTROL | ModifiersState::SHIFT | ModifiersState::ALT, ~BindingMode::SEARCH, ~BindingMode::VI; Action::MoveDividerDown;
             Key::Named(ArrowLeft), ModifiersState::CONTROL | ModifiersState::SHIFT | ModifiersState::ALT, ~BindingMode::SEARCH, ~BindingMode::VI; Action::MoveDividerLeft;
@@ -1253,12 +1283,8 @@ pub fn platform_key_bindings(
 }
 
 // Windows
-#[cfg(all(target_os = "windows", not(test)))]
-pub fn platform_key_bindings(
-    use_navigation_key_bindings: bool,
-    use_splits: bool,
-    _: ConfigKeyboard,
-) -> Vec<KeyBinding> {
+#[cfg(target_os = "windows")]
+pub fn platform_key_bindings(use_splits: bool, _: ConfigKeyboard) -> Vec<KeyBinding> {
     let mut key_bindings = bindings!(
         KeyBinding;
         "v", ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::VI; Action::Paste;
@@ -1291,25 +1317,23 @@ pub fn platform_key_bindings(
         Key::Named(ArrowDown), +BindingMode::SEARCH; SearchAction::SearchHistoryNext;
     );
 
-    if use_navigation_key_bindings {
-        key_bindings.extend(bindings!(
-            KeyBinding;
-            "t", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::TabCreateNew;
-            Key::Named(Tab), ModifiersState::CONTROL; Action::SelectNextTab;
-            Key::Named(Tab), ModifiersState::CONTROL | ModifiersState::SHIFT; Action::SelectPrevTab;
-            "w", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::CloseCurrentSplitOrTab;
-            "[", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::SelectPrevTab;
-            "]", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::SelectNextTab;
-        ));
-    }
+    key_bindings.extend(bindings!(
+        KeyBinding;
+        "t", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::TabCreateNew;
+        Key::Named(Tab), ModifiersState::CONTROL; Action::SelectNextTab;
+        Key::Named(Tab), ModifiersState::CONTROL | ModifiersState::SHIFT; Action::SelectPrevTab;
+        "w", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::CloseCurrentSplitOrTab;
+        "[", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::SelectPrevTab;
+        "]", ModifiersState::CONTROL | ModifiersState::SHIFT; Action::SelectNextTab;
+    ));
 
     if use_splits {
         key_bindings.extend(bindings!(
             KeyBinding;
             "r", ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::SEARCH, ~BindingMode::VI; Action::SplitRight;
             "d", ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::SEARCH, ~BindingMode::VI; Action::SplitDown;
-            "]", ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::SEARCH, ~BindingMode::VI; Action::SelectNextSplit;
-            "[", ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::SEARCH, ~BindingMode::VI; Action::SelectPrevSplit;
+            "]", ModifiersState::CONTROL | ModifiersState::ALT, ~BindingMode::SEARCH, ~BindingMode::VI; Action::SelectNextSplit;
+            "[", ModifiersState::CONTROL | ModifiersState::ALT, ~BindingMode::SEARCH, ~BindingMode::VI; Action::SelectPrevSplit;
             Key::Named(ArrowUp), ModifiersState::CONTROL | ModifiersState::SHIFT | ModifiersState::ALT, ~BindingMode::SEARCH, ~BindingMode::VI; Action::MoveDividerUp;
             Key::Named(ArrowDown), ModifiersState::CONTROL | ModifiersState::SHIFT | ModifiersState::ALT, ~BindingMode::SEARCH, ~BindingMode::VI; Action::MoveDividerDown;
             Key::Named(ArrowLeft), ModifiersState::CONTROL | ModifiersState::SHIFT | ModifiersState::ALT, ~BindingMode::SEARCH, ~BindingMode::VI; Action::MoveDividerLeft;
@@ -1323,17 +1347,176 @@ pub fn platform_key_bindings(
 }
 
 #[cfg(test)]
-pub fn platform_key_bindings(_: bool, _: bool, _: ConfigKeyboard) -> Vec<KeyBinding> {
-    vec![]
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
     use rio_window::keyboard::ModifiersState;
 
     type MockBinding = Binding<usize>;
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn tab_and_split_shortcuts_trigger_one_navigation_action() {
+        for splits in [false, true] {
+            let bindings = platform_key_bindings(splits, ConfigKeyboard::default());
+            for (key, tab, split) in [
+                ("[", Action::SelectPrevTab, Action::SelectPrevSplit),
+                ("]", Action::SelectNextTab, Action::SelectNextSplit),
+            ] {
+                let trigger = BindingKey::Keycode {
+                    key: Key::Character(key.into()),
+                    location: KeyLocation::Standard,
+                };
+                for (mods, expected) in [
+                    (ModifiersState::CONTROL | ModifiersState::SHIFT, Some(tab)),
+                    (
+                        ModifiersState::CONTROL | ModifiersState::ALT,
+                        splits.then_some(split),
+                    ),
+                ] {
+                    let actions: Vec<_> = bindings
+                        .iter()
+                        .filter(|b| {
+                            b.is_triggered_by(BindingMode::empty(), mods, &trigger)
+                        })
+                        .map(|b| b.action.clone())
+                        .collect();
+                    assert_eq!(
+                        actions,
+                        expected.into_iter().collect::<Vec<_>>(),
+                        "{key} {mods:?}, splits={splits}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn windows_unidentified_ctrl_alt_matches_custom_binding() {
+        use rio_window::keyboard::NativeKey;
+
+        let mods = ModifiersState::CONTROL | ModifiersState::ALT;
+        for ch in ['n', 'e', 'd', 'm', 'g'] {
+            let binding = convert(ConfigKeyBinding {
+                key: ch.to_string(),
+                with: "control | alt".into(),
+                action: "CreateTab".into(),
+                esc: String::new(),
+                mode: String::new(),
+            })
+            .unwrap();
+            let key = windows_unidentified_binding_key(
+                &Key::Unidentified(NativeKey::Windows(ch.to_ascii_uppercase() as u16)),
+                Key::Character(ch.to_string().into()),
+                None,
+                mods,
+            );
+            assert!(binding.is_triggered_by(
+                BindingMode::empty(),
+                mods,
+                &BindingKey::Keycode {
+                    key,
+                    location: KeyLocation::Standard
+                },
+            ));
+        }
+    }
+
+    #[test]
+    fn windows_unicode_packet_matches_custom_binding() {
+        use rio_window::keyboard::NativeKey;
+
+        let unidentified = Key::Unidentified(NativeKey::Windows(0xe7));
+        for text in ["\u{e010}", "\u{e018}", "\u{1f680}"] {
+            let binding = convert(ConfigKeyBinding {
+                key: text.into(),
+                esc: "\x1b[101;7u".into(),
+                with: String::new(),
+                action: String::new(),
+                mode: String::new(),
+            })
+            .unwrap();
+            let key = windows_unidentified_binding_key(
+                &unidentified,
+                unidentified.clone(),
+                Some(text),
+                ModifiersState::empty(),
+            );
+            assert!(binding.is_triggered_by(
+                BindingMode::empty(),
+                ModifiersState::empty(),
+                &BindingKey::Keycode {
+                    key,
+                    location: KeyLocation::Standard
+                },
+            ));
+        }
+        for text in [None, Some(""), Some("ab"), Some("a\u{301}")] {
+            assert_eq!(
+                windows_unidentified_binding_key(
+                    &unidentified,
+                    unidentified.clone(),
+                    text,
+                    ModifiersState::empty()
+                ),
+                unidentified,
+            );
+        }
+    }
+
+    #[test]
+    fn binding_key_preserves_character_and_named_key_rules() {
+        let a = Key::Character("a".into());
+        for mods in [
+            ModifiersState::empty(),
+            ModifiersState::SHIFT,
+            ModifiersState::ALT,
+        ] {
+            assert_eq!(
+                key_for_binding(&Key::Character("A".into()), a.clone(), Some("A"), mods),
+                a
+            );
+        }
+        assert_eq!(
+            key_for_binding(
+                &Key::Character("\u{e5}".into()),
+                a.clone(),
+                Some("\u{e5}"),
+                ModifiersState::ALT
+            ),
+            a
+        );
+        assert_eq!(
+            key_for_binding(
+                &Key::Character("!".into()),
+                Key::Character("1".into()),
+                Some("!"),
+                ModifiersState::SHIFT
+            ),
+            Key::Character("1".into())
+        );
+        let enter = Key::Named(Enter);
+        assert_eq!(
+            key_for_binding(
+                &enter,
+                enter.clone(),
+                Some("\r"),
+                ModifiersState::CONTROL | ModifiersState::ALT
+            ),
+            enter
+        );
+        let unidentified =
+            Key::Unidentified(rio_window::keyboard::NativeKey::Unidentified);
+        assert_eq!(
+            key_for_binding(&unidentified, a.clone(), None, ModifiersState::CONTROL),
+            unidentified
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            key_for_binding(&unidentified, a, Some("\u{e010}"), ModifiersState::empty()),
+            unidentified
+        );
+    }
 
     impl Default for MockBinding {
         fn default() -> Self {

@@ -62,7 +62,6 @@ pub fn draw(sugarloaf: &mut Sugarloaf, mouse_x: f32, mouse_y: f32, scale: f32) {
         let x = base_x + col as f32 * px;
         let y = base_y + row as f32 * px;
         sugarloaf.rect(
-            None,
             x,
             y,
             len as f32 * px,

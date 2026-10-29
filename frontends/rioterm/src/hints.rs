@@ -7,6 +7,19 @@ use rio_backend::event::EventListener;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+/// Native handlers need an explicit scheme for bare email hint matches.
+/// Keep actual URIs and filesystem paths verbatim.
+pub fn native_open_target(target: &str) -> std::borrow::Cow<'_, str> {
+    static EMAIL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\A[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\z").unwrap()
+    });
+    if EMAIL.is_match(target) {
+        std::borrow::Cow::Owned(format!("mailto:{target}"))
+    } else {
+        std::borrow::Cow::Borrowed(target)
+    }
+}
+
 /// State for hint selection mode
 pub struct HintState {
     /// Currently active hint configuration
@@ -39,6 +52,45 @@ pub struct HintMatch {
 
     /// The hint configuration that created this match
     pub hint: Rc<Hint>,
+}
+
+/// Resolve an explicit OSC 8 target without applying prose punctuation rules.
+pub fn hyperlink_at_point<T: EventListener>(
+    terminal: &Crosswords<T>,
+    point: Pos,
+    hint: Rc<Hint>,
+) -> Option<HintMatch> {
+    let grid = &terminal.grid;
+    if !hint.hyperlinks
+        || point.row < grid.topmost_line()
+        || point.row > grid.bottommost_line()
+        || point.col.0 >= grid.columns()
+    {
+        return None;
+    }
+    let hyperlink = terminal.cell_hyperlink(point.row, point.col)?;
+    let mut start_col = point.col;
+    let mut end_col = point.col;
+    while start_col > Column(0) {
+        let previous = start_col - 1;
+        if terminal.cell_hyperlink(point.row, previous).as_ref() != Some(&hyperlink) {
+            break;
+        }
+        start_col = previous;
+    }
+    while end_col < grid.columns() - 1 {
+        let next = end_col + 1;
+        if terminal.cell_hyperlink(point.row, next).as_ref() != Some(&hyperlink) {
+            break;
+        }
+        end_col = next;
+    }
+    Some(HintMatch {
+        text: hyperlink.uri().to_owned(),
+        start: Pos::new(point.row, start_col),
+        end: Pos::new(point.row, end_col),
+        hint,
+    })
 }
 
 impl HintState {
@@ -86,16 +138,16 @@ impl HintState {
             }
         };
 
-        // Find regex matches if regex is specified
+        // Find OSC 8 hyperlinks if enabled
+        if hint.hyperlinks {
+            self.find_hyperlink_matches(term, hint.clone());
+        }
+
+        // Explicit targets precede guessed URLs when both start at the same cell.
         if let Some(regex_pattern) = &hint.regex {
             if let Ok(regex) = onig::Regex::new(regex_pattern) {
                 self.find_regex_matches(term, &regex, hint.clone());
             }
-        }
-
-        // Find OSC 8 hyperlinks if enabled
-        if hint.hyperlinks {
-            self.find_hyperlink_matches(term, hint.clone());
         }
 
         // Cancel hint mode if no matches found
@@ -169,12 +221,6 @@ impl HintState {
         &self.matches
     }
 
-    /// Get keys pressed so far
-    #[allow(dead_code)]
-    pub fn keys_pressed(&self) -> &[char] {
-        &self.keys
-    }
-
     /// Get visible labels (filtered by current input)
     pub fn visible_labels(&self) -> Vec<(usize, Vec<char>)> {
         let keys_len = self.keys.len();
@@ -192,59 +238,89 @@ impl HintState {
             .collect()
     }
 
-    /// Update the alphabet used for hint labels
-    #[allow(dead_code)]
-    pub fn update_alphabet(&mut self, alphabet: &str) {
-        if self.alphabet != alphabet {
-            self.alphabet = alphabet.to_string();
-            self.keys.clear();
-        }
-    }
-
-    // Private helper methods
-
     fn find_regex_matches<T: EventListener>(
         &mut self,
         term: &rio_backend::crosswords::Crosswords<T>,
         regex: &onig::Regex,
         hint: Rc<Hint>,
     ) {
-        // Get the visible area of the terminal
-        let grid = &term.grid;
-        let display_offset = grid.display_offset();
-        let visible_lines = grid.screen_lines();
-
-        // Scan each visible line for matches
-        for line_idx in 0..visible_lines {
-            let line = Line(line_idx as i32 - display_offset as i32);
-            if line < Line(0) || line.0 >= grid.total_lines() as i32 {
-                continue;
+        let cols = term.columns();
+        if cols == 0 {
+            return;
+        }
+        let first = -(term.grid.display_offset() as i32);
+        let last = first + term.screen_lines() as i32 - 1;
+        // Bound extraction across wraps, as the mouse hint path does.
+        let max_rows = (2048 / cols).max(1) as i32;
+        let mut row = first;
+        while row <= last {
+            let start = row;
+            while row < last
+                && row - start + 1 < max_rows
+                && term.grid[Line(row)][Column(cols - 1)].wrapline()
+            {
+                row += 1;
             }
+            let line = LogicalLine::from_rows(term, start, row);
+            row += 1;
 
-            // Extract text from the line
-            let line_text = self.extract_line_text(term, line);
-
-            // Find all matches in this line. Onig yields (byte_start, byte_end);
-            for (start, end) in regex.find_iter(&line_text) {
-                let start_col = Column(line_text[..start].chars().count());
-                let mut match_text = line_text[start..end].to_string();
-
-                // Apply post-processing if enabled
-                if hint.post_processing {
-                    match_text = post_process_hyperlink_uri(&match_text);
+            let mut region = onig::Region::new();
+            let mut offset = 0;
+            while offset < line.text.len() {
+                let param = onig::MatchParam::default();
+                // Match the mouse path's search budget for user-supplied regexes.
+                // Safety: the parameter owns the live pointer for this call.
+                unsafe {
+                    onig_sys::onig_set_retry_limit_in_search_of_match_param(
+                        param.as_raw(),
+                        100_000,
+                    );
                 }
-
-                let end_col =
-                    Column(start_col.0 + match_text.chars().count().saturating_sub(1));
-
-                let hint_match = HintMatch {
-                    text: match_text,
-                    start: Pos::new(line, start_col),
-                    end: Pos::new(line, end_col),
-                    hint: hint.clone(),
+                region.clear();
+                match regex.search_with_param(
+                    &line.text,
+                    offset,
+                    line.text.len(),
+                    onig::SearchOptions::SEARCH_OPTION_NONE,
+                    Some(&mut region),
+                    param,
+                ) {
+                    Ok(Some(_)) => (),
+                    Ok(None) | Err(_) => break,
+                }
+                let Some((start, end)) = region.pos(0) else {
+                    break;
                 };
-
-                self.matches.push(hint_match);
+                // Skip empty matches without splitting a UTF-8 character.
+                offset = if end > start {
+                    end
+                } else {
+                    start + line.text[start..].chars().next().map_or(1, char::len_utf8)
+                };
+                if start >= end {
+                    continue;
+                }
+                let text = &line.text[start..end];
+                let len = if hint.post_processing {
+                    trim_match_tail(text)
+                } else {
+                    text.len()
+                };
+                if len == 0 {
+                    continue;
+                }
+                let mut end = line.map[start + len - 1];
+                if end.col.0 + 1 < cols
+                    && term.grid[end.row][end.col].wide() == Wide::Wide
+                {
+                    end.col += 1;
+                }
+                self.matches.push(HintMatch {
+                    text: text[..len].to_string(),
+                    start: line.map[start],
+                    end,
+                    hint: hint.clone(),
+                });
             }
         }
     }
@@ -268,10 +344,6 @@ impl HintState {
 
         for line_idx in 0..visible_lines {
             let line = Line(line_idx as i32 - display_offset as i32);
-            if line < Line(0) || line.0 >= grid.total_lines() as i32 {
-                continue;
-            }
-
             let mut col = 0usize;
             let cols = grid.columns();
             while col < cols {
@@ -293,44 +365,31 @@ impl HintState {
                     end_col += 1;
                 }
 
-                // Look up the URI once for the whole span.
-                if let Some(hyperlink) = term.cell_hyperlink(line, Column(start_col)) {
-                    let mut uri = hyperlink.uri().to_string();
-                    if hint.post_processing {
-                        uri = post_process_hyperlink_uri(&uri);
-                    }
-                    self.matches.push(HintMatch {
-                        text: uri,
-                        start: Pos::new(line, Column(start_col)),
-                        end: Pos::new(line, Column(end_col - 1)),
-                        hint: hint.clone(),
-                    });
-                }
+                self.matches.push(HintMatch {
+                    text: link.uri().to_string(),
+                    start: Pos::new(line, Column(start_col)),
+                    end: Pos::new(line, Column(end_col - 1)),
+                    hint: hint.clone(),
+                });
 
                 col = end_col;
             }
         }
     }
 
-    fn extract_line_text<T: EventListener>(
-        &self,
-        term: &rio_backend::crosswords::Crosswords<T>,
-        line: Line,
-    ) -> String {
-        let grid = &term.grid;
-        let mut text = String::new();
-
-        for col in 0..grid.columns() {
-            let cell = &grid[line][Column(col)];
-            text.push(cell.c());
-        }
-
-        text.trim_end().to_string()
-    }
-
     fn generate_labels(&mut self) {
         self.labels.clear();
         let mut generator = LabelGenerator::new(&self.alphabet);
+        // Equal-width labels cannot be prefixes of other labels. Otherwise a
+        // dense screen makes short labels unreachable while typing longer ones.
+        let base = generator.alphabet.len();
+        if base > 1 {
+            let mut capacity = base;
+            while capacity < self.matches.len() {
+                generator.indices.push(0);
+                capacity = capacity.saturating_mul(base);
+            }
+        }
 
         for _ in 0..self.matches.len() {
             self.labels.push(generator.next());
@@ -447,6 +506,15 @@ impl LogicalLine {
             end_line += 1;
         }
 
+        Some(Self::from_rows(term, start_line, end_line))
+    }
+
+    fn from_rows<T: EventListener>(
+        term: &Crosswords<T>,
+        start_line: i32,
+        end_line: i32,
+    ) -> Self {
+        let cols = term.columns();
         // Record the source cell of every byte. Wide-char spacers are
         // skipped so the text holds each character once; blank (`\0`)
         // cells read as spaces, matching what is on screen; zero-width
@@ -478,7 +546,7 @@ impl LogicalLine {
             map.pop();
         }
 
-        Some(LogicalLine { text, map })
+        LogicalLine { text, map }
     }
 
     /// Find the regex match covering `point` in this line.
@@ -662,6 +730,13 @@ pub fn resolve_path_for_opening(text: &str, cwd: Option<&Path>) -> Option<PathBu
         return None;
     }
 
+    #[cfg(windows)]
+    if let Some(candidate) = posix_to_windows(text) {
+        let candidate = PathBuf::from(candidate);
+        // A recognized drive or share must not fall back to a different cwd.
+        return candidate.exists().then_some(candidate);
+    }
+
     // Expand a recognized path prefix. Anything falling through is treated as
     // a bare relative path (e.g. `src/main.rs`).
     let expanded: PathBuf = if let Some(rest) = text.strip_prefix("~/") {
@@ -697,60 +772,126 @@ pub fn resolve_path_for_opening(text: &str, cwd: Option<&Path>) -> Option<PathBu
     }
 }
 
-/// Apply post-processing to hyperlink URIs (same as in screen/mod.rs)
-fn post_process_hyperlink_uri(uri: &str) -> String {
-    let chars: Vec<char> = uri.chars().collect();
-    if chars.is_empty() {
-        return String::new();
-    }
-
-    let mut end_idx = chars.len() - 1;
-    let mut open_parents = 0;
-    let mut open_brackets = 0;
-
-    // First pass: handle uneven brackets/parentheses
-    for (i, &c) in chars.iter().enumerate() {
-        match c {
-            '(' => open_parents += 1,
-            '[' => open_brackets += 1,
-            ')' => {
-                if open_parents == 0 {
-                    // Unmatched closing parenthesis, truncate here
-                    end_idx = i.saturating_sub(1);
-                    break;
-                } else {
-                    open_parents -= 1;
-                }
-            }
-            ']' => {
-                if open_brackets == 0 {
-                    // Unmatched closing bracket, truncate here
-                    end_idx = i.saturating_sub(1);
-                    break;
-                } else {
-                    open_brackets -= 1;
-                }
-            }
-            _ => (),
+/// Convert only unambiguous MSYS, Cygwin, WSL and forward-slash UNC paths.
+#[cfg(any(windows, test))]
+fn posix_to_windows(text: &str) -> Option<String> {
+    if let Some(rest) = text.strip_prefix("//") {
+        let (server, path) = rest.split_once('/')?;
+        let share = path.split('/').next()?;
+        if server.is_empty() || share.is_empty() || matches!(server, "." | "?") {
+            return None;
         }
+        return Some(format!(
+            "\\\\{}",
+            rest.trim_end_matches('/').replace('/', "\\")
+        ));
     }
-
-    // Second pass: remove trailing delimiters
-    while end_idx > 0 {
-        match chars[end_idx] {
-            '.' | ',' | ':' | ';' | '?' | '!' | '(' | '[' | '\'' => {
-                end_idx = end_idx.saturating_sub(1);
-            }
-            _ => break,
-        }
+    let explicit_root = text.starts_with("/cygdrive/") || text.starts_with("/mnt/");
+    let rest = text
+        .strip_prefix("/cygdrive/")
+        .or_else(|| text.strip_prefix("/mnt/"))
+        .or_else(|| text.strip_prefix('/'))?;
+    let mut chars = rest.chars();
+    let drive = chars.next()?;
+    if !drive.is_ascii_alphabetic() {
+        return None;
     }
-
-    chars.into_iter().take(end_idx + 1).collect()
+    let tail = chars.as_str();
+    if (!tail.is_empty() && !tail.starts_with('/')) || (tail.is_empty() && !explicit_root)
+    {
+        return None;
+    }
+    let tail = tail
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\\");
+    Some(format!("{}:\\{tail}", drive.to_ascii_uppercase()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_open_targets_preserve_urls_and_paths_and_expand_bare_email() {
+        assert_eq!(
+            native_open_target("name+tag@example.com"),
+            "mailto:name+tag@example.com"
+        );
+        for target in [
+            "http://127.0.0.1:1234/path?x=1;y=2&z=3",
+            "https://example.com/a;b;)#section",
+            "mailto:name+tag@example.com?subject=a&body=b",
+            "ssh://user@example.com:22/path",
+            "file:///C:/Program%20Files/readme.txt",
+            r"C:\Program Files\a;b.txt",
+            r"\\server\share\file.txt",
+            "/tmp/name@example.com",
+            "not an email@example.com",
+        ] {
+            assert_eq!(native_open_target(target), target);
+        }
+    }
+
+    #[test]
+    fn windows_path_conversion_is_unambiguous() {
+        for (source, target) in [
+            ("/d/", r"D:\"),
+            ("/d//x", r"D:\x"),
+            ("/cygdrive/c", r"C:\"),
+            ("/mnt/c", r"C:\"),
+            ("/mnt/c/x/y.txt", r"C:\x\y.txt"),
+            (
+                "/c/Program Files (x86)/a;b.txt",
+                r"C:\Program Files (x86)\a;b.txt",
+            ),
+            ("//server/share", r"\\server\share"),
+            ("//server/share/doc.pdf", r"\\server\share\doc.pdf"),
+        ] {
+            assert_eq!(
+                posix_to_windows(source).as_deref(),
+                Some(target),
+                "{source}"
+            );
+        }
+        for source in [
+            "/d",
+            "/tmp",
+            "/usr/bin",
+            "/cygdrive//x",
+            "C:/x",
+            "relative/x",
+            "",
+            "//server",
+            "//server/",
+            "///server/share",
+            "//?/C:/file",
+            "//./pipe/name",
+        ] {
+            assert_eq!(posix_to_windows(source), None, "{source}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_resolution_uses_the_reported_drive() {
+        let path = std::env::temp_dir()
+            .join(format!("rio-hint-path-{}.txt", std::process::id()));
+        std::fs::write(&path, "test").unwrap();
+        let slashed = path.to_string_lossy().replace('\\', "/");
+        assert_eq!(resolve_path_for_opening(&slashed, None), Some(path.clone()));
+        if let Some((drive, tail)) = slashed.split_once(':') {
+            for source in [
+                format!("/{drive}{tail}"),
+                format!("/cygdrive/{drive}{tail}"),
+                format!("/mnt/{drive}{tail}"),
+            ] {
+                assert_eq!(resolve_path_for_opening(&source, None), Some(path.clone()));
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
     use rio_backend::config::hints::{HintAction, HintInternalAction};
 
     #[test]
@@ -790,6 +931,101 @@ mod tests {
     }
 
     #[test]
+    fn osc8_hint_targets_are_verbatim_and_keep_the_rule() {
+        use rio_backend::config::hints::{HintAction, HintInternalAction, HintMouse};
+        use rio_backend::performer::handler::Processor;
+
+        let mut term = mock_term("        ");
+        Processor::default().advance(
+            &mut term,
+            b"\x1b]8;id=one;https://example.com/a;b;\x07link\x1b]8;;\x07",
+        );
+        let hint = Rc::new(Hint {
+            regex: None,
+            hyperlinks: true,
+            post_processing: true,
+            persist: true,
+            action: HintAction::Action {
+                action: HintInternalAction::Copy,
+            },
+            mouse: HintMouse::default(),
+            binding: None,
+        });
+        let mut state = HintState::new("ab".into());
+        state.start(hint.clone());
+        state.update_matches(&term);
+        assert_eq!(state.matches().len(), 1);
+        assert_eq!(state.matches()[0].text, "https://example.com/a;b;");
+        assert!(Rc::ptr_eq(&state.matches()[0].hint, &hint));
+        let mouse = hyperlink_at_point(&term, Pos::new(Line(0), Column(1)), hint.clone())
+            .unwrap();
+        assert_eq!(mouse.text, state.matches()[0].text);
+        assert!(Rc::ptr_eq(&mouse.hint, &hint));
+        assert_eq!(mouse.start, Pos::new(Line(0), Column(0)));
+        assert_eq!(mouse.end, Pos::new(Line(0), Column(3)));
+        assert!(
+            hyperlink_at_point(&term, Pos::new(Line(0), Column(4)), hint.clone())
+                .is_none()
+        );
+        assert!(
+            hyperlink_at_point(&term, Pos::new(Line(0), Column(100)), hint).is_none()
+        );
+    }
+
+    #[test]
+    fn osc8_target_takes_precedence_over_a_visible_url() {
+        use rio_backend::config::hints::{HintAction, HintInternalAction, HintMouse};
+        use rio_backend::performer::handler::Processor;
+        let mut term = mock_term(&" ".repeat(64));
+        Processor::default().advance(
+            &mut term,
+            b"\x1b]8;;https://target.example/a;b;\x07https://label.example\x1b]8;;\x07",
+        );
+        let hint = Rc::new(Hint {
+            regex: Some("https://[^ ]+".into()),
+            hyperlinks: true,
+            post_processing: true,
+            persist: false,
+            action: HintAction::Action {
+                action: HintInternalAction::Open,
+            },
+            mouse: HintMouse::default(),
+            binding: None,
+        });
+        let mut state = HintState::new("ab".into());
+        state.start(hint);
+        state.update_matches(&term);
+        assert_eq!(state.matches().len(), 1);
+        assert_eq!(state.matches()[0].text, "https://target.example/a;b;");
+    }
+
+    #[test]
+    fn regex_hints_stop_at_empty_terminal_cells() {
+        use rio_backend::config::hints::{HintAction, HintInternalAction, HintMouse};
+        let uri = "https://plain.example";
+        let mut term = mock_term(&format!("{uri}          "));
+        for col in uri.len()..term.grid.columns() {
+            term.grid[Line(0)][Column(col)].set_c('\0');
+        }
+        let mut state = HintState::new("ab".into());
+        state.start(Rc::new(Hint {
+            regex: Some(r"https://[^\s]+".into()),
+            hyperlinks: false,
+            post_processing: true,
+            persist: false,
+            action: HintAction::Action {
+                action: HintInternalAction::Open,
+            },
+            mouse: HintMouse::default(),
+            binding: None,
+        }));
+        state.update_matches(&term);
+        assert_eq!(state.matches().len(), 1);
+        assert_eq!(state.matches()[0].text, uri);
+        assert_eq!(state.matches()[0].end.col, Column(uri.len() - 1));
+    }
+
+    #[test]
     fn test_visible_labels() {
         let mut state = HintState::new("abc".to_string());
         state.labels = vec![vec!['a'], vec!['b'], vec!['a', 'b'], vec!['a', 'c']];
@@ -805,6 +1041,93 @@ mod tests {
         assert_eq!(visible[0].1, Vec::<char>::new()); // "a" with "a" removed = []
         assert_eq!(visible[1].1, vec!['b']); // "ab" with "a" removed = ['b']
         assert_eq!(visible[2].1, vec!['c']); // "ac" with "a" removed = ['c']
+    }
+
+    fn copy_hint(regex: Option<&str>, hyperlinks: bool) -> Rc<Hint> {
+        use rio_backend::config::hints::{HintAction, HintInternalAction, HintMouse};
+        Rc::new(Hint {
+            regex: regex.map(str::to_string),
+            hyperlinks,
+            post_processing: false,
+            persist: false,
+            action: HintAction::Action {
+                action: HintInternalAction::Copy,
+            },
+            mouse: HintMouse::default(),
+            binding: None,
+        })
+    }
+
+    #[test]
+    fn keyboard_hints_include_visible_scrollback() {
+        use rio_backend::performer::handler::Processor;
+        let mut term = mock_term(&format!("{}\r\n{}", " ".repeat(40), " ".repeat(40)));
+        Processor::default().advance(
+            &mut term,
+            b"\x1b]8;;https://history.example/a;b;\x07history-token\x1b]8;;\x07\r\n\r\n\r\n",
+        );
+        term.scroll_display(rio_backend::crosswords::grid::Scroll::Top);
+        assert!(term.grid.display_offset() > 0);
+        for (hint, expected) in [
+            (copy_hint(Some("history-token"), false), "history-token"),
+            (copy_hint(None, true), "https://history.example/a;b;"),
+        ] {
+            let mut state = HintState::new("ab".into());
+            state.start(hint);
+            state.update_matches(&term);
+            assert_eq!(state.matches().len(), 1, "{expected}");
+            assert_eq!(state.matches()[0].text, expected);
+            assert!(state.matches()[0].start.row < Line(0));
+            assert_eq!(state.keyboard_input(&term, 'a').unwrap().text, expected);
+        }
+    }
+
+    #[test]
+    fn keyboard_hints_use_cell_positions_and_combining_text() {
+        use rio_backend::performer::handler::Processor;
+        let mut term = mock_term(&" ".repeat(80));
+        Processor::default().advance(&mut term, "日本 cafe\u{301}.txt".as_bytes());
+        let mut state = HintState::new("ab".into());
+        state.start(copy_hint(Some("cafe\u{301}\\.txt"), false));
+        state.update_matches(&term);
+        assert_eq!(state.matches().len(), 1);
+        let found = &state.matches()[0];
+        assert_eq!(found.text, "cafe\u{301}.txt");
+        assert_eq!(found.start, Pos::new(Line(0), Column(5)));
+        assert_eq!(found.end, Pos::new(Line(0), Column(12)));
+    }
+
+    #[test]
+    fn keyboard_hints_follow_visible_soft_wraps() {
+        let term = mock_term("see http://examp\nle.com/path here");
+        let mut state = HintState::new("ab".into());
+        state.start(copy_hint(Some(r"https?://\S+"), false));
+        state.update_matches(&term);
+        assert_eq!(state.matches().len(), 1);
+        assert_eq!(state.matches()[0].text, "http://example.com/path");
+        assert_eq!(state.matches()[0].start, Pos::new(Line(0), Column(4)));
+        assert_eq!(state.matches()[0].end, Pos::new(Line(1), Column(10)));
+    }
+
+    #[test]
+    fn keyboard_hints_can_select_every_match_on_a_dense_screen() {
+        let term = mock_term("one two three four five six seven");
+        let mut state = HintState::new("ab".into());
+        state.start(copy_hint(Some(r"\S+"), false));
+        state.update_matches(&term);
+        let labels = state.labels.clone();
+        let expected: Vec<_> = state.matches.iter().map(|m| m.text.clone()).collect();
+        assert_eq!(labels.len(), 7);
+        for (index, label) in labels.iter().enumerate() {
+            state.start(copy_hint(Some(r"\S+"), false));
+            state.update_matches(&term);
+            let mut selected = None;
+            for c in label {
+                assert!(selected.is_none(), "label was selected before completion");
+                selected = state.keyboard_input(&term, *c);
+            }
+            assert_eq!(selected.unwrap().text, expected[index]);
+        }
     }
 
     #[test]
@@ -1174,5 +1497,52 @@ mod tests {
         assert_eq!(trim_match_tail("http://a.b/(c)"), "http://a.b/(c)".len());
         // Trailing prose delimiters are dropped.
         assert_eq!(trim_match_tail("http://a.b/c,."), "http://a.b/c".len());
+    }
+
+    #[test]
+    fn test_trim_match_tail_urls() {
+        fn trim_tail(s: &str) -> &str {
+            &s[..trim_match_tail(s)]
+        }
+
+        // Test removing trailing parenthesis
+        assert_eq!(trim_tail("https://example.com)"), "https://example.com");
+
+        // Test removing trailing comma
+        assert_eq!(trim_tail("https://example.com,"), "https://example.com");
+
+        // Test removing trailing period
+        assert_eq!(trim_tail("https://example.com."), "https://example.com");
+
+        // Test handling balanced parentheses (should keep them)
+        assert_eq!(
+            trim_tail("https://example.com/path(with)parens"),
+            "https://example.com/path(with)parens"
+        );
+
+        // Test handling unbalanced parentheses
+        assert_eq!(
+            trim_tail("https://example.com/path)"),
+            "https://example.com/path"
+        );
+
+        // Test handling multiple trailing delimiters
+        assert_eq!(trim_tail("https://example.com.'),"), "https://example.com");
+
+        // Test markdown-style URLs
+        assert_eq!(trim_tail("https://example.com)"), "https://example.com");
+
+        // Test handling unbalanced brackets
+        assert_eq!(
+            trim_tail("https://example.com/path]"),
+            "https://example.com/path"
+        );
+
+        // Test balanced brackets (should keep them)
+        assert_eq!(
+            trim_tail("https://example.com/path[with]brackets"),
+            "https://example.com/path[with]brackets"
+        );
+        assert_eq!(trim_tail(")"), "");
     }
 }

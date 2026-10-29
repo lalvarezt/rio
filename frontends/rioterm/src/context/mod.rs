@@ -19,7 +19,7 @@ use rio_backend::error::{RioError, RioErrorLevel, RioErrorType};
 use rio_backend::event::EventListener;
 use rio_backend::event::WindowId;
 use rio_backend::selection::SelectionRange;
-use rio_backend::sugarloaf::{font::SugarloafFont, Rect, Sugarloaf, SugarloafErrors};
+use rio_backend::sugarloaf::{font::SugarloafFont, Sugarloaf, SugarloafErrors};
 use std::error::Error;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -42,9 +42,17 @@ use teletypewriter::create_pty;
 #[cfg(not(target_os = "windows"))]
 use teletypewriter::{create_pty_with_fork, create_pty_with_spawn};
 
+pub struct TabApplication {
+    pub program: String,
+    pub title: String,
+    pub remote: bool,
+    pub reported: bool,
+}
+
 pub struct Context<T: EventListener> {
     pub route_id: usize,
     pub terminal: Arc<FairMutex<Crosswords<T>>>,
+    pub metadata: Arc<parking_lot::Mutex<rio_backend::crosswords::TerminalMetadata>>,
     pub renderable_content: RenderableContent,
     pub messenger: Messenger,
     #[cfg(not(target_os = "windows"))]
@@ -64,11 +72,14 @@ pub struct Context<T: EventListener> {
     /// `{{ program }}` and the empty-title strip fallback without ever
     /// inspecting the foreground process.
     pub spawned_program: String,
+    /// Present for panes launched directly through Rio's SSH connector.
+    pub ssh: Option<crate::ssh::Connection>,
     _io_thread: Option<JoinHandle<(Machine<teletypewriter::Pty, T>, performer::State)>>,
 }
 
 impl<T: rio_backend::event::EventListener> Drop for Context<T> {
     fn drop(&mut self) {
+        self.terminal.lock().invalidate_clipboard_requests();
         // Shutdown the terminal's PTY.
         let _ = self.messenger.channel.send(Msg::Shutdown);
         // Also hang up synchronously: quit paths call process::exit
@@ -87,10 +98,20 @@ impl<T: EventListener> Context<T> {
         let has_updated = old_selection != selection_range;
 
         if has_updated {
-            // Selection affects terminal line rendering, so use terminal damage
+            let mut terminal = self.terminal.lock();
+            // Only the old and new visible selection rows need repainting, not all text.
+            let top = -(terminal.display_offset() as i32);
+            let bottom = top + terminal.screen_lines() as i32 - 1;
+            for selection in [old_selection, selection_range].into_iter().flatten() {
+                for line in
+                    selection.start.row.0.max(top)..=selection.end.row.0.min(bottom)
+                {
+                    terminal.grid[rio_backend::crosswords::pos::Line(line)].dirty = true;
+                }
+            }
             self.renderable_content
                 .pending_update
-                .set_terminal_damage(rio_backend::event::TerminalDamage::Full);
+                .set_terminal_damage(rio_backend::event::TerminalDamage::Partial);
         }
 
         self.renderable_content.selection_range = selection_range;
@@ -114,20 +135,21 @@ pub struct ContextManagerConfig {
     #[cfg(test)]
     pub dead_pty: bool,
     pub shell: Shell,
+    pub ssh: Option<crate::ssh::Connection>,
     #[cfg(not(target_os = "windows"))]
     pub use_fork: bool,
     pub shell_integration: bool,
     pub working_dir: Option<String>,
     pub spawn_performer: bool,
     pub cwd: bool,
-    pub is_native: bool,
-    pub split_color: [f32; 4],
-    pub split_active_color: [f32; 4],
     pub panel: rio_backend::config::layout::Panel,
+    pub divider_width: f32,
     pub title: rio_backend::config::title::Title,
     pub keyboard: rio_backend::config::keyboard::Keyboard,
     pub scrollback_history_limit: usize,
+    pub scrollback_history_byte_limit: Option<usize>,
     pub grapheme_clustering: bool,
+    pub clipboard: rio_backend::clipboard::ClipboardPolicy,
 }
 
 const DEFAULT_CONTEXT_CAPACITY: usize = 28;
@@ -182,6 +204,7 @@ pub fn create_dead_context<T: rio_backend::event::EventListener>(
         // Dead context never sees new input — no scrollback needed.
         0,
     );
+    let metadata = terminal.metadata.clone();
     let terminal: Arc<FairMutex<Crosswords<T>>> = Arc::new(FairMutex::new(terminal));
     let (sender, _receiver) = corcovado::channel::channel();
 
@@ -195,12 +218,14 @@ pub fn create_dead_context<T: rio_backend::event::EventListener>(
         child_terminator: teletypewriter::ChildTerminator::retired(),
         messenger: Messenger::new(sender),
         renderable_content: RenderableContent::new(Cursor::default()),
+        metadata,
         terminal,
         rich_text_id,
         dimension,
         title: ContextTitle::default(),
         title_dirty: false,
         spawned_program: String::new(),
+        ssh: None,
         _io_thread: None,
     }
 }
@@ -253,6 +278,8 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         dimension: ContextDimension,
         config: &ContextManagerConfig,
     ) -> Result<Context<T>, Box<dyn Error>> {
+        #[cfg(feature = "profiling")]
+        let _timing = crate::profiling::span("startup.context");
         let route_id = ROUTE_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
 
         #[cfg(test)]
@@ -280,7 +307,14 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             config.scrollback_history_limit,
         );
         terminal.set_grapheme_clustering(config.grapheme_clustering);
+        terminal.set_clipboard_policy(config.clipboard);
+        terminal.graphics.coalesce_updates = true;
+        terminal.set_scrollback_limits(
+            config.scrollback_history_limit,
+            config.scrollback_history_byte_limit,
+        );
         terminal.blinking_cursor = cursor_state.1;
+        let metadata = terminal.metadata.clone();
         let terminal: Arc<FairMutex<Crosswords<T>>> = Arc::new(FairMutex::new(terminal));
 
         let integration = if config.shell_integration {
@@ -307,6 +341,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 pty = match create_pty_with_fork(
                     shell_program,
                     shell_args,
+                    &config.working_dir,
                     &integration.env,
                     cols,
                     rows,
@@ -349,6 +384,8 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
         #[cfg(target_os = "windows")]
         {
+            #[cfg(feature = "profiling")]
+            let _timing = crate::profiling::span("startup.conpty");
             pty = match create_pty(
                 shell_program,
                 shell_args.to_vec(),
@@ -390,10 +427,15 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             #[cfg(not(target_os = "windows"))]
             child_terminator,
             messenger,
+            metadata,
             terminal,
             rich_text_id,
             renderable_content: RenderableContent::new(cursor_state.0.clone()),
             dimension,
+            ssh: config
+                .ssh
+                .clone()
+                .or_else(|| crate::ssh::Connection::from_shell(&config.shell)),
             title: ContextTitle::default(),
             title_dirty: false,
             spawned_program: spawned_program_name(config),
@@ -471,9 +513,8 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             contexts: smallvec![ContextGrid::new(
                 initial_context,
                 scaled_margin,
-                ctx_config.split_color,
-                ctx_config.split_active_color,
                 ctx_config.panel,
+                ctx_config.divider_width,
             )],
             capacity: DEFAULT_CONTEXT_CAPACITY,
             event_proxy,
@@ -513,9 +554,8 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             contexts: smallvec![ContextGrid::new(
                 initial_context,
                 Margin::default(),
-                config.split_color,
-                config.split_active_color,
                 config.panel,
+                config.divider_width,
             )],
             capacity,
             event_proxy,
@@ -571,7 +611,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             self.current_index = new_index;
         }
 
-        self.keep_only_active_context_visible(sugarloaf);
+        self.clear_inactive_image_overlays(sugarloaf);
         false
     }
 
@@ -592,11 +632,9 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     }
 
     #[inline]
-    pub fn schedule_render_on_route(&mut self, millis: u64) {
-        self.event_proxy.send_event(
-            RioEvent::PrepareRenderOnRoute(millis, self.current_route),
-            self.window_id,
-        );
+    pub fn schedule_render(&mut self, millis: u64) {
+        self.event_proxy
+            .send_event(RioEvent::PrepareRender(millis), self.window_id);
     }
 
     #[inline]
@@ -710,12 +748,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[inline]
     pub fn select_tab(&mut self, tab_index: usize) {
-        if self.config.is_native {
-            self.event_proxy
-                .send_event(RioEvent::SelectNativeTabByIndex(tab_index), self.window_id);
-            return;
-        }
-
         self.set_current(tab_index);
     }
 
@@ -756,12 +788,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[inline]
     pub fn select_last_tab(&mut self) {
-        if self.config.is_native {
-            self.event_proxy
-                .send_event(RioEvent::SelectNativeTabLast, self.window_id);
-            return;
-        }
-
         self.set_current(self.contexts.len() - 1);
     }
 
@@ -781,6 +807,10 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         self.contexts.len()
     }
 
+    pub fn tab_id(&self, index: usize) -> usize {
+        self.contexts[index].tab_id
+    }
+
     #[cfg(test)]
     pub fn title(&self, index: usize) -> Option<&ContextTitle> {
         self.contexts.get(index).map(|grid| &grid.current().title)
@@ -791,6 +821,40 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         self.contexts
             .get(index)
             .and_then(|grid| grid.custom_title.as_deref())
+    }
+
+    /// Each tab displays the status of its own focused split, even while
+    /// another tab is selected. Other splits in that tab do not contribute.
+    pub fn program_status_for_tab(
+        &self,
+        index: usize,
+    ) -> Option<rio_backend::program_status::ProgramStatusRecord> {
+        let context = self.contexts.get(index)?.current();
+        context.metadata.lock().status.clone()
+    }
+
+    pub fn application_for_tab(&self, index: usize) -> Option<TabApplication> {
+        #[cfg(feature = "profiling")]
+        let _timing = crate::profiling::span("tabs.application");
+        let context = self.contexts.get(index)?.current();
+        let metadata = context.metadata.lock();
+        let reported_app = metadata.app.as_ref();
+        let program = reported_app
+            .cloned()
+            .unwrap_or_else(|| context.spawned_program.clone());
+        Some(TabApplication {
+            program,
+            title: metadata.title.clone(),
+            remote: metadata.remote,
+            reported: reported_app.is_some(),
+        })
+    }
+
+    /// A pane can be the focused split of a tab that is not selected.
+    pub fn is_route_focused_in_tab(&self, route_id: usize) -> bool {
+        self.contexts
+            .iter()
+            .any(|grid| grid.current().route_id == route_id)
     }
 
     #[inline]
@@ -963,15 +1027,22 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     }
 
     /// The title the strip displays for `index`'s tab: the user rename,
-    /// else the rendered content, else the foreground program, else
-    /// "~". The native titlebar reads the same chain, so the two can
-    /// never disagree.
+    /// else the rendered content, else the SSH destination or spawned
+    /// program, else "~". A transport executable title also uses the
+    /// SSH destination. The native titlebar reads the same chain.
     pub fn displayed_title_for_tab(&self, index: usize) -> String {
         if let Some(custom) = self.custom_title(index) {
             return custom.to_string();
         }
         if let Some(grid) = self.contexts.get(index) {
             let context = grid.current();
+            if let Some(connection) = &context.ssh {
+                if context.title.content.is_empty()
+                    || context.title.content == context.spawned_program
+                {
+                    return connection.destination.clone();
+                }
+            }
             if !context.title.content.is_empty() {
                 return context.title.content.clone();
             }
@@ -1059,14 +1130,28 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         &self.contexts[self.current_index]
     }
 
-    #[inline]
-    pub fn get_panel_borders(&self) -> Vec<Rect> {
-        self.contexts[self.current_index].get_panel_borders()
+    pub fn is_route_visible(&self, route_id: usize) -> bool {
+        self.current_grid()
+            .contexts()
+            .values()
+            .any(|item| item.val.route_id == route_id)
     }
 
-    #[inline]
-    pub fn get_current_grid_scaled_margin(&self) -> rio_backend::config::layout::Margin {
-        self.contexts[self.current_index].get_scaled_margin()
+    pub fn update_scrollback_config(&mut self, lines: usize, bytes: Option<usize>) {
+        self.config.scrollback_history_limit = lines;
+        self.config.scrollback_history_byte_limit = bytes;
+    }
+
+    pub fn update_layout_config(
+        &mut self,
+        panel: rio_backend::config::layout::Panel,
+        divider_width: f32,
+    ) {
+        self.config.panel = panel;
+        self.config.divider_width = divider_width;
+        for grid in &mut self.contexts {
+            grid.update_layout_config(panel, divider_width);
+        }
     }
 
     #[cfg(test)]
@@ -1082,6 +1167,12 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn request_close_window(&self) {
+        self.event_proxy
+            .send_event(RioEvent::CloseWindow, self.window_id);
+    }
+
     #[inline]
     pub fn close_current_context(&mut self, sugarloaf: &mut Sugarloaf) {
         if self.contexts.len() == 1 {
@@ -1089,8 +1180,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             // keep Rio running in background.
             #[cfg(target_os = "macos")]
             {
-                self.event_proxy
-                    .send_event(RioEvent::CloseWindow, self.window_id);
+                self.request_close_window();
             }
             return;
         }
@@ -1111,7 +1201,19 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             self.set_current(0);
         }
 
-        self.keep_only_active_context_visible(sugarloaf);
+        self.clear_inactive_image_overlays(sugarloaf);
+    }
+
+    pub fn close_unfocused_tab(&mut self, index: usize, sugarloaf: &mut Sugarloaf) {
+        if index >= self.contexts.len() || index == self.current_index {
+            return;
+        }
+        self.contexts[index].remove_from_sugarloaf(sugarloaf);
+        self.contexts.remove(index);
+        if index < self.current_index {
+            self.current_index -= 1;
+        }
+        self.clear_inactive_image_overlays(sugarloaf);
     }
 
     #[inline]
@@ -1136,12 +1238,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[inline]
     pub fn switch_to_next(&mut self) {
-        if self.config.is_native {
-            self.event_proxy
-                .send_event(RioEvent::SelectNativeTabNext, self.window_id);
-            return;
-        }
-
         if self.contexts.len() - 1 == self.current_index {
             self.current_index = 0;
         } else {
@@ -1153,12 +1249,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[inline]
     pub fn switch_to_prev(&mut self) {
-        if self.config.is_native {
-            self.event_proxy
-                .send_event(RioEvent::SelectNativeTabPrev, self.window_id);
-            return;
-        }
-
         if self.current_index == 0 {
             self.current_index = self.contexts.len() - 1;
         } else {
@@ -1196,10 +1286,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[inline]
     pub fn move_current_tab_to(&mut self, target: usize) {
-        if self.config.is_native {
-            return;
-        }
-
         let current = self.current_index;
         if target == current || target >= self.contexts.len() {
             return;
@@ -1210,39 +1296,102 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         self.set_current(target);
     }
 
+    pub fn current_ssh(&self) -> Option<crate::ssh::Connection> {
+        if let Some(connection) = &self.current().ssh {
+            return Some(connection.clone());
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let current = self.current();
+            let mut argv = teletypewriter::foreground_process_args(
+                *current.main_fd,
+                current.shell_pid,
+            )
+            .ok()?
+            .into_iter();
+            let shell = Shell {
+                program: argv.next(),
+                args: argv.collect(),
+            };
+            crate::ssh::Connection::from_shell(&shell)
+        }
+        #[cfg(target_os = "windows")]
+        None
+    }
+
+    pub fn report_ssh_error(&self, message: String) {
+        self.event_proxy
+            .send_event(RioEvent::SshError(message), self.window_id);
+    }
+
+    /// Tabs and splits share the same host, directory, and authentication rules.
+    fn config_here(&self, inherit_ssh: bool) -> Result<ContextManagerConfig, String> {
+        let mut config = self.config.clone();
+        if let Some(connection) = inherit_ssh.then(|| self.current_ssh()).flatten() {
+            let directory = {
+                let terminal = self.current().terminal.lock();
+                terminal
+                    .remote_directory
+                    .as_ref()
+                    .map(|(_, path)| path.clone())
+                    .or_else(|| {
+                        let reported_remote =
+                            terminal.user_vars.get("RIO_SSH").is_some_and(|v| v == "1");
+                        (self.current().ssh.is_some() || reported_remote)
+                            .then_some(terminal.current_directory.clone())
+                            .flatten()
+                    })
+            };
+            let directory = config.cwd.then_some(directory).flatten();
+            // The retained recipe or live SSH argv identifies the endpoint.
+            // OSC 7 can report a machine name while ssh -G reports an IP or
+            // localhost tunnel. Keep the directory from this SSH pane.
+            config.shell = connection.duplicate_shell(directory.as_deref(), None)?;
+            config.ssh = Some(connection);
+            // Remote paths are arguments to the remote shell, never a local cwd.
+            config.shell_integration = false;
+            return Ok(config);
+        }
+        if !inherit_ssh && crate::ssh::Connection::from_shell(&config.shell).is_some() {
+            config.shell = Shell::default();
+        }
+        config.ssh = None;
+        if config.cwd {
+            #[cfg(not(target_os = "windows"))]
+            if let Ok(path) = teletypewriter::foreground_process_path(
+                *self.current().main_fd,
+                self.current().shell_pid,
+            ) {
+                config.working_dir = Some(path.to_string_lossy().into_owned());
+            }
+            #[cfg(target_os = "windows")]
+            if let Some(path) = self
+                .current()
+                .terminal
+                .lock()
+                .current_directory
+                .as_ref()
+                .filter(|p| p.is_dir())
+            {
+                config.working_dir = Some(path.to_string_lossy().into_owned());
+            }
+        }
+        Ok(config)
+    }
+
     pub fn split(
         &mut self,
         rich_text_id: usize,
         split_down: bool,
         sugarloaf: &mut Sugarloaf,
     ) {
-        let mut working_dir = self.config.working_dir.clone();
-        if self.config.cwd {
-            #[cfg(not(target_os = "windows"))]
-            {
-                let current_context = self.current();
-                if let Ok(path) = teletypewriter::foreground_process_path(
-                    *current_context.main_fd,
-                    current_context.shell_pid,
-                ) {
-                    working_dir = Some(path.to_string_lossy().to_string());
-                }
+        let cloned_config = match self.config_here(true) {
+            Ok(config) => config,
+            Err(message) => {
+                self.report_ssh_error(message);
+                return;
             }
-
-            #[cfg(target_os = "windows")]
-            {
-                // if let Ok(path) = teletypewriter::foreground_process_path() {
-                //     working_dir =
-                //         Some(path.to_string_lossy().to_string());
-                // }
-                working_dir = None;
-            }
-        }
-
-        let mut cloned_config = self.config.clone();
-        if working_dir.is_some() {
-            cloned_config.working_dir = working_dir;
-        }
+        };
 
         let current = self.current();
         let cursor = current.cursor_from_ref();
@@ -1291,21 +1440,20 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             dead_pty: false,
             cwd: config.navigation.current_working_directory,
             shell,
+            ssh: None,
             working_dir,
             spawn_performer: true,
             #[cfg(not(target_os = "windows"))]
             use_fork: config.use_fork,
             shell_integration: config.shell_integration,
-            is_native: config.navigation.is_native(),
-            // When navigation is collapsed and does not contain any color rule
-            // does not make sense fetch for foreground process names
-            split_color: config.colors.split,
-            split_active_color: config.colors.split_active,
-            panel: config.panel,
+            panel: config.panel(),
+            divider_width: config.window.divider_width(),
             title: config.title,
             keyboard: config.keyboard,
             scrollback_history_limit: config.scrollback_history_limit,
+            scrollback_history_byte_limit: config.scrollback_history_byte_limit,
             grapheme_clustering: config.grapheme_clustering,
+            clipboard: config.clipboard,
         };
 
         let current = self.current();
@@ -1338,52 +1486,56 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[inline]
     pub fn add_context(&mut self, redirect: bool, rich_text_id: usize) {
-        let mut working_dir = self.config.working_dir.clone();
-        if self.config.cwd {
-            #[cfg(not(target_os = "windows"))]
-            {
-                let current_context = self.current();
-                if let Ok(path) = teletypewriter::foreground_process_path(
-                    *current_context.main_fd,
-                    current_context.shell_pid,
-                ) {
-                    working_dir = Some(path.to_string_lossy().to_string());
+        self.add_context_here(redirect, rich_text_id, true);
+    }
+
+    pub fn add_context_here(
+        &mut self,
+        redirect: bool,
+        rich_text_id: usize,
+        inherit_ssh: bool,
+    ) {
+        match self.config_here(inherit_ssh) {
+            Ok(config) => self.add_context_with_config(redirect, rich_text_id, config),
+            Err(message) => self.report_ssh_error(message),
+        }
+    }
+
+    pub fn connect_ssh(
+        &mut self,
+        rich_text_id: usize,
+        connection: crate::ssh::Connection,
+    ) {
+        match connection.connect_shell() {
+            Ok(shell) => {
+                let mut config = self.config.clone();
+                config.shell = shell;
+                config.ssh = Some(connection.clone());
+                config.shell_integration = false;
+                self.add_context_with_config(true, rich_text_id, config);
+                if let Err(message) = crate::ssh::remember(&connection) {
+                    tracing::warn!("Could not save SSH connection: {message}");
                 }
             }
-
-            #[cfg(target_os = "windows")]
-            {
-                // if let Ok(path) = teletypewriter::foreground_process_path() {
-                //     working_dir =
-                //         Some(path.to_string_lossy().to_string());
-                // }
-                working_dir = None;
-            }
+            Err(message) => self.report_ssh_error(message),
         }
+    }
 
-        if self.config.is_native {
-            self.event_proxy
-                .send_event(RioEvent::CreateNativeTab(working_dir), self.window_id);
-            return;
-        }
-
+    fn add_context_with_config(
+        &mut self,
+        redirect: bool,
+        rich_text_id: usize,
+        cloned_config: ContextManagerConfig,
+    ) {
         let size = self.contexts.len();
         if size < self.capacity {
             let last_index = self.contexts.len();
 
-            let mut cloned_config = self.config.clone();
-            if working_dir.is_some() {
-                cloned_config.working_dir = working_dir;
-            }
-
             let current = self.current();
             let cursor = current.cursor_from_ref();
-            let mut dimension = current.dimension;
-
-            // If current has splits then shouldn't use that dimension
-            if self.current_grid().len() > 1 {
-                dimension = self.current_grid().grid_dimension();
-            }
+            // Pane dimensions exclude padding and margins even without splits.
+            // A new tab's layout needs the whole window, not that inner viewport.
+            let dimension = self.current_grid().grid_dimension();
 
             match ContextManager::create_context(
                 (&cursor, current.renderable_content.has_blinking_enabled),
@@ -1399,9 +1551,8 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                     self.contexts.push(ContextGrid::new(
                         new_context,
                         previous_scaled_margin,
-                        self.config.split_color,
-                        self.config.split_active_color,
                         self.config.panel,
+                        self.config.divider_width,
                     ));
                     if redirect {
                         self.current_index = last_index;
@@ -1415,33 +1566,28 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         }
     }
 
-    /// Hide all rich text components except for the current tab
+    /// Clear image overlays for inactive tabs.
     #[inline]
-    pub fn keep_only_active_context_visible(&self, sugarloaf: &mut Sugarloaf) {
+    pub fn clear_inactive_image_overlays(&self, sugarloaf: &mut Sugarloaf) {
         for (idx, context) in self.contexts.iter().enumerate() {
             // Skip the current tab
             if idx == self.current_index {
-                context.set_all_rich_text_visibility(sugarloaf, true);
                 continue;
             }
 
-            context.set_all_rich_text_visibility(sugarloaf, false);
+            context.clear_image_overlays(sugarloaf);
         }
     }
 
-    /// Switch visibility between two contexts (hide old, show new)
+    /// Clear image overlays for a tab being hidden.
     #[inline]
-    pub fn switch_context_visibility(
+    pub fn clear_context_image_overlays(
         &self,
         sugarloaf: &mut Sugarloaf,
         old_index: usize,
-        new_index: usize,
     ) {
         if let Some(old_context) = self.contexts.get(old_index) {
-            old_context.set_all_rich_text_visibility(sugarloaf, false);
-        }
-        if let Some(new_context) = self.contexts.get(new_index) {
-            new_context.set_all_rich_text_visibility(sugarloaf, true);
+            old_context.clear_image_overlays(sugarloaf);
         }
     }
 }
@@ -1480,6 +1626,482 @@ pub fn process_open_url(
 pub mod test {
     use super::*;
     use crate::event::VoidListener;
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires RIO_TEST_SSH_TARGET and remote Rio shell integration"]
+    fn live_windows_ssh_connection_uses_conpty() {
+        #[derive(Clone, Default)]
+        struct SshEvents(Arc<std::sync::Mutex<Vec<(usize, String)>>>);
+        impl SshEvents {
+            fn reply_to(&self, context: &Context<Self>) {
+                self.0.lock().unwrap().retain(|(route, text)| {
+                    if *route == context.route_id {
+                        context.messenger.send_write(text.clone().into_bytes());
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
+        impl EventListener for SshEvents {
+            fn send_event(&self, event: RioEvent, _: WindowId) {
+                if let RioEvent::PtyWrite(route, text) = event {
+                    self.0.lock().unwrap().push((route, text));
+                }
+            }
+        }
+        let events = SshEvents::default();
+        let target = std::env::var("RIO_TEST_SSH_TARGET").unwrap();
+        let mut args = vec!["-A".into()];
+        if let Ok(config) = std::env::var("RIO_TEST_SSH_CONFIG") {
+            args.extend(["-F".into(), config]);
+        }
+        args.push(target);
+        if let Ok(command) = std::env::var("RIO_TEST_SSH_COMMAND") {
+            args.push(command);
+        }
+        let connection = crate::ssh::Connection::from_shell(&Shell {
+            program: Some("ssh".into()),
+            args,
+        })
+        .unwrap();
+        let shell = connection.connect_shell().unwrap();
+        let resolved_destination = connection.destination.clone();
+        let dimension = ContextDimension::build(
+            800.0,
+            600.0,
+            rio_backend::sugarloaf::layout::TextDimensions::default(),
+            rio_backend::sugarloaf::layout::CellMetrics {
+                cell_width: 8,
+                cell_height: 16,
+                cell_baseline: 12,
+                face_width: 8.0,
+                face_height: 16.0,
+                face_y: 0.0,
+            },
+            1.0,
+            14.0,
+            Margin::default(),
+        );
+        let mut manager = ContextManager::start(
+            (&Cursor::default(), false),
+            events.clone(),
+            WindowId::from(0),
+            0,
+            0,
+            ContextManagerConfig {
+                dead_pty: true,
+                ..Default::default()
+            },
+            dimension,
+            Margin::default(),
+            None,
+        )
+        .unwrap();
+        let mut config = manager.config.clone();
+        config.dead_pty = false;
+        config.spawn_performer = true;
+        config.shell_integration = false;
+        config.shell = shell;
+        config.ssh = Some(connection.clone());
+        manager.add_context_with_config(true, 1, config);
+        let deadline = Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            events.reply_to(manager.current());
+            if manager
+                .current()
+                .terminal
+                .lock()
+                .user_vars
+                .get("RIO_SSH")
+                .is_some_and(|value| value == "1")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "SSH did not start a remote shell over ConPTY"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        manager
+            .current()
+            .messenger
+            .send_write("printf '\\033]1337;SetUserVar=RIO_TEST_TRANSPORT=%s\\007' \"$(printf %s \"$SSH_CONNECTION\" | base64 -w0)\"; printf '\\033]1337;SetUserVar=RIO_TEST_INPUT=%s\\007' \"$(printf %s 'é λ 中文' | base64 -w0)\"; printf 'UNICODE: \\303\\251 \\316\\273 \\344\\270\\255\\346\\226\\207\\n'; cd /tmp\r".as_bytes().to_vec());
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while !manager
+            .current()
+            .terminal
+            .lock()
+            .remote_directory
+            .as_ref()
+            .is_some_and(|(_, path)| path == std::path::Path::new("/tmp"))
+        {
+            events.reply_to(manager.current());
+            assert!(
+                Instant::now() < deadline,
+                "remote directory was not reported: {:?}",
+                manager.current().terminal.lock().remote_directory
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // Check visible output before resize/redraw commands scroll it away.
+        {
+            let terminal = manager.current().terminal.lock();
+            assert_eq!(
+                terminal.user_vars.get("RIO_TEST_INPUT").map(String::as_str),
+                Some("é λ 中文"),
+                "SSH input did not preserve UTF-8"
+            );
+            let output: String = terminal
+                .grid
+                .display_iter()
+                .filter(|cell| {
+                    cell.wide() != rio_backend::crosswords::square::Wide::Spacer
+                })
+                .map(|cell| cell.c())
+                .filter(|c| *c != '\0')
+                .collect();
+            assert!(
+                output.contains("UNICODE: é λ 中文"),
+                "SSH output did not preserve UTF-8: {output}"
+            );
+        }
+        manager.config.dead_pty = false;
+        // Exercise the real ConPTY -> native SSH window-change path. Merely
+        // reflowing Rio's grid hides a remote PTY stuck at its default 80x24.
+        for (columns, lines) in [(113, 31), (47, 12), (120, 40)] {
+            manager
+                .current()
+                .messenger
+                .send_resize(rio_backend::event::WindowSize {
+                    cols: columns,
+                    rows: lines,
+                    width: columns * 8,
+                    height: lines * 16,
+                })
+                .unwrap();
+            let expected = format!("{lines} {columns}");
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                manager.current().messenger.send_write(
+                    b"printf '\\033]1337;SetUserVar=RIO_TEST_SIZE=%s\\007' \"$(stty size | tr -d '\\n' | base64 -w0)\"\r".to_vec(),
+                );
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                events.reply_to(manager.current());
+                let actual = manager
+                    .current()
+                    .terminal
+                    .lock()
+                    .user_vars
+                    .get("RIO_TEST_SIZE")
+                    .cloned();
+                if actual.as_deref() == Some(expected.as_str()) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "SSH PTY did not resize to {expected}; remote reported {actual:?}"
+                );
+            }
+        }
+        manager.current().messenger.send_write(
+            b"printf '\\033]1337;SetUserVar=RIO_TEST_SLEEP=cmVhZHk=\\007'; sleep 30\r"
+                .to_vec(),
+        );
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !manager
+            .current()
+            .terminal
+            .lock()
+            .user_vars
+            .contains_key("RIO_TEST_SLEEP")
+        {
+            events.reply_to(manager.current());
+            assert!(Instant::now() < deadline, "remote sleep did not start");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        manager.current().messenger.send_write(vec![3]);
+        for _ in 0..15 {
+            events.reply_to(manager.current());
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        manager.current().messenger.send_write(
+            b"printf '\\033]1337;SetUserVar=RIO_TEST_INTERRUPT=YWxpdmU=\\007'\r".to_vec(),
+        );
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !manager
+            .current()
+            .terminal
+            .lock()
+            .user_vars
+            .contains_key("RIO_TEST_INTERRUPT")
+        {
+            events.reply_to(manager.current());
+            assert!(
+                Instant::now() < deadline,
+                "Ctrl+C did not interrupt the remote program and preserve its SSH shell"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let transport = manager
+            .current()
+            .terminal
+            .lock()
+            .user_vars
+            .get("RIO_TEST_TRANSPORT")
+            .cloned()
+            .expect("parent did not report its SSH transport");
+        manager.config.spawn_performer = true;
+        manager.config.cwd = false;
+        let home_config = manager.config_here(true).unwrap();
+        assert!(home_config.shell.args.contains(&resolved_destination));
+        manager.config.cwd = true;
+        manager.add_context(true, 2);
+        assert_eq!(manager.len(), 3);
+        assert_eq!(
+            manager.current().ssh.as_ref().unwrap().destination,
+            connection.destination
+        );
+        // Exercise the same recipe/config path used by new tabs and both splits.
+        // Report the actual sibling cwd; an echoed command cannot satisfy this.
+        manager.current().messenger.send_write(
+            b"printf '\\033]1337;SetUserVar=RIO_TEST_TRANSPORT=%s\\007' \"$(printf %s \"$SSH_CONNECTION\" | base64 -w0)\"; printf '\\033]1337;SetUserVar=RIO_TEST_CWD=%s\\007' \"$(printf %s \"$PWD\" | base64 -w0)\"\r".to_vec()
+        );
+        let deadline = Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            events.reply_to(manager.current());
+            if manager
+                .current()
+                .terminal
+                .lock()
+                .user_vars
+                .get("RIO_TEST_CWD")
+                .is_some_and(|value| value == "/tmp")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "sibling did not inherit the remote cwd"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        manager.contexts.remove(1);
+        manager.current_index -= 1;
+        assert_ne!(
+            manager
+                .current()
+                .terminal
+                .lock()
+                .user_vars
+                .get("RIO_TEST_TRANSPORT"),
+            Some(&transport),
+            "native Windows SSH sibling reused the original transport"
+        );
+        manager.current().messenger.send_write(
+            b"printf '\\033]1337;SetUserVar=RIO_TEST_SURVIVED=YWxpdmU=\\007'\r".to_vec(),
+        );
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while manager
+            .current()
+            .terminal
+            .lock()
+            .user_vars
+            .get("RIO_TEST_SURVIVED")
+            .is_none()
+        {
+            events.reply_to(manager.current());
+            assert!(
+                Instant::now() < deadline,
+                "sibling stopped after closing the original pane"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        manager.add_context_here(true, 3, false);
+        assert!(
+            manager.current().ssh.is_none(),
+            "New Local Tab inherited SSH"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires RIO_TEST_SSH_TARGET and an already authenticated Windows SSH master"]
+    fn live_ssh_tabs_and_split_launches_reuse_connection_and_directory() {
+        use std::time::Duration;
+        #[derive(Clone, Default)]
+        struct SshEvents(Arc<std::sync::Mutex<Vec<(usize, String)>>>);
+        impl EventListener for SshEvents {
+            fn send_event(&self, event: RioEvent, _: WindowId) {
+                if let RioEvent::PtyWrite(route, text) = event {
+                    self.0.lock().unwrap().push((route, text));
+                }
+            }
+        }
+        let events = SshEvents::default();
+        let target =
+            std::env::var("RIO_TEST_SSH_TARGET").expect("set RIO_TEST_SSH_TARGET");
+        let connection = crate::ssh::Connection::new(&target, true).unwrap();
+        let shell = connection
+            .duplicate_shell(None, None)
+            .expect("authenticate the SSH master first");
+        let dimension = ContextDimension::build(
+            800.0,
+            600.0,
+            rio_backend::sugarloaf::layout::TextDimensions::default(),
+            rio_backend::sugarloaf::layout::CellMetrics {
+                cell_width: 8,
+                cell_height: 16,
+                cell_baseline: 12,
+                face_width: 8.0,
+                face_height: 16.0,
+                face_y: 0.0,
+            },
+            1.0,
+            14.0,
+            Margin::default(),
+        );
+        let mut manager = ContextManager::start(
+            (&Cursor::default(), false),
+            events.clone(),
+            WindowId::from(0),
+            0,
+            0,
+            ContextManagerConfig {
+                dead_pty: true,
+                ..Default::default()
+            },
+            dimension,
+            Margin::default(),
+            None,
+        )
+        .unwrap();
+        manager.config.dead_pty = false;
+        manager.config.spawn_performer = true;
+        manager.config.cwd = true;
+        let mut config = manager.config.clone();
+        config.shell = shell;
+        manager.add_context_with_config(true, 1, config);
+
+        let wait_for = |context: &Context<SshEvents>, variable: &str| -> String {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                // Native terminals send cursor/device queries before drawing.
+                // Mirror the window event loop's replies in this headless test.
+                {
+                    let mut replies = events.0.lock().unwrap();
+                    let mut index = 0;
+                    while index < replies.len() {
+                        if replies[index].0 == context.route_id {
+                            let (_, text) = replies.remove(index);
+                            context.messenger.send_write(text.into_bytes());
+                        } else {
+                            index += 1;
+                        }
+                    }
+                }
+                if let Some(value) =
+                    context.terminal.lock().user_vars.get(variable).cloned()
+                {
+                    return value;
+                }
+                if context
+                    ._io_thread
+                    .as_ref()
+                    .is_some_and(|thread| thread.is_finished())
+                    || Instant::now() >= deadline
+                {
+                    let terminal = context.terminal.lock();
+                    use rio_backend::crosswords::pos::{Column, Line, Pos};
+                    let output = terminal.bounds_to_string(
+                        Pos::new(Line(0), Column(0)),
+                        Pos::new(
+                            Line(context.dimension.lines as i32 - 1),
+                            Column(context.dimension.columns - 1),
+                        ),
+                    );
+                    panic!("SSH pane {} did not report {variable} before exiting or timing out: {output}", context.route_id);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let report = |context: &Context<SshEvents>, variable: &str, expression: &str| {
+            context.messenger.send_write(format!(
+                "[Console]::Write(\"$([char]27)]1337;SetUserVar={variable}=$([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]({expression}))))$([char]7)\")\r"
+            ).into_bytes());
+        };
+        // Wait for integration, then move the original shell without modifying
+        // any remote files. The connection's server-side port proves reuse.
+        wait_for(manager.current(), "RIO_SSH");
+        manager.current().messenger.send_write(b"$global:RioReuseProbe = 'parent'; Set-Location -LiteralPath 'C:\\Windows'\r".to_vec());
+        report(manager.current(), "RIO_TEST_READY", "$PWD.Path");
+        assert_eq!(wait_for(manager.current(), "RIO_TEST_READY"), "C:\\Windows");
+        report(
+            manager.current(),
+            "RIO_TEST_TRANSPORT",
+            "$env:SSH_CONNECTION",
+        );
+        let transport = wait_for(manager.current(), "RIO_TEST_TRANSPORT");
+
+        // Also cover SSH launched inside a shell: identify the live foreground
+        // argv when Rio did not retain a connection recipe at creation time.
+        manager.current_mut().ssh = None;
+        assert_eq!(manager.current_ssh().unwrap().destination, target);
+
+        manager.add_context(true, 2);
+        assert_eq!(manager.len(), 3);
+        wait_for(manager.current(), "RIO_SSH");
+        report(manager.current(), "RIO_TEST_DIRECTORY", "$PWD.Path");
+        assert_eq!(
+            wait_for(manager.current(), "RIO_TEST_DIRECTORY"),
+            "C:\\Windows"
+        );
+        report(
+            manager.current(),
+            "RIO_TEST_TRANSPORT",
+            "$env:SSH_CONNECTION",
+        );
+        assert_eq!(wait_for(manager.current(), "RIO_TEST_TRANSPORT"), transport);
+        report(manager.current(), "RIO_TEST_INDEPENDENT", "$null -eq (Get-Variable RioReuseProbe -Scope Global -ErrorAction SilentlyContinue)");
+        assert_eq!(wait_for(manager.current(), "RIO_TEST_INDEPENDENT"), "True");
+
+        // Both split directions call config_here and create_context. Exercise
+        // that exact launch path without requiring a graphical window or GPU.
+        for split in ["right", "down"] {
+            let config = manager.config_here(true).unwrap();
+            let pane = ContextManager::create_context(
+                (&Cursor::default(), false),
+                events.clone(),
+                WindowId::from(0),
+                3,
+                manager.current().dimension,
+                &config,
+            )
+            .unwrap();
+            wait_for(&pane, "RIO_SSH");
+            report(&pane, "RIO_TEST_DIRECTORY", "$PWD.Path");
+            assert_eq!(
+                wait_for(&pane, "RIO_TEST_DIRECTORY"),
+                "C:\\Windows",
+                "{split} split"
+            );
+            report(&pane, "RIO_TEST_TRANSPORT", "$env:SSH_CONNECTION");
+            assert_eq!(
+                wait_for(&pane, "RIO_TEST_TRANSPORT"),
+                transport,
+                "{split} split"
+            );
+        }
+
+        // Closing the original pane must not close its sibling shell.
+        manager.contexts.remove(1);
+        manager.current_index -= 1;
+        report(manager.current(), "RIO_TEST_SURVIVED", "'alive'");
+        assert_eq!(wait_for(manager.current(), "RIO_TEST_SURVIVED"), "alive");
+    }
 
     #[test]
     fn test_capacity() {
@@ -1580,6 +2202,99 @@ pub mod test {
     }
 
     #[test]
+    #[ignore = "manual tab chrome contention measurement"]
+    fn measure_tab_chrome_contention() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut cm =
+            ContextManager::start_with_capacity(8, VoidListener {}, WindowId::from(0))
+                .unwrap();
+        for _ in 1..8 {
+            cm.add_context(false, 0);
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(std::sync::Barrier::new(9));
+        let producers: Vec<_> = cm
+            .contexts
+            .iter()
+            .map(|grid| {
+                let terminal = grid.current().terminal.clone();
+                let stop = stop.clone();
+                let ready = ready.clone();
+                std::thread::spawn(move || {
+                    let bytes =
+                        b"\x1b[31mred\x1b[0m \x1b[1;32mgreen\x1b[0m\r\n".repeat(8192);
+                    let mut parser = crate::performer::handler::Processor::default();
+                    ready.wait();
+                    while !stop.load(Ordering::Relaxed) {
+                        let _lease = terminal.lease();
+                        let mut terminal = terminal.lock_unfair();
+                        parser.advance(&mut *terminal, &bytes);
+                    }
+                })
+            })
+            .collect();
+        ready.wait();
+        let mut locked = Vec::new();
+        let mut published = Vec::new();
+        for _ in 0..100 {
+            let start = Instant::now();
+            for grid in &cm.contexts {
+                let context = grid.current();
+                let terminal = context.terminal.lock();
+                std::hint::black_box((
+                    terminal.title.clone(),
+                    terminal.user_vars.get("RIO_APP").cloned(),
+                    terminal.user_vars.get("RIO_SSH").cloned(),
+                ));
+                drop(terminal);
+                std::hint::black_box(
+                    context.terminal.lock().program_status.display_status(),
+                );
+            }
+            locked.push(start.elapsed().as_micros());
+            let start = Instant::now();
+            for index in 0..cm.len() {
+                std::hint::black_box(cm.application_for_tab(index));
+                std::hint::black_box(cm.program_status_for_tab(index));
+            }
+            published.push(start.elapsed().as_micros());
+        }
+        stop.store(true, Ordering::Relaxed);
+        for producer in producers {
+            producer.join().unwrap();
+        }
+        locked.sort_unstable();
+        published.sort_unstable();
+        println!("8 busy tabs, 100 samples: terminal_lock_p50_us={} terminal_lock_p95_us={} metadata_p50_us={} metadata_p95_us={}", locked[50], locked[95], published[50], published[95]);
+    }
+
+    #[test]
+    fn tab_chrome_does_not_wait_for_pty_terminal_lock() {
+        let cm =
+            ContextManager::start_with_capacity(2, VoidListener {}, WindowId::from(0))
+                .unwrap();
+        let terminal = cm.current().terminal.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            let _lease = terminal.lease();
+            let _terminal = terminal.lock_unfair();
+            ready_tx.send(()).unwrap();
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .is_ok()
+        });
+        ready_rx.recv().unwrap();
+        assert!(cm.application_for_tab(0).is_some());
+        assert!(cm.program_status_for_tab(0).is_none());
+        let _ = done_tx.send(());
+        assert!(
+            producer.join().unwrap(),
+            "tab chrome waited for the PTY lock"
+        );
+    }
+
+    #[test]
     fn bell_marks_background_tabs_only_and_clears_on_focus() {
         let mut cm =
             ContextManager::start_with_capacity(5, VoidListener {}, WindowId::from(0))
@@ -1612,6 +2327,91 @@ pub mod test {
         assert!(cm.bell(2));
         assert!(cm.clear_current_bell());
         assert!(!cm.bell(2));
+    }
+
+    #[test]
+    fn tab_paths_follow_local_and_remote_osc_directory_reports() {
+        use rio_backend::performer::handler::Processor;
+
+        let mut cm =
+            ContextManager::start_with_capacity(2, VoidListener {}, WindowId::from(0))
+                .unwrap();
+        cm.config.title = rio_backend::config::title::Title::default();
+        cm.current_mut().spawned_program = "ssh.exe".into();
+        cm.current_mut().ssh =
+            Some(crate::ssh::Connection::new("user@remote", false).unwrap());
+        let mut parser = Processor::default();
+        parser.advance(
+            &mut *cm.current().terminal.lock(),
+            b"\x1b]2;ssh.exe\x07\x1b]7;file://remote.invalid/home/user/project\x07",
+        );
+        cm.update_titles(true);
+        assert_eq!(cm.displayed_title_for_current_tab(), "/home/user/project");
+        assert!(cm.current().terminal.lock().current_directory.is_none());
+
+        parser.advance(
+            &mut *cm.current().terminal.lock(),
+            b"\x1b]7;file://remote.invalid/home/user/other\x07",
+        );
+        cm.update_titles(true);
+        assert_eq!(cm.displayed_title_for_current_tab(), "/home/user/other");
+
+        let route = cm.current().route_id;
+        assert!(!cm.on_title_change(route, Some("vim remote.txt")));
+        assert_eq!(cm.displayed_title_for_current_tab(), "/home/user/other");
+        assert!(!cm.on_title_change(route, Some("")));
+        assert_eq!(cm.displayed_title_for_current_tab(), "/home/user/other");
+
+        cm.add_context_here(true, 0, false);
+        cm.current_mut().spawned_program = "fish".into();
+        #[cfg(windows)]
+        let (directory_report, expected_path) = (
+            "\x1b]7;file:///C:/rio-local-project\x07",
+            "C:/rio-local-project",
+        );
+        #[cfg(not(windows))]
+        let (directory_report, expected_path) =
+            ("\x1b]7;file:///rio-local-project\x07", "/rio-local-project");
+        parser.advance(
+            &mut *cm.current().terminal.lock(),
+            directory_report.as_bytes(),
+        );
+        parser.advance(&mut *cm.current().terminal.lock(), b"\x1b]2;fish\x07");
+        cm.update_titles(true);
+        assert_eq!(cm.displayed_title_for_current_tab(), expected_path);
+        cm.set_current(0);
+        assert_eq!(cm.displayed_title_for_current_tab(), "/home/user/other");
+    }
+
+    #[test]
+    fn ssh_tab_title_uses_destination_instead_of_transport_program() {
+        let mut cm =
+            ContextManager::start_with_capacity(1, VoidListener {}, WindowId::from(0))
+                .unwrap();
+        cm.current_mut().spawned_program = "ssh.exe".into();
+        cm.current_mut().ssh =
+            Some(crate::ssh::Connection::new("user@remote", false).unwrap());
+        cm.config.title.content = "{{ TITLE || PROGRAM }}".into();
+
+        // Windows' default template falls back to the native SSH executable
+        // when the remote shell does not send an OSC title.
+        cm.update_titles(true);
+        assert_eq!(cm.displayed_title_for_current_tab(), "user@remote");
+
+        let route = cm.current().route_id;
+        cm.on_title_change(route, Some("ssh.exe"));
+        assert_eq!(cm.displayed_title_for_current_tab(), "user@remote");
+        cm.on_title_change(route, Some("vim remote.txt"));
+        assert_eq!(cm.displayed_title_for_current_tab(), "vim remote.txt");
+
+        cm.set_custom_title(0, Some("Production".into()));
+        assert_eq!(cm.displayed_title_for_current_tab(), "Production");
+        cm.set_custom_title(0, None);
+        cm.current_mut().title.content.clear();
+        assert_eq!(cm.displayed_title_for_current_tab(), "user@remote");
+
+        cm.current_mut().ssh = None;
+        assert_eq!(cm.displayed_title_for_current_tab(), "ssh.exe");
     }
 
     #[test]

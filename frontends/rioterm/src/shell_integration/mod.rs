@@ -32,6 +32,7 @@ const ZSH_ZSHENV: &str = include_str!("zshenv.zsh");
 const ZSH_INTEGRATION: &str = include_str!("rio-integration.zsh");
 const FISH_INTEGRATION: &str = include_str!("rio.fish");
 const POWERSHELL_INTEGRATION: &str = include_str!("rio.ps1");
+const BASH_INTEGRATION: &str = include_str!("rio.bash");
 
 /// Everything shell integration wants applied to one spawn: extra
 /// environment, and for PowerShell a replacement `(program, args)`
@@ -160,7 +161,10 @@ fn powershell_command(
         return None;
     }
     #[cfg(target_os = "windows")]
-    let program = Some(resolved_program.to_string());
+    let program = {
+        let _ = configured_program;
+        Some(resolved_program.to_string())
+    };
     #[cfg(not(target_os = "windows"))]
     let program = {
         let _ = resolved_program;
@@ -218,6 +222,7 @@ fn materialize(base: &Path) -> std::io::Result<()> {
     let fish = base.join("data").join("fish").join("vendor_conf.d");
     std::fs::create_dir_all(&fish)?;
     write_if_changed(&fish.join("rio.fish"), FISH_INTEGRATION)?;
+    write_if_changed(&base.join("rio.bash"), BASH_INTEGRATION)?;
 
     let powershell = base.join("powershell");
     std::fs::create_dir_all(&powershell)?;

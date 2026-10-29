@@ -12,13 +12,17 @@ use std::borrow::Cow;
 
 #[inline(never)]
 pub fn build_key_sequence(key: &KeyEvent, mods: ModifiersState, mode: Mode) -> Vec<u8> {
-    let mut modifiers = mods.into();
-
     let kitty_seq = mode.intersects(
         Mode::REPORT_ALL_KEYS_AS_ESC
             | Mode::DISAMBIGUATE_ESC_CODES
             | Mode::REPORT_EVENT_TYPES,
     );
+    let mods = if kitty_seq {
+        mods
+    } else {
+        mods & !(ModifiersState::CAPS_LOCK | ModifiersState::NUM_LOCK)
+    };
+    let mut modifiers = mods.into();
 
     let kitty_encode_all = mode.contains(Mode::REPORT_ALL_KEYS_AS_ESC);
     // The default parameter is 1, so we can omit it.
@@ -434,8 +438,8 @@ bitflags::bitflags! {
         const ALT     = 0b0000_0010;
         const CONTROL = 0b0000_0100;
         const SUPER   = 0b0000_1000;
-        // NOTE: Kitty protocol defines additional modifiers to what is present here, like
-        // Capslock, but it's not a modifier as per winit.
+        const CAPS_LOCK = 0b0100_0000;
+        const NUM_LOCK = 0b1000_0000;
     }
 }
 
@@ -453,6 +457,8 @@ impl From<ModifiersState> for SequenceModifiers {
         modifiers.set(Self::ALT, mods.alt_key());
         modifiers.set(Self::CONTROL, mods.control_key());
         modifiers.set(Self::SUPER, mods.super_key());
+        modifiers.set(Self::CAPS_LOCK, mods.contains(ModifiersState::CAPS_LOCK));
+        modifiers.set(Self::NUM_LOCK, mods.contains(ModifiersState::NUM_LOCK));
         modifiers
     }
 }
@@ -463,4 +469,38 @@ fn is_control_character(text: &str) -> bool {
     // does not match the reported text (`^H`), despite not technically being part of C0 or C1.
     let codepoint = text.bytes().next().unwrap();
     text.len() == 1 && (codepoint < 0x20 || (0x7f..=0x9f).contains(&codepoint))
+}
+
+#[cfg(test)]
+mod lock_modifier_tests {
+    use super::*;
+
+    #[test]
+    fn locks_use_kitty_modifier_values() {
+        for (state, expected) in [
+            (ModifiersState::CAPS_LOCK, 65),
+            (ModifiersState::NUM_LOCK, 129),
+            (
+                ModifiersState::CAPS_LOCK
+                    | ModifiersState::NUM_LOCK
+                    | ModifiersState::CONTROL,
+                197,
+            ),
+        ] {
+            assert_eq!(
+                SequenceModifiers::from(state).encode_esc_sequence(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn locks_do_not_change_shortcut_modifiers() {
+        let full = ModifiersState::CAPS_LOCK
+            | ModifiersState::NUM_LOCK
+            | ModifiersState::CONTROL;
+        let event = rio_window::event::Modifiers::from(full);
+        assert_eq!(event.state(), ModifiersState::CONTROL);
+        assert_eq!(event.state_with_locks(), full);
+    }
 }
