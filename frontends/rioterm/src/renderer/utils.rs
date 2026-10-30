@@ -1,3 +1,4 @@
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use crate::constants;
 use crate::layout::ContextDimension;
 use rio_backend::config::navigation::Navigation;
