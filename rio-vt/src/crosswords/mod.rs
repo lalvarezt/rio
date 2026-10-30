@@ -12267,6 +12267,92 @@ mod tests {
     }
 
     #[test]
+    fn repeated_characters_match_scalar_input_across_modes_and_batches() {
+        use crate::performer::handler::{Handler, Processor};
+
+        for cols in [1, 2, 3, 20] {
+            for clustering in [false, true] {
+                for wrapping in [false, true] {
+                    for insert in [false, true] {
+                        for (prefix, c) in [
+                            ("", 'x'),
+                            ("", 'é'),
+                            ("", '中'),
+                            ("a", '\u{301}'),
+                            ("👩", '\u{200d}'),
+                            ("\x1b(0", 'q'),
+                        ] {
+                            for count in [0, 1, 2, 255, 256, 257, 1025] {
+                                let make = || {
+                                    let mut term = new_term(cols, 3);
+                                    for _ in 0..cols * 2 {
+                                        term.input('中');
+                                        term.input('a');
+                                    }
+                                    term.goto(Line(0), Column(0));
+                                    term.mode.set(Mode::GRAPHEME_CLUSTER, clustering);
+                                    term.mode.set(Mode::LINE_WRAP, wrapping);
+                                    term.mode.set(Mode::INSERT, insert);
+                                    term
+                                };
+                                let mut repeated = make();
+                                let mut scalar = make();
+                                let initial = format!(
+                                    "\x1b[1;31m\x1b]8;id=repeat;https://example.com/repeat\x1b\\{prefix}{c}"
+                                );
+                                let mut parser = Processor::default();
+                                parser.advance(&mut repeated, initial.as_bytes());
+                                Processor::default()
+                                    .advance(&mut scalar, initial.as_bytes());
+                                let rep = format!("\x1b[{count}b");
+                                for &byte in rep.as_bytes() {
+                                    parser.advance(&mut repeated, &[byte]);
+                                }
+                                for _ in 0..count.max(1) {
+                                    scalar.input(c);
+                                }
+                                assert_eq!(
+                                    repeated.grid.cursor.pos,
+                                    scalar.grid.cursor.pos
+                                );
+                                assert_eq!(
+                                    repeated.grid.cursor.should_wrap,
+                                    scalar.grid.cursor.should_wrap
+                                );
+                                assert_eq!(
+                                    repeated.grid.topmost_line(),
+                                    scalar.grid.topmost_line()
+                                );
+                                for line in scalar.grid.topmost_line().0..3 {
+                                    for col in 0..cols {
+                                        let a = repeated.grid[Line(line)][Column(col)];
+                                        let b = scalar.grid[Line(line)][Column(col)];
+                                        assert_eq!(
+                                            (a.c(), a.wide(), a.cell_flags(), a.style_id()),
+                                            (b.c(), b.wide(), b.cell_flags(), b.style_id()),
+                                            "cols={cols} clustering={clustering} wrapping={wrapping} insert={insert} c={c:?} count={count} cell={line},{col}"
+                                        );
+                                        assert_eq!(
+                                            extras_of(&repeated, line, col),
+                                            extras_of(&scalar, line, col)
+                                        );
+                                        assert_eq!(
+                                            repeated
+                                                .cell_hyperlink(Line(line), Column(col)),
+                                            scalar
+                                                .cell_hyperlink(Line(line), Column(col))
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn mixed_bulk_writes_match_scalar_over_existing_wide_cells() {
         use crate::performer::handler::Handler;
 

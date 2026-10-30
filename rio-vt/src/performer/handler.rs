@@ -1160,6 +1160,21 @@ fn add_resolved_kitty_id(reply: &mut String, image_id: u32) {
     }
 }
 
+// Keep the bounded repeat buffer out of the CSI dispatcher's stack frame.
+#[inline(never)]
+fn repeat_character<H: Handler>(
+    performer: &mut Performer<'_, H>,
+    c: char,
+    mut count: usize,
+) {
+    let codepoints = [c as u32; 256];
+    while count != 0 {
+        let take = count.min(codepoints.len());
+        performer.print_codepoints(&codepoints[..take]);
+        count -= take;
+    }
+}
+
 impl<U: Handler> Perform for Performer<'_, U> {
     fn osc_discarded(&mut self, command: Option<u16>, bell: bool) {
         if command == Some(5522) {
@@ -1184,7 +1199,9 @@ impl<U: Handler> Perform for Performer<'_, U> {
         self.state.preceding_char = s.chars().next_back();
     }
 
-    #[inline]
+    // Keep one bulk entry point shared by decoded input and REP. Inlining
+    // this wrapper makes the compiler outline the writer at a different seam.
+    #[inline(never)]
     fn print_codepoints(&mut self, codepoints: &[u32]) {
         if codepoints.is_empty() {
             return;
@@ -1549,9 +1566,7 @@ impl<U: Handler> Perform for Performer<'_, U> {
             ('B', []) | ('e', []) => handler.move_down(next_param_or(1) as usize),
             ('b', []) => {
                 if let Some(c) = self.state.preceding_char {
-                    for _ in 0..next_param_or(1) {
-                        handler.input(c);
-                    }
+                    repeat_character(self, c, next_param_or(1) as usize);
                 } else {
                     warn!("tried to repeat with no preceding char");
                 }
