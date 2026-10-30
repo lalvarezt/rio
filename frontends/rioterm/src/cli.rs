@@ -7,7 +7,12 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Parser, Default, Debug)]
-#[clap(author, about, version)]
+#[clap(
+    author,
+    about,
+    version,
+    after_help = "SSH terminal integration: rio +ssh [options] [--] SSH_ARGS...\nRun rio +ssh --help for details."
+)]
 pub struct Cli {
     /// Options which can be passed via IPC.
     #[clap(flatten)]

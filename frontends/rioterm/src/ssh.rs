@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+pub mod native;
+
 #[cfg(windows)]
 #[path = "ssh/windows.rs"]
 mod windows;
@@ -14,6 +16,8 @@ mod windows;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Connection {
     pub destination: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    program: Option<String>,
     #[serde(default)]
     pub powershell: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -35,6 +39,7 @@ impl Connection {
         }
         Ok(Self {
             destination: destination.into(),
+            program: None,
             powershell,
             remote_shell: None,
             options: Vec::new(),
@@ -50,7 +55,9 @@ impl Connection {
         {
             return None;
         }
-        Self::from_args(&shell.args)
+        let mut connection = Self::from_args(&shell.args)?;
+        connection.program = shell.program.clone();
+        Some(connection)
     }
 
     fn from_args(args: &[String]) -> Option<Self> {
@@ -77,7 +84,7 @@ impl Connection {
             for (offset, flag) in arg[1..].char_indices() {
                 match flag {
                     // These are not interactive SSH connections.
-                    'O' | 'W' | 'G' | 'V' | 'Q' | 's' => return None,
+                    'O' | 'W' | 'G' | 'V' | 'Q' | 's' | 'N' | 'f' => return None,
                     'B' | 'b' | 'c' | 'D' | 'E' | 'e' | 'F' | 'I' | 'i' | 'J' | 'L'
                     | 'l' | 'm' | 'o' | 'P' | 'p' | 'R' | 'S' | 'w' => {
                         let value_start = offset + 2;
@@ -98,7 +105,7 @@ impl Connection {
                     | 'Y' | 'y' => {
                         options.push(format!("-{flag}"));
                     }
-                    'f' | 'g' | 'M' | 'N' | 'n' | 'T' | 't' => {}
+                    'g' | 'M' | 'n' | 'T' | 't' => {}
                     _ => return None,
                 }
             }
@@ -126,11 +133,14 @@ impl Connection {
         Some(connection)
     }
 
+    fn program(&self) -> &str {
+        self.program
+            .as_deref()
+            .unwrap_or(if cfg!(windows) { "ssh.exe" } else { "ssh" })
+    }
+
     fn command(&self) -> Command {
-        #[cfg(windows)]
-        let mut command = Command::new(windows::program());
-        #[cfg(not(windows))]
-        let mut command = Command::new("ssh");
+        let mut command = Command::new(self.program());
         command.args(&self.options);
         command
     }
@@ -189,20 +199,22 @@ impl Connection {
                 let mut check = self.command();
                 check.args(["-S", &path, "-O", "check", &self.destination]);
                 let output = local_output(check)?;
-                if !output.status.success() {
-                    return Err(command_error("The shared SSH connection is unavailable. Reconnect with Connect via SSH before opening another tab or split", &output));
+                if output.status.success() {
+                    vec![
+                        "-S".into(),
+                        path,
+                        "-oControlMaster=no".into(),
+                        // If the master dies after the check, do not authenticate again.
+                        "-oPreferredAuthentications=none".into(),
+                    ]
+                } else {
+                    // Native `ssh host` need not have created a shared master.
+                    // Let a new terminal connection authenticate normally.
+                    vec!["-oControlMaster=no".into(), "-S".into(), "none".into()]
                 }
-                vec![
-                    "-S".into(),
-                    path,
-                    "-oControlMaster=no".into(),
-                    // If the master dies after the check, do not authenticate again.
-                    "-oPreferredAuthentications=none".into(),
-                ]
             };
             args.extend(
                 [
-                    "-oBatchMode=yes",
                     "-oConnectTimeout=5",
                     "-oConnectionAttempts=1",
                     "-oClearAllForwardings=yes",
@@ -273,7 +285,7 @@ impl Connection {
             args.push(posix_quote(shell));
         }
         Ok(Shell {
-            program: Some("ssh".into()),
+            program: Some(self.program().into()),
             args,
         })
     }
@@ -372,7 +384,15 @@ fn default_control_path() -> Result<String, String> {
 
 /// Bound configuration and sharing checks. Match exec in a user's SSH config
 /// must not leave the window waiting indefinitely.
-fn local_output(mut command: Command) -> Result<std::process::Output, String> {
+fn local_output(command: Command) -> Result<std::process::Output, String> {
+    capture_output(command, None, Duration::from_secs(2))
+}
+
+fn capture_output(
+    mut command: Command,
+    input: Option<Vec<u8>>,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
     use std::io::Read;
     let program = command.get_program().to_string_lossy().into_owned();
     #[cfg(windows)]
@@ -382,11 +402,22 @@ fn local_output(mut command: Command) -> Result<std::process::Output, String> {
         command.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
     let mut child = command
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Could not start {program}: {e}"))?;
+    if let Some(input) = input {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().unwrap();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+        });
+    }
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
     let stdout = std::thread::spawn(move || {
@@ -415,7 +446,7 @@ fn local_output(mut command: Command) -> Result<std::process::Output, String> {
                     stderr,
                 });
             }
-            Ok(None) if start.elapsed() < Duration::from_secs(2) => {
+            Ok(None) if start.elapsed() < timeout => {
                 std::thread::sleep(Duration::from_millis(5))
             }
             _ => {
@@ -571,6 +602,36 @@ mod tests {
     }
 
     #[test]
+    fn selected_ssh_executable_survives_recipes_and_history() {
+        for program in ["/opt/openssh/bin/ssh", "C:\\OpenSSH\\ssh.exe"] {
+            let connection = Connection::from_shell(&Shell {
+                program: Some(program.into()),
+                args: vec!["-A".into(), "host".into()],
+            })
+            .unwrap();
+            assert_eq!(connection.command().get_program(), program);
+            let shell = connection.finish_shell(vec![], None).unwrap();
+            assert_eq!(shell.program.as_deref(), Some(program));
+            #[cfg(windows)]
+            for duplicate in [false, true] {
+                let shell = windows::shell(&connection, None, duplicate).unwrap();
+                assert_eq!(shell.program.as_deref(), Some(program));
+            }
+            let saved = toml::to_string(&connection).unwrap();
+            let restored: Connection = toml::from_str(&saved).unwrap();
+            assert_eq!(restored.command().get_program(), program);
+        }
+    }
+
+    #[test]
+    fn old_connection_history_uses_ssh_from_path() {
+        let connection: Connection =
+            toml::from_str("destination = 'host'\npowershell = false").unwrap();
+        let expected = if cfg!(windows) { "ssh.exe" } else { "ssh" };
+        assert_eq!(connection.command().get_program(), expected);
+    }
+
+    #[test]
     fn preserves_identity_options_after_destination_and_in_saved_recipes() {
         let connection = parse(&[
             "host",
@@ -615,7 +676,7 @@ mod tests {
         ])
         .unwrap();
         let shell = connection.connect_shell().unwrap();
-        assert_eq!(shell.program.as_deref(), windows::program().to_str());
+        assert_eq!(shell.program.as_deref(), Some(connection.program()));
         assert!(!shell
             .args
             .iter()
@@ -658,7 +719,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn missing_control_socket_fails_without_connecting_or_authenticating() {
+    fn missing_control_socket_launches_an_independent_interactive_connection() {
         let connection = parse(&[
             "-F",
             "/dev/null",
@@ -667,10 +728,10 @@ mod tests {
             "no-network.invalid",
         ])
         .unwrap();
-        assert!(connection
-            .duplicate_shell(None, None)
-            .unwrap_err()
-            .contains("unavailable"));
+        let shell = connection.duplicate_shell(None, None).unwrap();
+        assert!(shell.args.iter().any(|arg| arg == "-oControlMaster=no"));
+        assert!(shell.args.windows(2).any(|args| args == ["-S", "none"]));
+        assert!(!shell.args.iter().any(|arg| arg == "-oBatchMode=yes"));
     }
 
     #[cfg(unix)]

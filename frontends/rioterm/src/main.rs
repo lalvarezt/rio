@@ -148,6 +148,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         AttachConsole(ATTACH_PARENT_PROCESS);
     }
 
+    // Shell-facing helpers must run before configuration, logging, or a GUI.
+    let mut helper_args = std::env::args_os().skip(1);
+    if helper_args.next().as_deref() == Some(std::ffi::OsStr::new("+ssh")) {
+        std::process::exit(ssh::native::run(helper_args));
+    }
+
     // Load command line options.
     let args = cli::Cli::parse();
 

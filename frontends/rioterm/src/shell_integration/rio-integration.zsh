@@ -6,6 +6,13 @@ if [[ -n "${_rio_integration+x}" ]]; then
 fi
 builtin typeset -g _rio_integration=1
 
+if [[ -n ${RIO_BIN-} ]] && (( ! $+functions[ssh] && ! $+aliases[ssh] )); then
+    ssh() {
+        local native=${commands[ssh]:-ssh}
+        "$RIO_BIN" +ssh --ssh "$native" -- "$@"
+    }
+fi
+
 _rio_report_pwd() {
     builtin printf '\e]7;kitty-shell-cwd://%s%s\a' "${HOST-}" "$PWD"
 }

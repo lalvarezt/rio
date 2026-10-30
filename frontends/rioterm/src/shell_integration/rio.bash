@@ -3,6 +3,14 @@
 [[ -z ${_rio_bash_context_loaded-} ]] || return
 _rio_bash_context_loaded=1
 
+if [[ -n ${RIO_BIN-} ]] && ! declare -F ssh >/dev/null && ! alias ssh &>/dev/null; then
+    ssh() {
+        local native
+        native=$(type -P ssh) || return 127
+        "$RIO_BIN" +ssh --ssh "$native" -- "$@"
+    }
+fi
+
 _rio_report_app() {
     local app="${1##*/}" encoded transport=MA== had_functrace=0
     [[ -n ${SSH_CONNECTION-}${SSH_CLIENT-}${SSH_TTY-} ]] && transport=MQ==
@@ -38,6 +46,7 @@ _rio_preexec() {
 _rio_prompt_app() {
     local previous_status=$?
     builtin printf '\e]133;A\a'
+    builtin printf '\e]7;kitty-shell-cwd://%s%s\a' "${HOSTNAME-}" "$PWD"
     _rio_report_app bash
     _rio_at_prompt=1
     return "$previous_status"

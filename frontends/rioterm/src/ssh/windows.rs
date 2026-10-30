@@ -1,16 +1,6 @@
 //! Native Windows OpenSSH. Each pane owns an independent SSH process.
 use super::*;
 
-pub(super) fn program() -> PathBuf {
-    if let Some(root) = std::env::var_os("SystemRoot") {
-        let path = PathBuf::from(root).join("System32/OpenSSH/ssh.exe");
-        if path.is_file() {
-            return path;
-        }
-    }
-    PathBuf::from("ssh.exe")
-}
-
 pub(super) fn shell(
     connection: &Connection,
     directory: Option<&Path>,
@@ -36,9 +26,7 @@ pub(super) fn shell(
         ]);
     }
     args.extend(connection.options.clone());
-    let mut shell = connection.finish_shell(args, directory)?;
-    shell.program = Some(program().to_string_lossy().into_owned());
-    Ok(shell)
+    connection.finish_shell(args, directory)
 }
 
 #[cfg(test)]
@@ -57,7 +45,7 @@ mod tests {
         ])
         .unwrap();
         let shell = shell(&connection, None, true).unwrap();
-        assert_eq!(shell.program.as_deref(), program().to_str());
+        assert_eq!(shell.program.as_deref(), Some(connection.program()));
         assert!(shell.args.iter().any(|arg| arg == "-A"));
         assert!(shell.args.windows(2).any(|args| args == ["-p", "2222"]));
         assert!(shell

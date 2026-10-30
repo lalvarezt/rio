@@ -16,6 +16,13 @@ end
 
 status is-interactive; or exit
 
+if set -q RIO_BIN; and not functions -q ssh
+    function ssh --wraps=ssh --description 'SSH with Rio terminal integration'
+        set -l native (command -s ssh)
+        "$RIO_BIN" +ssh --ssh "$native" -- $argv
+    end
+end
+
 function __rio_report_pwd --on-variable PWD --on-event fish_prompt \
         --description 'Report the working directory to rio (OSC 7)'
     printf '\e]7;kitty-shell-cwd://%s%s\a' $hostname $PWD

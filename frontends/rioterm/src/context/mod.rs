@@ -74,6 +74,7 @@ pub struct Context<T: EventListener> {
     pub spawned_program: String,
     /// Present for panes launched directly through Rio's SSH connector.
     pub ssh: Option<crate::ssh::Connection>,
+    ssh_session: Option<crate::ssh::native::PaneSession>,
     _io_thread: Option<JoinHandle<(Machine<teletypewriter::Pty, T>, performer::State)>>,
 }
 
@@ -226,6 +227,7 @@ pub fn create_dead_context<T: rio_backend::event::EventListener>(
         title_dirty: false,
         spawned_program: String::new(),
         ssh: None,
+        ssh_session: None,
         _io_thread: None,
     }
 }
@@ -317,14 +319,21 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         let metadata = terminal.metadata.clone();
         let terminal: Arc<FairMutex<Crosswords<T>>> = Arc::new(FairMutex::new(terminal));
 
-        let integration = if config.shell_integration {
-            crate::shell_integration::prepare(
-                config.shell.program.as_deref(),
-                &config.shell.args,
-            )
-        } else {
-            crate::shell_integration::SpawnIntegration::default()
-        };
+        let mut integration =
+            if crate::ssh::Connection::from_shell(&config.shell).is_some() {
+                crate::ssh::native::prepare_shell(&config.shell)
+            } else if config.shell_integration {
+                crate::shell_integration::prepare(
+                    config.shell.program.as_deref(),
+                    &config.shell.args,
+                )
+            } else {
+                crate::shell_integration::SpawnIntegration::default()
+            };
+        let ssh_session = crate::ssh::native::PaneSession::new(route_id);
+        if let Some(session) = &ssh_session {
+            integration.env.push(session.env());
+        }
         let (shell_program, shell_args) = match &integration.command {
             Some((program, args)) => (program.as_deref(), args.as_slice()),
             None => (
@@ -436,6 +445,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 .ssh
                 .clone()
                 .or_else(|| crate::ssh::Connection::from_shell(&config.shell)),
+            ssh_session,
             title: ContextTitle::default(),
             title_dirty: false,
             spawned_program: spawned_program_name(config),
@@ -1297,6 +1307,14 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     }
 
     pub fn current_ssh(&self) -> Option<crate::ssh::Connection> {
+        if let Some(connection) = self
+            .current()
+            .ssh_session
+            .as_ref()
+            .and_then(|session| session.connection())
+        {
+            return Some(connection);
+        }
         if let Some(connection) = &self.current().ssh {
             return Some(connection.clone());
         }
@@ -1627,6 +1645,23 @@ pub mod test {
     use super::*;
     use crate::event::VoidListener;
 
+    #[test]
+    fn typed_ssh_uses_local_pane_recipe_and_local_tabs_clear_it() {
+        let mut manager =
+            ContextManager::start_with_capacity(1, VoidListener {}, WindowId::from(0))
+                .unwrap();
+        let session = crate::ssh::native::PaneSession::new(usize::MAX - 3).unwrap();
+        let path = std::path::PathBuf::from(session.env().1)
+            .join(std::process::id().to_string());
+        let connection = crate::ssh::Connection::new("native-host", false).unwrap();
+        std::fs::write(&path, toml::to_string(&connection).unwrap()).unwrap();
+        manager.current_mut().ssh_session = Some(session);
+        assert_eq!(manager.current_ssh(), Some(connection));
+        assert!(manager.config_here(false).unwrap().ssh.is_none());
+        std::fs::remove_file(path).unwrap();
+        assert!(manager.current_ssh().is_none());
+    }
+
     #[cfg(windows)]
     #[test]
     #[ignore = "requires RIO_TEST_SSH_TARGET and remote Rio shell integration"]
@@ -1664,7 +1699,7 @@ pub mod test {
         }
         let connection = crate::ssh::Connection::from_shell(&Shell {
             program: Some("ssh".into()),
-            args,
+            args: args.clone(),
         })
         .unwrap();
         let shell = connection.connect_shell().unwrap();
@@ -1706,6 +1741,32 @@ pub mod test {
         config.shell_integration = false;
         config.shell = shell;
         config.ssh = Some(connection.clone());
+        if let Ok(wrapper) = std::env::var("RIO_TEST_SSH_WRAPPER_BIN") {
+            use base64::Engine as _;
+            let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
+            let args = args
+                .iter()
+                .map(|arg| quote(arg))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let script = format!(
+                "$env:RIO_BIN={};\n{}\nssh -t {args}",
+                quote(&wrapper),
+                include_str!("../shell_integration/rio-ssh.ps1"),
+            );
+            let bytes: Vec<u8> =
+                script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            config.shell = Shell {
+                program: Some("powershell.exe".into()),
+                args: vec![
+                    "-NoLogo".into(),
+                    "-NoExit".into(),
+                    "-EncodedCommand".into(),
+                    base64::engine::general_purpose::STANDARD.encode(bytes),
+                ],
+            };
+            config.ssh = None;
+        }
         manager.add_context_with_config(true, 1, config);
         let deadline = Instant::now() + std::time::Duration::from_secs(20);
         loop {
@@ -1720,10 +1781,12 @@ pub mod test {
             {
                 break;
             }
-            assert!(
-                Instant::now() < deadline,
-                "SSH did not start a remote shell over ConPTY"
-            );
+            if Instant::now() >= deadline {
+                let terminal = manager.current().terminal.lock();
+                let output: String =
+                    terminal.grid.display_iter().map(|cell| cell.c()).collect();
+                panic!("SSH did not start a remote shell over ConPTY: {output}");
+            }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         manager

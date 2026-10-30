@@ -14,11 +14,13 @@
 //! rewritten to `-NoExit -EncodedCommand <script>` carrying the script
 //! inline, which runs after the user's profile and is exempt from
 //! execution policy (the default Windows client policy blocks script
-//! FILES, so a dot-sourced file would error in every pane). Shells
-//! with neither hook (bash needs `--posix` argv surgery, cmd.exe only
-//! has a machine-wide registry key) are left untouched, and every
+//! FILES, so a dot-sourced file would error in every pane). A bare Bash
+//! spawn uses an rcfile that loads the user's .bashrc first. Configured
+//! Bash arguments and cmd.exe are left untouched, and every
 //! integrated pane exports `RIO_SHELL_INTEGRATION` pointing at the
 //! script directory so any shell can source the integration manually.
+//! Supported shells also wrap native `ssh` with `rio +ssh` unless the
+//! user already defined an SSH function or alias.
 //!
 //! Old versions' script directories are deliberately left in place: a
 //! concurrently running older rio still spawns shells whose `ZDOTDIR`
@@ -32,6 +34,7 @@ const ZSH_ZSHENV: &str = include_str!("zshenv.zsh");
 const ZSH_INTEGRATION: &str = include_str!("rio-integration.zsh");
 const FISH_INTEGRATION: &str = include_str!("rio.fish");
 const POWERSHELL_INTEGRATION: &str = include_str!("rio.ps1");
+const POWERSHELL_SSH: &str = include_str!("rio-ssh.ps1");
 const BASH_INTEGRATION: &str = include_str!("rio.bash");
 
 /// Everything shell integration wants applied to one spawn: extra
@@ -63,7 +66,21 @@ pub fn prepare(shell_program: Option<&str>, args: &[String]) -> SpawnIntegration
         "RIO_SHELL_INTEGRATION".to_string(),
         dir.to_string_lossy().to_string(),
     ));
-    let command = powershell_command(&shell_name, shell_program, &program, args);
+    if let Ok(executable) = std::env::current_exe() {
+        env.push(("RIO_BIN".into(), executable.to_string_lossy().into_owned()));
+    }
+    let command =
+        powershell_command(&shell_name, shell_program, &program, args).or_else(|| {
+            (shell_name == "bash" && args.is_empty()).then(|| {
+                (
+                    shell_program.map(str::to_owned),
+                    vec![
+                        "--rcfile".into(),
+                        dir.join("rio.bashrc").to_string_lossy().into_owned(),
+                    ],
+                )
+            })
+        });
     SpawnIntegration { env, command }
 }
 
@@ -181,7 +198,8 @@ fn powershell_command(
 fn powershell_args() -> Vec<String> {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
-    let utf16le: Vec<u8> = POWERSHELL_INTEGRATION
+    let script = format!("{POWERSHELL_INTEGRATION}\n{POWERSHELL_SSH}");
+    let utf16le: Vec<u8> = script
         .encode_utf16()
         .flat_map(|unit| unit.to_le_bytes())
         .collect();
@@ -196,11 +214,25 @@ fn powershell_args() -> Vec<String> {
 /// by rio's version so upgrades write fresh scripts and downgrades
 /// never read newer ones.
 fn integration_dir() -> Option<&'static Path> {
+    use std::hash::{Hash, Hasher};
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     DIR.get_or_init(|| {
-        let base = dirs::cache_dir()?
-            .join("rio")
-            .join(format!("shell-integration-{}", env!("CARGO_PKG_VERSION")));
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        for script in [
+            ZSH_ZSHENV,
+            ZSH_INTEGRATION,
+            FISH_INTEGRATION,
+            POWERSHELL_INTEGRATION,
+            POWERSHELL_SSH,
+            BASH_INTEGRATION,
+        ] {
+            script.hash(&mut hash);
+        }
+        let base = dirs::cache_dir()?.join("rio").join(format!(
+            "shell-integration-{}-{:016x}",
+            env!("CARGO_PKG_VERSION"),
+            hash.finish()
+        ));
         if let Err(err) = materialize(&base) {
             tracing::warn!("shell integration scripts not written: {err}");
             return None;
@@ -223,10 +255,15 @@ fn materialize(base: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(&fish)?;
     write_if_changed(&fish.join("rio.fish"), FISH_INTEGRATION)?;
     write_if_changed(&base.join("rio.bash"), BASH_INTEGRATION)?;
+    write_if_changed(&base.join("rio.bashrc"),
+        "[[ -f ~/.bashrc ]] && source ~/.bashrc\nsource \"$RIO_SHELL_INTEGRATION/rio.bash\"\n")?;
 
     let powershell = base.join("powershell");
     std::fs::create_dir_all(&powershell)?;
-    write_if_changed(&powershell.join("rio.ps1"), POWERSHELL_INTEGRATION)?;
+    write_if_changed(
+        &powershell.join("rio.ps1"),
+        &format!("{POWERSHELL_INTEGRATION}\n{POWERSHELL_SSH}"),
+    )?;
     Ok(())
 }
 
@@ -330,7 +367,10 @@ mod test {
             .chunks_exact(2)
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect();
-        assert_eq!(String::from_utf16(&units).unwrap(), POWERSHELL_INTEGRATION);
+        assert_eq!(
+            String::from_utf16(&units).unwrap(),
+            format!("{POWERSHELL_INTEGRATION}\n{POWERSHELL_SSH}")
+        );
     }
 
     #[test]
@@ -446,5 +486,96 @@ mod test {
         assert_eq!(std::fs::read_to_string(&zshenv).unwrap(), ZSH_ZSHENV);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_wrappers_preserve_arguments_status_and_user_functions() {
+        use std::os::unix::fs::PermissionsExt;
+        let base =
+            std::env::temp_dir().join(format!("rio-ssh-shells-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let helper = base.join("rio helper");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$RIO_TEST_ARGV\"\nexit 23\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        for (shell, script) in [
+            ("bash", BASH_INTEGRATION),
+            ("zsh", ZSH_INTEGRATION),
+            ("fish", FISH_INTEGRATION),
+        ] {
+            let source = base.join(format!("rio.{shell}"));
+            std::fs::write(&source, script).unwrap();
+            let argv_file = base.join(format!("{shell}-argv"));
+            let body = format!(
+                "source '{}'; ssh -A host \"printf '%s' 'a b; \\$x'\"",
+                source.display()
+            );
+            let command = || {
+                let mut command = std::process::Command::new(shell);
+                match shell {
+                    "bash" => {
+                        command.args(["--noprofile", "--norc"]);
+                    }
+                    "zsh" => {
+                        command.arg("-df");
+                    }
+                    "fish" => {
+                        command.arg("--no-config");
+                    }
+                    _ => unreachable!(),
+                }
+                command
+                    .env("RIO_BIN", &helper)
+                    .env("RIO_TEST_ARGV", &argv_file);
+                command
+            };
+            let output = command()
+                .args(["-ic", &body])
+                .env("RIO_BIN", &helper)
+                .env("RIO_TEST_ARGV", &argv_file)
+                .output();
+            let output = match output {
+                Ok(output) => output,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("{shell}: {error}"),
+            };
+            assert_eq!(
+                output.status.code(),
+                Some(23),
+                "{shell}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let passed = std::fs::read_to_string(&argv_file).unwrap();
+            let passed: Vec<_> = passed.lines().collect();
+            assert_eq!(&passed[..2], ["+ssh", "--ssh"], "{shell}");
+            assert_eq!(
+                &passed[3..],
+                ["--", "-A", "host", "printf '%s' 'a b; $x'"],
+                "{shell}"
+            );
+
+            let body = if shell == "fish" {
+                format!(
+                    "function ssh; echo USER_SSH; end; source '{}'; ssh",
+                    source.display()
+                )
+            } else {
+                format!(
+                    "ssh() {{ echo USER_SSH; }}; source '{}'; ssh",
+                    source.display()
+                )
+            };
+            let output = command().args(["-ic", &body]).output().unwrap();
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("USER_SSH"),
+                "{shell}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(base);
     }
 }
