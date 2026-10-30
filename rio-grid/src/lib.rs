@@ -40,6 +40,9 @@ use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+mod raster_cache;
+use raster_cache::{RasterCache, RasterKey};
+
 /// Snapshot's per-frame extras map. Keyed by the cell's `extras_id`,
 /// populated by `Crosswords::snapshot_visible` from a walk of visible
 /// cells. The renderer reads via `extras.get(&id)`.
@@ -1371,6 +1374,9 @@ pub struct GridGlyphRasterizer {
     synthesis_cache: FxHashMap<u32, (bool, bool)>,
     run_cache: Vec<Vec<RunCacheEntry>>,
     geometry_cache: GeometryCache,
+    bitmap_cache: RasterCache,
+    #[cfg(test)]
+    rasterizations: usize,
 
     // macOS: stage the run in UTF-16 (what CoreText wants natively)
     // so the shaper call can hand the buffer straight to
@@ -1449,6 +1455,9 @@ impl GridGlyphRasterizer {
                 .map(|_| Vec::with_capacity(RUN_BUCKET_SIZE))
                 .collect(),
             geometry_cache: GeometryCache::default(),
+            bitmap_cache: RasterCache::default(),
+            #[cfg(test)]
+            rasterizations: 0,
             #[cfg(target_os = "macos")]
             run_utf16_scratch: Vec::new(),
             run_cell_starts: Vec::new(),
@@ -1479,6 +1488,7 @@ impl GridGlyphRasterizer {
         self.font_resolve.clear();
         self.ascent_cache.clear();
         self.synthesis_cache.clear();
+        self.bitmap_cache.clear();
         self.geometry_cache = GeometryCache::default();
         for bucket in &mut self.run_cache {
             bucket.clear();
@@ -3023,6 +3033,108 @@ mod geometry_tests {
     use rio_backend::sugarloaf::grid::cpu::CpuGridRenderer;
 
     #[test]
+    fn pane_atlases_reuse_rasters_but_keep_their_own_slots() {
+        let fonts = FontLibrary::default();
+        let mut rasterizer = GridGlyphRasterizer::new();
+        let (font, emoji) = rasterizer.resolve_font('A', 0, &fonts, 0);
+        let (bold, italic) = rasterizer.get_synthesis(font, &fonts);
+        let run =
+            shape_preedit_text(&mut rasterizer, "ABC", font, 16, 64, &fonts).unwrap();
+        shape_preedit_text(&mut rasterizer, "ABC", font, 16, 64, &fonts).unwrap();
+        let mut first = GridRenderer::Cpu(CpuGridRenderer::new(80, 24));
+        let mut second = GridRenderer::Cpu(CpuGridRenderer::new(80, 24));
+        let resolve = |grid: &mut GridRenderer, rasterizer: &mut GridGlyphRasterizer| {
+            resolve_run_geometry(
+                &run, rasterizer, grid, font, 64, 16, 20.0, emoji, italic, bold,
+            )
+            .unwrap()
+        };
+        let a = resolve(&mut first, &mut rasterizer);
+        let initial = rasterizer.rasterizations;
+        assert!(initial > 0);
+        let b = resolve(&mut second, &mut rasterizer);
+        assert!(!Arc::ptr_eq(&a, &b), "atlas slots belong to each pane");
+        assert_eq!(
+            rasterizer.rasterizations, initial,
+            "the same glyph bitmap should only be rasterized once"
+        );
+        second.clear_atlas();
+        let rebuilt = resolve(&mut second, &mut rasterizer);
+        assert!(!Arc::ptr_eq(&b, &rebuilt));
+        assert_eq!(
+            rasterizer.rasterizations, initial,
+            "atlas resets can re-upload the existing bitmap"
+        );
+        rasterizer.clear_font_caches();
+        second.clear_atlas();
+        let refreshed =
+            shape_preedit_text(&mut rasterizer, "ABC", font, 16, 64, &fonts).unwrap();
+        shape_preedit_text(&mut rasterizer, "ABC", font, 16, 64, &fonts).unwrap();
+        resolve_run_geometry(
+            &refreshed,
+            &mut rasterizer,
+            &mut second,
+            font,
+            64,
+            16,
+            20.0,
+            emoji,
+            italic,
+            bold,
+        )
+        .unwrap();
+        assert!(
+            rasterizer.rasterizations > initial,
+            "font reloads invalidate cached bitmaps"
+        );
+    }
+
+    #[test]
+    #[ignore = "CPU profiling harness; run explicitly with --ignored --nocapture"]
+    fn profile_fresh_panes() {
+        let fonts = FontLibrary::default();
+        let trials = std::env::var("RIO_BENCH_TRIALS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1);
+        for _ in 0..trials {
+            let mut rasterizer = GridGlyphRasterizer::new();
+            if std::env::var_os("RIO_BENCH_DISABLE_BITMAP_CACHE").is_some() {
+                rasterizer.bitmap_cache = RasterCache::new(0);
+            }
+            let (font, emoji) = rasterizer.resolve_font('A', 0, &fonts, 0);
+            let (bold, italic) = rasterizer.get_synthesis(font, &fonts);
+            let text: String = ('!'..='~').collect();
+            let run =
+                shape_preedit_text(&mut rasterizer, &text, font, 20, 80, &fonts).unwrap();
+            shape_preedit_text(&mut rasterizer, &text, font, 20, 80, &fonts).unwrap();
+            let mut times = Vec::new();
+            let mut counts = Vec::new();
+            for _ in 0..8 {
+                let mut grid = GridRenderer::Cpu(CpuGridRenderer::new(160, 50));
+                let previous = rasterizer.rasterizations;
+                let start = std::time::Instant::now();
+                resolve_run_geometry(
+                    &run,
+                    &mut rasterizer,
+                    &mut grid,
+                    font,
+                    80,
+                    20,
+                    25.0,
+                    emoji,
+                    italic,
+                    bold,
+                )
+                .unwrap();
+                times.push(start.elapsed().as_micros());
+                counts.push(rasterizer.rasterizations - previous);
+            }
+            println!("{{\"pane_us\":{times:?},\"rasterizations\":{counts:?}}}");
+        }
+    }
+
+    #[test]
     fn fractional_sizes_in_one_bucket_do_not_reuse_different_shapes() {
         let fonts = FontLibrary::default();
         let mut rasterizer = GridGlyphRasterizer::new();
@@ -3039,6 +3151,36 @@ mod geometry_tests {
         assert!(!Arc::ptr_eq(&first, &actual));
         assert_eq!(actual.advance, expected.advance);
         assert_eq!(actual.ascent_px, expected.ascent_px);
+    }
+
+    #[test]
+    fn shared_rasters_distinguish_pixel_size_and_synthesis() {
+        let fonts = FontLibrary::default();
+        let mut rasterizer = GridGlyphRasterizer::new();
+        let (font, emoji) = rasterizer.resolve_font('A', 0, &fonts, 0);
+        let run = shape_preedit_text(&mut rasterizer, "A", font, 16, 66, &fonts).unwrap();
+        let glyph = run.glyphs[0].id;
+        for (pixels, bold) in [(16, false), (17, false), (17, true)] {
+            let mut grid = GridRenderer::Cpu(CpuGridRenderer::new(80, 24));
+            ensure_glyph_by_id(
+                &mut rasterizer,
+                &mut grid,
+                font,
+                glyph,
+                66,
+                pixels,
+                20.0,
+                run.ascent_px,
+                emoji,
+                false,
+                bold,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            rasterizer.rasterizations, 3,
+            "different raster sizes and synthetic weights need distinct pixels"
+        );
     }
 
     #[test]
@@ -3129,7 +3271,23 @@ fn ensure_glyph_by_id(
         return Some((key, slot, true));
     }
 
+    let raster_key = RasterKey {
+        font_id,
+        glyph_id,
+        pixels: size_u16,
+        emoji: is_emoji,
+        bold: synthetic_bold,
+        italic: synthetic_italic,
+    };
+    if let Some(raw) = rasterizer.bitmap_cache.get(&raster_key) {
+        return insert_raw_glyph(grid, key, raw, cell_h, ascent_px);
+    }
+
     // Rasterize via the platform-native backend.
+    #[cfg(test)]
+    {
+        rasterizer.rasterizations += 1;
+    }
     let raw = rasterize_glyph_native(
         rasterizer,
         font_id,
@@ -3139,6 +3297,22 @@ fn ensure_glyph_by_id(
         synthetic_bold,
         synthetic_italic,
     )?;
+    let result = insert_raw_glyph(grid, key, &raw, cell_h, ascent_px);
+    rasterizer.bitmap_cache.insert(raster_key, &raw);
+    #[cfg(not(target_os = "macos"))]
+    {
+        rasterizer.glyph_bytes = raw.bytes;
+    }
+    result
+}
+
+fn insert_raw_glyph(
+    grid: &mut GridRenderer,
+    key: GlyphKey,
+    raw: &RawGlyph,
+    cell_h: f32,
+    ascent_px: i16,
+) -> Option<(GlyphKey, AtlasSlot, bool)> {
     let is_color = raw.is_color;
 
     // Convert CG-convention `left`/`top` into grid-convention
@@ -3162,10 +3336,6 @@ fn ensure_glyph_by_id(
     } else {
         grid.insert_glyph(key, raster)
     };
-    #[cfg(not(target_os = "macos"))]
-    {
-        rasterizer.glyph_bytes = raw.bytes;
-    }
     Some((key, slot?, is_color))
 }
 
@@ -3274,6 +3444,7 @@ fn ensure_custom_glyph_by_codepoint(
 /// Platform-agnostic raw-glyph struct. Both backends populate this
 /// shape and let the caller convert bearings to the grid's
 /// cell-bottom-relative convention.
+#[derive(Clone)]
 struct RawGlyph {
     width: u32,
     height: u32,

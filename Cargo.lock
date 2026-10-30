@@ -4709,6 +4709,7 @@ dependencies = [
  "criterion",
  "dashmap",
  "deflate",
+ "dwrote",
  "font-kit",
  "fontconfig-parser",
  "futures",

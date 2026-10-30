@@ -1,91 +1,113 @@
-//! Windows per-codepoint font discovery via font-kit walk.
-//!
-//! On Linux we get this via fontconfig's `FcFontSort` + `FcCharSet`
-//! (a single C call returns sorted candidates). On Windows there's no
-//! equivalent in our dep tree — `IDWriteFontFallback::MapCharacters`
-//! would be the moral twin but lives in the `windows` / `dwrote` crates,
-//! neither of which Debian ships, so we'd violate the workspace's
-//! Debian-only constraint.
-//!
-//! The fallback approach here: ask font-kit for every installed font,
-//! then mmap each and probe its CMAP for the codepoint via ttf-parser.
-//! Slower per cold lookup than DirectWrite (we touch every font file
-//! once until we hit a match), but cached at the font-cache layer so
-//! the cost amortizes to zero after the first hit per codepoint per
-//! session. doesn't ship Windows discovery yet either, so this
-//! still puts us ahead.
-//!
-//! Future replacement path: when either `windows` or `dwrote` lands in
-//! Debian, swap the body of `discover_fallback` for a single
-//! `IDWriteFontFallback::MapCharacters` call and delete the walk.
+//! Windows font fallback through DirectWrite's character mapping.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
-use font_kit::handle::Handle;
-use font_kit::source::SystemSource;
-use memmap2::Mmap;
+use dwrote::{
+    FontCollection, FontFallback, FontStretch, FontStyle, FontWeight, TextAnalysisSource,
+    TextAnalysisSourceMethods,
+};
 
-/// Cached list of every installed font path + collection index.
-/// Built once on first miss; subsequent misses iterate in-memory only.
-/// `Vec<(PathBuf, u32)>` rather than `Vec<Handle>` so we don't hold
-/// onto font-kit's Memory variant (would defeat the lazy mmap).
-static SYSTEM_FONTS: OnceLock<Vec<(PathBuf, u32)>> = OnceLock::new();
-
-fn system_font_index() -> &'static [(PathBuf, u32)] {
-    SYSTEM_FONTS
-        .get_or_init(|| {
-            let source = SystemSource::new();
-            source
-                .all_fonts()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|h| match h {
-                    Handle::Path { path, font_index } => Some((path, font_index)),
-                    Handle::Memory { .. } => None,
-                })
-                .collect()
-        })
-        .as_slice()
+// DirectWrite objects stay on the thread that uses them. Mapping a character
+// avoids enumerating and opening every installed font on the rendering thread.
+thread_local! {
+    static FALLBACK: (FontCollection, Option<FontFallback>) = (
+        FontCollection::system(),
+        FontFallback::get_system_fallback(),
+    );
 }
 
-/// Find a font file installed on the system that contains `ch`.
-///
-/// The signature mirrors `font/linux.rs::discover_fallback` so the
-/// cross-platform call site in `FontLibrary::resolve_font_for_char`
-/// stays platform-uniform. Style hints are accepted but ignored on
-/// this path — picking the right weight/italic among multiple matches
-/// would require reading each candidate's `OS/2` table, and the
-/// payoff is small for fallback glyphs (CJK, emoji, symbols are
-/// usually single-weight families anyway).
+struct CharacterSource {
+    length: u32,
+}
+
+impl TextAnalysisSourceMethods for CharacterSource {
+    fn get_locale_name(&self, position: u32) -> (Cow<'_, str>, u32) {
+        (Cow::Borrowed("en-us"), self.length.saturating_sub(position))
+    }
+
+    fn get_paragraph_reading_direction(&self) -> u32 {
+        // DWRITE_READING_DIRECTION_LEFT_TO_RIGHT.
+        0
+    }
+}
+
+/// Find an installed font for one Unicode scalar, including supplementary
+/// characters represented by a UTF-16 surrogate pair.
 pub fn discover_fallback(
     _primary_family: &str,
     ch: char,
     _want_mono: bool,
-    _want_bold: bool,
-    _want_italic: bool,
+    want_bold: bool,
+    want_italic: bool,
 ) -> Option<(PathBuf, u32)> {
-    for (path, face_index) in system_font_index() {
-        if face_contains_char(path, *face_index, ch) {
-            return Some((path.clone(), *face_index));
+    let mut buffer = [0; 2];
+    let text = ch.encode_utf16(&mut buffer);
+    let length = text.len() as u32;
+    let source = TextAnalysisSource::from_text(
+        Box::new(CharacterSource { length }),
+        Cow::Borrowed(text),
+    );
+
+    FALLBACK.with(|(collection, fallback)| {
+        let mapped = fallback.as_ref()?.map_characters(
+            &source,
+            0,
+            length,
+            collection,
+            // The configured faces have already been checked by the caller.
+            None,
+            if want_bold {
+                FontWeight::Bold
+            } else {
+                FontWeight::Regular
+            },
+            if want_italic {
+                FontStyle::Italic
+            } else {
+                FontStyle::Normal
+            },
+            FontStretch::Normal,
+        );
+        if mapped.mapped_length < text.len() {
+            return None;
         }
-    }
-    None
+        let face = mapped.mapped_font?.create_font_face();
+        let path = face
+            .files()
+            .ok()?
+            .into_iter()
+            .find_map(|file| file.font_file_path().ok())?;
+        Some((path, face.get_index()))
+    })
 }
 
-/// `true` if the font at `(path, face_index)` declares a glyph for
-/// `ch`. mmap + parse + CMAP lookup; fast in practice (< 1 ms per
-/// font) because ttf-parser only walks the table directory and the
-/// CMAP, not the full font.
-fn face_contains_char(path: &PathBuf, face_index: u32, ch: char) -> bool {
-    let Ok(file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let Ok(mmap) = (unsafe { Mmap::map(&file) }) else {
-        return false;
-    };
-    let Ok(face) = ttf_parser::Face::parse(&mmap, face_index) else {
-        return false;
-    };
-    face.glyph_index(ch).is_some()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mapped_faces_cover_bmp_and_supplementary_characters() {
+        for (ch, bold, italic) in
+            [('─', false, false), ('Ω', true, true), ('😀', false, false)]
+        {
+            let (path, index) =
+                discover_fallback("Cascadia Mono", ch, true, bold, italic)
+                    .expect("Windows provides a font for this character");
+            let bytes = std::fs::read(path).unwrap();
+            let face = ttf_parser::Face::parse(&bytes, index).unwrap();
+            assert!(
+                face.glyph_index(ch).is_some(),
+                "mapped face must cover {ch}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_character_has_no_fallback() {
+        assert!(
+            discover_fallback("Cascadia Mono", '\u{10ffff}', true, false, false)
+                .is_none()
+        );
+    }
 }

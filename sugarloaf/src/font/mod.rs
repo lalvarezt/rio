@@ -307,8 +307,8 @@ impl FontLibrary {
     /// Slow-path cascade discovery — register a fallback font on
     /// first hit so future queries land in the fast path. Per-platform
     /// because the underlying API differs (CoreText `CTFontCreateForString`
-    /// on macOS, fontconfig `FcFontSort` on Linux, font-kit walk on
-    /// Windows). Returns `None` when no system font covers `ch`.
+    /// on macOS, fontconfig `FcFontSort` on Linux, DirectWrite character
+    /// mapping on Windows). Returns `None` when no system font covers `ch`.
     #[cfg(target_os = "macos")]
     fn cascade_discover(
         &self,
@@ -734,7 +734,7 @@ impl FontLibraryData {
     pub fn insert(&mut self, font_data: FontData) {
         let id = self.inner.len();
         // Index by PS name so the cascade resolver (CoreText on macOS,
-        // fontconfig on Linux, font-kit walk on Windows) can map a
+        // fontconfig on Linux, DirectWrite on Windows) can map a
         // discovered font back to a Rio `font_id`. Only paid at load
         // time. Duplicate names (same face loaded twice) resolve to
         // the first-inserted id, which is the entry the rest of the
@@ -1196,7 +1196,7 @@ pub struct FontData {
     /// PostScript name extracted at construction so the cross-platform
     /// `font_id_for_postscript_name` lookup can avoid reparsing the
     /// font file. Used by both the macOS CoreText cascade resolver and
-    /// the Linux/Windows fontconfig/font-kit cascade resolver to map
+    /// the Linux/Windows fontconfig/DirectWrite cascade resolver to map
     /// a discovered font back to a Rio `font_id`. `None` only for
     /// fonts where the PS name couldn't be parsed (rare — corrupt
     /// font, or zero-name TTF).
