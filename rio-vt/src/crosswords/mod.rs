@@ -2114,6 +2114,9 @@ impl<U: EventListener> Crosswords<U> {
 
     /// Write ordinary mixed-width text up to the current row boundary.
     /// Complex clusters and row-edge wide characters retain the scalar paths.
+    // Keep row mutation out of the run scanner's generated code so its live
+    // classification state does not compete with the writer's temporaries.
+    #[inline(never)]
     fn write_ordinary_row(
         &mut self,
         template: Square,
@@ -12268,6 +12271,10 @@ mod tests {
         use crate::performer::handler::Handler;
 
         let runs: Vec<Vec<u32>> = [
+            "éééééééééééééééééééééééééééééééé",
+            "日本語漢字日本語漢字日本語漢字日本語漢字",
+            "élève Straße привет سلام élève Straße привет سلام",
+            "éééééééééééééééé\u{301}中a",
             "a中é日b界c",
             "中a日é界b",
             "é日a中\u{301}b界",
