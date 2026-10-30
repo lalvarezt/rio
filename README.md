@@ -1,3 +1,24 @@
+## Personal fork disclaimer
+
+> [!WARNING]
+> **This is a personal project, provided as-is.**
+>
+> I maintain this fork for my own use. Expect rough edges and changes driven by
+> my needs, with no guarantees of stability, maintenance, or support.
+>
+> Most of the changes in this fork were developed with AI assistance.
+
+The design is heavily based on [Rex by Superlogical](https://www.superlogical.com/).
+
+- Credit to [Raphael Amorim](https://github.com/raphamorim), Rio's creator, and the
+[Rio contributors](https://github.com/raphamorim/rio) for the terminal this fork
+- Credit to [Mitchell Hashimoto](https://github.com/mitchellh), Ghostty's creator, and the
+[Ghostty contributors](https://github.com/ghostty-org/ghostty) for the terminal this fork
+builds on
+- Credit Superlogical team for Rex and its design.
+
+---
+
 <!-- LOGO -->
 <h1>
 <p align="center">
