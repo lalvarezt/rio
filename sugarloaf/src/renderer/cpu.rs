@@ -699,28 +699,27 @@ fn fill_translucent_simd(
         let row = &mut buf[row_start..row_end];
 
         // 256-bit chunks first.
-        let mut chunks8 = row.chunks_exact_mut(8);
-        for chunk in &mut chunks8 {
+        let (chunks8, tail) = row.as_chunks_mut::<8>();
+        for chunk in chunks8 {
             let dst = u32x8::new([
                 chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
                 chunk[7],
             ]);
             let out = blend_over_simd_const_src_x8(src_v8, inv_v8, dst);
             let arr = out.to_array();
-            chunk.copy_from_slice(&arr);
+            *chunk = arr;
         }
-        let tail = chunks8.into_remainder();
 
         // 128-bit tail.
-        let mut chunks4 = tail.chunks_exact_mut(4);
-        for chunk in &mut chunks4 {
+        let (chunks4, rest) = tail.as_chunks_mut::<4>();
+        for chunk in chunks4 {
             let dst = u32x4::new([chunk[0], chunk[1], chunk[2], chunk[3]]);
             let out = blend_over_simd_const_src_x4(src_v4, inv_v4, dst);
             let arr = out.to_array();
-            chunk.copy_from_slice(&arr);
+            *chunk = arr;
         }
         // Scalar tail.
-        for px in chunks4.into_remainder() {
+        for px in rest {
             *px = blend_over_swar(src_premul, *px);
         }
     }

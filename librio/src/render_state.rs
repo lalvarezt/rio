@@ -120,6 +120,13 @@ impl RenderState {
 
     pub fn update(&mut self) {
         let mut term = self.terminal.lock();
+        if term.synchronized_output() {
+            if !term.sync_update_expired(rio_vt::time::Instant::now()) {
+                term.damage_event_in_flight = false;
+                return;
+            }
+            term.end_sync_update();
+        }
         let damage = if self.rows.is_empty() {
             TerminalDamage::Full
         } else {
@@ -483,8 +490,8 @@ impl RenderState {
                     KittyOverlayGeometry {
                         x: geometry.x,
                         y: geometry.y,
-                        width: geometry.width,
-                        height: geometry.height,
+                        width: geometry.width as f64,
+                        height: geometry.height as f64,
                         source_rect: geometry.source_rect,
                     },
                 ))

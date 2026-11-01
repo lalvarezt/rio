@@ -86,3 +86,7 @@ wgpu = ["renderer", "dep:sugarloaf", "sugarloaf/wgpu"]
 
 [dev-dependencies]
 criterion = { workspace = true }
+
+[[bench]]
+name = "vt_sync"
+harness = false

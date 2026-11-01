@@ -870,7 +870,7 @@ dependencies = [
 
 [[package]]
 name = "corcovado"
-version = "0.5.28"
+version = "0.5.29"
 dependencies = [
  "criterion",
  "libc",
@@ -1824,17 +1824,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ghostty-bench"
-version = "0.5.28"
-dependencies = [
- "rio-unicode",
- "rio-vt",
- "rustc-hash 2.1.3",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "gif"
 version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2565,7 +2554,7 @@ dependencies = [
 
 [[package]]
 name = "librio"
-version = "0.5.28"
+version = "0.5.29"
 dependencies = [
  "bitflags 2.13.1",
  "corcovado",
@@ -2579,7 +2568,7 @@ dependencies = [
 
 [[package]]
 name = "librio-wasm"
-version = "0.5.28"
+version = "0.5.29"
 dependencies = [
  "js-sys",
  "librio",
@@ -2588,7 +2577,7 @@ dependencies = [
 
 [[package]]
 name = "libsugarloaf"
-version = "0.5.28"
+version = "0.5.29"
 dependencies = [
  "librio",
  "raw-window-handle",
@@ -3965,7 +3954,7 @@ dependencies = [
 
 [[package]]
 name = "rio-backend"
-version = "0.5.28"
+version = "0.5.29"
 dependencies = [
  "base64",
  "dirs",
@@ -3984,11 +3973,11 @@ dependencies = [
 
 [[package]]
 name = "rio-fonts"
-version = "0.5.28"
+version = "0.5.29"
 
 [[package]]
 name = "rio-grapheme-width"
-version = "0.5.28"
+version = "0.5.29"
 dependencies = [
  "phf",
  "ucd-trie",
@@ -3996,7 +3985,7 @@ dependencies = [
 
 [[package]]
 name = "rio-graphics"
-version = "0.5.28"
+version = "0.5.29"
 dependencies = [
  "image",
  "parking_lot",
@@ -4009,7 +3998,7 @@ dependencies = [
 
 [[package]]
 name = "rio-grid"
-version = "0.5.28"
+version = "0.5.29"
 dependencies = [
  "rapidhash",
  "rio-backend",
@@ -4020,7 +4009,7 @@ dependencies = [
 
 [[package]]
 name = "rio-notifier"
-version = "0.5.28"
+version = "0.5.29"
 dependencies = [
  "block2 0.5.1",
  "objc-rs 0.3.2",
@@ -4033,7 +4022,7 @@ dependencies = [
 
 [[package]]
 name = "rio-unicode"
-version = "0.5.28"
+version = "0.5.29"
 dependencies = [
  "unicode-segmentation",
  "unicode-width-16",
@@ -4041,7 +4030,7 @@ dependencies = [
 
 [[package]]
 name = "rio-vt"
-version = "0.5.28"
+version = "0.5.29"
 dependencies = [
  "base64",
  "bitflags 2.13.1",
@@ -4077,7 +4066,7 @@ dependencies = [
 
 [[package]]
 name = "rio-window"
-version = "0.5.28"
+version = "0.5.29"
 dependencies = [
  "ahash",
  "atomic-waker",
@@ -4131,7 +4120,7 @@ dependencies = [
 
 [[package]]
 name = "rioterm"
-version = "0.5.28"
+version = "0.5.29"
 dependencies = [
  "ahash",
  "base64",
@@ -4693,7 +4682,7 @@ dependencies = [
 
 [[package]]
 name = "sugarloaf"
-version = "0.5.28"
+version = "0.5.29"
 dependencies = [
  "approx",
  "ash",
@@ -4836,7 +4825,7 @@ dependencies = [
 
 [[package]]
 name = "teletypewriter"
-version = "0.5.28"
+version = "0.5.29"
 dependencies = [
  "corcovado",
  "dirs",

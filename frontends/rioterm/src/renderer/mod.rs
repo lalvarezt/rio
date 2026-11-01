@@ -21,6 +21,7 @@ pub mod trail_cursor;
 pub mod utils;
 pub mod window_chrome;
 
+#[cfg(test)]
 use rio_backend::event::TerminalDamage;
 
 type VirtualAnchors = rustc_hash::FxHashMap<(u32, u64), (usize, usize)>;
@@ -45,10 +46,9 @@ fn positioned_kitty_placement<'a>(
     Some(std::borrow::Cow::Owned(anchored))
 }
 
-use crate::context::renderable::{PendingUpdate, RenderableContent};
+use crate::context::renderable::RenderableContent;
 use crate::context::ContextManager;
 use crate::crosswords::style::{Style as CellStyle, StyleFlags};
-use crate::crosswords::Mode;
 use rio_backend::config::colors::term::TermColors;
 use rio_backend::config::colors::{
     term::{List, DIM_FACTOR},
@@ -189,7 +189,6 @@ pub struct Renderer {
     kitty_animation_routes: rustc_hash::FxHashSet<usize>,
     kitty_animation_deadline: Option<std::time::Instant>,
     kitty_animations_visible: bool,
-    is_vi_mode_enabled: bool,
     is_game_mode_enabled: bool,
     pub is_window_focused: bool,
     draw_bold_text_with_light_colors: bool,
@@ -286,7 +285,6 @@ impl Renderer {
             draw_bold_text_with_light_colors: config.draw_bold_text_with_light_colors,
             config_blinking_interval: config.cursor.blinking_interval.clamp(350, 1200),
             option_as_alt: config.option_as_alt.to_lowercase(),
-            is_vi_mode_enabled: false,
             config_has_blinking_enabled: config.cursor.blinking,
             is_window_focused: true,
             ignore_selection_fg_color: config.ignore_selection_fg_color,
@@ -468,11 +466,6 @@ impl Renderer {
         term_colors[NamedColor::Cursor as usize].unwrap_or(self.named_colors.cursor)
     }
 
-    #[inline]
-    pub fn set_vi_mode(&mut self, is_vi_mode_enabled: bool) {
-        self.is_vi_mode_enabled = is_vi_mode_enabled;
-    }
-
     // Get the RGB value for a color index.
     #[inline]
     pub fn color(&self, color: usize, term_colors: &TermColors) -> ColorArray {
@@ -582,97 +575,19 @@ impl Renderer {
                 // No updates pending, skip rendering
                 continue;
             }
-            any_panel_dirty = true;
 
-            // UI-side damage (scroll, selection, resize, etc.)
-            let ui_terminal_damage = context
-                .renderable_content
-                .pending_update
-                .take_terminal_damage();
-            context.renderable_content.pending_update.reset();
-
-            let captured_styles = {
+            {
                 let mut terminal = context.terminal.lock();
-
-                // Clear in-flight flag so PTY thread can notify again
-                terminal.damage_event_in_flight = false;
-
-                let pty_damage = terminal.peek_damage_event();
-
-                let damage = if force_full_damage {
-                    TerminalDamage::Full
-                } else {
-                    match (ui_terminal_damage, pty_damage) {
-                        (Some(ui), Some(pty)) => {
-                            PendingUpdate::merge_terminal_damages(ui, pty)
-                        }
-                        (Some(d), None) | (None, Some(d)) => d,
-                        // UI-only damage (overlay hover, command-palette
-                        // input, etc.): cells didn't change, but the
-                        // panel still has to go through the render path
-                        // so UI overlays paint on top of a fresh frame.
-                        // Noop skips row emission in
-                        // `screen::render`'s emit loop — grid keeps its
-                        // resident CPU bg/fg buffers, zero row work.
-                        (None, None) => TerminalDamage::Noop,
-                    }
-                };
-
-                terminal.reset_damage();
-
-                let captured_styles = terminal.snapshot_visible_deferred(
-                    &damage,
-                    &mut context.renderable_content.visible_rows,
-                    &mut context.renderable_content.row_styles,
-                    &mut context.renderable_content.extras,
-                    &mut context.renderable_content.deferred_styles,
-                );
-                context.renderable_content.term_colors = terminal.colors;
-                context.renderable_content.display_offset = terminal.display_offset();
-                context.renderable_content.columns = terminal.columns();
-                context.renderable_content.screen_lines = terminal.screen_lines();
-                context.renderable_content.history_size = terminal.history_size();
-                context.renderable_content.lines_evicted = terminal.lines_evicted();
-                context.renderable_content.blinking_cursor = terminal.blinking_cursor;
-                context.renderable_content.cursor.state = terminal.cursor();
-                context.renderable_content.is_vi_mode =
-                    terminal.mode().contains(Mode::VI);
-                if terminal.graphics.kitty_graphics_dirty
-                    || context.renderable_content.graphics_snapshot_invalid
-                {
-                    context.renderable_content.graphics_snapshot_invalid = false;
-                    context.renderable_content.kitty_virtual_placements =
-                        terminal.graphics.kitty_virtual_placements.clone();
-                    RenderableContent::capture_kitty_dimensions(
-                        &mut context.renderable_content.kitty_images,
-                        &terminal.graphics.kitty_images,
-                    );
-                    context.renderable_content.kitty_placements = {
-                        let mut placements =
-                            terminal.graphics.resolved_kitty_placements();
-                        // Tie-break on the unique key so equal
-                        // z-indexes keep a stable paint order across
-                        // frames (map iteration order is not).
-                        placements
-                            .sort_by_key(|p| (p.z_index, p.image_id, p.placement_id));
-                        placements
-                    };
-                    context.renderable_content.atlas_placements =
-                        terminal.graphics.atlas_placements.clone();
-                    context.renderable_content.kitty_graphics_dirty = true;
-                    terminal.graphics.kitty_graphics_dirty = false;
-                } else {
-                    context.renderable_content.kitty_graphics_dirty = false;
-                }
-                context.renderable_content.frame_damage = damage;
+                any_panel_dirty = true;
+                let captured_styles = context
+                    .renderable_content
+                    .update_from_terminal_deferred(&mut terminal, force_full_damage);
                 drop(terminal);
-                captured_styles
-            };
-
-            // Only owned cells and palette values cross the lock boundary:
-            // expanding mixed rows here lets PTY parsing resume sooner, without
-            // exposing the snapshot to style-ID reuse on the terminal thread.
-            context.renderable_content.all_rows_modified = captured_styles.resolve();
+                let all_rows_modified = captured_styles.map(|styles| styles.resolve());
+                if let Some(modified) = all_rows_modified {
+                    context.renderable_content.all_rows_modified = modified;
+                }
+            }
 
             // Recalculate image overlay positions every frame when placements
             // exist. Positions depend on display_offset and history_size which

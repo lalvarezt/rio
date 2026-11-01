@@ -1371,7 +1371,6 @@ impl Screen<'_> {
                         let context = self.context_manager.current_mut();
                         let mut terminal = context.terminal.lock();
                         terminal.toggle_vi_mode();
-                        let has_vi_mode_enabled = terminal.mode().contains(Mode::VI);
                         drop(terminal);
                         context
                             .renderable_content
@@ -1379,7 +1378,6 @@ impl Screen<'_> {
                             .set_terminal_damage(
                                 rio_backend::event::TerminalDamage::Full,
                             );
-                        self.renderer.set_vi_mode(has_vi_mode_enabled);
                         self.mark_dirty();
                     }
                     Act::ViMotion(motion) => {
@@ -3852,6 +3850,9 @@ impl Screen<'_> {
         let dim = self.context_manager.current().dimension.dimension;
         let width = dim.width as f64;
         let height = dim.height as f64;
+        if !(width > 0.0 && height > 0.0) {
+            return;
+        }
         let mode = self.get_mode();
 
         const MOUSE_WHEEL_UP: u8 = 64;
@@ -4312,7 +4313,7 @@ impl Screen<'_> {
                             | rio_backend::event::TerminalDamage::Partial
                     )
                 );
-            if needs_search {
+            if needs_search && !terminal.synchronized_output() {
                 let hints = self
                     .search_state
                     .dfas_mut()
@@ -4388,11 +4389,10 @@ impl Screen<'_> {
                     current.route_id,
                 );
 
-                let cursor_color = if current.renderable_content.is_vi_mode {
-                    self.renderer.named_colors.vi_cursor
-                } else {
-                    self.renderer.named_colors.cursor
-                };
+                let cursor_color = self.renderer.cursor_color(
+                    &current.renderable_content.term_colors,
+                    current.renderable_content.is_vi_mode,
+                );
                 self.renderer.trail_cursor.draw(
                     &mut self.sugarloaf,
                     scale_factor,
@@ -4464,10 +4464,7 @@ impl Screen<'_> {
                 /// configured shape so the user can tell IME is
                 /// taking input.
                 cursor_preedit: bool,
-                /// Resolved cursor color: `vi-cursor` in Vi mode,
-                /// otherwise OSC 12 wins, then the theme `cursor`.
-                /// `state.colors.cursor → config.cursor_color`
-                /// resolution. Per-panel
+                /// Resolved by `Renderer::cursor_color`. Per-panel
                 /// because each terminal can issue its own OSC 12.
                 cursor_color: rio_backend::config::colors::ColorArray,
                 is_active: bool,
@@ -4617,6 +4614,8 @@ impl Screen<'_> {
                     None
                 };
                 let cursor_preedit = preedit_line.is_some();
+                // `vi-cursor` in Vi mode; otherwise OSC 12, then the
+                // theme `cursor`.
                 let cursor_color = self
                     .renderer
                     .cursor_color(&term_colors, ctx.renderable_content.is_vi_mode);
@@ -5055,11 +5054,11 @@ impl Screen<'_> {
 
             // Return snapshots to their route so the next frame reuses storage.
             // Unmatched frames belong to closed terminals and release their payloads.
-            for (_, item) in self
+            for item in self
                 .context_manager
                 .current_grid_mut()
                 .contexts_mut()
-                .iter_mut()
+                .values_mut()
             {
                 let route_id = item.val.route_id;
                 if let Some(idx) = panels.iter().position(|p| p.route_id == route_id) {

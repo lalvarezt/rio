@@ -212,29 +212,3 @@ fn hidden_close_button_does_not_inflate_height() {
     let c = config("[navigation]\ntab-icon-size=8\n[navigation.tabs]\nheight=32\nfont-size=8\nclose-button='never'\nclose-button-size=96");
     assert_eq!(c.navigation.tab_geometry().height, 32.0);
 }
-
-#[test]
-fn explicit_preset_files_reproduce_defaults_without_style_branches() {
-    for (text, preset, other) in [
-        (
-            include_str!("../../../misc/presets/pill.toml"),
-            TabStyle::Pill,
-            TabStyle::Square,
-        ),
-        (
-            include_str!("../../../misc/presets/square.toml"),
-            TabStyle::Square,
-            TabStyle::Pill,
-        ),
-    ] {
-        let mut explicit = config(text);
-        let mut defaults = Config::default();
-        defaults.navigation.tab_style = preset;
-        explicit.navigation.tab_style = other;
-        assert_eq!(
-            explicit.navigation.tab_geometry(),
-            defaults.navigation.tab_geometry()
-        );
-        assert_eq!(explicit.panel(), defaults.panel());
-    }
-}

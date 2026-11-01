@@ -675,7 +675,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 }
 
                 let mut has_checked_adaptive_colors = false;
-                for (_id, route) in self.router.routes.iter_mut() {
+                for route in self.router.routes.values_mut() {
                     // Apply system theme to ensure colors are consistent
                     if !has_checked_adaptive_colors {
                         let system_theme = event_loop.system_theme();

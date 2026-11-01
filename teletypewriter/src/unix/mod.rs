@@ -439,6 +439,7 @@ struct ShellUser {
 impl ShellUser {
     /// look for shell, username, longname, and home dir in the respective environment variables
     /// before falling back on looking in to `passwd`.
+    #[allow(clippy::question_mark)]
     fn from_env() -> Result<Self, Error> {
         let user = std::env::var("USER").ok();
         let home = std::env::var("HOME").ok();

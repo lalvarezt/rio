@@ -552,12 +552,12 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         // sibling weights when a leaf is replaced by a nested split container.
         Style {
             display: Display::Flex,
-            flex_basis: length(0.0),
+            flex_basis: length(0.0_f32),
             flex_grow: 1.0,
             flex_shrink: 1.0,
             min_size: geometry::Size {
-                width: length(0.0),
-                height: length(0.0),
+                width: length(0.0_f32),
+                height: length(0.0_f32),
             },
             ..Default::default()
         }
@@ -594,8 +594,8 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             flex_grow: current_style.flex_grow,
             flex_shrink: current_style.flex_shrink,
             min_size: geometry::Size {
-                width: length(0.0),
-                height: length(0.0),
+                width: length(0.0_f32),
+                height: length(0.0_f32),
             },
             ..Default::default()
         };
@@ -603,7 +603,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
 
         // Reset the current panel to flexible sizing inside the new container
         let mut reset_style = current_style;
-        reset_style.flex_basis = length(0.0);
+        reset_style.flex_basis = length(0.0_f32);
         reset_style.flex_grow = 1.0;
         reset_style.flex_shrink = 1.0;
         self.tree.set_style(current_node, reset_style)?;
@@ -642,7 +642,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         let mut style = self.tree.style(node)?.clone();
 
         if let Some(size) = width.or(height) {
-            style.flex_basis = length(0.0);
+            style.flex_basis = length(0.0_f32);
             style.flex_grow = size;
             style.flex_shrink = 1.0;
         }
@@ -657,7 +657,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         let mut stack = vec![self.root_node];
         while let Some(node) = stack.pop() {
             if let Ok(mut style) = self.tree.style(node).cloned() {
-                style.flex_basis = length(0.0);
+                style.flex_basis = length(0.0_f32);
                 style.flex_grow = 1.0;
                 style.flex_shrink = 1.0;
                 let _ = self.tree.set_style(node, style);
@@ -774,12 +774,17 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
 
             // Clear margin since Taffy layout already accounts for spacing
             item.val.dimension.margin = Margin::all(0.0);
+            let resized =
+                item.val.dimension.width != width || item.val.dimension.height != height;
             item.val.dimension.update_width(width);
             item.val.dimension.update_height(height);
 
             // Layout owns both reflow and the PTY notification; config/font
             // updates already reach this path and must not notify a second time.
             let mut terminal = item.val.terminal.lock();
+            if resized {
+                terminal.end_sync_update();
+            }
             terminal.resize::<ContextDimension>(item.val.dimension);
             drop(terminal);
 

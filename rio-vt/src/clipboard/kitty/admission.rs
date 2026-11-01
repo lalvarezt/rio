@@ -36,7 +36,7 @@ impl Pool {
     pub fn admit(&self) -> Result<Admission, super::WriteError> {
         self.inner
             .slots
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |slots| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |slots| {
                 slots.checked_add(1).filter(|total| *total <= self.slots)
             })
             .map_err(|_| super::WriteError::Busy)?;
@@ -70,7 +70,7 @@ impl Admission {
         self.pool
             .inner
             .bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes)
                     .filter(|total| *total <= self.pool.bytes)
             })

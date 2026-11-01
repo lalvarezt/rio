@@ -1521,8 +1521,8 @@ pub unsafe extern "C" fn rio_render_state_kitty_placement(
                 z_index,
                 x: geometry.x,
                 y: geometry.y,
-                width: geometry.width,
-                height: geometry.height,
+                width: geometry.width as f32,
+                height: geometry.height as f32,
                 // source_rect is [u0, v0, u1, v1]; the C side gets
                 // origin + size, which is what image crops want.
                 src_x: geometry.source_rect[0],
