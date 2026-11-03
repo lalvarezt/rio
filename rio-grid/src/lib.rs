@@ -42,6 +42,8 @@ use std::sync::Arc;
 
 mod raster_cache;
 use raster_cache::{RasterCache, RasterKey};
+#[cfg(test)]
+mod foreground_tests;
 
 /// Snapshot's per-frame extras map. Keyed by the cell's `extras_id`,
 /// populated by `Crosswords::snapshot_visible` from a walk of visible
@@ -2050,6 +2052,7 @@ pub fn build_row_fg<P: GridPalette>(
     let default_fg = row_styles
         .uniform()
         .map(|style| cell_fg(Square::from_char(' '), style, palette, term_colors));
+    let mut last_fg: Option<(Style, [u8; 4])> = None;
 
     let mut x: usize = 0;
     while x < max {
@@ -2469,12 +2472,17 @@ pub fn build_row_fg<P: GridPalette>(
                 (
                     CellText::ATLAS_GRAYSCALE,
                     default_fg.unwrap_or_else(|| {
-                        cell_fg(
-                            row[Column(src_col)],
-                            row_styles.at(src_col),
-                            palette,
-                            term_colors,
-                        )
+                        // Mixed rows still commonly share a style across many glyphs.
+                        let style = row_styles.at(src_col);
+                        if let Some((previous, color)) = last_fg {
+                            if previous == style {
+                                return color;
+                            }
+                        }
+                        let color =
+                            cell_fg(row[Column(src_col)], style, palette, term_colors);
+                        last_fg = Some((style, color));
+                        color
                     }),
                 )
             } else {
