@@ -445,6 +445,8 @@ impl VulkanContext {
 
     /// End the command buffer, submit, present, advance frame index.
     pub fn present_frame(&mut self, frame: VulkanFrame) {
+        let submit_timing =
+            tracing::debug_span!(target: "rio_profile", "gpu.submit").entered();
         let sync = &self.frames[frame.slot];
         unsafe {
             self.shared
@@ -463,7 +465,10 @@ impl VulkanContext {
             self.shared
                 .queue_submit(self.queue, &[submit], sync.in_flight)
                 .expect("queue_submit");
+            drop(submit_timing);
 
+            let _present_timing =
+                tracing::debug_span!(target: "rio_profile", "gpu.present").entered();
             let swapchains = [self.swapchain];
             let image_indices = [frame.image_index];
             let present_info = vk::PresentInfoKHR::default()

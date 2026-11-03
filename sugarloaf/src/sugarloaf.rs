@@ -877,8 +877,15 @@ impl Sugarloaf<'_> {
         &mut self,
         grids: &mut [(&mut crate::grid::GridRenderer, crate::grid::GridUniforms)],
     ) {
-        self.renderer
-            .prepare(&mut self.ctx, &mut self.image_data, &self.image_overlays);
+        {
+            let _timing =
+                tracing::debug_span!(target: "rio_profile", "gpu.prepare").entered();
+            self.renderer.prepare(
+                &mut self.ctx,
+                &mut self.image_data,
+                &self.image_overlays,
+            );
+        }
 
         match self.ctx.inner {
             #[cfg(feature = "wgpu")]
@@ -977,6 +984,8 @@ impl Sugarloaf<'_> {
             _ => return,
         };
 
+        let acquire_timing =
+            tracing::debug_span!(target: "rio_profile", "gpu.acquire").entered();
         let frame = match ctx.acquire_frame() {
             Some(f) => f,
             None => {
@@ -986,6 +995,7 @@ impl Sugarloaf<'_> {
                 return;
             }
         };
+        drop(acquire_timing);
 
         let bg = self
             .background_color
@@ -998,12 +1008,17 @@ impl Sugarloaf<'_> {
         // Pre-pass: per-panel grid atlas uploads + UI text overlay
         // atlas uploads. MUST happen before `cmd_begin_rendering` —
         // `vkCmdCopyBufferToImage` is invalid inside a render pass.
+        let upload_timing =
+            tracing::debug_span!(target: "rio_profile", "gpu.upload").entered();
         self.text.init_vulkan(ctx);
         for (grid, _) in grids.iter_mut() {
             grid.prepare_vulkan(ctx, cmd, frame.slot);
         }
         self.text.prepare_vulkan(ctx, cmd, frame.slot);
+        drop(upload_timing);
 
+        let encode_timing =
+            tracing::debug_span!(target: "rio_profile", "gpu.encode").entered();
         vkr::cmd_acquire_image_for_rendering(&device, cmd, frame.image);
 
         let color_attachment = vkr::build_color_attachment(&frame, bg);
@@ -1057,6 +1072,7 @@ impl Sugarloaf<'_> {
             device.cmd_end_rendering(cmd);
         }
         vkr::cmd_release_image_to_present(&device, cmd, frame.image);
+        drop(encode_timing);
 
         ctx.present_frame(frame);
 
