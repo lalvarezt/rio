@@ -18,6 +18,9 @@ struct Capture {
     target_frames: usize,
     settle_time: Duration,
     samples: BTreeMap<&'static str, Vec<f64>>,
+    steady_samples: BTreeMap<&'static str, Vec<f64>>,
+    warmup_frames: usize,
+    measuring_frame: bool,
     active: Vec<&'static str>,
 }
 
@@ -45,6 +48,12 @@ pub fn init() {
                 .map(Duration::from_millis)
                 .unwrap_or(Duration::from_secs(2)),
             samples: BTreeMap::new(),
+            steady_samples: BTreeMap::new(),
+            warmup_frames: std::env::var("RIO_PROFILE_WARMUP_FRAMES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            measuring_frame: false,
             active: Vec::new(),
         })
     });
@@ -90,6 +99,12 @@ fn record(name: &'static str, elapsed: f64) {
         let samples = capture.samples.entry(name).or_default();
         if samples.len() < 100_000 {
             samples.push(elapsed);
+        }
+        if capture.measuring_frame {
+            let samples = capture.steady_samples.entry(name).or_default();
+            if samples.len() < 100_000 {
+                samples.push(elapsed);
+            }
         }
     }
 }
@@ -167,6 +182,14 @@ pub fn shell_title(route: usize, title: Option<&str>) {
     }
 }
 
+/// Select the measurement phase before any spans for this frame are opened.
+pub fn begin_frame() {
+    let mut capture = CAPTURE.get().unwrap().lock().unwrap();
+    capture.measuring_frame = capture.ready.is_some()
+        && capture.frames >= capture.warmup_frames
+        && capture.frames < capture.target_frames;
+}
+
 pub fn frame() {
     let mut capture = CAPTURE.get().unwrap().lock().unwrap();
     let now = Instant::now();
@@ -174,11 +197,19 @@ pub fn frame() {
     if capture.ready.is_some() {
         capture.shell_frame.get_or_insert(now);
         if let Some(last) = capture.last_frame {
+            let elapsed = (now - last).as_secs_f64() * 1000.0;
             capture
                 .samples
                 .entry("frame.interval")
                 .or_default()
-                .push((now - last).as_secs_f64() * 1000.0);
+                .push(elapsed);
+            if capture.measuring_frame {
+                capture
+                    .steady_samples
+                    .entry("frame.interval")
+                    .or_default()
+                    .push(elapsed);
+            }
         }
         capture.last_frame = Some(now);
         capture.frames += 1;
@@ -242,8 +273,20 @@ fn write_report(path: std::path::PathBuf) {
         capture.start.elapsed().as_secs_f64() * 1000.0
     )
     .unwrap();
+    write_metrics(&mut file, &mut capture.samples);
+    write!(
+        file,
+        "}},\"warmup_frames\":{},\"steady_metrics\":{{",
+        capture.warmup_frames
+    )
+    .unwrap();
+    write_metrics(&mut file, &mut capture.steady_samples);
+    writeln!(file, "}}}}").unwrap();
+}
+
+fn write_metrics(file: &mut impl Write, metrics: &mut BTreeMap<&'static str, Vec<f64>>) {
     let mut separator = "";
-    for (name, samples) in &mut capture.samples {
+    for (name, samples) in metrics {
         let first = samples[0];
         samples.sort_by(f64::total_cmp);
         let n = samples.len();
@@ -252,5 +295,4 @@ fn write_report(path: std::path::PathBuf) {
             samples.iter().sum::<f64>(), median, samples[(n as f64 * 0.95).ceil() as usize - 1], samples[n - 1]).unwrap();
         separator = ",\n";
     }
-    writeln!(file, "}}}}").unwrap();
 }

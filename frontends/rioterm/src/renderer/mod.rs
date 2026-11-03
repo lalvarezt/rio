@@ -577,6 +577,8 @@ impl Renderer {
             }
 
             {
+                #[cfg(feature = "profiling")]
+                let _snapshot_timing = crate::profiling::span("frame.snapshot");
                 let mut terminal = context.terminal.lock();
                 any_panel_dirty = true;
                 let captured_styles = context

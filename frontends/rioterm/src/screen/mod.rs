@@ -4276,6 +4276,8 @@ impl Screen<'_> {
     ) -> Option<crate::context::renderable::WindowUpdate> {
         self.release_inactive_grids();
         #[cfg(feature = "profiling")]
+        crate::profiling::begin_frame();
+        #[cfg(feature = "profiling")]
         let _timing = crate::profiling::span("frame.screen");
         self.update_close_button_hover(self.mouse.x, self.mouse.y);
         if self.renderer.is_window_focused {
@@ -4653,6 +4655,8 @@ impl Screen<'_> {
             }
 
             // --- ensure every panel has a matching GridRenderer ---
+            #[cfg(feature = "profiling")]
+            let grid_timing = crate::profiling::span("frame.grid");
             for p in &panels {
                 self.ensure_grid(p.route_id, p.cols, p.rows);
             }
@@ -5024,6 +5028,9 @@ impl Screen<'_> {
 
                 frame_grids.push((grid, uniforms));
             }
+
+            #[cfg(feature = "profiling")]
+            drop(grid_timing);
 
             if should_present {
                 #[cfg(feature = "profiling")]

@@ -33,3 +33,9 @@ sugarloaf/src/**/*.spv
 
 # Claude Code worktrees/session data
 .claude/
+
+# Local rendering profile results
+/misc/render-profile/captures/
+/misc/render-profile/*.json
+/misc/render-profile/*.html
+/misc/render-profile/*-20??-??-??.md
