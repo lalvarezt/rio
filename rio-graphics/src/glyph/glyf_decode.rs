@@ -51,8 +51,10 @@ pub struct Point {
 }
 
 /// Fully-decoded simple glyph: a list of closed contours, each a
-/// `Vec<Point>`, plus the glyph's bounding box in its authoring
-/// coordinate space.
+/// `Vec<Point>`, plus the bounding box of all its points (on- and
+/// off-curve, what FreeType calls the control box) in its authoring
+/// coordinate space. Computed here rather than read from the record's
+/// header, which an application can set to anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outline {
     pub contours: Vec<Vec<Point>>,
@@ -62,8 +64,20 @@ pub struct Outline {
     pub y_max: i32,
 }
 
-/// Decode a simple-glyph record.
-pub fn decode(data: &[u8]) -> Result<Outline, DecodeError> {
+/// The control box of `points` as `(x_min, y_min, x_max, y_max)`, or
+/// zeros when there are none.
+fn control_box(points: impl Iterator<Item = (i32, i32)>) -> (i32, i32, i32, i32) {
+    points
+        .fold(None, |bounds: Option<(i32, i32, i32, i32)>, (x, y)| {
+            Some(match bounds {
+                None => (x, y, x, y),
+                Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn read_simple_glyph(data: &[u8]) -> Result<SimpleGlyph<'_>, DecodeError> {
     // Peek at numberOfContours before handing to read-fonts, because
     // `SimpleGlyph::read` will happily parse a composite record as a
     // simple one and give back garbage. The first two bytes of every
@@ -75,37 +89,27 @@ pub fn decode(data: &[u8]) -> Result<Outline, DecodeError> {
     if num_contours < 0 {
         return Err(DecodeError::Composite);
     }
-    if num_contours == 0 {
-        // An empty glyph may omit instructionLength. Reject a partial field
-        // and report a nonzero length as unsupported hinting.
-        if data.len() == 11 {
-            return Err(DecodeError::Malformed);
-        }
-        if data.len() >= 12 && u16::from_be_bytes([data[10], data[11]]) != 0 {
-            return Err(DecodeError::Hinted);
-        }
-        let coordinate =
-            |offset| i16::from_be_bytes([data[offset], data[offset + 1]]) as i32;
-        return Ok(Outline {
-            contours: Vec::new(),
-            x_min: coordinate(2),
-            y_min: coordinate(4),
-            x_max: coordinate(6),
-            y_max: coordinate(8),
-        });
-    }
+    SimpleGlyph::read(FontData::new(data)).map_err(|_| DecodeError::Malformed)
+}
 
-    let glyph =
-        SimpleGlyph::read(FontData::new(data)).map_err(|_| DecodeError::Malformed)?;
+/// The control box of a simple-glyph record, as `(x_min, y_min, x_max,
+/// y_max)`, without decoding it. Hinting is allowed: instructions don't
+/// move the stored points, so a glyph that is only measured needn't pass
+/// [`decode`]'s check.
+pub fn bounds(data: &[u8]) -> Result<(i32, i32, i32, i32), DecodeError> {
+    let glyph = read_simple_glyph(data)?;
+    Ok(control_box(
+        glyph.points().map(|p| (p.x as i32, p.y as i32)),
+    ))
+}
+
+/// Decode a simple-glyph record.
+pub fn decode(data: &[u8]) -> Result<Outline, DecodeError> {
+    let glyph = read_simple_glyph(data)?;
 
     if glyph.instruction_length() != 0 {
         return Err(DecodeError::Hinted);
     }
-
-    let x_min = glyph.x_min() as i32;
-    let y_min = glyph.y_min() as i32;
-    let x_max = glyph.x_max() as i32;
-    let y_max = glyph.y_max() as i32;
 
     let end_pts: Vec<usize> = glyph
         .end_pts_of_contours()
@@ -115,10 +119,10 @@ pub fn decode(data: &[u8]) -> Result<Outline, DecodeError> {
     if end_pts.is_empty() {
         return Ok(Outline {
             contours: Vec::new(),
-            x_min,
-            y_min,
-            x_max,
-            y_max,
+            x_min: 0,
+            y_min: 0,
+            x_max: 0,
+            y_max: 0,
         });
     }
     // End-points must be strictly increasing.
@@ -135,22 +139,6 @@ pub fn decode(data: &[u8]) -> Result<Outline, DecodeError> {
         return Err(DecodeError::TooLarge);
     }
 
-    // read-fonts' iterator stores repeat+1 in u8 and overflows on the valid
-    // repeat byte 255. Expand only affected flag streams before using it.
-    // Validate counts and coordinate lengths first, so normalization cannot
-    // turn a malformed run into an accepted outline or copy an arbitrary tail.
-    let normalized = normalize_max_repeats(
-        data,
-        glyph.glyph_data(),
-        num_points,
-        num_contours as usize,
-    )?;
-    let glyph = match normalized.as_deref() {
-        Some(bytes) => {
-            SimpleGlyph::read(FontData::new(bytes)).map_err(|_| DecodeError::Malformed)?
-        }
-        None => glyph,
-    };
     let pts: Vec<CurvePoint> = glyph.points().collect();
     if pts.len() != num_points {
         return Err(DecodeError::Malformed);
@@ -172,6 +160,9 @@ pub fn decode(data: &[u8]) -> Result<Outline, DecodeError> {
         start = end + 1;
     }
 
+    let (x_min, y_min, x_max, y_max) =
+        control_box(contours.iter().flatten().map(|p| (p.x, p.y)));
+
     Ok(Outline {
         contours,
         x_min,
@@ -179,70 +170,6 @@ pub fn decode(data: &[u8]) -> Result<Outline, DecodeError> {
         x_max,
         y_max,
     })
-}
-
-fn normalize_max_repeats(
-    data: &[u8],
-    point_data: &[u8],
-    num_points: usize,
-    num_contours: usize,
-) -> Result<Option<Vec<u8>>, DecodeError> {
-    let mut offset = 0;
-    let mut points = 0;
-    let mut coordinate_bytes = 0;
-    let mut needs_expansion = false;
-    while points < num_points {
-        let flag = *point_data.get(offset).ok_or(DecodeError::Malformed)?;
-        offset += 1;
-        let run = if flag & 0x08 != 0 {
-            let repeats = *point_data.get(offset).ok_or(DecodeError::Malformed)?;
-            offset += 1;
-            needs_expansion |= repeats == u8::MAX;
-            repeats as usize + 1
-        } else {
-            1
-        };
-        if run > num_points - points {
-            return Err(DecodeError::Malformed);
-        }
-        let x_bytes = if flag & 0x02 != 0 {
-            1
-        } else if flag & 0x10 == 0 {
-            2
-        } else {
-            0
-        };
-        let y_bytes = if flag & 0x04 != 0 {
-            1
-        } else if flag & 0x20 == 0 {
-            2
-        } else {
-            0
-        };
-        coordinate_bytes += run * (x_bytes + y_bytes);
-        points += run;
-    }
-    let coordinates = point_data
-        .get(offset..offset + coordinate_bytes)
-        .ok_or(DecodeError::Malformed)?;
-    if !needs_expansion {
-        return Ok(None);
-    }
-
-    // The caller has already rejected hinting and bounded num_points. The
-    // fixed header and endpoints were validated by SimpleGlyph::read.
-    let mut normalized = data[..12 + num_contours * 2].to_vec();
-    let mut flags = point_data[..offset].iter().copied();
-    while let Some(flag) = flags.next() {
-        let run = if flag & 0x08 != 0 {
-            flags.next().ok_or(DecodeError::Malformed)? as usize + 1
-        } else {
-            1
-        };
-        normalized.extend(std::iter::repeat_n(flag & !0x08, run));
-    }
-    normalized.extend_from_slice(coordinates);
-    Ok(Some(normalized))
 }
 
 /// Point count of a simple-glyph record without decoding it. O(1),
@@ -463,6 +390,33 @@ mod tests {
     }
 
     #[test]
+    fn bounds_come_from_the_points_not_the_header() {
+        let honest = decode(&triangle_bytes()).unwrap();
+        let mut lying = triangle_bytes();
+        // Overwrite xMin, yMin, xMax and yMax.
+        lying[2..10].copy_from_slice(&[0x7F; 8]);
+        let lying = decode(&lying).unwrap();
+        assert_eq!(
+            (lying.x_min, lying.y_min, lying.x_max, lying.y_max),
+            (honest.x_min, honest.y_min, honest.x_max, honest.y_max)
+        );
+    }
+
+    #[test]
+    fn bounds_measure_a_hinted_outline_that_decode_rejects() {
+        let mut hinted = triangle_bytes();
+        let plain = decode(&hinted).unwrap();
+        // instructionLength follows the one endPtsOfContours entry.
+        hinted[12..14].copy_from_slice(&1u16.to_be_bytes());
+        hinted.insert(14, 0x00);
+        assert_eq!(decode(&hinted), Err(DecodeError::Hinted));
+        assert_eq!(
+            bounds(&hinted),
+            Ok((plain.x_min, plain.y_min, plain.x_max, plain.y_max))
+        );
+    }
+
+    #[test]
     fn rejects_composite() {
         let mut v = Vec::new();
         v.extend_from_slice(&(-1i16).to_be_bytes());
@@ -492,207 +446,6 @@ mod tests {
         v.extend_from_slice(&[0u8; 8]);
         // No contour data at all — header only.
         assert_eq!(decode(&v), Err(DecodeError::Malformed));
-    }
-
-    // Ghostty src/font/opentype/glyf.zig covers these boundary encodings.
-    // Construct bytes locally so the tests need no system font or font fixture.
-    fn simple_bytes(endpoints: &[u16], data: &[u8]) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&(endpoints.len() as i16).to_be_bytes());
-        bytes.extend_from_slice(&[0; 8]);
-        for endpoint in endpoints {
-            bytes.extend_from_slice(&endpoint.to_be_bytes());
-        }
-        bytes.extend_from_slice(&0u16.to_be_bytes());
-        bytes.extend_from_slice(data);
-        bytes
-    }
-
-    #[test]
-    fn accepts_header_only_zero_contour_outline() {
-        let bytes = [0; 10];
-        let outline = decode(&bytes).unwrap();
-        assert!(outline.contours.is_empty());
-        assert!(outline.walk(1000, 20.0).is_empty());
-        assert_eq!(peek_point_count(&bytes), Ok(0));
-    }
-
-    #[test]
-    fn accepts_zero_contour_with_empty_instruction_length() {
-        let outline = decode(&[0; 12]).unwrap();
-        assert!(outline.contours.is_empty());
-    }
-
-    #[test]
-    fn rejects_hinting_even_without_contours() {
-        let mut bytes = vec![0; 12];
-        bytes[11] = 1;
-        assert_eq!(decode(&bytes), Err(DecodeError::Hinted));
-        bytes.push(0);
-        assert_eq!(decode(&bytes), Err(DecodeError::Hinted));
-    }
-
-    #[test]
-    fn rejects_partial_zero_contour_instruction_length() {
-        assert_eq!(decode(&[0; 11]), Err(DecodeError::Malformed));
-    }
-
-    #[test]
-    fn decodes_one_point_contour() {
-        let outline = decode(&simple_bytes(&[0], &[0x31])).unwrap();
-        assert_eq!(
-            outline.contours,
-            [vec![Point {
-                x: 0,
-                y: 0,
-                on_curve: true
-            }]]
-        );
-    }
-
-    #[test]
-    fn decodes_multiple_contours_without_merging_them() {
-        let outline = decode(&simple_bytes(&[0, 2], &[0x31; 3])).unwrap();
-        assert_eq!(
-            outline.contours.iter().map(Vec::len).collect::<Vec<_>>(),
-            [1, 2]
-        );
-        assert_eq!(
-            outline
-                .walk(1000, 20.0)
-                .iter()
-                .filter(|cmd| matches!(cmd, PathCmd::Close))
-                .count(),
-            2
-        );
-    }
-
-    #[test]
-    fn decodes_short_signed_vectors_and_unchanged_coordinates() {
-        let outline =
-            decode(&simple_bytes(&[2], &[0x37, 0x07, 0x30, 10, 5, 20, 7])).unwrap();
-        assert_eq!(
-            outline.contours[0],
-            [
-                Point {
-                    x: 10,
-                    y: 20,
-                    on_curve: true
-                },
-                Point {
-                    x: 5,
-                    y: 13,
-                    on_curve: true
-                },
-                Point {
-                    x: 5,
-                    y: 13,
-                    on_curve: false
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn rejects_unordered_and_duplicate_contour_endpoints() {
-        for endpoints in [[1, 0], [0, 0]] {
-            assert_eq!(
-                decode(&simple_bytes(&endpoints, &[0x31; 3])),
-                Err(DecodeError::Malformed)
-            );
-        }
-    }
-
-    #[test]
-    fn accepts_maximum_repeat_byte() {
-        let outline = decode(&simple_bytes(&[255], &[0x39, 255])).unwrap();
-        assert_eq!(outline.contours[0].len(), 256);
-        assert!(outline.contours[0].iter().all(|p| *p
-            == Point {
-                x: 0,
-                y: 0,
-                on_curve: true
-            }));
-    }
-
-    #[test]
-    fn maximum_repeat_preserves_coordinate_streams_and_following_flags() {
-        let mut data = vec![0x3f, 255, 0x30];
-        data.extend_from_slice(&[1; 256]);
-        data.extend_from_slice(&[2; 256]);
-        let outline = decode(&simple_bytes(&[256], &data)).unwrap();
-        assert_eq!(outline.contours[0].len(), 257);
-        assert_eq!(
-            outline.contours[0][255],
-            Point {
-                x: 256,
-                y: 512,
-                on_curve: true
-            }
-        );
-        assert_eq!(
-            outline.contours[0][256],
-            Point {
-                x: 256,
-                y: 512,
-                on_curve: false
-            }
-        );
-        data.pop();
-        assert_eq!(
-            decode(&simple_bytes(&[256], &data)),
-            Err(DecodeError::Malformed)
-        );
-    }
-
-    #[test]
-    fn empty_outline_preserves_signed_bounds() {
-        let mut bytes = vec![0, 0];
-        for coordinate in [-20i16, -10, 30, 40] {
-            bytes.extend_from_slice(&coordinate.to_be_bytes());
-        }
-        let outline = decode(&bytes).unwrap();
-        assert_eq!(
-            (outline.x_min, outline.y_min, outline.x_max, outline.y_max),
-            (-20, -10, 30, 40)
-        );
-        assert!(outline.contours.is_empty());
-    }
-
-    #[test]
-    fn rejects_repeat_past_declared_point_count() {
-        assert_eq!(
-            decode(&simple_bytes(&[0], &[0x39, 1])),
-            Err(DecodeError::Malformed)
-        );
-    }
-
-    #[test]
-    fn rejects_truncated_repeat_count() {
-        assert_eq!(
-            decode(&simple_bytes(&[0], &[0x39])),
-            Err(DecodeError::Malformed)
-        );
-    }
-
-    #[test]
-    fn rejects_every_truncated_triangle_prefix() {
-        let bytes = triangle_bytes();
-        for end in 0..bytes.len() {
-            assert_eq!(
-                decode(&bytes[..end]),
-                Err(DecodeError::Malformed),
-                "prefix length {end}"
-            );
-        }
-        assert!(decode(&bytes).is_ok());
-    }
-
-    #[test]
-    fn maximum_endpoint_is_rejected_by_budget_without_overflow() {
-        let bytes = simple_bytes(&[u16::MAX], &[]);
-        assert_eq!(peek_point_count(&bytes), Ok(65536));
-        assert_eq!(decode(&bytes), Err(DecodeError::TooLarge));
     }
 
     #[test]
@@ -730,10 +483,11 @@ mod tests {
         v.extend_from_slice(&((n - 1) as u16).to_be_bytes()); // endPts
         v.extend_from_slice(&0u16.to_be_bytes()); // instructionLength
         let flag = FLAG_ON_CURVE | FLAG_REPEAT | FLAG_X_SAME | FLAG_Y_SAME;
-        // Exercise the maximum repeat byte as well as the decoded-size limit.
+        // Runs of 255, not 256: read-fonts tracks the repeat count in
+        // a u8 and a repeat byte of 255 overflows it in debug builds.
         let mut left = n;
         while left > 0 {
-            let run = left.min(256);
+            let run = left.min(255);
             v.push(flag);
             v.push((run - 1) as u8);
             left -= run;

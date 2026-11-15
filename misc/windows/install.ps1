@@ -5,7 +5,7 @@ param(
     [string]$Destination = "$env:USERPROFILE/.local/bin",
     # Install an existing executable without rebuilding it.
     [string]$Binary,
-    [ValidateSet('x64', 'arm64', 'x86')]
+    [ValidateSet('x64', 'arm64')]
     [string]$Architecture = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant()
 )
 
@@ -17,12 +17,12 @@ $oldDebug = $env:CARGO_PROFILE_DEV_DEBUG
 $oldIncremental = $env:CARGO_INCREMENTAL
 Push-Location (Join-Path $PSScriptRoot '../..')
 try {
-    $runtimeFiles = @('conpty.dll', 'OpenConsole.exe', 'ConPTY-LICENSE.txt', 'Font-LICENSE.txt')
     if ($Binary -and -not [IO.File]::Exists($Binary)) { throw "Rio executable not found: $Binary" }
 
-    # Prepare the pinned local runtime before spending time on compilation.
+    # Prepare the upstream runtime layout before compilation.
     & "$PSScriptRoot/prepare-runtime.ps1" -Architecture $Architecture
     $runtime = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "../../target/runtime/$Architecture"))
+    $runtimeFiles = @(Get-ChildItem -LiteralPath $runtime -File -Recurse | ForEach-Object { $_.FullName.Substring($runtime.Length + 1) })
     if (-not $Binary) {
         $cargoProfile = if ($Profile -eq 'release') { 'release' } else { 'dev' }
         if ($Profile -eq 'debug') {

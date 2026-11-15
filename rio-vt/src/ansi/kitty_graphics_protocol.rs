@@ -1924,9 +1924,19 @@ fn read_payload(cmd: &KittyGraphicsCommand) -> Result<Vec<u8>, GraphicError> {
 
                 debug!("Opening shared memory: {}", shm_name_str);
 
+                // On Linux the name is a file under /dev/shm, which any
+                // program in the terminal can replace with a FIFO; a
+                // blocking open of one would hang the parser (and the
+                // terminal lock) until a writer shows up. Open without
+                // blocking and insist on a regular file below.
+                #[cfg(target_os = "linux")]
+                let oflag = libc::O_RDONLY | libc::O_NONBLOCK;
+                #[cfg(not(target_os = "linux"))]
+                let oflag = libc::O_RDONLY;
+
                 unsafe {
                     // Open shared memory
-                    let fd: RawFd = libc::shm_open(shm_name.as_ptr(), libc::O_RDONLY, 0);
+                    let fd: RawFd = libc::shm_open(shm_name.as_ptr(), oflag, 0);
 
                     if fd < 0 {
                         let err = std::io::Error::last_os_error();
@@ -1946,6 +1956,13 @@ fn read_payload(cmd: &KittyGraphicsCommand) -> Result<Vec<u8>, GraphicError> {
                     let mut stat: libc::stat = std::mem::zeroed();
                     if libc::fstat(fd, &mut stat) < 0 {
                         debug!("Failed to fstat shared memory");
+                        return Err(GraphicError::InvalidData);
+                    }
+                    // Only where the name is a filesystem path; macOS
+                    // shm objects do not report S_IFREG.
+                    #[cfg(target_os = "linux")]
+                    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+                        debug!("Shared memory '{}' is not a regular file", shm_name_str);
                         return Err(GraphicError::InvalidData);
                     }
 
@@ -3164,6 +3181,42 @@ mod tests {
     }
 
     #[test]
+    fn test_declared_size_is_not_reserved_for_direct_chunks() {
+        // `S=` is a client claim about file/shm reads; a direct chunked
+        // upload must neither trust it for allocation nor fail on it.
+        let mut state = KittyGraphicsState::default();
+        let huge = format!("a=t,f=32,s=1,v=1,m=1,i=1,S={}", u32::MAX);
+        let p = vec![b"G".as_ref(), huge.as_bytes(), b"/wAA"];
+        assert!(parse(&p, &mut state).is_some());
+        let stored = state.loading.as_ref().expect("stored");
+        assert_eq!(stored.payload.len(), 3);
+        assert!(
+            stored.payload.capacity() < 1024 * 1024,
+            "capacity {} must not follow the declared size",
+            stored.payload.capacity()
+        );
+    }
+
+    #[test]
+    fn test_repeated_chunk_ids_keep_one_in_flight_upload() {
+        // Repeated IDs on continuation chunks do not create parallel uploads.
+        // The first chunk keeps ownership of the single bounded load.
+        let mut state = KittyGraphicsState::default();
+        for i in 1..=3u32 {
+            let ctl = format!("a=t,f=32,s=1,v=1,m=1,i={i}");
+            let p = vec![b"G".as_ref(), ctl.as_bytes(), b"/wAA"];
+            parse(&p, &mut state).expect("pending chunk");
+            assert_eq!(state.loading.as_ref().unwrap().image_id, 1);
+        }
+        assert_eq!(state.loading.as_ref().unwrap().image_id, 1);
+
+        // A continuation still appends to the one pending upload.
+        let p = vec![b"G".as_ref(), b"a=t,m=1,i=3", b"/wAA"];
+        parse(&p, &mut state).expect("pending chunk");
+        assert_eq!(state.loading.as_ref().unwrap().payload.len(), 12);
+    }
+
+    #[test]
     fn test_padding_in_middle_of_raw_concat_would_fail() {
         // Sanity check: confirm the exact failure mode we fixed — a
         // naive concat of padded chunks produces a string with `=` in
@@ -3475,6 +3528,25 @@ mod tests {
             payload: SmallVec::from_slice(name.as_bytes()),
             ..Default::default()
         }
+    }
+
+    /// A FIFO planted under /dev/shm must not block the parser: the
+    /// open is non-blocking and the fstat type check rejects it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_shm_fifo_is_rejected_without_blocking() {
+        if !std::path::Path::new("/dev/shm").is_dir() {
+            return;
+        }
+        let name = format!("/rio-shm-fifo-{}", std::process::id());
+        let path = format!("/dev/shm{name}");
+        let _ = std::fs::remove_file(&path);
+        let cpath = std::ffi::CString::new(path.clone()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+
+        let result = create_graphic_data(&mut shm_command(&name, 0, 4));
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(result, Err(GraphicError::InvalidData)));
     }
 
     #[cfg(all(unix, not(target_os = "android")))]

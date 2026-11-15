@@ -43,3 +43,129 @@ the available profiling tools.
 Local raw diffs, logs, and measurements are retained under
 `.local-support/merge-upstream-2026-11-15/`. Validation results and final decisions
 will be added here after integration.
+
+## Integration decisions
+
+- Use upstream OSC 7501 parsing, status types, opt-in, query replies, and OSC 133
+  lifecycle events. Keep the bounded pane store and tab display as a UI adapter.
+  The frontend explicitly opts in, including dead-pane test fixtures.
+- Use upstream whole-OSC payload handling, hyperlink rules, OSC 9 dispatch,
+  XTGETTCAP limits, APC and OSC accumulation limits, and combining-mark caps.
+  Adapt combining marks to the fork's wide-cell representation.
+- Keep the 64 KiB Kitty clipboard packet budget and abort callback. Upstream
+  has no Kitty clipboard implementation to replace this fork feature.
+- Keep SetUserVar because app icons and SSH integration read it. Bound names to
+  128 bytes, decoded values to 4096 bytes, and the store to 64 entries.
+- Use upstream glyph protocol 1.12 layout, decoding, rasterization, and atlas
+  identity. Keep the existing row, style, shaping, and cross-pane bitmap caches.
+- Use upstream ConPTY loading, pipe workers, exit watcher, package version
+  1.25.261109001, signature verification, ZIP layout, and MSI components.
+  Restore its parking_lot dependency, removed by the old fork pipe implementation.
+- Remove the old local ConPTY package and preparation script. Adapt install.ps1
+  to copy architecture subdirectories and the upstream license. Upstream packages
+  x64 and ARM64. The former x86 preparation option is removed. Preparation now
+  requires pwsh and network access, matching upstream's fetch script.
+- Keep the fork's pipe-before-backend teardown order and resize error propagation.
+  These contracts remain in the fork PTY interface.
+- Use upstream command-finish notifications, launch overrides, fixed titles,
+  hold-after-exit behavior, macOS numpad Enter, PTY close-on-exec, image APIs,
+  release metadata, and dependency updates. Keep failed-config reload recovery,
+  terminal-resource cleanup, SSH sessions, and desktop chrome.
+- Use upstream zsh prompt and command marks. Keep the SSH wrapper and app reports,
+  removing the fork's duplicate prompt-start mark.
+
+## Parser exception
+
+The retained parser handles valid UTF-8 across read boundaries. Replacing it
+wholesale with upstream fails the existing
+`partial_utf8_preserves_ascii_before_the_next_partial_character` test. For
+`éĆ` split after the first byte, upstream drops `C`.
+The upstream-parser comparison passes 53 tests and fails 12 fork regression
+checks, including this text-loss case and C1 and opaque-string handling.
+
+Keep the boundary scanners, UTF-8 corrections, and string-state handling.
+The OSC buffer, verbatim dispatch, and limits use upstream's design. The
+same-caller comparison also measures a graphics benefit, described below.
+
+## Fork coverage
+
+The initial fork range changes 365 files. Of these, 325 remain byte-for-byte
+unchanged. Forty change during integration, including five outside the
+35-file overlap with upstream. The local `fork-audit.json` records each file.
+
+| Affected files | Decision |
+| --- | --- |
+| .gitignore, .goreleaser.yaml, Cargo.toml, Cargo.lock | Upstream versions and package layout, with fork dependency patches retained. |
+| extra/man/rio.5.scd, rio-backend/src/config/mod.rs | Add hold and command-finish configuration beside fork UI options. |
+| rio-backend/src/config/hints.rs | Upstream explicit-URI documentation. |
+| application.rs, bindings/mod.rs, cli.rs, context/mod.rs, context/title.rs, main.rs, screen/mod.rs in frontends/rioterm/src | Upstream launch, hold, notifications, and keypad behavior with fork UI, SSH, and cleanup. |
+| shell_integration/mod.rs and rio-integration.zsh | Upstream command lifecycle with fork SSH and app reports. |
+| librio/src/capi.rs, lib.rs, render_state.rs | Upstream status delegate and image APIs. Keep paste encoding, snapshot optimizations, and geometry casts. |
+| misc/windows/install.ps1, prepare-runtime.ps1, rio.wxs | Install and package upstream runtime layout. |
+| misc/windows/prepare-conpty.ps1, vendor/windows-console/SHA256SUMS, and its old NuGet archive | Remove the replaced preparation path and binary. |
+| rio-graphics/src/glyph/glyf_decode.rs, rio-grid/src/lib.rs, sugarloaf/src/lib.rs | Upstream glyph layout and decode with fork rendering optimizations. |
+| rio-vt/src/ansi/kitty_graphics_protocol.rs | Upstream nonblocking shared-memory checks. Keep the bounded single upload needed by fork animation and image identity. Port resource tests to that representation. |
+| rio-vt/src/crosswords/mod.rs, event/mod.rs, performer/handler.rs, performer/mod.rs, performer/osc.rs, performer/parser/mod.rs, program_status.rs | Upstream protocols and limits with the correctness and UI adaptations above. |
+| teletypewriter/src/unix/mod.rs | Upstream close-on-exec on both spawn paths. |
+| teletypewriter/src/windows/child.rs, conpty.rs, pipes.rs | Upstream implementation with fork resize result contract. |
+
+The dependency restoration also changes teletypewriter/Cargo.toml, outside the
+original affected-file audit.
+
+## Performance
+
+Compare the pinned task-start fork, the integrated candidate, and the same
+candidate with upstream's parser. The parser comparison changes that module and
+compatibility adapters. All use the same probe and resolved probe dependencies.
+
+The probe times file reads, terminal processing, and a visible snapshot after each
+64 KiB of input. Fixtures use a 120 by 80 terminal, 10,000 history lines, and
+1 KiB or 64 KiB reads. Setup and final state hashes are outside timing. Builds
+use Rust 1.99.1, optimization level 3, no LTO, and 16 codegen units. Runs alternate
+on one pinned CPU with builds idle. Allocation passes run separately.
+
+- Four 512 by 512 RGBA uploads confirm the retained parser takes 4.6% and 6.3%
+  less time than upstream's parser at the two read sizes. Medians are 3.38 ms
+  and 2.94 ms over 33 samples. These are CPU caller timings, not interactive gains.
+- Ordinary text and short protocols show no consistent parser advantage.
+- Whole OSC title and hyperlink workloads take about 9.5% less time than the
+  pre-merge fork and allocate 69,906 fewer times per 4 MiB fixture.
+- Status handling costs about 2–3% more and makes 80,660 additional allocations
+  per 4 MiB fixture. It emits the upstream status event and updates the fork UI
+  mirror. Both versions handle reports.
+- Combining marks cost about 2% more with the per-cell bound. This keeps the
+  upstream protection against quadratic accumulation.
+- Large unsupported APC input costs about 1.6 to 2.4 times the old fork's time,
+  with roughly 7 MiB more peak process memory. Upstream accumulates it under its
+  64 MiB cap. The old fork stopped at a much smaller budget.
+- Common fixtures preserve visible text, cursor, and history hashes. Those hashes
+  do not establish image-pixel or complete protocol equivalence.
+
+Upstream also changes accepted input sizes. Ordinary OSC and OSC 7501 accumulation
+can exceed the old 64 KiB and 4 KiB limits, respectively, though OSC 7501 reports
+still validate against the protocol limit. Single image and APC payloads now stop
+at upstream's 64 MiB wire cap. Retained OSC capacity rises to 1 MiB. These are
+intentional upstream resource-policy tradeoffs.
+
+Raw samples, fixture hashes, binary hashes, commands, CPU details, source trees,
+and allocation and memory results are retained under
+`.local-support/merge-upstream-2026-11-15/`, including `evidence.json` and the
+adjacent scripts and logs. The probe is `misc/render-profile/stream-probe.rs`.
+Allocation bytes sum requested allocation and reallocation sizes. Memory uses
+whole-process Linux VmHWM, not interval-only live bytes.
+
+Preliminary runs with candidate status handling disabled are excluded. Final
+runs explicitly opt in, matching the frontend caller.
+
+## Validation status
+
+- Exact task-start Linux and Windows workspace baselines pass.
+- Integrated Linux workspace tests with wgpu pass, including metadata boundary
+  coverage. Clippy with all targets and features passes with warnings.
+- The C API smoke test compiles and passes on Linux. The Makefile entry is macOS
+  specific, so Linux links the static library with m, dl, pthread, and stdc++.
+- A native Wayland ASCII smoke run presents 90 frames. This checks execution,
+  not image quality or before-and-after rendering performance.
+- Windows candidate validation continues after restoring the pipe dependency.
+- macOS execution, Windows performance, image-pixel comparison, and a full desktop
+  interaction matrix remain outside completed coverage.

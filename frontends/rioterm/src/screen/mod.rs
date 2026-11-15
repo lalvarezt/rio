@@ -1195,6 +1195,10 @@ impl Screen<'_> {
         };
 
         if !bytes.is_empty() {
+            if self.context_manager.close_if_exited() {
+                return;
+            }
+
             self.scroll_bottom_when_cursor_not_visible();
             self.clear_selection();
 
@@ -3947,7 +3951,14 @@ impl Screen<'_> {
     pub fn paste(&mut self, text: &str, bracketed: bool) {
         if self.search_active() {
             self.search_input_batch(text.chars());
-        } else if bracketed && self.get_mode().contains(Mode::BRACKETED_PASTE) {
+            return;
+        }
+
+        if !text.is_empty() && self.context_manager.close_if_exited() {
+            return;
+        }
+
+        if bracketed && self.get_mode().contains(Mode::BRACKETED_PASTE) {
             self.scroll_bottom_when_cursor_not_visible();
             self.clear_selection();
 

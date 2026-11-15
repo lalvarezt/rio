@@ -1,8 +1,9 @@
 #![allow(clippy::missing_safety_doc)]
 
 use crate::{
-    Action, Engine, Key, KeyAction, KeyEvent, Modifiers, RenderState, SelectionKind,
-    Side, Square, Style, StyleFlags, Surface, SurfaceDelegate, SurfaceDesc, SurfaceId,
+    Action, Engine, ImageLayer, ImageProtocol, Key, KeyAction, KeyEvent, Modifiers,
+    RenderState, SelectionKind, Side, Square, Style, StyleFlags, Surface,
+    SurfaceDelegate, SurfaceDesc, SurfaceId,
 };
 use rio_vt::config::colors::{AnsiColor, ColorRgb, NamedColor};
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -15,6 +16,31 @@ pub const RIO_ACTION_CURSOR_BLINKING_CHANGE: u32 = 2;
 /// OSC 9;4 progress: `data_a` is the ConEmu state (0 remove, 1 set,
 /// 2 error, 3 indeterminate, 4 paused), `data_b` the 0-100 value.
 pub const RIO_ACTION_PROGRESS: u32 = 3;
+/// A shell command finished: `data_a` is its exit status as a signed
+/// 32-bit value in two's complement (read it as `int32_t`), or
+/// `RIO_EXIT_STATUS_NONE` when the shell sent none; `data_b` is how
+/// long it ran, in milliseconds.
+pub const RIO_ACTION_COMMAND_FINISHED: u32 = 4;
+/// `INT32_MIN`, which no real exit status takes.
+pub const RIO_EXIT_STATUS_NONE: u32 = i32::MIN as u32;
+
+/// `rio_program_status_s::event`: a report, or a lifecycle event after
+/// which the host drops records (see `program_status_cb`).
+pub const RIO_PROGRAM_STATUS_REPORT: u32 = 0;
+pub const RIO_PROGRAM_STATUS_PROMPT_START: u32 = 1;
+pub const RIO_PROGRAM_STATUS_RESET: u32 = 2;
+
+pub const RIO_PROGRAM_STATE_IDLE: u32 = 0;
+pub const RIO_PROGRAM_STATE_WORKING: u32 = 1;
+pub const RIO_PROGRAM_STATE_DONE: u32 = 2;
+pub const RIO_PROGRAM_STATE_BLOCKED: u32 = 3;
+pub const RIO_PROGRAM_STATE_ERROR: u32 = 4;
+pub const RIO_PROGRAM_STATE_CLEAR: u32 = 5;
+
+pub const RIO_PROGRAM_KIND_NONE: u32 = 0;
+pub const RIO_PROGRAM_KIND_PERMISSION: u32 = 1;
+pub const RIO_PROGRAM_KIND_QUESTION: u32 = 2;
+pub const RIO_PROGRAM_KIND_AUTH: u32 = 3;
 
 pub const RIO_COLOR_NAMED: u8 = 0;
 pub const RIO_COLOR_INDEXED: u8 = 1;
@@ -77,6 +103,25 @@ pub struct rio_action_s {
     pub data_b: u32,
 }
 
+/// One OSC 7501 event. Strings are UTF-8, NULL when absent, and valid
+/// only for the duration of the callback.
+#[repr(C)]
+pub struct rio_program_status_s {
+    /// `RIO_PROGRAM_STATUS_*`. The fields below are set only for REPORT.
+    pub event: u32,
+    /// `RIO_PROGRAM_STATE_*`.
+    pub state: u32,
+    /// `RIO_PROGRAM_KIND_*`; only ever non-NONE when `state` is BLOCKED.
+    pub kind: u32,
+    /// 0-100, or -1 when absent (indeterminate).
+    pub progress: i32,
+    /// Slash-separated record path; NULL addresses the root record.
+    pub id: *const c_char,
+    pub app: *const c_char,
+    pub msg: *const c_char,
+    pub title: *const c_char,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct rio_runtime_config_s {
@@ -85,6 +130,8 @@ pub struct rio_runtime_config_s {
     pub action_cb: Option<extern "C" fn(*mut c_void, usize, rio_action_s)>,
     pub clipboard_write_cb: Option<extern "C" fn(*mut c_void, usize, u8, *const c_char)>,
     pub close_surface_cb: Option<extern "C" fn(*mut c_void, usize)>,
+    pub program_status_cb:
+        Option<extern "C" fn(*mut c_void, usize, *const rio_program_status_s)>,
 }
 
 #[repr(C)]
@@ -192,10 +239,16 @@ impl SurfaceDelegate for CDelegate {
     }
 
     fn action(&self, surface: SurfaceId, action: Action) {
+        if let Action::ProgramStatus(event) = action {
+            self.program_status(surface, event);
+            return;
+        }
         let Some(cb) = self.config.action_cb else {
             return;
         };
         match action {
+            // Has its own callback; routed above.
+            Action::ProgramStatus(_) => {}
             Action::SetTitle { title, subtitle } => {
                 let title = CString::new(title).unwrap_or_default();
                 let subtitle_c = subtitle.map(|s| CString::new(s).unwrap_or_default());
@@ -240,6 +293,26 @@ impl SurfaceDelegate for CDelegate {
                     },
                 );
             }
+            Action::CommandFinished {
+                exit_status,
+                duration,
+            } => {
+                cb(
+                    self.config.userdata,
+                    surface,
+                    rio_action_s {
+                        tag: RIO_ACTION_COMMAND_FINISHED,
+                        title: std::ptr::null(),
+                        subtitle: std::ptr::null(),
+                        // The sentinel is INT32_MIN, so a status
+                        // saturated down to it moves up by one.
+                        data_a: exit_status.map_or(RIO_EXIT_STATUS_NONE, |status| {
+                            status.max(i32::MIN + 1) as u32
+                        }),
+                        data_b: u32::try_from(duration.as_millis()).unwrap_or(u32::MAX),
+                    },
+                );
+            }
             Action::CursorBlinkingChange => {
                 cb(
                     self.config.userdata,
@@ -272,6 +345,74 @@ impl SurfaceDelegate for CDelegate {
         if let Some(cb) = self.config.close_surface_cb {
             cb(self.config.userdata, surface);
         }
+    }
+
+    fn handles_program_status(&self) -> bool {
+        self.config.program_status_cb.is_some()
+    }
+}
+
+impl CDelegate {
+    fn program_status(&self, surface: SurfaceId, event: crate::ProgramStatusEvent) {
+        use crate::{BlockedKind, ProgramState, ProgramStatusEvent};
+        let Some(cb) = self.config.program_status_cb else {
+            return;
+        };
+        let report = match event {
+            ProgramStatusEvent::PromptStart | ProgramStatusEvent::Reset => {
+                let event = if matches!(event, ProgramStatusEvent::Reset) {
+                    RIO_PROGRAM_STATUS_RESET
+                } else {
+                    RIO_PROGRAM_STATUS_PROMPT_START
+                };
+                let status = rio_program_status_s {
+                    event,
+                    state: 0,
+                    kind: RIO_PROGRAM_KIND_NONE,
+                    progress: -1,
+                    id: std::ptr::null(),
+                    app: std::ptr::null(),
+                    msg: std::ptr::null(),
+                    title: std::ptr::null(),
+                };
+                cb(self.config.userdata, surface, &status);
+                return;
+            }
+            ProgramStatusEvent::Report(report) => report,
+        };
+        // Validated upstream: no control characters, so no interior NUL.
+        let cstr = |s: Option<String>| s.and_then(|s| CString::new(s).ok());
+        let (id, app, msg, title) = (
+            cstr(report.id),
+            cstr(report.app),
+            cstr(report.msg),
+            cstr(report.title),
+        );
+        let ptr =
+            |s: &Option<CString>| s.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
+        let status = rio_program_status_s {
+            event: RIO_PROGRAM_STATUS_REPORT,
+            state: match report.state {
+                ProgramState::Idle => RIO_PROGRAM_STATE_IDLE,
+                ProgramState::Working => RIO_PROGRAM_STATE_WORKING,
+                ProgramState::Done => RIO_PROGRAM_STATE_DONE,
+                ProgramState::Blocked => RIO_PROGRAM_STATE_BLOCKED,
+                ProgramState::Error => RIO_PROGRAM_STATE_ERROR,
+                ProgramState::Clear => RIO_PROGRAM_STATE_CLEAR,
+            },
+            kind: match report.kind {
+                None => RIO_PROGRAM_KIND_NONE,
+                Some(BlockedKind::Permission) => RIO_PROGRAM_KIND_PERMISSION,
+                Some(BlockedKind::Question) => RIO_PROGRAM_KIND_QUESTION,
+                Some(BlockedKind::Auth) => RIO_PROGRAM_KIND_AUTH,
+            },
+            progress: report.progress.map_or(-1, i32::from),
+            id: ptr(&id),
+            app: ptr(&app),
+            msg: ptr(&msg),
+            title: ptr(&title),
+        };
+        cb(self.config.userdata, surface, &status);
     }
 }
 
@@ -1587,6 +1728,201 @@ pub unsafe extern "C" fn rio_render_state_kitty_image_rgba(
         }
         let slice = unsafe { std::slice::from_raw_parts_mut(buf, cap) };
         unsafe { &*state }.kitty_image_rgba(image_id, slice)
+    }))
+    .unwrap_or(0)
+}
+
+/// Image protocols, for `rio_image_placement_s.protocol` and the
+/// `rio_render_state_image_*` lookups. Ids are only unique within one.
+pub const RIO_IMAGE_PROTOCOL_KITTY: u8 = 0;
+/// Sixel and iTerm2 inline images, which share one store.
+pub const RIO_IMAGE_PROTOCOL_INLINE: u8 = 1;
+
+/// Image layers, for `rio_image_placement_s.layer`. Draw in this order:
+/// images below the background, cell backgrounds, images below the
+/// text, text, images above the text; within a layer by z-index.
+pub const RIO_IMAGE_LAYER_BELOW_BACKGROUND: u8 = 0;
+pub const RIO_IMAGE_LAYER_BELOW_TEXT: u8 = 1;
+pub const RIO_IMAGE_LAYER_ABOVE_TEXT: u8 = 2;
+
+/// One rectangle of one image, of any protocol, resolved to viewport
+/// pixels. `x`/`y` are relative to the grid origin (add your padding);
+/// `src_*` is the normalized source rectangle within the image. Cache
+/// textures by (`protocol`, `image_id`, `image_stamp`): the stamp
+/// changes whenever the image's pixels do, and is never 0 while they
+/// are available, so 0 can stand for "no texture yet".
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct rio_image_placement_s {
+    pub image_id: u64,
+    pub image_stamp: u64,
+    pub z_index: i32,
+    pub protocol: u8,
+    pub layer: u8,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub src_x: f32,
+    pub src_y: f32,
+    pub src_w: f32,
+    pub src_h: f32,
+}
+
+fn image_protocol(protocol: u8) -> Option<ImageProtocol> {
+    match protocol {
+        RIO_IMAGE_PROTOCOL_KITTY => Some(ImageProtocol::Kitty),
+        RIO_IMAGE_PROTOCOL_INLINE => Some(ImageProtocol::Inline),
+        _ => None,
+    }
+}
+
+/// Number of image placements of every protocol in the last snapshot
+/// (visible or not), in draw order: by z-index, lowest first, with
+/// sixel/iTerm2 images under kitty ones at the same z. Resolve each
+/// with [`rio_render_state_image_placement`], which filters to the
+/// viewport. The kitty-only calls above remain as a subset of this:
+/// draw from one or the other, never both, or kitty images are drawn
+/// twice. Later versions may add protocols; skip a placement whose
+/// protocol you don't know.
+#[no_mangle]
+pub unsafe extern "C" fn rio_render_state_image_count(
+    state: *const RenderState,
+) -> usize {
+    catch_unwind(AssertUnwindSafe(|| {
+        if state.is_null() {
+            return 0;
+        }
+        unsafe { &*state }.image_count()
+    }))
+    .unwrap_or(0)
+}
+
+/// Changes whenever an update changes the placement list or moves it
+/// on screen (a scroll). A host that keeps a draw list rebuilds it only
+/// when this differs from the value it last built against. Compare for
+/// equality only; it is 0 until the first image appears.
+#[no_mangle]
+pub unsafe extern "C" fn rio_render_state_image_placements_generation(
+    state: *const RenderState,
+) -> u64 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if state.is_null() {
+            return 0;
+        }
+        unsafe { &*state }.image_placements_generation()
+    }))
+    .unwrap_or(0)
+}
+
+/// Resolve placement `index` against the current viewport with the
+/// renderer's cell metrics. Returns false when it's scrolled out of view.
+#[no_mangle]
+pub unsafe extern "C" fn rio_render_state_image_placement(
+    state: *const RenderState,
+    index: usize,
+    cell_width: f32,
+    cell_height: f32,
+    out: *mut rio_image_placement_s,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if state.is_null() || out.is_null() {
+            return false;
+        }
+        let Some(placement) =
+            unsafe { &*state }.image_placement(index, cell_width, cell_height)
+        else {
+            return false;
+        };
+        let geometry = placement.geometry;
+        unsafe {
+            *out = rio_image_placement_s {
+                image_id: placement.image_id,
+                image_stamp: placement.image_stamp,
+                z_index: placement.z_index,
+                protocol: match placement.protocol {
+                    ImageProtocol::Kitty => RIO_IMAGE_PROTOCOL_KITTY,
+                    ImageProtocol::Inline => RIO_IMAGE_PROTOCOL_INLINE,
+                },
+                layer: match placement.layer {
+                    ImageLayer::BelowBackground => RIO_IMAGE_LAYER_BELOW_BACKGROUND,
+                    ImageLayer::BelowText => RIO_IMAGE_LAYER_BELOW_TEXT,
+                    ImageLayer::AboveText => RIO_IMAGE_LAYER_ABOVE_TEXT,
+                },
+                x: geometry.x,
+                y: geometry.y,
+                width: geometry.width as f32,
+                height: geometry.height as f32,
+                src_x: geometry.source_rect[0],
+                src_y: geometry.source_rect[1],
+                src_w: geometry.source_rect[2] - geometry.source_rect[0],
+                src_h: geometry.source_rect[3] - geometry.source_rect[1],
+            };
+        }
+        true
+    }))
+    .unwrap_or(false)
+}
+
+/// Pixel dimensions and change stamp of an image of either protocol;
+/// false when it is unknown. Each out pointer may be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn rio_render_state_image_info(
+    state: *const RenderState,
+    protocol: u8,
+    image_id: u64,
+    out_width: *mut u32,
+    out_height: *mut u32,
+    out_stamp: *mut u64,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if state.is_null() {
+            return false;
+        }
+        let Some(protocol) = image_protocol(protocol) else {
+            return false;
+        };
+        let Some((width, height, stamp)) =
+            unsafe { &*state }.image_info(protocol, image_id)
+        else {
+            return false;
+        };
+        unsafe {
+            if !out_width.is_null() {
+                *out_width = width as u32;
+            }
+            if !out_height.is_null() {
+                *out_height = height as u32;
+            }
+            if !out_stamp.is_null() {
+                *out_stamp = stamp;
+            }
+        }
+        true
+    }))
+    .unwrap_or(false)
+}
+
+/// Copy an image of either protocol into `buf` as tightly-packed
+/// RGBA8. Returns the bytes written (width * height * 4), or 0 when the
+/// image is unknown or `cap` is too small.
+#[no_mangle]
+pub unsafe extern "C" fn rio_render_state_image_rgba(
+    state: *const RenderState,
+    protocol: u8,
+    image_id: u64,
+    buf: *mut u8,
+    cap: usize,
+) -> usize {
+    catch_unwind(AssertUnwindSafe(|| {
+        if state.is_null() || buf.is_null() {
+            return 0;
+        }
+        let Some(protocol) = image_protocol(protocol) else {
+            return 0;
+        };
+        let slice = unsafe { std::slice::from_raw_parts_mut(buf, cap) };
+        unsafe { &*state }.image_rgba(protocol, image_id, slice)
     }))
     .unwrap_or(0)
 }

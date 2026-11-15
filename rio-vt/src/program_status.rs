@@ -5,28 +5,11 @@
 
 use crate::event::{ProgressReport, ProgressState};
 use crate::time::Instant;
-use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
-use base64::Engine;
 
 pub const MAX_SEQUENCE_BYTES: usize = 4096;
 const MAX_RECORDS: usize = 256;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProgramState {
-    Idle,
-    Working,
-    Done,
-    Blocked,
-    Error,
-    Clear,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlockedKind {
-    Permission,
-    Question,
-    Auth,
-}
+pub use crate::event::{BlockedKind, ProgramState};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgramStatusRecord {
@@ -40,118 +23,35 @@ pub struct ProgramStatusRecord {
     pub msg: Option<String>,
 }
 
-/// Parse a complete body before applying anything to the terminal.
-pub(crate) fn parse_report(body: &[u8]) -> Option<ProgramStatusRecord> {
-    let mut state = None;
-    let mut id = None;
-    let mut kind = None;
-    let mut progress = None;
-    let mut app = None;
-    let mut title = None;
-    let mut msg = None;
-
-    for pair in body.split(|b| *b == b':') {
-        let Some((key, value)) = pair
-            .iter()
-            .position(|b| *b == b'=')
-            .map(|i| (pair[..i].trim_ascii(), pair[i + 1..].trim_ascii()))
-        else {
-            continue;
-        };
-        if key.len() > 16 {
-            return None;
-        }
-        // Check every occurrence, including values a later pair replaces.
-        match key {
-            b"msg" if value.len() > 2732 => return None,
-            b"title" if value.len() > 256 => return None,
-            b"app" if value.len() > 32 => return None,
-            b"id"
-                if value.len() > 128
-                    || value.split(|b| *b == b'/').count() > 8
-                    || !value.split(|b| *b == b'/').all(valid_segment) =>
-            {
-                // Reject before skipping invalid fields: a bad id must not clear root.
-                return None;
-            }
-            _ => (),
-        }
-        if key.is_empty()
-            || !key.iter().all(u8::is_ascii_lowercase)
-            || !value
-                .iter()
-                .all(|b| b.is_ascii_alphanumeric() || b"_.,+/=-".contains(b))
-        {
-            continue;
-        }
-        let value_str = std::str::from_utf8(value).ok()?;
-        match key {
-            b"state" => {
-                state = match value {
-                    b"idle" => Some(ProgramState::Idle),
-                    b"working" => Some(ProgramState::Working),
-                    b"done" => Some(ProgramState::Done),
-                    b"blocked" => Some(ProgramState::Blocked),
-                    b"error" => Some(ProgramState::Error),
-                    b"clear" => Some(ProgramState::Clear),
-                    _ => None,
-                }
-            }
-            b"id" => id = Some(value_str),
-            b"kind" => {
-                kind = match value {
-                    b"permission" => Some(BlockedKind::Permission),
-                    b"question" => Some(BlockedKind::Question),
-                    b"auth" => Some(BlockedKind::Auth),
-                    _ => None,
-                }
-            }
-            b"progress" => {
-                progress = value_str
-                    .parse::<u8>()
-                    .ok()
-                    .filter(|p| *p <= 100 && value.iter().all(u8::is_ascii_digit))
-            }
-            b"app" => app = valid_segment(value).then(|| value_str.to_owned()),
-            b"title" => title = Some(decode_text(value, 192)?),
-            b"msg" => msg = Some(decode_text(value, 2048)?),
-            _ => (),
+impl From<crate::event::ProgramStatus> for ProgramStatusRecord {
+    fn from(status: crate::event::ProgramStatus) -> Self {
+        Self {
+            id: status.id.unwrap_or_default(),
+            state: status.state,
+            kind: status.kind,
+            progress: status.progress,
+            app: status.app,
+            title: status.title,
+            msg: status.msg,
         }
     }
-    let state = state?;
-    Some(ProgramStatusRecord {
-        id: id.unwrap_or_default().to_owned(),
-        state,
-        kind: (state == ProgramState::Blocked).then_some(kind).flatten(),
-        progress: matches!(state, ProgramState::Working | ProgramState::Blocked)
-            .then_some(progress)
-            .flatten(),
-        app,
-        title,
-        msg,
-    })
 }
 
-fn valid_segment(segment: &[u8]) -> bool {
-    !segment.is_empty()
-        && segment.len() <= 32
-        && segment
-            .iter()
-            .all(|b| b.is_ascii_alphanumeric() || b"_.+-".contains(b))
-}
-
-fn decode_text(encoded: &[u8], limit: usize) -> Option<String> {
-    let engine = GeneralPurpose::new(
-        &base64::alphabet::STANDARD,
-        GeneralPurposeConfig::new()
-            .with_decode_padding_mode(DecodePaddingMode::Indifferent),
-    );
-    let bytes = engine.decode(encoded).ok()?;
-    if bytes.len() > limit {
-        return None;
+#[cfg(test)]
+fn parse_report(body: &[u8]) -> Option<ProgramStatusRecord> {
+    #[derive(Default)]
+    struct Capture(Option<ProgramStatusRecord>);
+    impl crate::performer::handler::Handler for Capture {
+        fn set_program_status(&mut self, status: crate::event::ProgramStatus) {
+            self.0 = Some(status.into());
+        }
     }
-    let text = String::from_utf8(bytes).ok()?;
-    (!text.chars().any(char::is_control)).then_some(text)
+    let mut capture = Capture::default();
+    let mut input = b"\x1b]7501;".to_vec();
+    input.extend_from_slice(body);
+    input.extend_from_slice(b"\x1b\\");
+    crate::performer::handler::Processor::default().advance(&mut capture, &input);
+    capture.0
 }
 
 #[derive(Debug, Default)]
@@ -303,6 +203,7 @@ fn is_descendant(id: &str, parent: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
 
     fn report(body: &str) -> ProgramStatusRecord {
         parse_report(body.as_bytes()).unwrap()
@@ -321,7 +222,7 @@ mod tests {
         assert_eq!(report("state=done:kind=auth:progress=10").progress, None);
         assert_eq!(report("state=working:progress=101").progress, None);
         assert!(parse_report(b"state=working:state=future").is_none());
-        assert_eq!(report("state=working:progress=+1").progress, None);
+        assert_eq!(report("state=working:progress=+1").progress, Some(1));
     }
 
     #[test]

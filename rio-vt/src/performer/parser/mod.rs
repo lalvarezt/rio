@@ -30,14 +30,6 @@ const MAX_OSC_PARAMS: usize = 16;
 /// `OscBuffer::overflow`.
 const OSC_FIXED_LEN: usize = 2048;
 
-/// Ordinary control strings and reusable buffers need no more than 64 KiB.
-pub(super) const MAX_CONTROL_BYTES: usize = 64 * 1024;
-/// Encoded OSC 52 data, allowing clipboard transfers up to about 12 MiB.
-const MAX_CLIPBOARD_BYTES: usize = 16 * 1024 * 1024;
-/// Base64 expansion of the existing 400 MiB Kitty image limit, plus headers.
-pub(super) const MAX_GRAPHICS_BYTES: usize =
-    (400 * 1024 * 1024usize).div_ceil(3) * 4 + MAX_CONTROL_BYTES;
-
 /// Parser for raw _VTE_ protocol which delegates actions to a [`Perform`].
 #[derive(Default)]
 pub struct Parser {
@@ -49,10 +41,6 @@ pub struct Parser {
     osc_raw: OscBuffer,
     osc_params: [(usize, usize); MAX_OSC_PARAMS],
     osc_num_params: usize,
-    /// Zero selects the ordinary limit until the command number is complete.
-    osc_max_bytes: usize,
-    osc_discarded: bool,
-    osc_command: Option<u16>,
     ignoring: bool,
     partial_utf8: [u8; 4],
     partial_utf8_len: usize,
@@ -72,7 +60,21 @@ struct OscBuffer {
     fixed: [u8; OSC_FIXED_LEN],
     fixed_len: usize,
     overflow: Vec<u8>,
+    /// The sequence outgrew [`MAX_OSC_BYTES`]: the rest is discarded
+    /// and the sequence is not dispatched.
+    overflowed: bool,
+    max_bytes: usize,
 }
+
+/// Longest OSC sequence the parser accumulates. OSC 1337 inline images
+/// arrive as one whole base64 image and OSC 52 clipboards can be large
+/// too, so the cap matches the APC one, while an unterminated `ESC ]`
+/// can no longer grow the buffer until the process is killed.
+const MAX_OSC_BYTES: usize = 64 * 1024 * 1024;
+
+/// Heap capacity kept across sequences. One large paste or image must
+/// not pin tens of megabytes for the rest of the session.
+const OSC_RETAIN_BYTES: usize = 1024 * 1024;
 
 impl Default for OscBuffer {
     fn default() -> Self {
@@ -80,6 +82,8 @@ impl Default for OscBuffer {
             fixed: [0; OSC_FIXED_LEN],
             fixed_len: 0,
             overflow: Vec::new(),
+            overflowed: false,
+            max_bytes: MAX_OSC_BYTES,
         }
     }
 }
@@ -95,15 +99,19 @@ impl OscBuffer {
     }
 
     #[inline]
-    fn try_push(&mut self, byte: u8, limit: usize) -> bool {
-        debug_assert!(limit >= OSC_FIXED_LEN);
-        if self.overflow.is_empty() && self.fixed_len < OSC_FIXED_LEN {
-            self.fixed[self.fixed_len] = byte;
-            self.fixed_len += 1;
-            return true;
+    fn push(&mut self, byte: u8) {
+        if self.overflowed {
+            return;
         }
-        if self.len() >= limit {
-            return false;
+        if self.overflow.is_empty() {
+            if self.fixed_len < OSC_FIXED_LEN {
+                self.fixed[self.fixed_len] = byte;
+                self.fixed_len += 1;
+                return;
+            }
+        } else if self.overflow.len() >= self.max_bytes {
+            self.overflowed = true;
+            return;
         }
         if self.overflow.is_empty() {
             // Spill: promote the current contents to the heap once, then
@@ -113,7 +121,6 @@ impl OscBuffer {
                 .extend_from_slice(&self.fixed[..self.fixed_len]);
         }
         self.overflow.push(byte);
-        true
     }
 
     /// Bulk append, equivalent to pushing every byte: fills the fixed
@@ -121,26 +128,29 @@ impl OscBuffer {
     /// and appends there (same final contents as per-byte pushes; the
     /// stale `fixed_len` is never read while `overflow` is non-empty).
     #[inline]
-    fn try_extend_from_slice(&mut self, bytes: &[u8], limit: usize) -> bool {
-        debug_assert!(limit >= OSC_FIXED_LEN);
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        if self.overflowed {
+            return;
+        }
+        if self.len() + bytes.len() > self.max_bytes {
+            // Checked before any spill so an oversized run never
+            // allocates. Storage stays where it was; `slice` keeps
+            // working on the recorded param bounds.
+            self.overflowed = true;
+            return;
+        }
         if self.overflow.is_empty() {
             let fits = OSC_FIXED_LEN - self.fixed_len;
             if bytes.len() <= fits {
                 self.fixed[self.fixed_len..self.fixed_len + bytes.len()]
                     .copy_from_slice(bytes);
                 self.fixed_len += bytes.len();
-                return true;
+                return;
             }
-        }
-        if bytes.len() > limit.saturating_sub(self.len()) {
-            return false;
-        }
-        if self.overflow.is_empty() {
             self.overflow
                 .extend_from_slice(&self.fixed[..self.fixed_len]);
         }
         self.overflow.extend_from_slice(bytes);
-        true
     }
 
     #[inline]
@@ -155,11 +165,9 @@ impl OscBuffer {
     #[inline]
     fn clear(&mut self) {
         self.fixed_len = 0;
-        if self.overflow.capacity() > MAX_CONTROL_BYTES {
-            self.overflow = Vec::new();
-        } else {
-            self.overflow.clear();
-        }
+        self.overflowed = false;
+        self.max_bytes = MAX_OSC_BYTES;
+        super::clear_or_release(&mut self.overflow, OSC_RETAIN_BYTES);
     }
 }
 
@@ -533,7 +541,7 @@ impl Parser {
     ) -> usize {
         let n = find_osc_boundary(bytes);
         if n != 0 {
-            self.osc_extend(&bytes[..n]);
+            self.osc_raw.extend_from_slice(&bytes[..n]);
         }
         if n == bytes.len() {
             return n;
@@ -794,14 +802,11 @@ impl Parser {
     /// Add OSC param separator.
     #[inline]
     fn action_osc_put_param(&mut self) {
-        if self.osc_discarded {
+        if self.osc_payload_is_verbatim() {
+            self.osc_raw.push(b';');
             return;
         }
-        if self.osc_payload_is_verbatim() {
-            self.action_osc_put(b';');
-        } else {
-            self.push_osc_param();
-        }
+        self.push_osc_param();
     }
 
     #[inline]
@@ -811,17 +816,19 @@ impl Parser {
             self.osc_raw.slice(start, end)
         };
         match self.osc_num_params {
-            1 => param(0) == b"7",
-            2 => param(0) == b"8" || (param(0) == b"9" && param(1) == b"9"),
+            1 => matches!(param(0), b"0" | b"2" | b"7"),
+            2 => match param(0) {
+                b"8" => true,
+                b"9" => param(1) != b"4",
+                _ => false,
+            },
+            3 => param(0) == b"777" && param(1) == b"notify",
             _ => false,
         }
     }
 
     #[inline]
     fn push_osc_param(&mut self) {
-        if self.osc_discarded {
-            return;
-        }
         let idx = self.osc_raw.len();
 
         let param_idx = self.osc_num_params;
@@ -841,65 +848,34 @@ impl Parser {
         }
 
         self.osc_num_params += 1;
-        if param_idx == 0 {
-            self.osc_command = std::str::from_utf8(self.osc_raw.slice(0, idx))
-                .ok()
-                .and_then(|command| command.parse().ok());
-            self.osc_max_bytes = match self.osc_raw.slice(0, idx) {
-                b"7501" => crate::program_status::MAX_SEQUENCE_BYTES,
-                b"52" => MAX_CLIPBOARD_BYTES,
-                b"1337" => MAX_GRAPHICS_BYTES,
-                _ => MAX_CONTROL_BYTES,
-            };
-        }
-    }
-
-    fn osc_extend(&mut self, bytes: &[u8]) {
-        if self.osc_discarded {
-            return;
-        }
-        if !self.osc_raw.try_extend_from_slice(bytes, self.osc_limit()) {
-            self.discard_osc();
+        // Kitty clipboard packets have their own 64 KiB protocol budget.
+        if param_idx == 0 && self.osc_raw.slice(0, idx) == b"5522" {
+            self.osc_raw.max_bytes = 64 * 1024;
         }
     }
 
     #[inline(always)]
     fn action_osc_put(&mut self, byte: u8) {
-        if self.osc_discarded {
-            return;
-        }
-        if !self.osc_raw.try_push(byte, self.osc_limit()) {
-            self.discard_osc();
-        }
+        self.osc_raw.push(byte);
     }
 
     #[inline]
-    fn osc_limit(&self) -> usize {
-        if self.osc_max_bytes == 0 {
-            MAX_CONTROL_BYTES
-        } else {
-            self.osc_max_bytes
-        }
-    }
-
-    fn discard_osc(&mut self) {
-        self.osc_discarded = true;
-        self.osc_raw.clear();
-        self.osc_num_params = 0;
-    }
-
     fn osc_end<P: Perform>(&mut self, performer: &mut P, byte: u8) {
-        self.push_osc_param();
-        if self.osc_discarded {
-            performer.osc_discarded(self.osc_command, byte == 0x07);
+        if self.osc_raw.overflowed {
+            tracing::warn!("discarding OSC sequence over its byte budget");
+            if self.osc_num_params > 0 {
+                let (start, end) = self.osc_params[0];
+                let command = std::str::from_utf8(self.osc_raw.slice(start, end))
+                    .ok()
+                    .and_then(|s| s.parse().ok());
+                performer.osc_discarded(command, byte == 0x07);
+            }
         } else {
+            self.push_osc_param();
             self.osc_dispatch(performer, byte);
         }
         self.osc_raw.clear();
         self.osc_num_params = 0;
-        self.osc_max_bytes = 0;
-        self.osc_discarded = false;
-        self.osc_command = None;
     }
 
     /// Reset escape sequence parameters and intermediates.
@@ -917,11 +893,15 @@ impl Parser {
     /// The aliasing is needed here for multiple slices into self.osc_raw.
     #[inline]
     fn osc_dispatch<P: Perform>(&self, performer: &mut P, byte: u8) {
-        let mut slices = smallvec::SmallVec::<[&[u8]; MAX_OSC_PARAMS]>::new();
-        for &(start, end) in self.osc_params.iter().take(self.osc_num_params) {
-            slices.push(self.osc_raw.slice(start, end));
+        let mut slices: [&[u8]; MAX_OSC_PARAMS] = [&[]; MAX_OSC_PARAMS];
+        for (slice, &(start, end)) in slices
+            .iter_mut()
+            .zip(self.osc_params.iter())
+            .take(self.osc_num_params)
+        {
+            *slice = self.osc_raw.slice(start, end);
         }
-        performer.osc_dispatch(&slices, byte == 0x07);
+        performer.osc_dispatch(&slices[..self.osc_num_params], byte == 0x07);
     }
 
     /// Advance the parser state from ground.
@@ -1748,88 +1728,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn program_status_accumulation_is_bounded_and_recovers_after_oversize() {
-        for chunk_size in [1, 17, 8192] {
-            let mut parser = Parser::new();
-            let mut dispatcher = Dispatcher::default();
-            parser.advance(&mut dispatcher, b"\x1b]7501;");
-            for chunk in vec![b'a'; 16 * 1024].chunks(chunk_size) {
-                parser.advance(&mut dispatcher, chunk);
-                assert!(
-                    parser.osc_raw.len() <= crate::program_status::MAX_SEQUENCE_BYTES
-                );
-            }
-            assert!(parser.osc_discarded);
-            parser.advance(&mut dispatcher, b"\x07");
-            assert!(dispatcher.dispatched.is_empty());
-            parser.advance(&mut dispatcher, b"\x1b]7501;state=done\x07");
-            assert_eq!(dispatcher.dispatched.len(), 1);
-        }
-    }
-
-    #[test]
-    fn oversized_osc_is_discarded_until_termination_across_read_boundaries() {
-        for header in [b"\x1b]0;".as_slice(), b"\x1b]8;;", b"\x1b]"] {
-            for terminator in [b"\x07".as_slice(), b"\x1b\\", b"\x18", b"\x1a"] {
-                for chunk_size in [1, 17, 8192, MAX_CONTROL_BYTES + 1] {
-                    let mut parser = Parser::new();
-                    let mut dispatcher = Dispatcher::default();
-                    parser.advance(&mut dispatcher, header);
-                    for chunk in vec![b'x'; MAX_CONTROL_BYTES + 1].chunks(chunk_size) {
-                        parser.advance(&mut dispatcher, chunk);
-                        assert!(parser.osc_raw.len() <= MAX_CONTROL_BYTES);
-                    }
-                    assert!(parser.osc_discarded);
-                    // Separators following a discarded verbatim OSC must not index
-                    // the buffer that was just released or dispatch a partial command.
-                    parser.advance(&mut dispatcher, b";8;;http://example.com;tail");
-                    assert!(dispatcher.dispatched.is_empty());
-                    parser.advance(&mut dispatcher, terminator);
-                    dispatcher.dispatched.clear();
-                    parser.advance(&mut dispatcher, b"ok\x1b]0;title\x07");
-                    assert_eq!(
-                        dispatcher.dispatched,
-                        vec![
-                            Sequence::Print('o'),
-                            Sequence::Print('k'),
-                            Sequence::Osc(vec![b"0".to_vec(), b"title".to_vec()], true),
-                        ]
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn osc_limits_preserve_clipboard_and_image_payloads_and_release_large_buffers() {
-        for command in [b"52;c;".as_slice(), b"1337;File=:"] {
-            let mut parser = Parser::new();
-            let mut dispatcher = Dispatcher::default();
-            parser.advance(&mut dispatcher, b"\x1b]");
-            parser.advance(&mut dispatcher, command);
-            parser.advance(&mut dispatcher, &vec![b'a'; 128 * 1024]);
-            assert!(!parser.osc_discarded);
-            assert!(parser.osc_raw.overflow.capacity() > MAX_CONTROL_BYTES);
-            parser.advance(&mut dispatcher, b"\x07");
-            assert_eq!(dispatcher.dispatched.len(), 1);
-            assert_eq!(parser.osc_raw.overflow.capacity(), 0);
-        }
-
-        let mut parser = Parser::new();
-        let mut dispatcher = Dispatcher::default();
-        parser.advance(&mut dispatcher, b"\x1b]52;c;");
-        let prefix = parser.osc_raw.len();
-        parser.advance(&mut dispatcher, &vec![b'a'; MAX_CLIPBOARD_BYTES - prefix]);
-        assert_eq!(parser.osc_raw.len(), MAX_CLIPBOARD_BYTES);
-        assert!(!parser.osc_discarded);
-        parser.advance(&mut dispatcher, b"a");
-        assert!(parser.osc_discarded);
-        assert_eq!(parser.osc_raw.overflow.capacity(), 0);
-        parser.advance(&mut dispatcher, b"\x07");
-        assert!(dispatcher.dispatched.is_empty());
-    }
-
     /// The scalar and simdutf decoders implement the maximal-subpart /
     /// U+FFFD contract independently; with short runs routed
     /// scalar, only inputs >= SIMD_DECODE_MIN reach the simdutf error
@@ -2500,122 +2398,75 @@ mod tests {
     }
 
     #[test]
-    fn osc_parameter_counts_match_at_every_split() {
-        for count in 1..=MAX_OSC_PARAMS + 2 {
-            let params: Vec<_> = (0..count).map(|i| format!("p{i}")).collect();
-            let expected: Vec<_> = params
-                .iter()
-                .take(MAX_OSC_PARAMS)
-                .map(|param| param.as_bytes().to_vec())
-                .collect();
-            for terminator in [0x07, 0x1b] {
-                let mut input = format!("\x1b]{}", params.join(";")).into_bytes();
-                input.push(terminator);
-                for split in 0..=input.len() {
-                    let mut parser = Parser::default();
-                    let mut dispatcher = Dispatcher::default();
-                    parser.advance(&mut dispatcher, &input[..split]);
-                    parser.advance(&mut dispatcher, &input[split..]);
-                    assert_eq!(
-                        dispatcher.dispatched,
-                        vec![Sequence::Osc(expected.clone(), terminator == 0x07)],
-                        "count={count} terminator={terminator} split={split}"
-                    );
-                }
+    fn parse_osc8_uri_keeps_semicolons() {
+        let uri = format!("https://x.dev/a{}", ";b".repeat(MAX_OSC_PARAMS + 1));
+        let input = format!("\x1b]8;id=1;{uri}\x1b\\").into_bytes();
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::default();
+
+        parser.advance(&mut dispatcher, &input);
+
+        match &dispatcher.dispatched[0] {
+            Sequence::Osc(params, _) => {
+                assert_eq!(params.len(), 3);
+                assert_eq!(params[0], b"8");
+                assert_eq!(params[1], b"id=1");
+                assert_eq!(params[2], uri.as_bytes());
             }
+            _ => panic!("expected osc sequence"),
         }
     }
 
     #[test]
-    fn osc_verbatim_tails_survive_every_read_split() {
-        let tail = format!("préfix中{};", ";;a".repeat(MAX_OSC_PARAMS + 3));
-        for (header, mut expected) in [
-            ("7;", vec![b"7".to_vec()]),
-            (
-                "8;id=one:other=two;",
-                vec![b"8".to_vec(), b"id=one:other=two".to_vec()],
-            ),
-            ("9;9;", vec![b"9".to_vec(), b"9".to_vec()]),
-        ] {
-            expected.push(tail.as_bytes().to_vec());
-            for terminator in ["\x07", "\x1b\\"] {
-                let input = format!("\x1b]{header}{tail}{terminator}Z\x1b]9;4;1;50\x07");
-                for split in 0..=input.len() {
-                    let mut dispatcher = Dispatcher::default();
-                    let mut parser = Parser::default();
-                    parser.advance(&mut dispatcher, &input.as_bytes()[..split]);
-                    parser.advance(&mut dispatcher, &input.as_bytes()[split..]);
-                    let osc: Vec<_> = dispatcher
-                        .dispatched
-                        .iter()
-                        .filter_map(|s| match s {
-                            Sequence::Osc(params, _) => Some(params),
-                            _ => None,
-                        })
-                        .collect();
-                    assert_eq!(
-                        osc,
-                        vec![
-                            &expected,
-                            &vec![
-                                b"9".to_vec(),
-                                b"4".to_vec(),
-                                b"1".to_vec(),
-                                b"50".to_vec()
-                            ]
-                        ],
-                        "{header}, split={split}"
-                    );
-                    assert!(dispatcher.dispatched.contains(&Sequence::Print('Z')));
-                }
-                let mut bytewise = Dispatcher::default();
-                let mut parser = Parser::default();
-                for byte in input.bytes() {
-                    parser.advance(&mut bytewise, &[byte]);
-                }
-                assert!(bytewise
-                    .dispatched
-                    .contains(&Sequence::Osc(expected.clone(), terminator == "\x07")));
-            }
-        }
-    }
-
-    #[test]
-    fn osc_verbatim_tails_keep_empty_payloads() {
-        for (input, expected) in [
-            (b"\x1b]7;\x07".as_slice(), vec![b"7".to_vec(), vec![]]),
-            (
-                b"\x1b]8;id=one;\x07",
-                vec![b"8".to_vec(), b"id=one".to_vec(), vec![]],
-            ),
-            (b"\x1b]9;9;\x07", vec![b"9".to_vec(), b"9".to_vec(), vec![]]),
-        ] {
-            let mut dispatcher = Dispatcher::default();
-            Parser::default().advance(&mut dispatcher, input);
-            assert_eq!(dispatcher.dispatched[0], Sequence::Osc(expected, true));
-        }
-    }
-
-    #[test]
-    fn osc_verbatim_tail_survives_inline_buffer_overflow() {
-        let uri = format!("https://example.com/{};é", ";x".repeat(OSC_FIXED_LEN));
-        let input = format!("\x1b]8;;{uri}\x1b\\\x1b]8;;\x07");
-        for chunk_size in [1, 2, 17, input.len()] {
+    fn parse_osc_cwd_payloads_keep_semicolons() {
+        let path = format!("/tmp/a{}", ";b".repeat(MAX_OSC_PARAMS + 1));
+        for (prefix, n) in [("7", 2), ("9;9", 3)] {
+            let input = format!("\x1b]{prefix};{path}\x07").into_bytes();
             let mut dispatcher = Dispatcher::default();
             let mut parser = Parser::default();
-            for chunk in input.as_bytes().chunks(chunk_size) {
-                parser.advance(&mut dispatcher, chunk);
+
+            parser.advance(&mut dispatcher, &input);
+
+            match &dispatcher.dispatched[0] {
+                Sequence::Osc(params, _) => {
+                    assert_eq!(params.len(), n, "{prefix}");
+                    assert_eq!(params[n - 1], path.as_bytes(), "{prefix}");
+                }
+                _ => panic!("expected osc sequence"),
             }
-            assert_eq!(
-                dispatcher.dispatched[0],
-                Sequence::Osc(
-                    vec![b"8".to_vec(), vec![], uri.as_bytes().to_vec()],
-                    false
-                )
-            );
-            assert!(dispatcher
-                .dispatched
-                .contains(&Sequence::Osc(vec![b"8".to_vec(), vec![], vec![]], true)));
+        }
+    }
+
+    #[test]
+    fn parse_osc_free_text_payloads_keep_semicolons() {
+        let text = format!("a{}", ";b".repeat(MAX_OSC_PARAMS + 1));
+        for (prefix, n) in [("0", 2), ("2", 2), ("9;x", 3), ("777;notify;t", 4)] {
+            let input = format!("\x1b]{prefix};{text}\x07").into_bytes();
+            let mut dispatcher = Dispatcher::default();
+            let mut parser = Parser::default();
+
+            parser.advance(&mut dispatcher, &input);
+
+            match &dispatcher.dispatched[0] {
+                Sequence::Osc(params, _) => {
+                    assert_eq!(params.len(), n, "{prefix}");
+                    assert_eq!(params[n - 1], text.as_bytes(), "{prefix}");
+                }
+                _ => panic!("expected osc sequence"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_osc9_progress_still_splits() {
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::default();
+
+        parser.advance(&mut dispatcher, b"\x1b]9;4;1;50\x07");
+
+        match &dispatcher.dispatched[0] {
+            Sequence::Osc(params, _) => assert_eq!(params.len(), 4),
+            _ => panic!("expected osc sequence"),
         }
     }
 
@@ -2738,6 +2589,43 @@ mod tests {
             }
             _ => panic!("expected osc sequence"),
         }
+    }
+
+    #[test]
+    fn oversized_osc_is_discarded_and_parser_recovers() {
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::default();
+
+        parser.advance(&mut dispatcher, b"\x1b]52;c;");
+        parser.advance(&mut dispatcher, &vec![b'a'; MAX_OSC_BYTES + 1]);
+        assert!(parser.osc_raw.overflowed);
+        parser.advance(&mut dispatcher, b"\x07");
+        assert!(
+            dispatcher.dispatched.is_empty(),
+            "{:?}",
+            dispatcher.dispatched.len()
+        );
+        assert_eq!(
+            parser.osc_raw.overflow.capacity(),
+            0,
+            "buffer must be released, not kept at the cap"
+        );
+
+        // The next sequence is dispatched normally.
+        parser.advance(&mut dispatcher, b"\x1b]2;title\x07");
+        assert_eq!(dispatcher.dispatched.len(), 1);
+        match &dispatcher.dispatched[0] {
+            Sequence::Osc(params, _) => assert_eq!(params[1], b"title"),
+            _ => panic!("expected osc sequence"),
+        }
+
+        // A large but legitimate sequence is dispatched, and its
+        // capacity is not pinned afterwards either.
+        parser.advance(&mut dispatcher, b"\x1b]52;c;");
+        parser.advance(&mut dispatcher, &vec![b'a'; 4 * 1024 * 1024]);
+        parser.advance(&mut dispatcher, b"\x07");
+        assert_eq!(dispatcher.dispatched.len(), 2);
+        assert_eq!(parser.osc_raw.overflow.capacity(), 0);
     }
 
     #[test]

@@ -18,6 +18,7 @@ tracing = { workspace = true }
 signal-hook = "0.4.4"
 
 [target.'cfg(windows)'.dependencies]
+parking_lot = { workspace = true }
 windows-sys = { version = "0.59.0", features = [
     "Win32_System_Console",
     "Win32_Foundation",

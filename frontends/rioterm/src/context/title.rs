@@ -52,6 +52,13 @@ fn shorten_path(absolute: &str) -> String {
     display_path
 }
 
+/// Whether the title has `{{ }}` variables to render; anything else is
+/// shown as-is.
+#[inline]
+pub fn is_template(title: &str) -> bool {
+    title.contains("{{")
+}
+
 /// Use event-known metadata instead of polling foreground processes. A supplied
 /// OSC title avoids locking; templates needing the directory take one shared lock.
 #[inline]
@@ -60,7 +67,7 @@ pub fn update_title<T: rio_backend::event::EventListener>(
     context: &Context<T>,
     prefetched_title: Option<&str>,
 ) -> String {
-    if template.is_empty() {
+    if !is_template(template) {
         return template.to_string();
     }
 
@@ -231,6 +238,10 @@ pub mod test {
             context_dimension,
         );
         assert_eq!(update_title("", &context, None), String::from(""));
+        assert_eq!(
+            update_title("my title, columns", &context, Some("shell")),
+            String::from("my title, columns")
+        );
         assert_eq!(
             update_title("{{columns}}", &context, None),
             String::from("64")

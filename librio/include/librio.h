@@ -21,6 +21,38 @@ typedef size_t rio_surface_id_t;
 /* OSC 9;4 progress: data_a is the ConEmu state (0 remove, 1 set, 2 error,
    3 indeterminate, 4 paused), data_b the 0-100 value. */
 #define RIO_ACTION_PROGRESS 3u
+/* OSC 133: a shell command finished (D after C). data_a is its exit
+   status as a signed 32-bit value in two's complement (read it as
+   (int32_t)data_a), or RIO_EXIT_STATUS_NONE (INT32_MIN) when the shell
+   sent none; data_b is how long it ran, in milliseconds. */
+#define RIO_ACTION_COMMAND_FINISHED 4u
+#define RIO_EXIT_STATUS_NONE 0x80000000u
+
+/* OSC 7501 program status (see program_status_cb). `event` is REPORT,
+   or a lifecycle event after which the host drops records: on
+   PROMPT_START (OSC 133 A) drop `working` and `blocked` records (and
+   optionally `idle`), keeping `done` and `error`; on RESET (RIS) drop
+   every record. When the child process exits (close_surface_cb), the
+   spec also drops `working` and `blocked` records. librio validates
+   reports against the spec and keeps no records itself, and sends
+   lifecycle events only once the surface has reported status. */
+#define RIO_PROGRAM_STATUS_REPORT 0u
+#define RIO_PROGRAM_STATUS_PROMPT_START 1u
+#define RIO_PROGRAM_STATUS_RESET 2u
+
+#define RIO_PROGRAM_STATE_IDLE 0u
+#define RIO_PROGRAM_STATE_WORKING 1u
+#define RIO_PROGRAM_STATE_DONE 2u
+#define RIO_PROGRAM_STATE_BLOCKED 3u
+#define RIO_PROGRAM_STATE_ERROR 4u
+/* Remove the record at `id` and everything beneath it; with no `id`,
+   every record on the surface. */
+#define RIO_PROGRAM_STATE_CLEAR 5u
+
+#define RIO_PROGRAM_KIND_NONE 0u
+#define RIO_PROGRAM_KIND_PERMISSION 1u
+#define RIO_PROGRAM_KIND_QUESTION 2u
+#define RIO_PROGRAM_KIND_AUTH 3u
 
 #define RIO_COLOR_NAMED 0u
 #define RIO_COLOR_INDEXED 1u
@@ -90,6 +122,19 @@ typedef struct {
   uint32_t data_b;
 } rio_action_s;
 
+/* Strings are UTF-8, NULL when absent, and valid only for the duration
+   of the callback. Each report replaces its record wholesale. */
+typedef struct {
+  uint32_t event;    /* RIO_PROGRAM_STATUS_*; fields below for REPORT only */
+  uint32_t state;    /* RIO_PROGRAM_STATE_* */
+  uint32_t kind;     /* RIO_PROGRAM_KIND_*; non-NONE only when BLOCKED */
+  int32_t progress;  /* 0-100, or -1 when absent (indeterminate) */
+  const char *id;    /* slash-separated record path; NULL = root record */
+  const char *app;   /* stable program id, e.g. "cargo", "claude-code" */
+  const char *msg;   /* one human-readable line */
+  const char *title; /* short label for the record */
+} rio_program_status_s;
+
 typedef struct {
   void *userdata;
   /* May fire on librio's PTY IO thread. Callbacks must only flag or
@@ -100,6 +145,10 @@ typedef struct {
   void (*clipboard_write_cb)(void *userdata, rio_surface_id_t surface, uint8_t kind,
                              const char *utf8);
   void (*close_surface_cb)(void *userdata, rio_surface_id_t surface);
+  /* OSC 7501. NULL to ignore program status: the terminal then also
+     leaves the support query (OSC 7501 ; ?) unanswered. */
+  void (*program_status_cb)(void *userdata, rio_surface_id_t surface,
+                            const rio_program_status_s *status);
 } rio_runtime_config_s;
 
 typedef struct {
@@ -415,6 +464,64 @@ bool rio_render_state_kitty_image_info(const rio_render_state_t *state,
 size_t rio_render_state_kitty_image_rgba(const rio_render_state_t *state,
                                          uint32_t image_id, uint8_t *buf,
                                          size_t cap);
+
+/* Image protocols, for rio_image_placement_s.protocol and the
+ * rio_render_state_image_* lookups. Ids are only unique within one. */
+#define RIO_IMAGE_PROTOCOL_KITTY 0u
+/* Sixel and iTerm2 inline images, which share one store. */
+#define RIO_IMAGE_PROTOCOL_INLINE 1u
+
+/* Image layers, for rio_image_placement_s.layer. Draw in this order:
+ * images below the background, cell backgrounds, images below the text,
+ * text, images above the text; within a layer by z-index. */
+#define RIO_IMAGE_LAYER_BELOW_BACKGROUND 0u
+#define RIO_IMAGE_LAYER_BELOW_TEXT 1u
+#define RIO_IMAGE_LAYER_ABOVE_TEXT 2u
+
+/* One rectangle of one image, of any protocol, resolved to viewport
+ * pixels. x/y are relative to the grid origin (add your padding); src_*
+ * is the normalized source rectangle (origin + size) to crop from the
+ * image. Cache textures by (protocol, image_id, image_stamp): the stamp
+ * changes whenever the image's pixels do, and is never 0 while they are
+ * available, so 0 can stand for "no texture yet". */
+typedef struct {
+  uint64_t image_id;
+  uint64_t image_stamp;
+  int32_t z_index;
+  uint8_t protocol;
+  uint8_t layer;
+  float x;
+  float y;
+  float width;
+  float height;
+  float src_x;
+  float src_y;
+  float src_w;
+  float src_h;
+} rio_image_placement_s;
+
+/* Every image placement in the last snapshot, visible or not, in draw
+ * order (by z-index, lowest first; sixel/iTerm2 under kitty at the same
+ * z). The kitty-only calls above are a subset of this list: draw from
+ * one or the other, never both, or kitty images are drawn twice. Later
+ * versions may add protocols; skip a placement whose protocol you don't
+ * know. */
+size_t rio_render_state_image_count(const rio_render_state_t *state);
+/* Changes when an update changes the placement list or moves it on
+ * screen; compare for equality to skip rebuilding a draw list. */
+uint64_t
+rio_render_state_image_placements_generation(const rio_render_state_t *state);
+bool rio_render_state_image_placement(const rio_render_state_t *state,
+                                      size_t index, float cell_width,
+                                      float cell_height,
+                                      rio_image_placement_s *out);
+bool rio_render_state_image_info(const rio_render_state_t *state,
+                                 uint8_t protocol, uint64_t image_id,
+                                 uint32_t *out_width, uint32_t *out_height,
+                                 uint64_t *out_stamp);
+size_t rio_render_state_image_rgba(const rio_render_state_t *state,
+                                   uint8_t protocol, uint64_t image_id,
+                                   uint8_t *buf, size_t cap);
 
 typedef struct {
   double x;

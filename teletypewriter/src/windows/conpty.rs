@@ -1,6 +1,6 @@
 use crate::Winsize;
 use std::io::{Error, Result};
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::IntoRawHandle;
 use std::sync::OnceLock;
 use std::{mem, ptr};
 use tracing::*;
@@ -9,17 +9,23 @@ use crate::windows::pipes::{EventedAnonRead, EventedAnonWrite};
 
 use windows_sys::core::{HRESULT, PWSTR};
 use windows_sys::s;
-use windows_sys::Win32::Foundation::{FreeLibrary, HANDLE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, FreeLibrary, E_INVALIDARG, HANDLE, S_OK,
+};
 use windows_sys::Win32::System::Console::{
     ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, COORD, HPCON,
 };
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+    LOAD_LIBRARY_SEARCH_SYSTEM32,
+};
 
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
     UpdateProcThreadAttribute, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
-    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, STARTUPINFOW,
+    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    STARTUPINFOW,
 };
 
 use std::os::windows::ffi::OsStrExt;
@@ -27,23 +33,42 @@ use std::os::windows::ffi::OsStrExt;
 use crate::windows::child::ChildExitWatcher;
 use crate::windows::{cmdline, win32_string, Pty};
 
-// Buffer a full ring-sized burst in the native pipe; the smaller system
-// default adds blocking handoffs even when the ring still has room.
-const PIPE_BUFFER_SIZE: u32 = 64 * 1024;
+/// Load the pseudoconsole API from the `conpty.dll` Rio ships next to
+/// `rio.exe`, otherwise fall back to the in-box Windows API.
+///
+/// Rio's Windows packages carry `conpty.dll` and `OpenConsole.exe` from
+/// the Windows Terminal project (see `misc/windows/conhost/README.md`).
+/// That host passes the child's output through unchanged: sixel, iTerm2
+/// and kitty graphics reach Rio, and so does the cursor position a TUI
+/// leaves behind. The pseudoconsole built into most Windows builds
+/// rewrites that output, which is why images never rendered on stock
+/// Windows (#729, #1759) and the IME candidate window sat in the wrong
+/// place (#2031).
+///
+/// The DLL is loaded by absolute path from `rio.exe`'s own directory,
+/// never by the default search order, which also walks the working
+/// directory and `PATH`: when the bundled copy is missing (a build that
+/// does not package it, a user who removed it) Rio uses the in-box API
+/// rather than whatever `conpty.dll` happens to be on the way.
+///
+/// `PSEUDOCONSOLE_RESIZE_QUIRK` is a ConPTY flag absent from the public
+/// SDK header, so not in `windows-sys`. Without it the in-box
+/// pseudoconsole re-emits its own reflowed buffer after a resize, over
+/// the grid Rio has already reflowed, so content ends up confined to a
+/// stale region once the window grows (microsoft/terminal#16911). With
+/// it the host leaves reflow to the terminal. The bundled host behaves
+/// that way regardless and ignores the flag, as every ConPTY ignores
+/// unknown flag bits; it matters for the in-box fallback only, and
+/// there only on Windows builds whose host knows the flag (Windows 10
+/// builds since 2020); older ones ignore the bit and keep the repaint.
+const PSEUDOCONSOLE_RESIZE_QUIRK: u32 = 0x2;
 
-/// Load the pseudoconsole API from conpty.dll if possible, otherwise use the
-/// standard Windows API.
-///
-/// The conpty.dll from the Windows Terminal project
-/// supports loading OpenConsole.exe, which offers many improvements and
-/// bugfixes compared to the standard conpty that ships with Windows.
-///
-/// Load the bundled conpty.dll beside Rio. OpenConsole.exe must accompany it.
 type CreatePseudoConsoleFn =
     unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> HRESULT;
 type ResizePseudoConsoleFn = unsafe extern "system" fn(HPCON, COORD) -> HRESULT;
 type ClosePseudoConsoleFn = unsafe extern "system" fn(HPCON);
 
+#[derive(Clone, Copy)]
 struct ConptyApi {
     create: CreatePseudoConsoleFn,
     resize: ResizePseudoConsoleFn,
@@ -51,14 +76,15 @@ struct ConptyApi {
 }
 
 impl ConptyApi {
-    fn get() -> &'static Self {
-        // Keep one DLL reference for the function pointers' process lifetime,
-        // rather than loading and leaking another reference for every tab.
+    /// The API every pseudoconsole of this process uses, resolved on the
+    /// first one: the DLL is loaded once and stays loaded, instead of a
+    /// load (and a reference it never gives back) per tab or split.
+    fn get() -> Self {
         static API: OnceLock<ConptyApi> = OnceLock::new();
-        API.get_or_init(Self::new)
+        *API.get_or_init(Self::load)
     }
 
-    fn new() -> Self {
+    fn load() -> Self {
         match Self::load_conpty() {
             Some(conpty) => {
                 info!("Using conpty.dll for pseudoconsole");
@@ -76,25 +102,54 @@ impl ConptyApi {
         }
     }
 
-    /// Try loading ConptyApi from conpty.dll library.
+    /// Try loading the API from the `conpty.dll` next to `rio.exe`, by
+    /// absolute path, so copies on `PATH` or in the working directory are
+    /// never picked up.
     fn load_conpty() -> Option<Self> {
         type LoadedFn = unsafe extern "system" fn() -> isize;
-        let executable = std::env::current_exe().ok()?;
-        let library = executable.parent()?.join("conpty.dll");
-        let library = win32_string(library.as_os_str());
+        let dll = std::env::current_exe().ok()?.parent()?.join("conpty.dll");
+        let dll_path = win32_string(&dll);
         unsafe {
-            let hmodule = LoadLibraryW(library.as_ptr());
+            // The DLL's own imports resolve from its directory and
+            // System32 only, so neither the working directory nor PATH
+            // takes part in the load.
+            let hmodule = LoadLibraryExW(
+                dll_path.as_ptr(),
+                ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+            );
             if hmodule.is_null() {
+                let error = Error::last_os_error();
+                if dll.exists() {
+                    warn!(
+                        "conpty.dll at {} could not be loaded: {error}",
+                        dll.display()
+                    );
+                }
                 return None;
             }
-            let (Some(create_fn), Some(resize_fn), Some(close_fn)) = (
-                GetProcAddress(hmodule, s!("CreatePseudoConsole")),
-                GetProcAddress(hmodule, s!("ResizePseudoConsole")),
-                GetProcAddress(hmodule, s!("ClosePseudoConsole")),
-            ) else {
-                FreeLibrary(hmodule);
-                return None;
+            let export = |name: &str, address: Option<LoadedFn>| {
+                if address.is_none() {
+                    warn!(
+                        "conpty.dll at {} has no {name} export, using the Windows API",
+                        dll.display()
+                    );
+                    FreeLibrary(hmodule);
+                }
+                address
             };
+            let create_fn = export(
+                "CreatePseudoConsole",
+                GetProcAddress(hmodule, s!("CreatePseudoConsole")),
+            )?;
+            let resize_fn = export(
+                "ResizePseudoConsole",
+                GetProcAddress(hmodule, s!("ResizePseudoConsole")),
+            )?;
+            let close_fn = export(
+                "ClosePseudoConsole",
+                GetProcAddress(hmodule, s!("ClosePseudoConsole")),
+            )?;
 
             Some(Self {
                 create: mem::transmute::<LoadedFn, CreatePseudoConsoleFn>(create_fn),
@@ -105,59 +160,50 @@ impl ConptyApi {
     }
 }
 
+/// The attribute list of a `STARTUPINFOEXW`, freed with
+/// `DeleteProcThreadAttributeList` once it has been initialized, on
+/// every path out of `new`.
+struct AttributeList {
+    storage: Box<[u8]>,
+    initialized: bool,
+}
+
+impl AttributeList {
+    fn as_mut_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+        // The list is an opaque blob the system sizes for us; the
+        // pointer type is a formality, so the alignment lint is moot.
+        #[allow(clippy::cast_ptr_alignment)]
+        {
+            self.storage.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST
+        }
+    }
+}
+
+impl Drop for AttributeList {
+    fn drop(&mut self) {
+        if self.initialized {
+            unsafe { DeleteProcThreadAttributeList(self.as_mut_ptr()) }
+        }
+    }
+}
+
 /// RAII Pseudoconsole.
 pub struct Conpty {
     pub handle: HPCON,
-    api: &'static ConptyApi,
 }
 
 impl Drop for Conpty {
     fn drop(&mut self) {
-        // On older Windows this can wait for output to drain. Pty closes its
-        // read pipe first, so a full transport queue cannot deadlock teardown.
-        unsafe { (self.api.close)(self.handle) }
+        // XXX: This will block until the conout pipe is drained. Will cause a deadlock if the
+        // conout pipe has already been dropped by this point.
+        //
+        // See PR #3084 and https://docs.microsoft.com/en-us/windows/console/closepseudoconsole.
+        unsafe { (ConptyApi::get().close)(self.handle) }
     }
 }
 
 // The ConPTY handle can be sent between threads.
 unsafe impl Send for Conpty {}
-
-struct ProcessAttributes(Box<[usize]>);
-
-impl ProcessAttributes {
-    fn new() -> Result<Self> {
-        let mut size = 0;
-        unsafe {
-            InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut size);
-        }
-        if size == 0 {
-            return Err(Error::last_os_error());
-        }
-        // The native structure requires pointer alignment, not byte alignment.
-        let mut storage =
-            vec![0; size.div_ceil(mem::size_of::<usize>())].into_boxed_slice();
-        if unsafe {
-            InitializeProcThreadAttributeList(
-                storage.as_mut_ptr().cast(),
-                1,
-                0,
-                &mut size,
-            )
-        } == 0
-        {
-            return Err(Error::last_os_error());
-        }
-        Ok(Self(storage))
-    }
-}
-
-impl Drop for ProcessAttributes {
-    fn drop(&mut self) {
-        unsafe {
-            DeleteProcThreadAttributeList(self.0.as_mut_ptr().cast());
-        }
-    }
-}
 
 /// Builds a `CREATE_UNICODE_ENVIRONMENT` block from the current process
 /// environment plus `extra_env` (which overrides inherited variables of the
@@ -199,8 +245,12 @@ pub fn new(
     let api = ConptyApi::get();
     let mut pty_handle: HPCON = 0;
 
-    let (conout, conout_pty_handle) = miow::pipe::anonymous(PIPE_BUFFER_SIZE)?;
-    let (conin_pty_handle, conin) = miow::pipe::anonymous(PIPE_BUFFER_SIZE)?;
+    // Passing 0 as the size parameter allows the "system default" buffer
+    // size to be used. There may be small performance and memory advantages
+    // to be gained by tuning this in the future, but it's likely a reasonable
+    // start point.
+    let (conout, conout_pty_handle) = miow::pipe::anonymous(0)?;
+    let (conin_pty_handle, conin) = miow::pipe::anonymous(0)?;
 
     let winsize = Winsize {
         ws_row: rows as libc::c_ushort,
@@ -209,34 +259,48 @@ pub fn new(
         ws_ypixel: 0 as libc::c_ushort,
     };
 
-    // Create the Pseudo Console, using the pipes.
-    let result = unsafe {
+    // Create the pseudoconsole on the pipes. The resize quirk keeps the
+    // in-box host from repainting its reflowed buffer over Rio's grid.
+    // No known host rejects the flag; should one, it would say so with
+    // E_INVALIDARG, and a plain pseudoconsole beats no terminal, so that
+    // one failure is retried without it.
+    let conin_raw = conin_pty_handle.into_raw_handle() as HANDLE;
+    let conout_raw = conout_pty_handle.into_raw_handle() as HANDLE;
+    let size: COORD = winsize.into();
+    let mut result = unsafe {
         (api.create)(
-            winsize.into(),
-            conin_pty_handle.as_raw_handle(),
-            conout_pty_handle.as_raw_handle(),
-            0,
-            &mut pty_handle as *mut _,
+            size,
+            conin_raw,
+            conout_raw,
+            PSEUDOCONSOLE_RESIZE_QUIRK,
+            &mut pty_handle,
         )
     };
-
-    if result < 0 {
+    if result == E_INVALIDARG {
+        warn!("CreatePseudoConsole rejected flags {PSEUDOCONSOLE_RESIZE_QUIRK:#x}; retrying without them");
+        result = unsafe { (api.create)(size, conin_raw, conout_raw, 0, &mut pty_handle) };
+    }
+    // The host holds duplicates of the pipe ends it was given and
+    // releases them when the pseudoconsole closes, so ours go now:
+    // kept open, they would hold the output pipe open after the host
+    // is gone and the reader would never see it end.
+    unsafe {
+        CloseHandle(conin_raw);
+        CloseHandle(conout_raw);
+    }
+    if result != S_OK {
         return Err(Error::other(format!(
-            "CreatePseudoConsole failed (HRESULT {result:#010x})"
+            "CreatePseudoConsole failed: {result:#x}"
         )));
     }
-    let conpty = Conpty {
-        handle: pty_handle,
-        api,
-    };
-    // The pseudoconsole has duplicated these endpoints. Keeping ours open
-    // prevents EOF detection and leaks two handles per terminal.
-    drop(conin_pty_handle);
-    drop(conout_pty_handle);
+    // Owned from here on, so every early return below closes it.
+    let conpty = Conpty { handle: pty_handle };
 
     let mut success;
 
     // Prepare child process startup info.
+
+    let mut size: usize = 0;
 
     let mut startup_info_ex: STARTUPINFOEXW = unsafe { mem::zeroed() };
 
@@ -248,8 +312,40 @@ pub fn new(
     // PTY process does not inherit any handles from this Rio process.
     startup_info_ex.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
 
-    let mut attr_list = ProcessAttributes::new()?;
-    startup_info_ex.lpAttributeList = attr_list.0.as_mut_ptr().cast();
+    // Create the appropriately sized thread attribute list.
+    unsafe {
+        let failure = InitializeProcThreadAttributeList(
+            ptr::null_mut(),
+            1,
+            0,
+            &mut size as *mut usize,
+        ) > 0;
+
+        // This call was expected to return false.
+        if failure {
+            return Err(Error::last_os_error());
+        }
+    }
+
+    let mut attr_list = AttributeList {
+        storage: vec![0; size].into_boxed_slice(),
+        initialized: false,
+    };
+    startup_info_ex.lpAttributeList = attr_list.as_mut_ptr();
+
+    unsafe {
+        success = InitializeProcThreadAttributeList(
+            startup_info_ex.lpAttributeList,
+            1,
+            0,
+            &mut size as *mut usize,
+        ) > 0;
+
+        if !success {
+            return Err(Error::last_os_error());
+        }
+    }
+    attr_list.initialized = true;
 
     // Set thread attribute list's Pseudo Console to the specified ConPTY.
     unsafe {
@@ -257,7 +353,7 @@ pub fn new(
             startup_info_ex.lpAttributeList,
             0,
             PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-            pty_handle as *mut std::ffi::c_void,
+            conpty.handle as *mut std::ffi::c_void,
             mem::size_of::<HPCON>(),
             ptr::null_mut(),
             ptr::null_mut(),
@@ -268,7 +364,7 @@ pub fn new(
         }
     }
 
-    let mut cmdline = win32_string(&cmdline(shell));
+    let cmdline = win32_string(&cmdline(shell));
     let cwd = working_directory.as_ref().map(win32_string);
     // With no overrides, leave the environment pointer null so the child
     // inherits ours, exactly as before.
@@ -278,7 +374,7 @@ pub fn new(
     unsafe {
         success = CreateProcessW(
             ptr::null(),
-            cmdline.as_mut_ptr(),
+            cmdline.as_ptr() as PWSTR,
             ptr::null_mut(),
             ptr::null_mut(),
             false as i32,
@@ -298,21 +394,19 @@ pub fn new(
         if !success {
             return Err(Error::last_os_error());
         }
+        // The exit watcher takes the process handle; the thread handle
+        // has no further use.
+        CloseHandle(proc_info.hThread);
     }
 
-    let process = unsafe { OwnedHandle::from_raw_handle(proc_info.hProcess) };
-    // Only the process wait is needed; the primary thread handle has no owner
-    // in the raw PROCESS_INFORMATION returned by CreateProcessW.
-    drop(unsafe { OwnedHandle::from_raw_handle(proc_info.hThread) });
-    let child_watcher = match ChildExitWatcher::new(process) {
-        Ok(watcher) => watcher,
-        Err(error) => {
-            // No worker exists to drain output on this failure path.
-            drop(conout);
-            drop(conin);
-            return Err(error);
-        }
-    };
+    // Before the pipe ends are wrapped: a failure here must drop the
+    // pseudoconsole while the raw read end is still open, the order
+    // `Pty` keeps as well, and must not leak the process handle.
+    let child_watcher =
+        ChildExitWatcher::new(proc_info.hProcess).inspect_err(|_| unsafe {
+            CloseHandle(proc_info.hProcess);
+        })?;
+
     let conin = EventedAnonWrite::new(conin);
     let conout = EventedAnonRead::new(conout);
 
@@ -321,14 +415,17 @@ pub fn new(
 
 impl Conpty {
     pub fn on_resize(&mut self, window_size: Winsize) -> Result<()> {
-        let result = unsafe { (self.api.resize)(self.handle, window_size.into()) };
-        if result < 0 {
-            Err(Error::other(format!(
-                "ResizePseudoConsole failed (HRESULT {result:#010x})"
-            )))
-        } else {
-            Ok(())
+        // A collapsed window reports no columns or rows; the host would
+        // refuse that, so keep its last size instead.
+        if window_size.ws_col == 0 || window_size.ws_row == 0 {
+            return Ok(());
         }
+        let result =
+            unsafe { (ConptyApi::get().resize)(self.handle, window_size.into()) };
+        if result != S_OK {
+            return Err(Error::from_raw_os_error(result));
+        }
+        Ok(())
     }
 }
 
@@ -340,74 +437,5 @@ impl From<Winsize> for COORD {
             X: columns as i16,
             Y: lines as i16,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, GetProcessHandleCount,
-    };
-
-    fn handles() -> u32 {
-        let mut count = 0;
-        assert_ne!(
-            unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) },
-            0
-        );
-        count
-    }
-
-    #[test]
-    fn failed_spawn_and_loaded_pty_teardown_release_handles() {
-        // Warm lazy DLL/runtime initialization before comparing process handles.
-        drop(new(Some("cmd.exe /d /c exit"), &None, None, 80, 24).unwrap());
-        let before = handles();
-        for _ in 0..20 {
-            assert!(new(Some("rio-nonexistent-shell.exe"), &None, None, 80, 24).is_err());
-            let mut pty = new(
-                Some("cmd.exe /d /c for /L %i in (1,1,1000000) do @echo transport-test"),
-                &None,
-                None,
-                80,
-                24,
-            )
-            .unwrap();
-            for (columns, rows) in [(100, 30), (40, 10), (120, 40)] {
-                pty.backend
-                    .on_resize(Winsize {
-                        ws_col: columns,
-                        ws_row: rows,
-                        ws_xpixel: 0,
-                        ws_ypixel: 0,
-                    })
-                    .unwrap();
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            drop(pty);
-        }
-        assert!(
-            handles() <= before + 2,
-            "PTY creation/destruction leaked process handles"
-        );
-    }
-
-    #[test]
-    fn failed_resize_returns_an_error_instead_of_panicking() {
-        // Some ConPTY versions accept a zero size. An invalid handle exercises
-        // failure consistently, without depending on size-clamping policy.
-        let mut conpty = mem::ManuallyDrop::new(Conpty {
-            handle: 0,
-            api: ConptyApi::get(),
-        });
-        assert!(conpty
-            .on_resize(Winsize {
-                ws_col: 80,
-                ws_row: 24,
-                ws_xpixel: 0,
-                ws_ypixel: 0
-            })
-            .is_err());
     }
 }

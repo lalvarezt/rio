@@ -271,8 +271,21 @@ pub enum RioEvent {
     /// Program status or legacy progress changed in the identified pane.
     ProgramStatusChanged(usize),
 
+    /// OSC 7501 program status, or a lifecycle event that affects it.
+    ProgramStatus(ProgramStatusEvent),
+
     /// Terminal bell ring, from the PTY identified by `route_id`.
     Bell(usize),
+
+    /// OSC 133 `D` after a `C` on the PTY identified by `route_id`: a
+    /// shell command finished. `exit_status` is `None` when the shell
+    /// sent none; `duration` is measured from the `C` that started the
+    /// command's output.
+    CommandFinished {
+        route_id: usize,
+        exit_status: Option<i32>,
+        duration: crate::time::Duration,
+    },
 
     /// Desktop notification from OSC 9 or OSC 777.
     DesktopNotification {
@@ -359,6 +372,8 @@ impl Debug for RioEvent {
             RioEvent::ProgramStatusChanged(route_id) => {
                 write!(f, "ProgramStatusChanged route {route_id}")
             }
+
+            RioEvent::ProgramStatus(event) => write!(f, "ProgramStatus({event:?})"),
             RioEvent::MouseCursorDirty => write!(f, "MouseCursorDirty"),
             RioEvent::ResetTitle => write!(f, "ResetTitle"),
             RioEvent::PrepareUpdateConfig => write!(f, "PrepareUpdateConfig"),
@@ -380,6 +395,14 @@ impl Debug for RioEvent {
             }
             RioEvent::Scroll(scroll) => write!(f, "Scroll {scroll:?}"),
             RioEvent::Bell(route_id) => write!(f, "Bell route {route_id}"),
+            RioEvent::CommandFinished {
+                route_id,
+                exit_status,
+                duration,
+            } => write!(
+                f,
+                "CommandFinished route {route_id} status {exit_status:?} after {duration:?}"
+            ),
             RioEvent::DesktopNotification { title, body } => {
                 write!(f, "DesktopNotification({title}, {body})")
             }
@@ -675,4 +698,66 @@ pub struct ProgressReport {
     pub state: ProgressState,
     /// Optional progress percentage (0-100), only used with Set, Error, and Pause states
     pub progress: Option<u8>,
+}
+
+/// Body of the reply to the OSC 7501 support query (`OSC 7501 ; ? ST`):
+/// `?` plus the states and kinds this terminal accepts, so a program can
+/// fall back when it wants one from a later revision of the spec.
+/// `clear` is left out because it is not a state.
+pub const PROGRAM_STATUS_QUERY_REPLY: &str =
+    "?:states=idle,working,done,blocked,error:kinds=permission,question,auth";
+
+/// `state` of an OSC 7501 program status report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgramState {
+    /// At rest, waiting for the user's next instruction.
+    Idle,
+    Working,
+    Done,
+    /// Waiting on the user; `ProgramStatus::kind` says for what.
+    Blocked,
+    Error,
+    /// Remove the addressed record and everything beneath it (every
+    /// record on the terminal when the report has no `id`).
+    Clear,
+}
+
+/// Why a `blocked` program is waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockedKind {
+    Permission,
+    Question,
+    Auth,
+}
+
+/// One validated OSC 7501 report. Each report replaces its record
+/// wholesale, so absent fields mean "not set", not "unchanged".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgramStatus {
+    pub state: ProgramState,
+    /// Only ever set on `Blocked`.
+    pub kind: Option<BlockedKind>,
+    /// Stable program identifier, e.g. `cargo` or `claude-code`.
+    pub app: Option<String>,
+    /// One human-readable line (decoded from base64).
+    pub msg: Option<String>,
+    /// Short label for the record (decoded from base64).
+    pub title: Option<String>,
+    /// 0-100; only on `Working` or `Blocked`, absent means indeterminate.
+    pub progress: Option<u8>,
+    /// Slash-separated record path; `None` addresses the root record.
+    pub id: Option<String>,
+}
+
+/// What the terminal tells its embedder about program status. Records
+/// live in the embedder; the lifecycle events tell it when the spec
+/// requires dropping some of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProgramStatusEvent {
+    Report(ProgramStatus),
+    /// OSC 133 `A`: a new shell prompt began, so `working` and `blocked`
+    /// records must be dropped (`idle` may be; `done`/`error` survive).
+    PromptStart,
+    /// Full reset (RIS): every record is removed.
+    Reset,
 }

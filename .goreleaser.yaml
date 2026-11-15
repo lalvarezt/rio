@@ -25,8 +25,10 @@ before:
     - if: '{{ eq .Runtime.Goos "windows" }}'
       cmd: wix extension add -g WixToolset.UI.wixext/5.0.2 WixToolset.Util.wixext/5.0.2
       output: true
+    # The ConPTY pair (conpty.dll + OpenConsole.exe) shipped next to
+    # rio.exe; pinned by version and hash in the script.
     - if: '{{ eq .Runtime.Goos "windows" }}'
-      cmd: powershell -NoProfile -ExecutionPolicy Bypass -File misc/windows/prepare-conpty.ps1
+      cmd: pwsh -NoProfile -ExecutionPolicy Bypass -File misc/windows/conhost/fetch.ps1
       output: true
 
 builds:
@@ -105,30 +107,35 @@ checksum:
   name_template: checksums.txt
 
 archives:
+  # Portable builds ship as a zip so the bundled ConPTY (conpty.dll,
+  # and OpenConsole.exe in a folder named for the machine) sits next
+  # to rio.exe, matching the installer. The bare .exe stays for one
+  # release: the Scoop manifest and the install page download it by
+  # name. Drop `binary` once both point at the zip.
   - id: win-x64
-    formats: [zip]
+    formats: [zip, binary]
     ids: [windows-x86_64]
     name_template: "{{ .ProjectName }}-portable-x86_64"
     files:
-      - LICENSE
-      - src: misc/windows/ConPTY-LICENSE.txt
-        strip_parent: true
-      - src: target/conpty/x64/conpty.dll
-        strip_parent: true
-      - src: target/conpty/x64/OpenConsole.exe
-        strip_parent: true
+      - src: ./misc/windows/conhost/amd64/conpty.dll
+        dst: conpty.dll
+      - src: ./misc/windows/conhost/LICENSE
+        dst: LICENSE-ConPTY.txt
+      - src: ./misc/windows/conhost/amd64/x64/OpenConsole.exe
+        dst: x64/OpenConsole.exe
+      - src: ./misc/windows/conhost/amd64/arm64/OpenConsole.exe
+        dst: arm64/OpenConsole.exe
   - id: win-arm64
-    formats: [zip]
+    formats: [zip, binary]
     ids: [windows-arm64]
     name_template: "{{ .ProjectName }}-portable-aarch64"
     files:
-      - LICENSE
-      - src: misc/windows/ConPTY-LICENSE.txt
-        strip_parent: true
-      - src: target/conpty/arm64/conpty.dll
-        strip_parent: true
-      - src: target/conpty/arm64/OpenConsole.exe
-        strip_parent: true
+      - src: ./misc/windows/conhost/arm64/conpty.dll
+        dst: conpty.dll
+      - src: ./misc/windows/conhost/LICENSE
+        dst: LICENSE-ConPTY.txt
+      - src: ./misc/windows/conhost/arm64/arm64/OpenConsole.exe
+        dst: arm64/OpenConsole.exe
 
 universal_binaries:
   - id: rio
@@ -267,13 +274,24 @@ msi:
     wxs: ./misc/windows/rio.wxs
     ids: [win-x64]
     extensions: [WixToolset.UI.wixext, WixToolset.Util.wixext]
-    extra_files: [./misc/windows/rio.ico, ./misc/windows/License.rtf]
+    extra_files:
+      - ./misc/windows/rio.ico
+      - ./misc/windows/License.rtf
+      - ./misc/windows/conhost/LICENSE
+      - ./misc/windows/conhost/amd64/conpty.dll
+      - ./misc/windows/conhost/amd64/x64/OpenConsole.exe
+      - ./misc/windows/conhost/amd64/arm64/OpenConsole.exe
   - id: win-arm64
     name: "{{ .ProjectName }}-installer-aarch64"
     wxs: ./misc/windows/rio.wxs
     ids: [win-arm64]
     extensions: [WixToolset.UI.wixext, WixToolset.Util.wixext]
-    extra_files: [./misc/windows/rio.ico, ./misc/windows/License.rtf]
+    extra_files:
+      - ./misc/windows/rio.ico
+      - ./misc/windows/License.rtf
+      - ./misc/windows/conhost/LICENSE
+      - ./misc/windows/conhost/arm64/conpty.dll
+      - ./misc/windows/conhost/arm64/arm64/OpenConsole.exe
 
 winget:
   - use: msi
