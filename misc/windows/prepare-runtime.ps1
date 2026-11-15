@@ -16,8 +16,7 @@ $licenses = @{
 foreach ($path in $licenses.Values) {
     if (!(Test-Path (Join-Path $root $path))) { throw "Runtime license not found: $path" }
 }
-& pwsh -NoProfile -ExecutionPolicy Bypass -File "$PSScriptRoot/conhost/fetch.ps1"
-if ($LASTEXITCODE -ne 0) { throw "ConPTY preparation failed (exit $LASTEXITCODE)." }
+& "$PSScriptRoot/conhost/fetch.ps1"
 foreach ($arch in $Architecture) {
     $output = if ($Destination) { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Destination) } else { Join-Path $root "target/runtime/$arch" }
     $packageArch = if ($arch -eq 'x64') { 'amd64' } else { $arch }

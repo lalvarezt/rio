@@ -22,7 +22,8 @@ try {
     # Prepare the upstream runtime layout before compilation.
     & "$PSScriptRoot/prepare-runtime.ps1" -Architecture $Architecture
     $runtime = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "../../target/runtime/$Architecture"))
-    $runtimeFiles = @(Get-ChildItem -LiteralPath $runtime -File -Recurse | ForEach-Object { $_.FullName.Substring($runtime.Length + 1) })
+    $runtimeFiles = @('conpty.dll', 'LICENSE-ConPTY.txt', 'Font-LICENSE.txt', "$Architecture/OpenConsole.exe")
+    if ($Architecture -eq 'x64') { $runtimeFiles += 'arm64/OpenConsole.exe' }
     if (-not $Binary) {
         $cargoProfile = if ($Profile -eq 'release') { 'release' } else { 'dev' }
         if ($Profile -eq 'debug') {

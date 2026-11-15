@@ -875,11 +875,17 @@ mod tests {
     fn shell_metadata_rejects_oversized_names_and_values() {
         let parse = |payload: &[u8]| parse_set_user_var(&[b"1337", payload]);
         assert!(parse(b"SetUserVar=RIO_SSH=MQ==").is_some());
-        assert!(parse(format!("SetUserVar={}=YQ==", "n".repeat(129)).as_bytes()).is_none());
+        assert!(
+            parse(format!("SetUserVar={}=YQ==", "n".repeat(129)).as_bytes()).is_none()
+        );
         use base64::Engine;
         let encode = |n| base64::engine::general_purpose::STANDARD.encode(vec![b'a'; n]);
-        assert!(parse(format!("SetUserVar=RIO_APP={}", encode(4096)).as_bytes()).is_some());
-        assert!(parse(format!("SetUserVar=RIO_APP={}", encode(4097)).as_bytes()).is_none());
+        assert!(
+            parse(format!("SetUserVar=RIO_APP={}", encode(4096)).as_bytes()).is_some()
+        );
+        assert!(
+            parse(format!("SetUserVar=RIO_APP={}", encode(4097)).as_bytes()).is_none()
+        );
     }
 
     #[test]

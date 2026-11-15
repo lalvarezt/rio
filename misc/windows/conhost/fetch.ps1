@@ -29,8 +29,15 @@ $archive = Join-Path $work "conpty.zip"
 
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 Write-Host "Downloading $url"
-Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing `
-    -MaximumRetryCount 3 -RetryIntervalSec 5
+for ($attempt = 0; ; $attempt++) {
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing
+        break
+    } catch {
+        if ($attempt -ge 3) { throw }
+        Start-Sleep -Seconds 5
+    }
+}
 
 $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
 if ($SkipHash) {

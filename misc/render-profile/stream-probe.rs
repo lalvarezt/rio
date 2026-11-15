@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
 
 // The pre-merge fork always handles status. Upstream adds an explicit opt-in.
-trait EnableProgramStatus { fn set_program_status_enabled(&mut self, _enabled: bool) {} }
+trait EnableProgramStatus {
+    fn set_program_status_enabled(&mut self, _enabled: bool) {}
+}
 impl<T: rio_vt::event::EventListener> EnableProgramStatus for Crosswords<T> {}
 
 struct Allocator;

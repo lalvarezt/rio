@@ -439,3 +439,86 @@ impl From<Winsize> for COORD {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetProcessHandleCount,
+    };
+
+    fn handles() -> u32 {
+        let mut count = 0;
+        assert_ne!(
+            unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) },
+            0
+        );
+        count
+    }
+
+    #[test]
+    fn failed_spawn_and_loaded_pty_teardown_release_handles() {
+        // Warm lazy DLL/runtime initialization before comparing process handles.
+        drop(new(Some("cmd.exe /d /c exit"), &None, None, 80, 24).unwrap());
+        let before = handles();
+        for _ in 0..20 {
+            assert!(new(Some("rio-nonexistent-shell.exe"), &None, None, 80, 24).is_err());
+            let mut pty = new(
+                Some("cmd.exe /d /c for /L %i in (1,1,1000000) do @echo transport-test"),
+                &None,
+                None,
+                80,
+                24,
+            )
+            .unwrap();
+            for (columns, rows) in [(100, 30), (40, 10), (120, 40)] {
+                pty.backend
+                    .on_resize(Winsize {
+                        ws_col: columns,
+                        ws_row: rows,
+                        ws_xpixel: 0,
+                        ws_ypixel: 0,
+                    })
+                    .unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            drop(pty);
+        }
+        assert!(
+            handles() <= before + 2,
+            "PTY creation/destruction leaked process handles"
+        );
+    }
+
+    #[test]
+    fn failed_resize_returns_an_error_instead_of_panicking() {
+        // Some ConPTY versions accept a zero size. An invalid handle exercises
+        // failure consistently, without depending on size-clamping policy.
+        let mut conpty = mem::ManuallyDrop::new(Conpty { handle: 0 });
+        assert!(conpty
+            .on_resize(Winsize {
+                ws_col: 80,
+                ws_row: 24,
+                ws_xpixel: 0,
+                ws_ypixel: 0
+            })
+            .is_err());
+    }
+    #[test]
+    #[ignore = "requires the signed upstream bundle beside the test executable"]
+    fn bundled_api_is_selected_instead_of_the_system_fallback() {
+        let dll = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("conpty.dll");
+        assert!(
+            dll.is_file(),
+            "prepare the upstream bundle before this test"
+        );
+        assert_ne!(
+            ConptyApi::get().create as *const () as usize,
+            CreatePseudoConsole as *const () as usize
+        );
+    }
+}

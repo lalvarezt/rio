@@ -41,8 +41,8 @@ the available profiling tools.
 - Record raw commands, samples, identities, timing boundaries, and coverage gaps.
 
 Local raw diffs, logs, and measurements are retained under
-`.local-support/merge-upstream-2026-11-15/`. Validation results and final decisions
-will be added here after integration.
+`.local-support/merge-upstream-2026-11-15/`. Final decisions, validation results,
+and coverage limits follow.
 
 ## Integration decisions
 
@@ -64,7 +64,8 @@ will be added here after integration.
 - Remove the old local ConPTY package and preparation script. Adapt install.ps1
   to copy architecture subdirectories and the upstream license. Upstream packages
   x64 and ARM64. The former x86 preparation option is removed. Preparation now
-  requires pwsh and network access, matching upstream's fetch script.
+  requires network access. The fetch retry loop also supports Windows PowerShell
+  5.1, used by the existing local installer.
 - Keep the fork's pipe-before-backend teardown order and resize error propagation.
   These contracts remain in the fork PTY interface.
 - Use upstream command-finish notifications, launch overrides, fixed titles,
@@ -89,8 +90,8 @@ same-caller comparison also measures a graphics benefit, described below.
 
 ## Fork coverage
 
-The initial fork range changes 365 files. Of these, 325 remain byte-for-byte
-unchanged. Forty change during integration, including five outside the
+The initial fork range changes 365 files. Of these, 324 remain byte-for-byte
+unchanged. Forty-one change during integration, including six outside the
 35-file overlap with upstream. The local `fork-audit.json` records each file.
 
 | Affected files | Decision |
@@ -108,9 +109,11 @@ unchanged. Forty change during integration, including five outside the
 | rio-vt/src/crosswords/mod.rs, event/mod.rs, performer/handler.rs, performer/mod.rs, performer/osc.rs, performer/parser/mod.rs, program_status.rs | Upstream protocols and limits with the correctness and UI adaptations above. |
 | teletypewriter/src/unix/mod.rs | Upstream close-on-exec on both spawn paths. |
 | teletypewriter/src/windows/child.rs, conpty.rs, pipes.rs | Upstream implementation with fork resize result contract. |
+| teletypewriter/Cargo.toml | Restore parking_lot for upstream Windows pipe workers. |
 
-The dependency restoration also changes teletypewriter/Cargo.toml, outside the
-original affected-file audit.
+The unchanged fork files include the hint implementation, whose literal-URI
+behavior already matches upstream's change, and the other desktop, SSH, font,
+clipboard, and rendering customizations outside this integration.
 
 ## Performance
 
@@ -135,6 +138,8 @@ on one pinned CPU with builds idle. Allocation passes run separately.
   mirror. Both versions handle reports.
 - Combining marks cost about 2% more with the per-cell bound. This keeps the
   upstream protection against quadratic accumulation.
+- Styled text with 64 KiB reads costs about 2% more, roughly 0.3 ms per 4 MiB
+  fixture. This small difference remains in the recorded results.
 - Large unsupported APC input costs about 1.6 to 2.4 times the old fork's time,
   with roughly 7 MiB more peak process memory. Upstream accumulates it under its
   64 MiB cap. The old fork stopped at a much smaller budget.
@@ -164,8 +169,22 @@ runs explicitly opt in, matching the frontend caller.
   coverage. Clippy with all targets and features passes with warnings.
 - The C API smoke test compiles and passes on Linux. The Makefile entry is macOS
   specific, so Linux links the static library with m, dl, pthread, and stdc++.
-- A native Wayland ASCII smoke run presents 90 frames. This checks execution,
+- Native Wayland ASCII and Unicode smoke runs each present 90 frames. This checks execution,
   not image quality or before-and-after rendering performance.
-- Windows candidate validation continues after restoring the pipe dependency.
+- Integrated Windows workspace tests pass after restoring the pipe dependency.
+- The signed upstream ConPTY package passes its hash and Authenticode checks.
+  Three isolated tests verify bundle selection, resize failure reporting, and
+  twenty cycles of failed spawn, resize, and teardown without leaked handles.
+  A terminal integration test preserves final output through the bundled host.
+- The local installer runs under Windows PowerShell 5.1, installs all six expected
+  files, and passes the terminal lifecycle test from the installed layout. The
+  explicit file list avoids copying stale files from the old runtime layout.
+- Existing platform and graphics tests remain ignored where their fixtures are
+  unavailable. The new bundle-only test is ignored in normal runs and was run
+  explicitly with the signed bundle. Real zsh and fish are installed on Linux.
 - macOS execution, Windows performance, image-pixel comparison, and a full desktop
   interaction matrix remain outside completed coverage.
+
+The Windows checkout remains on its original branch and revision. Validation
+uses extracted snapshots under its .git/info directory. Runtime installation
+targets an isolated test directory, leaving the user's installed Rio unchanged.
