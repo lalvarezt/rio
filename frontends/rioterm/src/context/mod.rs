@@ -316,6 +316,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             route_id,
             config.scrollback_history_limit,
         );
+        terminal.set_program_status_enabled(true);
         terminal.set_grapheme_clustering(config.grapheme_clustering);
         terminal.set_clipboard_policy(config.clipboard);
         terminal.graphics.coalesce_updates = true;

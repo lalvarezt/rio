@@ -1734,6 +1734,35 @@ mod tests {
         assert!(island.status_for_tab(&cm, 0).is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn program_status_rim_is_enabled_for_live_contexts() {
+        use rio_backend::event::{VoidListener, WindowId};
+        use rio_backend::performer::handler::Processor;
+
+        let mut cm =
+            ContextManager::start_with_capacity(2, VoidListener {}, WindowId::from(0))
+                .unwrap();
+        // Exercise production initialization: dead contexts opt in separately.
+        cm.config.dead_pty = false;
+        cm.config.shell.program = Some("/bin/sh".into());
+        cm.config.shell.args = vec!["-c".into(), "exit 0".into()];
+        cm.add_context(true, 0);
+        assert_eq!(cm.len(), 2, "the live PTY context must be created");
+
+        Processor::default().advance(
+            &mut *cm.current().terminal.lock(),
+            b"\x1b]7501;state=working:progress=40:app=cargo\x07",
+        );
+        let mut island = test_island();
+        island.sync_focused_program_status(&cm);
+        let rim = island
+            .status_rim(island.program_status.as_ref(), 1.0)
+            .expect("OSC 7501 must produce a status rim in a live tab");
+        assert_eq!(rim.progress, Some(40));
+        assert_eq!(rim.color, island.status_colors[0]);
+    }
+
     #[test]
     fn status_rim_uses_theme_colors_and_progress_stays_in_the_pill() {
         use rio_backend::event::{VoidListener, WindowId};
