@@ -1243,37 +1243,49 @@ impl<'a, T> GridIterator<'a, T> {
 impl<'a, T> Iterator for GridIterator<'a, T> {
     type Item = Indexed<&'a T>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         // Stop once we've reached the end of the grid.
         if self.current >= self.end {
             return None;
         }
 
-        match self.current {
-            Pos { col, .. } if col == self.grid.last_column() => {
-                self.current.col = Column(0);
-                self.current.row += 1;
-            }
-            _ => self.current.col += Column(1),
+        // One compare and one row lookup per cell: this walk is the
+        // regex search's inner loop. A row ends at the grid's last
+        // column; rows are never shorter than the width today, and a
+        // position past a row's end ends the walk like any stale one.
+        // The row above the grid, where `display_iter` starts, enters
+        // it at its first cell.
+        if self.current.col == self.grid.last_column() {
+            self.current.col = Column(0);
+            self.current.row += 1;
+        } else {
+            self.current.col += Column(1);
         }
 
-        // Guard both axes before indexing (#1713): positions can be
-        // stale relative to the live grid (resize between capture and
-        // use), and history rows keep their old length across column
-        // growth. Ending the iteration beats panicking.
+        self.cell_at(self.current)
+    }
+}
+
+impl<'a, T> GridIterator<'a, T> {
+    /// The cell at `pos`, or `None` when `pos` is past the live grid.
+    /// Positions can be stale relative to the grid (#1713: a resize
+    /// between capture and use), and the column guard also covers a
+    /// row that is somehow shorter than the width, which no resize
+    /// path leaves behind today. Ending the iteration beats panicking.
+    #[inline]
+    fn cell_at(&self, pos: Pos) -> Option<Indexed<&'a T>> {
         let screen_lines = self.grid.screen_lines() as i32;
-        let history = (self.grid.total_lines() - self.grid.screen_lines()) as i32;
-        if self.current.row.0 >= screen_lines || self.current.row.0 < -history {
+        if pos.row.0 >= screen_lines || pos.row < self.grid.topmost_line() {
             return None;
         }
-        let row = &self.grid[self.current.row];
-        if self.current.col.0 >= row.len() {
+        let row = &self.grid[pos.row];
+        if pos.col.0 >= row.len() {
             return None;
         }
-
         Some(Indexed {
-            square: &self.grid[self.current],
-            pos: self.current,
+            square: &row[pos.col],
+            pos,
         })
     }
 }
@@ -1284,6 +1296,7 @@ pub trait BidirectionalIterator: Iterator {
 }
 
 impl<T> BidirectionalIterator for GridIterator<'_, T> {
+    #[inline]
     fn prev(&mut self) -> Option<Self::Item> {
         let topmost_line = self.grid.topmost_line();
         let last_column = self.grid.last_column();
@@ -1295,15 +1308,20 @@ impl<T> BidirectionalIterator for GridIterator<'_, T> {
 
         match self.current {
             Pos { col: Column(0), .. } => {
-                self.current.col = last_column;
                 self.current.row -= 1;
+                // A shorter previous row is entered at its real end,
+                // so a backwards walk does not stop at a row boundary.
+                self.current.col = last_column;
+                if self.current.row >= topmost_line
+                    && self.current.row.0 < self.grid.screen_lines() as i32
+                {
+                    let len = self.grid[self.current.row].len();
+                    self.current.col = min(last_column, Column(len.saturating_sub(1)));
+                }
             }
             _ => self.current.col -= Column(1),
         }
 
-        Some(Indexed {
-            square: &self.grid[self.current],
-            pos: self.current,
-        })
+        self.cell_at(self.current)
     }
 }

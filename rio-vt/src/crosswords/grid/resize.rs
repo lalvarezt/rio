@@ -278,6 +278,10 @@ impl Grid<Square> {
         let base_abs = self.lines_evicted();
         let mut source = self.raw.take_all();
         source.reverse();
+        // Blank screen rows absorb new wraps without exposing history. Keep
+        // that screen origin when a later grow rejoins those same lines.
+        let has_room = remaining > 0 && source.last().is_some_and(Row::is_clear);
+        let mut screen_origin = 0;
         let old_wrapped = (old_top..=cursor_row)
             .filter(|&row| source[row].wrap_continuation)
             .count();
@@ -346,6 +350,11 @@ impl Grid<Square> {
             });
             if protected {
                 len = len.max(1);
+            }
+            if old_row == old_top {
+                screen_origin = output.len() - 1
+                    + deferred
+                    + usize::from(deferred == 0 && col == columns);
             }
             if len == 0 {
                 if !row.wrap_continuation {
@@ -449,7 +458,12 @@ impl Grid<Square> {
                 deferred += 1;
             }
         }
-        output.resize_with(output.len().max(self.lines), || Row::new(columns));
+        let minimum = if has_room {
+            screen_origin + self.lines
+        } else {
+            self.lines
+        };
+        output.resize_with(output.len().max(minimum), || Row::new(columns));
         if let Some((row, _)) = cursor_location {
             let top = output.len().saturating_sub(self.lines);
             if row >= top {
@@ -468,13 +482,16 @@ impl Grid<Square> {
         }
         let top = output.len().saturating_sub(self.lines);
         let map_cursor = |location: Option<(usize, usize)>, pending: bool| {
-            let Some((row, mut col)) = location.filter(|&(row, _)| row >= top) else {
+            let Some((row, mut col)) = location else {
                 return (crate::crosswords::pos::Pos::new(Line(0), Column(0)), false);
             };
             let pending = pending && col == columns - 1;
             col = col.min(columns - 1);
             (
-                crate::crosswords::pos::Pos::new(Line((row - top) as i32), Column(col)),
+                crate::crosswords::pos::Pos::new(
+                    Line(row.saturating_sub(top) as i32),
+                    Column(col),
+                ),
                 pending,
             )
         };

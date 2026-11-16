@@ -101,7 +101,6 @@ pub struct Screen<'screen> {
     /// link is skippable, so text changing under a shown underline
     /// still refreshes it. Reset on wheel scroll and highlight clears.
     last_hint_probe: Option<(Pos, rio_window::keyboard::ModifiersState)>,
-    pub resize_state: Option<crate::layout::ResizeState>,
     last_chrome_press: Option<ChromePress>,
     last_close_press: Option<(std::time::Instant, f32)>,
     grids: rustc_hash::FxHashMap<usize, PanelGrid>,
@@ -367,7 +366,6 @@ impl Screen<'_> {
             (&cursor, config.cursor.blinking),
             event_proxy,
             window_id.into(),
-            0,
             rich_text_id,
             context_manager_config,
             context_dimension,
@@ -413,7 +411,6 @@ impl Screen<'_> {
             renderer,
             bindings,
             last_ime_cursor_pos: None,
-            resize_state: None,
             last_chrome_press: None,
             last_close_press: None,
             grids: rustc_hash::FxHashMap::default(),
@@ -819,7 +816,7 @@ impl Screen<'_> {
                 current_context.dimension.line_height = config.line_height;
             }
 
-            context_grid.update_dimensions(&mut self.sugarloaf);
+            context_grid.update_dimensions(&self.sugarloaf);
 
             for current_context in context_grid.contexts_mut().values_mut() {
                 let current_context = current_context.context_mut();
@@ -831,6 +828,13 @@ impl Screen<'_> {
                 terminal.set_clipboard_policy(config.clipboard);
                 current_context.renderable_content =
                     RenderableContent::from_cursor_config(&config.cursor);
+                // The relayout above marked the pane dirty on the content
+                // just replaced; mark the new one, or an idle terminal in
+                // a background split keeps presenting the old metrics.
+                current_context
+                    .renderable_content
+                    .pending_update
+                    .set_dirty();
                 let shape = config.cursor.shape;
                 terminal.cursor_shape = shape;
                 terminal.default_cursor_shape = shape;
@@ -889,7 +893,7 @@ impl Screen<'_> {
 
         self.context_manager
             .current_grid_mut()
-            .update_dimensions(&mut self.sugarloaf);
+            .update_dimensions(&self.sugarloaf);
 
         self.mark_dirty();
         self.refresh_titles();
@@ -912,8 +916,7 @@ impl Screen<'_> {
         let width = new_size.width as f32;
         let height = new_size.height as f32;
 
-        self.context_manager
-            .resize_all_grids(width, height, &mut self.sugarloaf);
+        self.context_manager.resize_all_grids(width, height);
 
         // A resize reflows the cursor; that displacement is layout,
         // not travel, and must not animate a smear.
@@ -979,14 +982,13 @@ impl Screen<'_> {
                     .set_terminal_damage(rio_backend::event::TerminalDamage::Full);
             }
 
-            context_grid.update_dimensions(&mut self.sugarloaf);
+            context_grid.update_dimensions(&self.sugarloaf);
         }
 
         let width = new_size.width as f32;
         let height = new_size.height as f32;
 
-        self.context_manager
-            .resize_all_grids(width, height, &mut self.sugarloaf);
+        self.context_manager.resize_all_grids(width, height);
         self.refresh_titles();
         self.mark_dirty();
         // Rescaled cursor displacement is layout, not travel.
@@ -1490,12 +1492,10 @@ impl Screen<'_> {
                         self.split_down();
                     }
                     Act::MoveDividerUp => {
-                        // User wants divider to move up visually, which means expanding the bottom split
-                        self.move_divider_down();
+                        self.move_divider_up();
                     }
                     Act::MoveDividerDown => {
-                        // User wants divider to move down visually, which means expanding the top split
-                        self.move_divider_up();
+                        self.move_divider_down();
                     }
                     Act::MoveDividerLeft => {
                         self.move_divider_left();
@@ -1804,12 +1804,8 @@ impl Screen<'_> {
         // Allocate panel id; position lands on `ContextDimension`
         // through the Taffy layout pass (`apply_taffy_layout`).
         let rich_text_id = next_rich_text_id();
-        self.context_manager.split_from_config(
-            rich_text_id,
-            false,
-            config,
-            &mut self.sugarloaf,
-        );
+        self.context_manager
+            .split_from_config(rich_text_id, false, config);
 
         self.refresh_titles();
         self.mark_dirty();
@@ -1817,8 +1813,7 @@ impl Screen<'_> {
 
     pub fn split_right(&mut self) {
         let rich_text_id = next_rich_text_id();
-        self.context_manager
-            .split(rich_text_id, false, &mut self.sugarloaf);
+        self.context_manager.split(rich_text_id, false);
 
         self.refresh_titles();
         self.mark_dirty();
@@ -1826,19 +1821,15 @@ impl Screen<'_> {
 
     pub fn split_down(&mut self) {
         let rich_text_id = next_rich_text_id();
-        self.context_manager
-            .split(rich_text_id, true, &mut self.sugarloaf);
+        self.context_manager.split(rich_text_id, true);
 
         self.refresh_titles();
         self.mark_dirty();
     }
 
     pub fn move_divider_up(&mut self) {
-        let amount = 20.0; // Default movement amount
-        if self
-            .context_manager
-            .move_divider_up(amount, &mut self.sugarloaf)
-        {
+        let amount = 20.0; // logical pixels per keypress
+        if self.context_manager.move_divider_up(amount) {
             self.mark_dirty();
             // Divider displacement is layout, not cursor travel.
             self.renderer.trail_cursor.snap();
@@ -1846,11 +1837,8 @@ impl Screen<'_> {
     }
 
     pub fn move_divider_down(&mut self) {
-        let amount = 20.0; // Default movement amount
-        if self
-            .context_manager
-            .move_divider_down(amount, &mut self.sugarloaf)
-        {
+        let amount = 20.0; // logical pixels per keypress
+        if self.context_manager.move_divider_down(amount) {
             self.mark_dirty();
             // Divider displacement is layout, not cursor travel.
             self.renderer.trail_cursor.snap();
@@ -1858,11 +1846,8 @@ impl Screen<'_> {
     }
 
     pub fn move_divider_left(&mut self) {
-        let amount = 40.0; // Default movement amount
-        if self
-            .context_manager
-            .move_divider_left(amount, &mut self.sugarloaf)
-        {
+        let amount = 40.0; // logical pixels per keypress
+        if self.context_manager.move_divider_left(amount) {
             self.mark_dirty();
             // Divider displacement is layout, not cursor travel.
             self.renderer.trail_cursor.snap();
@@ -1870,11 +1855,8 @@ impl Screen<'_> {
     }
 
     pub fn move_divider_right(&mut self) {
-        let amount = 40.0; // Default movement amount
-        if self
-            .context_manager
-            .move_divider_right(amount, &mut self.sugarloaf)
-        {
+        let amount = 40.0; // logical pixels per keypress
+        if self.context_manager.move_divider_right(amount) {
             self.mark_dirty();
             // Divider displacement is layout, not cursor travel.
             self.renderer.trail_cursor.snap();
@@ -1902,8 +1884,7 @@ impl Screen<'_> {
         // Update the old tab's rich text positions to reflect the new margin
         // (on Linux/Windows when hide_if_single transitions from hidden to visible)
         #[cfg(not(target_os = "macos"))]
-        self.context_manager.contexts_mut()[old_index]
-            .update_dimensions(&mut self.sugarloaf);
+        self.context_manager.contexts_mut()[old_index].update_dimensions(&self.sugarloaf);
 
         // Allocate panel id; the layout pass handles positioning via
         // `ContextDimension` once the new tab's grid is built.
@@ -2022,7 +2003,7 @@ impl Screen<'_> {
                 self.resize_top_or_bottom_line(1);
                 self.context_manager
                     .current_grid_mut()
-                    .update_dimensions(&mut self.sugarloaf);
+                    .update_dimensions(&self.sugarloaf);
                 self.mark_dirty();
             }
             return;
@@ -2071,7 +2052,7 @@ impl Screen<'_> {
                 scaled_bottom,
                 margin.left,
             ));
-            context_grid.update_dimensions(&mut self.sugarloaf);
+            context_grid.update_dimensions(&self.sugarloaf);
         }
 
         // The tab strip appearing or vanishing shifts every panel;
@@ -3833,15 +3814,9 @@ impl Screen<'_> {
             self.mouse.left_button_state = ElementState::Released;
         }
 
-        if self.get_mode().contains(Mode::FOCUS_IN_OUT) {
-            let chr = if is_focused { "I" } else { "O" };
-
-            let msg = format!("\x1b[{chr}");
-            self.ctx_mut()
-                .current_mut()
-                .messenger
-                .send_write(msg.into_bytes());
-        }
+        // Which pane, if any, is focused from a program's view is the
+        // context manager's call: it also changes on tab and split switches.
+        self.context_manager.set_window_focus(is_focused);
     }
 
     #[inline]

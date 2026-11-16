@@ -88,5 +88,9 @@ wgpu = ["renderer", "dep:sugarloaf", "sugarloaf/wgpu"]
 criterion = { workspace = true }
 
 [[bench]]
+name = "vt_input"
+harness = false
+
+[[bench]]
 name = "vt_sync"
 harness = false

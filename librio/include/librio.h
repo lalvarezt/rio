@@ -137,9 +137,12 @@ typedef struct {
 
 typedef struct {
   void *userdata;
-  /* May fire on librio's PTY IO thread. Callbacks must only flag or
-     schedule work; calling back into rio_* from inside a callback is
-     undefined behavior. */
+  /* May fire on librio's PTY IO thread, or synchronously inside any
+     rio_surface_* call that changes what is shown. Callbacks must only
+     flag or schedule work; calling back into rio_* from inside a callback
+     is undefined behavior. wakeup_cb may not be repeated for later output
+     until the next rio_render_state_update: clear a "needs render" flag
+     before that call, not after, or a wakeup between the two is lost. */
   void (*wakeup_cb)(void *userdata, rio_surface_id_t surface);
   void (*action_cb)(void *userdata, rio_surface_id_t surface, rio_action_s action);
   void (*clipboard_write_cb)(void *userdata, rio_surface_id_t surface, uint8_t kind,
@@ -308,6 +311,14 @@ void rio_surface_paste(rio_surface_t *surface, const char *bytes, size_t len);
 uint32_t rio_surface_mode_bits(const rio_surface_t *surface);
 /* Returns true when the event was consumed and encoded to the PTY. */
 bool rio_surface_key(rio_surface_t *surface, const rio_key_event_s *event);
+/* Whether the surface has keyboard focus. A change is reported to a program
+ * that asked for focus events (DECSET 1004) as CSI I / CSI O, and a program
+ * that enables them is told the current state at once; nothing else is
+ * sent, and a repeated value is ignored. A surface starts unfocused. Report
+ * the host's own tab and split switches too: a surface the user is not
+ * looking at is unfocused to its program. Unlike input, this never scrolls
+ * the view or clears the selection. */
+void rio_surface_set_focus(rio_surface_t *surface, bool focused);
 /* Whether alt acts as meta, prefixing with ESC, instead of letting the text
  * the platform produced through. Defaults to true, as terminals do: it is the
  * difference between alt+d deleting a word and inserting a character. */

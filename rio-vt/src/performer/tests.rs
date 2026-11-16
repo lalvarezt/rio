@@ -11,7 +11,7 @@ struct TestPty {
     bytes: io::Cursor<Vec<u8>>,
     ending: Option<ErrorKind>,
     exhausted: Option<mpsc::Sender<()>>,
-    writer: TestWriter,
+    writer: RecordingWriter,
     child: Option<corcovado::Registration>,
     registration_error: bool,
     read_event: bool,
@@ -22,28 +22,6 @@ struct TestPty {
     read_calls: usize,
     first_read_delay: Option<Duration>,
     burst_boundary: Option<usize>,
-}
-
-#[derive(Default)]
-struct TestWriter {
-    bytes: Vec<u8>,
-    remaining: Option<usize>,
-}
-impl Write for TestWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let len = self.remaining.unwrap_or(bytes.len()).min(bytes.len());
-        if len == 0 {
-            return Err(ErrorKind::WouldBlock.into());
-        }
-        self.bytes.extend_from_slice(&bytes[..len]);
-        if let Some(remaining) = &mut self.remaining {
-            *remaining -= len;
-        }
-        Ok(len)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 impl Read for TestPty {
@@ -83,9 +61,48 @@ impl Read for TestPty {
     }
 }
 
+/// Keeps every byte written and announces each write, so a test can
+/// wait for a write instead of sleeping.
+#[derive(Default)]
+struct RecordingWriter {
+    remaining: Option<usize>,
+    bytes: Vec<u8>,
+    written: Option<mpsc::Sender<Vec<u8>>>,
+    /// A full PTY: every write is refused with `WouldBlock`.
+    blocked: bool,
+    /// Every write attempt, refused or not.
+    attempts: Option<mpsc::Sender<()>>,
+}
+
+impl Write for RecordingWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(sender) = &self.attempts {
+            let _ = sender.send(());
+        }
+        if self.blocked {
+            return Err(io::Error::from(ErrorKind::WouldBlock));
+        }
+        let len = self.remaining.unwrap_or(buf.len()).min(buf.len());
+        if len == 0 {
+            return Err(ErrorKind::WouldBlock.into());
+        }
+        if let Some(remaining) = &mut self.remaining {
+            *remaining -= len;
+        }
+        self.bytes.extend_from_slice(&buf[..len]);
+        if let Some(sender) = &self.written {
+            let _ = sender.send(buf[..len].to_vec());
+        }
+        Ok(len)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 impl ProcessReadWrite for TestPty {
     type Reader = Self;
-    type Writer = TestWriter;
+    type Writer = RecordingWriter;
     fn reader(&mut self) -> &mut Self {
         self
     }
@@ -171,7 +188,7 @@ fn machine(bytes: Vec<u8>, ending: Option<ErrorKind>) -> Machine<TestPty, VoidLi
             bytes: io::Cursor::new(bytes),
             ending,
             exhausted: None,
-            writer: TestWriter::default(),
+            writer: RecordingWriter::default(),
             child: None,
             registration_error: false,
             read_event: false,
@@ -517,6 +534,126 @@ fn hangup_without_readable_readiness_drains_residual_output() {
     assert_eq!(first_line(&machine, 12), "final output");
     assert_eq!(machine.pty.shutdown_calls, 1);
     assert_eq!(machine.pty.deregister_calls, 1);
+}
+
+// The test pty never reports writable readiness, so a keystroke can
+// only reach it on the wakeup that delivered it.
+#[test]
+fn input_is_written_on_the_wakeup_that_delivers_it() {
+    let mut machine = machine(Vec::new(), None);
+    let (sender, written) = mpsc::channel();
+    machine.pty.writer.written = Some(sender);
+    let channel = machine.channel();
+    let handle = machine.spawn();
+
+    channel
+        .send(Msg::Input(std::borrow::Cow::Borrowed(b"ls\r")))
+        .unwrap();
+    assert_eq!(
+        written.recv_timeout(Duration::from_secs(5)).unwrap(),
+        b"ls\r".to_vec()
+    );
+
+    channel.send(Msg::Shutdown).unwrap();
+    let (machine, _) = handle.join().unwrap();
+    assert_eq!(machine.pty.writer.bytes, b"ls\r".to_vec());
+}
+
+// Bytes refused by a full PTY wait for the writable event. Read
+// wakeups in between do not retry them.
+#[test]
+fn a_stuck_write_is_not_retried_on_read_wakeups() {
+    let (events, damaged) = mpsc::channel();
+    let (registration, readiness) = corcovado::Registration::new2();
+    let (attempts_tx, attempts) = mpsc::channel();
+    let terminal = Crosswords::new(
+        CrosswordsSize::new(80, 24),
+        CursorShape::Block,
+        EventRecorder(events.clone()),
+        WindowId::from(0),
+        0,
+        0,
+    );
+    let machine = Machine::new(
+        Arc::new(FairMutex::new(terminal)),
+        TestPty {
+            bytes: io::Cursor::new(b"output".to_vec()),
+            ending: None,
+            exhausted: None,
+            writer: RecordingWriter {
+                blocked: true,
+                attempts: Some(attempts_tx),
+                ..RecordingWriter::default()
+            },
+            child: Some(registration),
+            registration_error: false,
+            read_event: true,
+            shutdown_calls: 0,
+            deregister_calls: 0,
+            raw_error: None,
+            idle_reads: 0,
+            read_calls: 0,
+            first_read_delay: None,
+            burst_boundary: None,
+        },
+        EventRecorder(events),
+        WindowId::from(0),
+        0,
+    )
+    .unwrap();
+    let channel = machine.channel();
+    let handle = machine.spawn();
+    let wait = |rx: &mpsc::Receiver<()>| rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    // The keystroke is attempted on its wakeup and refused.
+    channel
+        .send(Msg::Input(std::borrow::Cow::Borrowed(b"a")))
+        .unwrap();
+    wait(&attempts);
+
+    // A read wakeup: output arrives and is parsed, nothing is written.
+    readiness.set_readiness(Ready::readable()).unwrap();
+    assert_eq!(
+        damaged.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "damaged"
+    );
+
+    channel.send(Msg::Shutdown).unwrap();
+    let (machine, state) = handle.join().unwrap();
+    assert!(
+        attempts.try_recv().is_err(),
+        "the read wakeup must not have retried the stuck bytes"
+    );
+    assert!(
+        !state.needs_write(),
+        "shutdown releases the bytes deferred to the writable event"
+    );
+    assert!(machine.pty.writer.bytes.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn the_reader_thread_serves_the_user() {
+    let class = std::thread::spawn(|| {
+        raise_io_thread_priority();
+        let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+        // SAFETY: queries the calling thread's own QoS class into a
+        // local; the relative priority out-parameter may be null.
+        unsafe {
+            libc::pthread_get_qos_class_np(
+                libc::pthread_self(),
+                &mut class,
+                std::ptr::null_mut(),
+            );
+        }
+        class
+    })
+    .join()
+    .unwrap();
+    assert_eq!(
+        class as u32,
+        libc::qos_class_t::QOS_CLASS_USER_INITIATED as u32
+    );
 }
 
 #[test]

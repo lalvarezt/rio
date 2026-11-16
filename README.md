@@ -34,7 +34,7 @@ builds on
     ·
     <a href="https://rioterm.com/docs/config">Config</a>
     ·
-    <a href="https://rioterm.com/changelog">Changelog</a>
+    <a href="https://github.com/raphamorim/rio/blob/main/CHANGELOG.md">Changelog</a>
     ·
     <a href="https://github.com/sponsors/raphamorim">Sponsor</a>
   </p>

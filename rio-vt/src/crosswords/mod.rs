@@ -508,6 +508,10 @@ where
     /// don't believe in a protocol nobody acts on) and reports are
     /// dropped here instead of waking the embedder for nothing.
     program_status_enabled: bool,
+    /// Keyboard focus as the host last reported it. To the program a pane
+    /// in a background tab or split is unfocused, so hosts report their
+    /// own pane switches too. Read when a program enables focus events.
+    focused: bool,
     /// Whether an OSC 7501 report arrived since the last full reset.
     /// Until one does, prompts and resets send no program-status events,
     /// so terminals that never use the protocol never wake the embedder
@@ -533,6 +537,16 @@ where
     keyboard_mode_idx: usize,
     inactive_keyboard_mode_stack: [u8; KEYBOARD_MODE_STACK_MAX_DEPTH],
     inactive_keyboard_mode_idx: usize,
+}
+
+/// The focus event a program asked for with DECSET 1004: CSI I when
+/// focused, CSI O when not.
+pub fn focus_report(focused: bool) -> &'static str {
+    if focused {
+        "\x1b[I"
+    } else {
+        "\x1b[O"
+    }
 }
 
 impl<U: EventListener> Crosswords<U> {
@@ -610,6 +624,7 @@ impl<U: EventListener> Crosswords<U> {
             damage_event_in_flight: false,
             sync_update_started: None,
             program_status_enabled: false,
+            focused: false,
             program_status_seen: false,
             command_started_at: None,
             modify_other_keys: 0,
@@ -2912,6 +2927,31 @@ impl<U: EventListener> Crosswords<U> {
         )
     }
 
+    /// Tell the terminal whether it has keyboard focus. Returns the
+    /// report the program is owed, CSI I (gained) or CSI O (lost), when
+    /// this is a change and the program asked for focus events (DECSET
+    /// 1004); the host writes it on its input path, so it keeps its order
+    /// against the keys typed around it. A terminal starts unfocused. To
+    /// a program, a pane in a background tab or split is unfocused, so
+    /// hosts call this for their own pane switches as well as for the
+    /// window.
+    #[must_use]
+    pub fn set_focus(&mut self, focused: bool) -> Option<&'static str> {
+        if self.focused == focused {
+            return None;
+        }
+        self.focused = focused;
+        self.mode
+            .contains(Mode::FOCUS_IN_OUT)
+            .then(|| focus_report(focused))
+    }
+
+    /// The focus report for the current state, for a host answering
+    /// [`RioEvent::FocusReport`] under the terminal lock.
+    pub fn focus_report(&self) -> &'static str {
+        focus_report(self.focused)
+    }
+
     pub fn mode(&self) -> Mode {
         self.mode
     }
@@ -4034,7 +4074,20 @@ impl<U: EventListener> Handler for Crosswords<U> {
                 self.event_proxy
                     .send_event(RioEvent::MouseCursorDirty, self.window_id);
             }
-            NamedPrivateMode::ReportFocusInOut => self.mode.insert(Mode::FOCUS_IN_OUT),
+            NamedPrivateMode::ReportFocusInOut => {
+                // The program learns where it stands right away: one
+                // started in a background pane would otherwise believe
+                // it is focused until the user looks away from it. A
+                // repeat of the enable, as editors send after a shell
+                // escape, is not news.
+                if !self.mode.contains(Mode::FOCUS_IN_OUT) {
+                    self.mode.insert(Mode::FOCUS_IN_OUT);
+                    self.event_proxy.send_event(
+                        RioEvent::FocusReport(self.route_id, self.focused),
+                        self.window_id,
+                    );
+                }
+            }
             NamedPrivateMode::BracketedPaste => self.mode.insert(Mode::BRACKETED_PASTE),
             NamedPrivateMode::KittyPasteEvents => {
                 self.mode.insert(Mode::KITTY_PASTE_EVENTS)
@@ -5063,7 +5116,11 @@ impl<U: EventListener> Handler for Crosswords<U> {
         // keeps scalar and bulk agreeing regardless of how the parser
         // chunks the stream) and are the common case, so that check
         // goes first.
+        // A kitty image placeholder is a cell of its own: the marks
+        // after it carry the image position, so it never continues a
+        // cluster even where the break rules would let it.
         if c > '\u{FF}'
+            && c != crate::ansi::kitty_virtual::PLACEHOLDER
             && self.mode.contains(Mode::GRAPHEME_CLUSTER)
             && self.try_cluster_append(c, width)
         {
@@ -7406,6 +7463,47 @@ mod tests {
     }
 
     #[test]
+    fn focus_is_reported_only_while_the_program_asks() {
+        let (mut cw, events) = make_crosswords_with_events(7);
+        // Enable replies, as (route, focused) the host answers with.
+        let replies = |events: &std::rc::Rc<std::cell::RefCell<Vec<RioEvent>>>| {
+            events
+                .borrow()
+                .iter()
+                .filter_map(|e| match e {
+                    RioEvent::FocusReport(route, focused) => Some((*route, *focused)),
+                    RioEvent::PtyWrite(..) => panic!("focus never rides PtyWrite"),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut parser = crate::performer::handler::Processor::default();
+
+        // Without the mode, focus is tracked but nothing is owed.
+        assert_eq!(cw.set_focus(true), None);
+        assert_eq!(cw.set_focus(false), None);
+        assert!(replies(&events).is_empty(), "{:?}", events.borrow());
+
+        // Enabling the mode asks the host to reply with the current state
+        // (unfocused); then a repeat of the enable is not news, a repeat
+        // of the state says nothing, and a change hands the host the
+        // report to write.
+        parser.advance(&mut cw, b"\x1b[?1004h\x1b[?1004h");
+        assert_eq!(replies(&events), vec![(7, false)]);
+        assert_eq!(cw.focus_report(), "\x1b[O");
+        assert_eq!(cw.set_focus(false), None);
+        assert_eq!(cw.set_focus(true), Some("\x1b[I"));
+        assert_eq!(cw.focus_report(), "\x1b[I");
+
+        // Enabling again after a disable, while focused, says so.
+        parser.advance(&mut cw, b"\x1b[?1004l\x1b[?1004h");
+        assert_eq!(replies(&events), vec![(7, false), (7, true)]);
+
+        parser.advance(&mut cw, b"\x1b[?1004l");
+        assert_eq!(cw.set_focus(false), None);
+    }
+
+    #[test]
     fn osc_7501_is_silent_until_the_embedder_opts_in() {
         let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let mut cw = Crosswords::new(
@@ -9441,6 +9539,49 @@ mod tests {
         }
     }
 
+    // A full snapshot used to clone every visible row into a fresh Vec,
+    // one allocation per row per frame while output scrolls. The rows
+    // already held by the snapshot keep their buffers across it.
+    #[test]
+    fn full_snapshot_reuses_the_row_buffers() {
+        use crate::event::TerminalDamage;
+        let mut cw = make_crosswords();
+        let lines = cw.grid.screen_lines();
+        let mut rows = Vec::new();
+        let mut row_styles = Vec::new();
+        let mut extras = snapshot::SnapshotExtras::default();
+        for line in 0..lines {
+            cw.input_str(&format!("{line}\r\n"));
+        }
+        cw.snapshot_visible(
+            &TerminalDamage::Full,
+            &mut rows,
+            &mut row_styles,
+            &mut extras,
+        );
+        assert_eq!(rows.len(), lines);
+        let buffers: Vec<*const Square> = rows.iter().map(|r| r.inner.as_ptr()).collect();
+        let text = |rows: &Vec<Row<Square>>| -> Vec<char> {
+            rows[0].inner.iter().map(|c| c.c()).collect()
+        };
+        let first = text(&rows);
+
+        for line in lines..2 * lines {
+            cw.input_str(&format!("{line}\r\n"));
+        }
+        cw.snapshot_visible(
+            &TerminalDamage::Full,
+            &mut rows,
+            &mut row_styles,
+            &mut extras,
+        );
+        let after: Vec<*const Square> = rows.iter().map(|r| r.inner.as_ptr()).collect();
+        assert_eq!(buffers, after, "a full snapshot reallocated its rows");
+        assert!(rows.iter().all(|r| r.dirty));
+        // The reused buffers carry the new content, not the old.
+        assert_ne!(text(&rows), first);
+    }
+
     #[test]
     fn snapshot_resolves_styles_per_row() {
         use crate::config::colors::{AnsiColor, ColorRgb};
@@ -9875,8 +10016,8 @@ mod tests {
         for _ in 0..6 {
             cw.linefeed();
         }
-        // History rows keep their old length across column growth;
-        // simulate one narrower than the grid (#1713).
+        // No resize path leaves a row narrower than the grid, but a
+        // walk must survive one all the same (#1713); make one by hand.
         cw.grid[Line(-2)].inner.truncate(2);
         let start = Pos::new(Line(-3), Column(0));
         // Must not panic; may end early at the narrow row.
@@ -10777,6 +10918,482 @@ mod tests {
                 "Old command should be cleared"
             );
         }
+    }
+
+    // Shrinking the columns wraps the cursor's line. The blank rows
+    // under the cursor take the wrap, so nothing goes to history, and
+    // the cursor follows its text down, still after the last character
+    // it was after. The saved cursor is only clamped to the new width,
+    // not reflowed. Growing back joins the line and the cursor follows.
+    #[test]
+    fn cursor_and_saved_cursor_after_a_reflow() {
+        let mut cw = Crosswords::new(
+            CrosswordsSize::new(10, 4),
+            CursorShape::Block,
+            VoidListener {},
+            crate::event::WindowId::from(0),
+            0,
+            10,
+        );
+        cw.input_str("abcdefghij");
+        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(0), Column(9)));
+        assert!(cw.grid.cursor.should_wrap);
+        cw.save_cursor_position();
+
+        cw.resize(CrosswordsSize::new(5, 4));
+
+        let text = |cw: &Crosswords<VoidListener>, line: i32| -> String {
+            let row = &cw.grid[Line(line)];
+            (0..row.len()).map(|c| row[Column(c)].c()).collect()
+        };
+        assert_eq!(cw.history_size(), 0, "the blank rows took the wrap");
+        assert_eq!(text(&cw, 0), "abcde");
+        assert!(cw.grid[Line(0)][Column(4)].wrapline());
+        assert_eq!(text(&cw, 1), "fghij");
+        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(1), Column(4)));
+        assert!(
+            cw.grid.cursor.should_wrap,
+            "still pending a wrap after the j"
+        );
+        // The fork retains the saved cursor's cell through reflow too.
+        assert_eq!(cw.grid.saved_cursor.pos, Pos::new(Line(1), Column(4)));
+
+        cw.resize(CrosswordsSize::new(10, 4));
+        assert_eq!(cw.history_size(), 0);
+        let joined = (0..4)
+            .find(|&line| cw.grid[Line(line)][Column(0)].c() == 'a')
+            .expect("the line came back on screen");
+        assert_eq!(text(&cw, joined), "abcdefghij");
+        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(joined), Column(9)));
+        assert!(cw.grid.cursor.should_wrap);
+    }
+
+    // The same join when the cursor is not pending a wrap: a 13 cell
+    // line at 5 columns has its tail "klm" on the third row with the
+    // cursor after the m. Growing to 10 joins the first two rows; the
+    // tail follows with the cursor after it.
+    #[test]
+    fn a_rejoined_line_keeps_the_cursor_after_its_text() {
+        let mut cw = Crosswords::new(
+            CrosswordsSize::new(10, 4),
+            CursorShape::Block,
+            VoidListener {},
+            crate::event::WindowId::from(0),
+            0,
+            10,
+        );
+        cw.input_str("abcdefghij");
+        cw.resize(CrosswordsSize::new(5, 4));
+        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(1), Column(4)));
+        // Three more cells wrap onto the next row: "klm" below "fghij".
+        cw.input_str("klm");
+        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(2), Column(3)));
+        assert!(!cw.grid.cursor.should_wrap);
+
+        cw.resize(CrosswordsSize::new(10, 4));
+        let text = |line: i32| -> String {
+            let row = &cw.grid[Line(line)];
+            (0..row.len())
+                .map(|c| row[Column(c)].c())
+                .collect::<String>()
+        };
+        let first = (-(cw.history_size() as i32)..4)
+            .find(|&line| cw.grid[Line(line)][Column(0)].c() == 'a')
+            .expect("the line is somewhere");
+        assert_eq!(text(first), "abcdefghij");
+        assert!(cw.grid[Line(first)][Column(9)].wrapline());
+        assert_eq!(text(first + 1).trim_end_matches('\0'), "klm");
+        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(first + 1), Column(3)));
+        assert!(!cw.grid.cursor.should_wrap);
+        assert!(first >= 0, "the joined line is on screen, not in history");
+    }
+
+    // The cursor inside a line that wrapped, with cells still after it
+    // on its row: the shrink carries the cursor with its cells to the
+    // next row, and the grow moves it back onto the joined row while
+    // the row below keeps the rest.
+    #[test]
+    fn a_cursor_inside_a_rejoined_line_lands_on_it() {
+        let mut cw = Crosswords::new(
+            CrosswordsSize::new(10, 4),
+            CursorShape::Block,
+            VoidListener {},
+            crate::event::WindowId::from(0),
+            0,
+            10,
+        );
+        cw.input_str("abcdefghijklm");
+        cw.goto(Line(0), Column(9));
+        cw.resize(CrosswordsSize::new(6, 4));
+        let text = |cw: &Crosswords<VoidListener>, line: i32| -> String {
+            let row = &cw.grid[Line(line)];
+            (0..row.len())
+                .map(|c| row[Column(c)].c())
+                .collect::<String>()
+                .trim_end_matches('\0')
+                .to_string()
+        };
+        assert_eq!(cw.history_size(), 0, "the blank row took the wrap");
+        assert_eq!(text(&cw, 0), "abcdef");
+        assert_eq!(text(&cw, 1), "ghijkl");
+        assert_eq!(text(&cw, 2), "m");
+        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(1), Column(3)), "on the j");
+
+        cw.resize(CrosswordsSize::new(10, 4));
+        assert_eq!(cw.history_size(), 0);
+        assert_eq!(text(&cw, 0), "abcdefghij");
+        assert_eq!(text(&cw, 1), "klm");
+        assert_eq!(
+            cw.grid.cursor.pos,
+            Pos::new(Line(0), Column(9)),
+            "still on the j"
+        );
+        assert!(!cw.grid.cursor.should_wrap);
+    }
+
+    // When the joined rows overflow the screen and the rows under the
+    // cursor hold content, nothing is dropped: a grow must not destroy
+    // output. The joined line goes above the screen and the cursor,
+    // already on the top row, stays there; a program repositions its
+    // cursor on the resize.
+    #[test]
+    fn a_rejoin_that_overflows_the_screen_keeps_the_bottom_row() {
+        let mut cw = Crosswords::new(
+            CrosswordsSize::new(6, 4),
+            CursorShape::Block,
+            VoidListener {},
+            crate::event::WindowId::from(0),
+            0,
+            10,
+        );
+        cw.input_str("abcdefghijkl");
+        for word in ["ooo", "ppp", "qqq"] {
+            cw.carriage_return();
+            cw.linefeed();
+            cw.input_str(word);
+        }
+        // History: abcdef. Screen: ghijkl, ooo, ppp, qqq.
+        assert_eq!(cw.history_size(), 1);
+        cw.goto(Line(0), Column(3));
+
+        cw.resize(CrosswordsSize::new(10, 4));
+        let text = |line: i32| -> String {
+            let row = &cw.grid[Line(line)];
+            (0..row.len())
+                .map(|c| row[Column(c)].c())
+                .collect::<String>()
+                .trim_end_matches('\0')
+                .to_string()
+        };
+        assert_eq!(cw.history_size(), 1);
+        assert_eq!(text(-1), "abcdefghij");
+        assert_eq!(text(0), "kl");
+        assert_eq!(text(1), "ooo");
+        assert_eq!(text(2), "ppp");
+        assert_eq!(text(3), "qqq", "the bottom row survived the grow");
+        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(0), Column(9)));
+    }
+
+    // Reported on #2058: a cursor in the middle of the top line, with
+    // blank rows under it, when the width shrinks. The cursor cannot
+    // move above the screen, so the blank rows at the bottom take the
+    // wrap instead and the cursor stays on its character. Growing back
+    // joins the line again under the cursor.
+    #[test]
+    fn a_shrink_keeps_a_top_row_cursor_on_its_character() {
+        let mut cw = Crosswords::new(
+            CrosswordsSize::new(10, 3),
+            CursorShape::Block,
+            VoidListener {},
+            crate::event::WindowId::from(0),
+            0,
+            10,
+        );
+        cw.input_str("abcdefghij");
+        cw.goto(Line(0), Column(3));
+        let text = |cw: &Crosswords<VoidListener>, line: i32| -> String {
+            let row = &cw.grid[Line(line)];
+            (0..row.len())
+                .map(|c| row[Column(c)].c())
+                .collect::<String>()
+                .trim_end_matches('\0')
+                .to_string()
+        };
+
+        cw.resize(CrosswordsSize::new(4, 3));
+        assert_eq!(cw.history_size(), 0, "the blank rows took the wrap");
+        assert_eq!(text(&cw, 0), "abcd");
+        assert_eq!(text(&cw, 1), "efgh");
+        assert_eq!(text(&cw, 2), "ij");
+        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(0), Column(3)));
+        assert_eq!(cw.grid[cw.grid.cursor.pos].c(), 'd');
+
+        cw.resize(CrosswordsSize::new(10, 3));
+        assert_eq!(cw.history_size(), 0);
+        assert_eq!(text(&cw, 0), "abcdefghij");
+        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(0), Column(3)));
+        assert_eq!(cw.grid[cw.grid.cursor.pos].c(), 'd');
+    }
+
+    // Reported on #2058: a wide character before the cursor. The spacer
+    // pushes the wide character down, so the row keeps one cell fewer
+    // than the width, and the cursor has to move back by that many.
+    #[test]
+    fn a_shrink_moves_the_cursor_by_the_cells_the_row_kept() {
+        let mut cw = Crosswords::new(
+            CrosswordsSize::new(10, 3),
+            CursorShape::Block,
+            VoidListener {},
+            crate::event::WindowId::from(0),
+            0,
+            10,
+        );
+        cw.input_str("abc\u{4e2d}def");
+        cw.goto(Line(0), Column(7));
+        assert_eq!(cw.grid[cw.grid.cursor.pos].c(), 'f');
+
+        cw.resize(CrosswordsSize::new(4, 3));
+        let cursor = cw.grid.cursor.pos;
+        assert_eq!(cw.grid[cursor].c(), 'f', "the cursor is still on the f");
+        // The rows: "abc" and a leading spacer, then the wide char with
+        // "de", then "f".
+        let row_of = |cw: &Crosswords<VoidListener>, c: char| -> i32 {
+            (-(cw.history_size() as i32)..3)
+                .find(|&line| {
+                    let row = &cw.grid[Line(line)];
+                    (0..row.len()).any(|col| row[Column(col)].c() == c)
+                })
+                .expect("the character is somewhere")
+        };
+        assert_eq!(row_of(&cw, 'f'), cursor.row.0);
+        assert_eq!(row_of(&cw, '\u{4e2d}'), row_of(&cw, 'e'));
+        assert_eq!(row_of(&cw, 'c'), row_of(&cw, '\u{4e2d}') - 1);
+        assert!(matches!(
+            cw.grid[Line(row_of(&cw, 'c'))][Column(3)].wide(),
+            crate::crosswords::square::Wide::LeadingSpacer
+        ));
+    }
+
+    // Reported on #2058: after `clear` the old output is in history
+    // and the prompt is on the top row. The shrink wraps the prompt
+    // line into the blank rows under it, and the grow back gives those
+    // rows back blank instead of sliding the cleared output onto the
+    // screen. The cursor ends after its text with no pending wrap, so
+    // the next character lands on the same row.
+    #[test]
+    fn a_round_trip_after_clear_keeps_the_history() {
+        let mut cw = Crosswords::new(
+            CrosswordsSize::new(10, 4),
+            CursorShape::Block,
+            VoidListener {},
+            crate::event::WindowId::from(0),
+            0,
+            10,
+        );
+        let mut parser = crate::performer::handler::Processor::default();
+        // `old` scrolls into history and the prompt starts on the top
+        // row, as after `clear`.
+        parser.advance(&mut cw, b"old\r\n\n\n\n\x1b[H$ abcdefg");
+        assert_eq!(cw.history_size(), 1);
+        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(0), Column(9)));
+
+        cw.resize(CrosswordsSize::new(4, 4));
+        cw.resize(CrosswordsSize::new(10, 4));
+
+        let text = |cw: &Crosswords<VoidListener>, line: i32| -> String {
+            let row = &cw.grid[Line(line)];
+            (0..row.len())
+                .map(|c| row[Column(c)].c())
+                .collect::<String>()
+                .trim_end_matches('\0')
+                .to_string()
+        };
+        assert_eq!(cw.history_size(), 1, "old stays cleared");
+        assert_eq!(text(&cw, -1), "old");
+        assert_eq!(text(&cw, 0), "$ abcdefg");
+        for line in 1..4 {
+            assert_eq!(text(&cw, line), "", "row {line} is blank again");
+        }
+        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(0), Column(9)));
+        assert!(!cw.grid.cursor.should_wrap, "the row has a column left");
+        parser.advance(&mut cw, b"h");
+        assert_eq!(text(&cw, 0), "$ abcdefgh");
+    }
+
+    // A long line in history wraps too when the width shrinks, but its
+    // new rows are history: they take no room from the screen and move
+    // no cursor. Otherwise a fragment of the cleared output surfaced
+    // right after `clear`.
+    #[test]
+    fn a_wrap_in_history_takes_no_room_from_the_screen() {
+        let mut cw = Crosswords::new(
+            CrosswordsSize::new(10, 4),
+            CursorShape::Block,
+            VoidListener {},
+            crate::event::WindowId::from(0),
+            0,
+            10,
+        );
+        let mut parser = crate::performer::handler::Processor::default();
+        parser.advance(&mut cw, b"oldoldold1\r\n\n\n\n\x1b[H$ abcdefg");
+        assert_eq!(cw.history_size(), 1);
+
+        cw.resize(CrosswordsSize::new(4, 4));
+
+        let text = |cw: &Crosswords<VoidListener>, line: i32| -> String {
+            let row = &cw.grid[Line(line)];
+            (0..row.len())
+                .map(|c| row[Column(c)].c())
+                .collect::<String>()
+                .trim_end_matches('\0')
+                .to_string()
+        };
+        assert_eq!(cw.history_size(), 3, "the old line is three history rows");
+        assert_eq!(text(&cw, -3), "oldo");
+        assert_eq!(text(&cw, -1), "d1");
+        assert_eq!(text(&cw, 0), "$ ab");
+        assert_eq!(text(&cw, 1), "cdef");
+        assert_eq!(text(&cw, 2), "g");
+        assert_eq!(text(&cw, 3), "");
+        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(2), Column(1)));
+
+        cw.resize(CrosswordsSize::new(10, 4));
+        assert_eq!(cw.history_size(), 1);
+        assert_eq!(text(&cw, -1), "oldoldold1");
+        assert_eq!(text(&cw, 0), "$ abcdefg");
+        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(0), Column(9)));
+    }
+
+    // With history above and blank room below, the shrink pays with
+    // the room and pushes nothing up. The grow back must then give back
+    // every history row the rejoin slid onto the screen, even when the
+    // rows it slid in outnumber the blank rows still left.
+    #[test]
+    fn a_grow_gives_back_every_row_it_slid_in_while_there_is_room() {
+        let mut cw = Crosswords::new(
+            CrosswordsSize::new(10, 4),
+            CursorShape::Block,
+            VoidListener {},
+            crate::event::WindowId::from(0),
+            0,
+            10,
+        );
+        let mut parser = crate::performer::handler::Processor::default();
+        parser.advance(&mut cw, b"old1\r\nold2\r\n\n\n\n\x1b[H$ abcdefg");
+        assert_eq!(cw.history_size(), 2);
+
+        cw.resize(CrosswordsSize::new(4, 4));
+        assert_eq!(cw.history_size(), 2, "the blank rows took the wrap");
+        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(2), Column(1)));
+        cw.resize(CrosswordsSize::new(10, 4));
+
+        let text = |line: i32| -> String {
+            let row = &cw.grid[Line(line)];
+            (0..row.len())
+                .map(|c| row[Column(c)].c())
+                .collect::<String>()
+                .trim_end_matches('\0')
+                .to_string()
+        };
+        assert_eq!(cw.history_size(), 2);
+        assert_eq!(text(-2), "old1");
+        assert_eq!(text(-1), "old2");
+        assert_eq!(text(0), "$ abcdefg");
+        assert_eq!(text(1), "");
+        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(0), Column(9)));
+    }
+
+    // The other side of the rule: a screen full to the bottom has no
+    // room, so the shrink pushed rows into history and the grow back
+    // pulls them onto the screen again. The round trip is the identity
+    // either way.
+    #[test]
+    fn a_round_trip_on_a_full_screen_brings_its_rows_back() {
+        let mut cw = Crosswords::new(
+            CrosswordsSize::new(10, 4),
+            CursorShape::Block,
+            VoidListener {},
+            crate::event::WindowId::from(0),
+            0,
+            10,
+        );
+        let rows = ["aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc", "$ abcdefg"];
+        for (i, word) in rows.iter().enumerate() {
+            if i > 0 {
+                cw.carriage_return();
+                cw.linefeed();
+            }
+            cw.input_str(word);
+        }
+        assert_eq!(cw.history_size(), 0);
+        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(3), Column(9)));
+
+        cw.resize(CrosswordsSize::new(5, 4));
+        assert_eq!(
+            cw.history_size(),
+            4,
+            "every row wrapped and nothing was blank"
+        );
+        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(3), Column(4)));
+        cw.resize(CrosswordsSize::new(10, 4));
+
+        let text = |line: i32| -> String {
+            let row = &cw.grid[Line(line)];
+            (0..row.len())
+                .map(|c| row[Column(c)].c())
+                .collect::<String>()
+                .trim_end_matches('\0')
+                .to_string()
+        };
+        assert_eq!(cw.history_size(), 0, "the pushed rows came back");
+        for (i, word) in rows.iter().enumerate() {
+            assert_eq!(text(i as i32), *word);
+        }
+        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(3), Column(9)));
+        assert!(!cw.grid.cursor.should_wrap);
+    }
+
+    // A resize that keeps the columns rotates the selection with the
+    // rows it covers, through a grow that pulls history back and a
+    // shrink that pushes rows into it.
+    #[test]
+    fn a_selection_follows_its_text_through_a_lines_only_resize() {
+        let mut cw = Crosswords::new(
+            CrosswordsSize::new(10, 4),
+            CursorShape::Block,
+            VoidListener {},
+            crate::event::WindowId::from(0),
+            0,
+            10,
+        );
+        for (i, word) in ["aaa", "bbb", "ccc", "ddd", "eee"].iter().enumerate() {
+            if i > 0 {
+                cw.carriage_return();
+                cw.linefeed();
+            }
+            cw.input_str(word);
+        }
+        assert_eq!(cw.history_size(), 1, "aaa scrolled into history");
+
+        let mut selection = Selection::new(
+            SelectionType::Simple,
+            Pos::new(Line(1), Column(0)),
+            Side::Left,
+        );
+        selection.update(Pos::new(Line(1), Column(2)), Side::Right);
+        cw.selection = Some(selection);
+        assert_eq!(cw.selection_to_string().as_deref(), Some("ccc"));
+
+        cw.resize(CrosswordsSize::new(10, 6));
+        assert_eq!(cw.history_size(), 0, "the grow pulled aaa back on screen");
+        assert_eq!(cw.selection_to_string().as_deref(), Some("ccc"));
+
+        cw.resize(CrosswordsSize::new(10, 3));
+        assert_eq!(cw.selection_to_string().as_deref(), Some("ccc"));
+
+        // A column change cannot be followed and drops the selection.
+        cw.resize(CrosswordsSize::new(8, 3));
+        assert!(cw.selection.is_none());
     }
 
     #[test]
@@ -14903,5 +15520,237 @@ mod tests {
         events.borrow_mut().clear();
         parser.advance(&mut term, b"\x1b[?9h\x1b[?9$p");
         assert_eq!(replies(&events), vec!["\x1b[?9;1$y".to_string()]);
+    }
+
+    // The bulk codepoint path under mode 2027. Every sample is written
+    // three ways, through the scalar `input`, through `input_codepoints`
+    // in one call, and through the parser in byte chunks of several
+    // sizes, and the grids must agree cell for cell: text, width, the
+    // marks attached to each cell, the cursor, and the wrap state.
+    mod bulk_codepoints_under_clustering {
+        use super::*;
+
+        const COLS: usize = 12;
+        const LINES: usize = 4;
+
+        fn term(clustering: bool, line_wrap: bool) -> Crosswords<VoidListener> {
+            let mut cw = Crosswords::new(
+                CrosswordsSize::new(COLS, LINES),
+                CursorShape::Block,
+                VoidListener {},
+                crate::event::WindowId::from(0),
+                0,
+                20,
+            );
+            cw.set_grapheme_clustering(clustering);
+            cw.mode.set(Mode::LINE_WRAP, line_wrap);
+            cw
+        }
+
+        /// Everything about a grid that printing can change.
+        fn picture(cw: &Crosswords<VoidListener>) -> Vec<String> {
+            let mut out = Vec::new();
+            for line in -(cw.history_size() as i32)..LINES as i32 {
+                let mut row_text = String::new();
+                for col in 0..COLS {
+                    let cell = cw.grid[Line(line)][Column(col)];
+                    let marks: String = cell
+                        .extras_id()
+                        .and_then(|id| cw.grid.extras_table.get(id))
+                        .map(|e| e.zerowidth.iter().collect())
+                        .unwrap_or_default();
+                    row_text.push_str(&format!(
+                        "[{}{}:{:?}:{:?}]",
+                        cell.c().escape_unicode(),
+                        marks.escape_unicode(),
+                        cell.wide(),
+                        cell.cell_flags()
+                    ));
+                }
+                row_text.push_str(&format!(
+                    " wrap={}",
+                    cw.grid[Line(line)].last().is_some_and(|c| c.wrapline())
+                ));
+                out.push(row_text);
+            }
+            out.push(format!(
+                "cursor={:?} should_wrap={} history={}",
+                cw.grid.cursor.pos,
+                cw.grid.cursor.should_wrap,
+                cw.history_size()
+            ));
+            out
+        }
+
+        /// The samples, each a sequence of separate print calls, so a
+        /// call can start with a continuation of the cell before the
+        /// cursor.
+        fn samples() -> Vec<Vec<&'static str>> {
+            vec![
+                vec!["déjà vu à côté de l'hôtel, señor Núñez"],
+                vec!["Съешь же ещё этих мягких булок"],
+                vec!["日本語のテキスト中文字符한국어"],
+                vec!["\u{1100}\u{1161}\u{11A8}\u{1100}\u{1161}"],
+                vec!["नमस्ते क्षि"],
+                vec!["สวัสดีครับ"],
+                vec!["\u{1F44D}\u{1F3FD} \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"],
+                vec!["\u{1F1E7}\u{1F1F7}\u{1F1EF}\u{1F1F5}\u{1F1E7}"],
+                vec!["\u{2764}\u{FE0F} \u{263A}\u{FE0E} \u{1F600}\u{1F601}\u{1F602}"],
+                vec!["e\u{301}a\u{308}o\u{302}"],
+                vec!["a\u{93E}b\u{93F}c"],
+                vec!["abc日本def\u{1F389}xyz"],
+                vec!["ab\u{10EEEE}cd\u{10EEEE}"],
+                vec!["\u{1F1E7}", "\u{1F1F7}"],
+                vec!["\u{1F468}", "\u{200D}\u{1F469}", "\u{200D}\u{1F467}"],
+                vec!["e", "\u{301}\u{308}", "x"],
+                vec!["日本語日本語", "のテ"],
+                vec!["\u{1F600}", "\u{1F3FD}\u{1F600}"],
+                vec!["\u{600}\u{660}\u{661}"],
+                vec!["x\u{200D}y\u{200D}z"],
+                vec!["ab\u{FE0F}cd\u{FE0E}"],
+                vec!["\u{D4E}\u{D15} a\u{D4E}b \u{D4E}\u{D4E}\u{D15}"],
+                vec!["\u{A9}\u{1F3FD} \u{AE}\u{FE0F} \u{A9}x"],
+                vec!["\u{915}\u{94D}\u{937} \u{928}\u{94D}\u{924}\u{947}"],
+                vec!["\u{D4E}\u{416}\u{417} \u{D4E}\u{65E5} \u{D4E}\u{10EEEE}x"],
+                vec!["aaaaaaaaaa\u{1100}", "\u{65E5}\u{1100}"],
+                vec![
+                    "abcdefghijЖklmnopqrstuvwxyzЗ",
+                    "éééééééé日ééééééé\u{AD}\u{A0}ÿ",
+                ],
+                vec!["\u{A9}\u{1F3FD}abcdefghij\u{AE}\u{FE0F}k"],
+                vec!["aaaaaaaaaa\u{1F1E7}", "\u{65E5}\u{1F1E7}\u{1F1E7}"],
+                vec!["aaaaaaaaa\u{1F468}\u{200D}", "\u{65E5}\u{1F469}"],
+            ]
+        }
+
+        fn run(clustering: bool, line_wrap: bool) {
+            for sample in samples() {
+                let mut scalar = term(clustering, line_wrap);
+                for call in &sample {
+                    for c in call.chars() {
+                        scalar.input(c);
+                    }
+                }
+                let want = picture(&scalar);
+
+                let mut bulk = term(clustering, line_wrap);
+                for call in &sample {
+                    let cps: Vec<u32> = call.chars().map(|c| c as u32).collect();
+                    bulk.input_codepoints(&cps);
+                }
+                assert_eq!(
+                    picture(&bulk),
+                    want,
+                    "bulk differs from scalar for {sample:?} (clustering={clustering}, line_wrap={line_wrap})"
+                );
+
+                for chunk in [1usize, 2, 3, 5, 7, 64] {
+                    let mut parsed = term(clustering, line_wrap);
+                    let mut parser = crate::performer::handler::Processor::default();
+                    for call in &sample {
+                        for bytes in call.as_bytes().chunks(chunk) {
+                            parser.advance(&mut parsed, bytes);
+                        }
+                    }
+                    assert_eq!(
+                        picture(&parsed),
+                        want,
+                        "parser in {chunk} byte chunks differs from scalar for {sample:?} (clustering={clustering}, line_wrap={line_wrap})"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn bulk_and_scalar_agree_with_clustering_on() {
+            run(true, true);
+        }
+
+        // Latin-1's printable ranges are exactly the codepoints below
+        // U+0100 with width one.
+        #[test]
+        fn latin_printable_is_exactly_width_one_below_0x100() {
+            let table = crate::codepoint_width::width_table();
+            for cp in 0u32..=0xFF {
+                assert_eq!(
+                    matches!(cp, 0x20..=0x7e | 0xa0..=0xff),
+                    crate::codepoint_width::width_in(table, cp) == Some(1),
+                    "U+{cp:04X}"
+                );
+            }
+        }
+
+        #[test]
+        fn bulk_and_scalar_agree_with_clustering_off() {
+            run(false, true);
+        }
+
+        // With auto-wrap off a wide codepoint at the last column is
+        // dropped; the next codepoint is still judged against the real
+        // last cell, in both paths.
+        #[test]
+        fn bulk_and_scalar_agree_without_auto_wrap() {
+            run(true, false);
+            run(false, false);
+        }
+
+        // A run of plain non-ASCII codepoints with clustering on: one
+        // cell per codepoint, cursor after the last.
+        #[test]
+        fn a_non_ascii_run_lands_one_cell_per_codepoint() {
+            let mut cw = term(true, true);
+            let cps: Vec<u32> = "Съешь же".chars().map(|c| c as u32).collect();
+            cw.input_codepoints(&cps);
+            let cell = cw.grid[Line(0)][Column(0)];
+            assert_eq!(cell.c(), 'С');
+            assert_eq!(cw.grid[Line(0)][Column(7)].c(), 'е');
+            assert_eq!(cw.grid.cursor.pos, Pos::new(Line(0), Column(cps.len())));
+        }
+
+        // A run whose first codepoint continues the cell before the
+        // cursor joins it, and the rest of the run is written fresh.
+        #[test]
+        fn a_run_starting_with_a_continuation_joins_the_previous_cell() {
+            let mut cw = term(true, true);
+            cw.input_codepoints(&['\u{1F1E7}' as u32]);
+            cw.input_codepoints(&['\u{1F1F7}' as u32, 'o' as u32, 'k' as u32]);
+            let flag = cw.grid[Line(0)][Column(0)];
+            assert_eq!(flag.c(), '\u{1F1E7}');
+            assert_eq!(
+                cw.grid
+                    .extras_table
+                    .get(flag.extras_id().unwrap())
+                    .unwrap()
+                    .zerowidth,
+                vec!['\u{1F1F7}']
+            );
+            assert_eq!(flag.wide(), crate::crosswords::square::Wide::Wide);
+            assert_eq!(cw.grid[Line(0)][Column(2)].c(), 'o');
+            assert_eq!(cw.grid[Line(0)][Column(3)].c(), 'k');
+            assert_eq!(cw.grid.cursor.pos, Pos::new(Line(0), Column(4)));
+        }
+
+        // Inside a run, a spacing mark after a Latin letter would join it
+        // and widen the cell, so the run ends before the mark and the
+        // scalar path does the join.
+        #[test]
+        fn a_spacing_mark_inside_a_run_ends_it_and_joins() {
+            let mut cw = term(true, true);
+            let cps: Vec<u32> = "ab\u{93E}cd".chars().map(|c| c as u32).collect();
+            cw.input_codepoints(&cps);
+            let b = cw.grid[Line(0)][Column(1)];
+            assert_eq!(b.c(), 'b');
+            assert_eq!(b.wide(), crate::crosswords::square::Wide::Wide);
+            assert_eq!(
+                cw.grid
+                    .extras_table
+                    .get(b.extras_id().unwrap())
+                    .unwrap()
+                    .zerowidth,
+                vec!['\u{93E}']
+            );
+            assert_eq!(cw.grid[Line(0)][Column(3)].c(), 'c');
+            assert_eq!(cw.grid[Line(0)][Column(4)].c(), 'd');
+        }
     }
 }

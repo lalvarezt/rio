@@ -17,13 +17,14 @@ use rio_backend::config::layout::Margin;
 use rio_backend::config::Shell;
 use smallvec::{smallvec, SmallVec};
 
+use crate::layout::{BorderDirection, GridId, PanelImages, ResizeState};
 use rio_backend::crosswords::pos::{CharsetIndex, StandardCharset};
 use rio_backend::crosswords::{Crosswords, MIN_COLUMNS, MIN_LINES};
 use rio_backend::error::{RioError, RioErrorLevel, RioErrorType};
 use rio_backend::event::EventListener;
 use rio_backend::event::WindowId;
 use rio_backend::selection::SelectionRange;
-use rio_backend::sugarloaf::{font::SugarloafFont, Sugarloaf, SugarloafErrors};
+use rio_backend::sugarloaf::{font::SugarloafFont, SugarloafErrors};
 use std::error::Error;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -32,6 +33,12 @@ use std::time::Instant;
 
 // Global atomic counter for generating unique route IDs
 static ROUTE_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
+
+/// A route id no pane has had before. Starts at one: zero is the
+/// manager's "no route yet" sentinel.
+pub fn next_route_id() -> usize {
+    ROUTE_ID_COUNTER.fetch_add(1, Ordering::SeqCst)
+}
 
 // Global atomic counter for generating unique rich text IDs
 static RICH_TEXT_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -161,10 +168,36 @@ pub struct ContextManagerConfig {
 
 const DEFAULT_CONTEXT_CAPACITY: usize = 28;
 
+/// A divider drag: the grid it started on, by its id since tab indices
+/// shift when tabs close, the shape that grid had, and where the drag
+/// started.
+#[derive(Debug, Clone, Copy)]
+struct BorderDrag {
+    grid: GridId,
+    shape: u64,
+    state: ResizeState,
+}
+
+/// One pointer move of a divider drag: the divider's direction, and
+/// whether the grid it moves is the one on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DragStep {
+    pub direction: BorderDirection,
+    pub visible: bool,
+}
+
 pub struct ContextManager<T: EventListener> {
     contexts: SmallVec<[ContextGrid<T>; DEFAULT_CONTEXT_CAPACITY]>,
     current_index: usize,
     current_route: usize,
+    /// Window focus as the platform last reported it. With the active
+    /// pane it decides which pane, if any, a program should consider
+    /// focused.
+    window_focused: bool,
+    /// The pane last told it has focus (CSI I), and so owed a CSI O.
+    focused_route: Option<usize>,
+    /// A divider drag in progress, pinned to the grid it started on.
+    border_drag: Option<BorderDrag>,
     #[allow(unused)]
     capacity: usize,
     event_proxy: T,
@@ -290,7 +323,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     ) -> Result<Context<T>, Box<dyn Error>> {
         #[cfg(feature = "profiling")]
         let _timing = crate::profiling::span("startup.context");
-        let route_id = ROUTE_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let route_id = next_route_id();
 
         #[cfg(test)]
         if config.dead_pty {
@@ -473,7 +506,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         cursor_state: (&Cursor, bool),
         event_proxy: T,
         window_id: WindowId,
-        route_id: usize,
         rich_text_id: usize,
         ctx_config: ContextManagerConfig,
         size: ContextDimension,
@@ -502,10 +534,12 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                     window_id,
                 );
 
+                // A dead pane is still a pane: it takes a minted route
+                // like any other, so the grid named after it is unique.
                 create_dead_context(
                     event_proxy.clone(),
                     window_id,
-                    route_id,
+                    next_route_id(),
                     0,
                     ContextDimension::default(),
                 )
@@ -530,6 +564,9 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         let mut manager = ContextManager {
             current_index: 0,
             current_route: 0,
+            window_focused: false,
+            focused_route: None,
+            border_drag: None,
             contexts: smallvec![ContextGrid::new(
                 initial_context,
                 scaled_margin,
@@ -571,6 +608,9 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         Ok(ContextManager {
             current_index: 0,
             current_route: 0,
+            window_focused: false,
+            focused_route: None,
+            border_drag: None,
             contexts: smallvec![ContextGrid::new(
                 initial_context,
                 Margin::default(),
@@ -649,7 +689,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     pub fn should_close_context_manager(
         &mut self,
         route_id: usize,
-        sugarloaf: &mut Sugarloaf,
+        sugarloaf: &mut impl PanelImages,
     ) -> bool {
         // Called when terminal.exit() fires: a tab-close action (the
         // context is already gone, nothing found below, return false)
@@ -666,7 +706,9 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         // the tab is focused and its focused panel was the one that
         // died, the sibling selection becomes the current route.
         if self.contexts[tab_index].len() > 1 {
-            self.contexts[tab_index].remove_by_route(route_id, sugarloaf);
+            if let Some(removed) = self.contexts[tab_index].remove_by_route(route_id) {
+                removed.release(sugarloaf);
+            }
             if tab_index == self.current_index {
                 self.sync_current_route();
             }
@@ -746,7 +788,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     }
 
     #[inline]
-    pub fn close_unfocused_tabs(&mut self, sugarloaf: &mut Sugarloaf) {
+    pub fn close_unfocused_tabs(&mut self, sugarloaf: &mut impl PanelImages) {
         let current_route_id = self.current().route_id;
         self.contexts.retain(|ctx| {
             let keep = ctx.current().route_id == current_route_id;
@@ -782,7 +824,9 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             self.sync_current_route();
             return;
         }
-        self.switch_to_next();
+        if !self.step_tab(true) {
+            return;
+        }
         // Make sure first split is selected - get the root key
         let current_tab = &mut self.contexts[self.current_index];
         if let Some(root) = current_tab.root {
@@ -797,7 +841,9 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             self.sync_current_route();
             return;
         }
-        self.switch_to_prev();
+        if !self.step_tab(false) {
+            return;
+        }
         // Make sure last split is selected - get the last key in order
         let current_tab = &mut self.contexts[self.current_index];
         let ordered_keys = current_tab.get_ordered_keys();
@@ -808,23 +854,23 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     }
 
     #[inline]
-    pub fn move_divider_up(&mut self, amount: f32, sugarloaf: &mut Sugarloaf) -> bool {
-        self.contexts[self.current_index].move_divider_up(amount, sugarloaf)
+    pub fn move_divider_up(&mut self, amount: f32) -> bool {
+        self.contexts[self.current_index].move_divider_up(amount)
     }
 
     #[inline]
-    pub fn move_divider_down(&mut self, amount: f32, sugarloaf: &mut Sugarloaf) -> bool {
-        self.contexts[self.current_index].move_divider_down(amount, sugarloaf)
+    pub fn move_divider_down(&mut self, amount: f32) -> bool {
+        self.contexts[self.current_index].move_divider_down(amount)
     }
 
     #[inline]
-    pub fn move_divider_left(&mut self, amount: f32, sugarloaf: &mut Sugarloaf) -> bool {
-        self.contexts[self.current_index].move_divider_left(amount, sugarloaf)
+    pub fn move_divider_left(&mut self, amount: f32) -> bool {
+        self.contexts[self.current_index].move_divider_left(amount)
     }
 
     #[inline]
-    pub fn move_divider_right(&mut self, amount: f32, sugarloaf: &mut Sugarloaf) -> bool {
-        self.contexts[self.current_index].move_divider_right(amount, sugarloaf)
+    pub fn move_divider_right(&mut self, amount: f32) -> bool {
+        self.contexts[self.current_index].move_divider_right(amount)
     }
 
     #[inline]
@@ -986,12 +1032,12 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     /// tab of an UNFOCUSED window would otherwise leave no trace at
     /// all. Edge-triggered: a BEL flood marks once and repaints once.
     #[inline]
-    pub fn ring_bell(&mut self, route_id: usize, window_focused: bool) -> bool {
+    pub fn ring_bell(&mut self, route_id: usize) -> bool {
         let Some(tab_index) = self.tab_index_for_route(route_id) else {
             return false;
         };
 
-        if window_focused && tab_index == self.current_index {
+        if self.window_focused && tab_index == self.current_index {
             return false;
         }
 
@@ -1013,15 +1059,90 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         std::mem::replace(&mut grid.bell, false)
     }
 
+    fn tab_index_for_grid(&self, id: GridId) -> Option<usize> {
+        self.contexts.iter().position(|grid| grid.id() == id)
+    }
+
+    /// Start a divider drag if a border of the current grid is under
+    /// the pointer. Returns the divider's direction, for the cursor.
+    pub fn begin_border_drag(&mut self, x: f32, y: f32) -> Option<BorderDirection> {
+        let grid = &self.contexts[self.current_index];
+        let border = grid.find_border_at_position(x, y)?;
+        let start_pos = match border.direction {
+            BorderDirection::Vertical => x,
+            BorderDirection::Horizontal => y,
+        };
+        let original_sizes = (
+            grid.get_panel_size(border.left_or_top, border.direction),
+            grid.get_panel_size(border.right_or_bottom, border.direction),
+        );
+        self.border_drag = Some(BorderDrag {
+            grid: grid.id(),
+            shape: grid.shape(),
+            state: ResizeState {
+                border,
+                start_pos,
+                original_sizes,
+            },
+        });
+        Some(border.direction)
+    }
+
+    /// Move the dragged divider to the pointer. The grid it started on
+    /// is the one resized, whichever tab is showing now and however the
+    /// tabs were renumbered since. A grid whose shape changed mid-drag
+    /// is left alone, its tree is not the one the drag knows, but the
+    /// drag stays on so the motion is still swallowed until the release.
+    /// `None` only when no drag is in progress.
+    pub fn drag_border_to(&mut self, x: f32, y: f32) -> Option<DragStep> {
+        let drag = *self.border_drag.as_ref()?;
+        let state = drag.state;
+        let direction = state.border.direction;
+        let current_pos = match direction {
+            BorderDirection::Vertical => x,
+            BorderDirection::Horizontal => y,
+        };
+        let Some(tab) = self.tab_index_for_grid(drag.grid) else {
+            return Some(DragStep {
+                direction,
+                visible: false,
+            });
+        };
+        let visible = tab == self.current_index;
+        let grid = &mut self.contexts[tab];
+        if grid.shape() == drag.shape {
+            grid.resize_border(
+                &state.border,
+                state.original_sizes,
+                current_pos - state.start_pos,
+            );
+        }
+        Some(DragStep { direction, visible })
+    }
+
+    /// End the divider drag, however it ends: the button released, the
+    /// window lost focus. The dragged grid sends the winsizes it held
+    /// back; every grid does when that grid cannot be found any more.
+    /// Returns whether a drag was in progress.
+    pub fn end_border_drag(&mut self) -> bool {
+        let Some(drag) = self.border_drag.take() else {
+            return false;
+        };
+        match self.tab_index_for_grid(drag.grid) {
+            Some(tab) => self.contexts[tab].end_border_resize(),
+            None => {
+                for context_grid in self.contexts.iter_mut() {
+                    context_grid.end_border_resize();
+                }
+            }
+        }
+        true
+    }
+
     #[inline]
-    pub fn resize_all_grids(
-        &mut self,
-        width: f32,
-        height: f32,
-        sugarloaf: &mut Sugarloaf,
-    ) {
+    pub fn resize_all_grids(&mut self, width: f32, height: f32) {
         for context_grid in self.contexts.iter_mut() {
-            context_grid.resize(width, height, sugarloaf);
+            context_grid.resize(width, height);
         }
     }
 
@@ -1161,6 +1282,46 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             Self::refresh_item_title(&template, context, None);
         }
         self.sync_window_title();
+        self.sync_focus_reports();
+    }
+
+    /// Window focus from the platform. Together with the active pane it
+    /// decides which program is told it has focus.
+    pub fn set_window_focus(&mut self, focused: bool) {
+        self.window_focused = focused;
+        self.sync_focus_reports();
+    }
+
+    /// To a program, focus means "my pane is the active one in a focused
+    /// window". Tell the pane that stops matching (CSI O) and the one that
+    /// starts (CSI I); each terminal speaks only when its program asked for
+    /// focus events. Idempotent, so every active-pane change calls it; a
+    /// pane that died owes nothing.
+    fn sync_focus_reports(&mut self) {
+        let wanted = self.window_focused.then(|| self.current().route_id);
+        if wanted == self.focused_route {
+            return;
+        }
+        if let Some(previous) = self.focused_route.take() {
+            if let Some(item) = self.get_by_route_id(previous) {
+                Self::write_focus(item.context(), false);
+            }
+        }
+        if wanted.is_some() {
+            Self::write_focus(self.current(), true);
+        }
+        self.focused_route = wanted;
+    }
+
+    /// The report goes down the same channel as keys, so a key typed
+    /// right after a focus change cannot overtake it.
+    fn write_focus(context: &Context<T>, focused: bool) {
+        // Under the lock, like the reply to a program enabling focus
+        // events, so the two cannot cross.
+        let mut terminal = context.terminal.lock();
+        if let Some(report) = terminal.set_focus(focused) {
+            context.messenger.send_write(report.as_bytes());
+        }
     }
 
     #[inline]
@@ -1196,8 +1357,10 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     }
 
     #[inline]
-    pub fn remove_current_grid(&mut self, sugarloaf: &mut Sugarloaf) {
-        self.contexts[self.current_index].remove_current(sugarloaf);
+    pub fn remove_current_grid(&mut self, sugarloaf: &mut impl PanelImages) {
+        if let Some(removed) = self.contexts[self.current_index].remove_current() {
+            removed.release(sugarloaf);
+        }
         self.sync_current_route();
     }
 
@@ -1255,7 +1418,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     }
 
     #[inline]
-    pub fn close_current_context(&mut self, sugarloaf: &mut Sugarloaf) {
+    pub fn close_current_context(&mut self, sugarloaf: &mut impl PanelImages) {
         if self.contexts.len() == 1 {
             // MacOS: Close last tab will work, leading to hide and
             // keep Rio running in background.
@@ -1267,25 +1430,23 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         }
 
         let index_to_remove = self.current_index;
-        let mut should_set_current = false;
-        if index_to_remove > 1 {
-            self.set_current(self.current_index - 1);
-        } else {
-            should_set_current = true;
-        }
 
         // Remove all rich text from the grid before removing the context
         self.contexts[index_to_remove].remove_from_sugarloaf(sugarloaf);
         self.contexts.remove(index_to_remove);
 
-        if should_set_current {
-            self.set_current(0);
-        }
+        // The neighbour is selected only now, so no focus report goes to
+        // the pane that just went away.
+        self.set_current(index_to_remove.saturating_sub(1));
 
         self.clear_inactive_image_overlays(sugarloaf);
     }
 
-    pub fn close_unfocused_tab(&mut self, index: usize, sugarloaf: &mut Sugarloaf) {
+    pub fn close_unfocused_tab(
+        &mut self,
+        index: usize,
+        sugarloaf: &mut impl PanelImages,
+    ) {
         if index >= self.contexts.len() || index == self.current_index {
             return;
         }
@@ -1317,26 +1478,34 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         self.contexts[self.current_index].current_mut()
     }
 
+    /// Move to the next or previous tab without syncing the route, so a
+    /// caller that goes on to pick a split in that tab syncs once, for the
+    /// pane that will actually show; a sync in between would tell the
+    /// tab's remembered split it gained and lost focus. Returns whether
+    /// the index moved.
+    fn step_tab(&mut self, forward: bool) -> bool {
+        let last = self.contexts.len() - 1;
+        self.current_index = match (forward, self.current_index) {
+            (true, index) if index == last => 0,
+            (true, index) => index + 1,
+            (false, 0) => last,
+            (false, index) => index - 1,
+        };
+        true
+    }
+
     #[inline]
     pub fn switch_to_next(&mut self) {
-        if self.contexts.len() - 1 == self.current_index {
-            self.current_index = 0;
-        } else {
-            self.current_index += 1;
+        if self.step_tab(true) {
+            self.sync_current_route();
         }
-
-        self.sync_current_route();
     }
 
     #[inline]
     pub fn switch_to_prev(&mut self) {
-        if self.current_index == 0 {
-            self.current_index = self.contexts.len() - 1;
-        } else {
-            self.current_index -= 1;
+        if self.step_tab(false) {
+            self.sync_current_route();
         }
-
-        self.sync_current_route();
     }
 
     #[inline]
@@ -1468,12 +1637,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         Ok(config)
     }
 
-    pub fn split(
-        &mut self,
-        rich_text_id: usize,
-        split_down: bool,
-        sugarloaf: &mut Sugarloaf,
-    ) {
+    pub fn split(&mut self, rich_text_id: usize, split_down: bool) {
         let cloned_config = match self.config_here(true) {
             Ok(config) => config,
             Err(message) => {
@@ -1494,15 +1658,15 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             &cloned_config,
         ) {
             Ok(new_context) => {
-                let new_route_id = new_context.route_id;
                 if split_down {
-                    self.contexts[self.current_index].split_down(new_context, sugarloaf);
+                    self.contexts[self.current_index].split_down(new_context);
                 } else {
-                    self.contexts[self.current_index].split_right(new_context, sugarloaf);
+                    self.contexts[self.current_index].split_right(new_context);
                 }
 
-                self.current_route = new_route_id;
-                self.sync_window_title();
+                // The grid's current pane is the new split when the
+                // split took, and the old one when it did not.
+                self.sync_current_route();
             }
             Err(..) => {
                 tracing::error!("not able to create a new context");
@@ -1515,7 +1679,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         rich_text_id: usize,
         split_down: bool,
         config: rio_backend::config::Config,
-        sugarloaf: &mut Sugarloaf,
     ) {
         let (shell, working_dir) = process_open_url(
             config.shell.to_owned(),
@@ -1557,15 +1720,15 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             &context_manager_config,
         ) {
             Ok(new_context) => {
-                let new_route_id = new_context.route_id;
                 if split_down {
-                    self.contexts[self.current_index].split_down(new_context, sugarloaf);
+                    self.contexts[self.current_index].split_down(new_context);
                 } else {
-                    self.contexts[self.current_index].split_right(new_context, sugarloaf);
+                    self.contexts[self.current_index].split_right(new_context);
                 }
 
-                self.current_route = new_route_id;
-                self.sync_window_title();
+                // The grid's current pane is the new split when the
+                // split took, and the old one when it did not.
+                self.sync_current_route();
             }
             Err(..) => {
                 tracing::error!("not able to create a new context");
@@ -1657,7 +1820,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     /// Clear image overlays for inactive tabs.
     #[inline]
-    pub fn clear_inactive_image_overlays(&self, sugarloaf: &mut Sugarloaf) {
+    pub fn clear_inactive_image_overlays(&self, sugarloaf: &mut impl PanelImages) {
         for (idx, context) in self.contexts.iter().enumerate() {
             // Skip the current tab
             if idx == self.current_index {
@@ -1672,7 +1835,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     #[inline]
     pub fn clear_context_image_overlays(
         &self,
-        sugarloaf: &mut Sugarloaf,
+        sugarloaf: &mut impl PanelImages,
         old_index: usize,
     ) {
         if let Some(old_context) = self.contexts.get(old_index) {
@@ -1715,6 +1878,96 @@ pub fn process_open_url(
 pub mod test {
     use super::*;
     use crate::event::VoidListener;
+
+    #[derive(Clone, Default)]
+    struct FocusRecorder(std::sync::Arc<std::sync::Mutex<Vec<(usize, String)>>>);
+
+    impl EventListener for FocusRecorder {
+        fn send_event(&self, event: RioEvent, _: WindowId) {
+            match event {
+                RioEvent::PtyWrite(route, text) => {
+                    self.0.lock().unwrap().push((route, text));
+                }
+                RioEvent::FocusReport(route, focused) => {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .push((route, format!("reply:{focused}")));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Focus follows the pane the user is looking at, not just the window:
+    // a tab switch tells the old pane it lost focus and the new one it
+    // gained it, when they asked for focus events.
+    #[test]
+    fn focus_reports_follow_tab_switches() {
+        use rio_backend::performer::handler::Processor;
+        let recorder = FocusRecorder::default();
+        let mut cm =
+            ContextManager::start_with_capacity(5, recorder.clone(), WindowId::from(0))
+                .unwrap();
+        cm.add_context(true, 0);
+        assert_eq!(cm.len(), 2);
+        // Each pane's PTY input lands on a channel the test reads.
+        let mut routes = Vec::new();
+        let mut inputs = Vec::new();
+        for i in 0..2 {
+            let (tx, rx) = corcovado::channel::channel();
+            let context = cm.contexts[i].current_mut();
+            context.messenger = Messenger::new(tx);
+            routes.push(context.route_id);
+            inputs.push(rx);
+            let mut parser = Processor::default();
+            parser.advance(&mut *context.terminal.lock(), b"\x1b[?1004h");
+        }
+        let drain = |rx: &corcovado::channel::Receiver<Msg>| {
+            let mut out = Vec::new();
+            while let Ok(Msg::Input(bytes)) = rx.try_recv() {
+                out.push(bytes.into_owned());
+            }
+            out
+        };
+        let gained = vec![b"\x1b[I".to_vec()];
+        let lost = vec![b"\x1b[O".to_vec()];
+        let none: Vec<Vec<u8>> = Vec::new();
+
+        // The window was never focused: enabling the mode asked for a
+        // reply telling each program it is unfocused, and the switch
+        // add_context made reported nothing.
+        assert_eq!(
+            *recorder.0.lock().unwrap(),
+            vec![
+                (routes[0], "reply:false".to_string()),
+                (routes[1], "reply:false".to_string())
+            ]
+        );
+        assert_eq!(drain(&inputs[0]), none);
+        assert_eq!(drain(&inputs[1]), none);
+
+        cm.set_window_focus(true); // tab 1 gains
+        assert_eq!(drain(&inputs[0]), none);
+        assert_eq!(drain(&inputs[1]), gained);
+
+        cm.switch_to_prev(); // tab 1 loses, tab 0 gains
+        assert_eq!(drain(&inputs[0]), gained);
+        assert_eq!(drain(&inputs[1]), lost);
+
+        cm.set_window_focus(false); // tab 0 loses
+        cm.set_window_focus(false); // a repeat: nothing
+        cm.switch_to_next(); // unfocused window: nothing
+        assert_eq!(drain(&inputs[0]), lost);
+        assert_eq!(drain(&inputs[1]), none);
+
+        cm.set_window_focus(true); // tab 1 gains
+        assert_eq!(drain(&inputs[0]), none);
+        assert_eq!(drain(&inputs[1]), gained);
+
+        // Nothing but the two enable replies rode the event path.
+        assert_eq!(recorder.0.lock().unwrap().len(), 2);
+    }
 
     #[test]
     fn typed_ssh_uses_local_pane_recipe_and_local_tabs_clear_it() {
@@ -1795,7 +2048,6 @@ pub mod test {
             (&Cursor::default(), false),
             events.clone(),
             WindowId::from(0),
-            0,
             0,
             ContextManagerConfig {
                 dead_pty: true,
@@ -2102,7 +2354,6 @@ pub mod test {
             (&Cursor::default(), false),
             events.clone(),
             WindowId::from(0),
-            0,
             0,
             ContextManagerConfig {
                 dead_pty: true,
@@ -2440,21 +2691,24 @@ pub mod test {
         let background_route = cm.contexts[2].current().route_id;
         let focused_route = cm.contexts[0].current().route_id;
 
-        assert!(cm.ring_bell(background_route, true));
+        cm.set_window_focus(true);
+        assert!(cm.ring_bell(background_route));
         assert!(cm.bell(2));
 
-        assert!(!cm.ring_bell(background_route, true));
+        assert!(!cm.ring_bell(background_route));
         assert!(cm.bell(2));
 
-        assert!(!cm.ring_bell(focused_route, true));
+        assert!(!cm.ring_bell(focused_route));
         assert!(!cm.bell(0));
 
-        assert!(cm.ring_bell(focused_route, false));
+        cm.set_window_focus(false);
+        assert!(cm.ring_bell(focused_route));
         assert!(cm.bell(0));
         cm.contexts[0].bell = false;
+        cm.set_window_focus(true);
 
         // Unknown routes (already-closed panes) are a no-op.
-        assert!(!cm.ring_bell(usize::MAX, true));
+        assert!(!cm.ring_bell(usize::MAX));
 
         // Focusing the tab drops the mark on the next rendered frame.
         cm.set_current(2);
@@ -2906,5 +3160,275 @@ pub mod test {
         context_manager.move_current_tab_to(5);
         assert_eq!(context_manager.current_index, 2);
         assert_eq!(order(&mut context_manager), vec![1, 0, 2, 3, 4]);
+    }
+}
+
+#[cfg(test)]
+mod sugarloaf_free {
+    use super::*;
+    use crate::layout::{BorderDirection, PanelImages};
+    use rio_backend::event::{VoidListener, WindowId};
+
+    /// Stands in for sugarloaf: records what the manager asks it to drop.
+    #[derive(Default)]
+    struct Images {
+        cleared: Vec<usize>,
+        removed_routes: Vec<usize>,
+    }
+
+    impl PanelImages for Images {
+        fn clear_image_overlays_for(&mut self, rich_text_id: usize) {
+            self.cleared.push(rich_text_id);
+        }
+
+        fn remove_route_images(&mut self, route_id: usize) {
+            self.removed_routes.push(route_id);
+        }
+    }
+
+    fn manager() -> ContextManager<VoidListener> {
+        let mut cm =
+            ContextManager::start_with_capacity(5, VoidListener {}, WindowId::from(0))
+                .unwrap();
+        cm.resize_all_grids(1200.0, 800.0);
+        cm
+    }
+
+    fn sorted(mut v: Vec<usize>) -> Vec<usize> {
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn closing_a_split_releases_only_that_pane() {
+        let mut cm = manager();
+        cm.split(7, false);
+        assert_eq!(cm.current_grid_len(), 2);
+        let route = cm.current().route_id;
+        let kept = cm
+            .current_grid()
+            .contexts()
+            .values()
+            .find(|item| item.val.rich_text_id != 7)
+            .map(|item| item.val.route_id)
+            .unwrap();
+
+        let mut images = Images::default();
+        cm.remove_current_grid(&mut images);
+        assert_eq!(images.cleared, vec![7]);
+        assert_eq!(images.removed_routes, vec![route]);
+        assert_eq!(cm.current_grid_len(), 1);
+        assert_eq!(cm.current().route_id, kept);
+    }
+
+    #[test]
+    fn closing_a_tab_releases_every_pane_in_it() {
+        let mut cm = manager();
+        cm.add_context(true, 1);
+        cm.split(2, true);
+        assert_eq!(cm.len(), 2);
+        let routes: Vec<usize> = cm
+            .current_grid()
+            .contexts()
+            .values()
+            .map(|i| i.val.route_id)
+            .collect();
+
+        let mut images = Images::default();
+        cm.close_current_context(&mut images);
+        assert_eq!(sorted(images.cleared), vec![1, 2]);
+        assert_eq!(sorted(images.removed_routes), sorted(routes));
+        assert_eq!(cm.len(), 1);
+        assert_eq!(cm.current().rich_text_id, 0);
+    }
+
+    #[test]
+    fn switching_tabs_clears_overlays_of_the_tabs_not_shown() {
+        let mut cm = manager();
+        cm.add_context(true, 1);
+        cm.add_context(true, 2);
+        cm.select_tab(1);
+        let mut images = Images::default();
+        cm.clear_inactive_image_overlays(&mut images);
+        assert_eq!(sorted(images.cleared), vec![0, 2]);
+        assert!(
+            images.removed_routes.is_empty(),
+            "a tab switch frees no images"
+        );
+    }
+
+    #[test]
+    fn closing_unfocused_tabs_releases_their_panes_and_keeps_the_current() {
+        let mut cm = manager();
+        cm.add_context(true, 1);
+        cm.add_context(true, 2);
+        cm.select_tab(1);
+        let routes: Vec<usize> = [0, 2]
+            .iter()
+            .map(|&tab| cm.contexts[tab].current().route_id)
+            .collect();
+        let mut images = Images::default();
+        cm.close_unfocused_tabs(&mut images);
+        assert_eq!(sorted(images.cleared), vec![0, 2]);
+        assert_eq!(sorted(images.removed_routes), sorted(routes));
+        assert_eq!(cm.len(), 1);
+        assert_eq!(cm.current().rich_text_id, 1);
+    }
+
+    /// Window position of the separator between the two leftmost panes
+    /// of a grid, a y inside both, and their widths.
+    fn separator(cm: &ContextManager<VoidListener>, tab: usize) -> (f32, f32, f32, f32) {
+        let grid = &cm.contexts[tab];
+        let mut rects: Vec<[f32; 4]> = grid
+            .contexts()
+            .values()
+            .map(|i| i.geometry.content)
+            .collect();
+        rects.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let (left, right) = (rects[0], rects[1]);
+        (
+            ((left[0] + left[2]) + right[0]) / 2.0,
+            left[1] + 1.0,
+            left[2],
+            right[2],
+        )
+    }
+
+    fn widths(cm: &ContextManager<VoidListener>, tab: usize) -> (f32, f32) {
+        let (_, _, l, r) = separator(cm, tab);
+        (l, r)
+    }
+
+    const VERTICAL: Option<DragStep> = Some(DragStep {
+        direction: BorderDirection::Vertical,
+        visible: true,
+    });
+
+    #[test]
+    fn a_divider_drag_follows_the_pointer_and_survives_a_tab_switch() {
+        let mut cm = manager();
+        cm.split(1, false);
+        let (x, y, lw, rw) = separator(&cm, 0);
+
+        assert_eq!(cm.drag_border_to(x, y), None, "no drag before a press");
+        assert_eq!(cm.begin_border_drag(x + 300.0, y), None, "not a border");
+        assert_eq!(cm.begin_border_drag(x, y), Some(BorderDirection::Vertical));
+
+        assert_eq!(cm.drag_border_to(x + 100.0, y), VERTICAL);
+        let (l, r) = widths(&cm, 0);
+        assert!((l - (lw + 100.0)).abs() <= 1.0, "left {l} from {lw}");
+        assert!((r - (rw - 100.0)).abs() <= 1.0, "right {r} from {rw}");
+
+        // A tab switch mid-drag: the drag stays on the grid it started
+        // on, and reports that grid is not the one on screen.
+        cm.add_context(true, 9);
+        assert_eq!(cm.current_index, 1);
+        assert_eq!(
+            cm.drag_border_to(x + 150.0, y),
+            Some(DragStep {
+                direction: BorderDirection::Vertical,
+                visible: false,
+            })
+        );
+        let (l, _) = widths(&cm, 0);
+        assert!((l - (lw + 150.0)).abs() <= 1.0, "left {l} from {lw}");
+        assert_eq!(
+            cm.contexts[1].panel_count(),
+            1,
+            "the new tab was not touched"
+        );
+
+        assert!(cm.end_border_drag(), "a drag was in progress");
+        assert!(!cm.end_border_drag(), "and now it is not");
+        assert_eq!(cm.drag_border_to(x, y), None);
+        let (l, _) = widths(&cm, 0);
+        assert!(
+            (l - (lw + 150.0)).abs() <= 1.0,
+            "ending the drag keeps the size"
+        );
+    }
+
+    // Tabs are renumbered when one closes. A drag pinned to tab 1
+    // keeps resizing that grid after tab 0 is closed and it becomes
+    // tab 0.
+    #[test]
+    fn a_divider_drag_survives_a_tab_closing_before_it() {
+        let mut cm = manager();
+        cm.add_context(true, 1);
+        assert_eq!(cm.current_index, 1);
+        cm.split(2, false);
+        let (x, y, lw, _) = separator(&cm, 1);
+        assert_eq!(cm.begin_border_drag(x, y), Some(BorderDirection::Vertical));
+        assert_eq!(cm.drag_border_to(x + 50.0, y), VERTICAL);
+
+        cm.select_tab(0);
+        let mut images = Images::default();
+        cm.close_current_context(&mut images);
+        assert_eq!(cm.len(), 1);
+        assert_eq!(
+            cm.contexts[0].panel_count(),
+            2,
+            "the split tab is now tab 0"
+        );
+
+        assert_eq!(cm.drag_border_to(x + 120.0, y), VERTICAL);
+        let (l, _) = widths(&cm, 0);
+        assert!((l - (lw + 120.0)).abs() <= 1.0, "left {l} from {lw}");
+        assert!(cm.end_border_drag());
+    }
+
+    // A pane closing in the dragged grid changes its tree: the drag
+    // stops moving anything but stays on, swallowing the motion, until
+    // the release ends it. A split that brings the pane count back does
+    // not revive it: the tree is still not the one the drag knows.
+    #[test]
+    fn a_divider_drag_freezes_when_its_grid_changes_shape() {
+        let mut cm = manager();
+        cm.split(1, false);
+        cm.split(2, true);
+        assert_eq!(cm.current_grid_len(), 3);
+        let (x, y, _, _) = separator(&cm, 0);
+        let rects = |cm: &ContextManager<VoidListener>| -> Vec<[f32; 4]> {
+            let mut rects: Vec<[f32; 4]> = cm
+                .current_grid()
+                .contexts()
+                .values()
+                .map(|i| i.geometry.content)
+                .collect();
+            rects.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            rects
+        };
+        assert_eq!(cm.begin_border_drag(x, y), Some(BorderDirection::Vertical));
+
+        let mut images = Images::default();
+        cm.remove_current_grid(&mut images);
+        assert_eq!(cm.current_grid_len(), 2);
+        let before = rects(&cm);
+        assert_eq!(cm.drag_border_to(x + 80.0, y), VERTICAL, "still a drag");
+        assert_eq!(rects(&cm), before, "nothing moved");
+
+        cm.split(3, false);
+        assert_eq!(cm.current_grid_len(), 3, "the pane count is back");
+        let before = rects(&cm);
+        assert_eq!(cm.drag_border_to(x + 160.0, y), VERTICAL);
+        assert_eq!(
+            rects(&cm),
+            before,
+            "the drag does not resize a rebuilt tree"
+        );
+        assert!(cm.end_border_drag(), "the release still ends the drag");
+    }
+
+    // Route ids are minted once, never zero, never reused: that is what
+    // lets a grid be named by its first pane's route.
+    #[test]
+    fn route_ids_are_minted_once_and_never_zero() {
+        let first = next_route_id();
+        let second = next_route_id();
+        assert!(first > 0);
+        assert!(second > first);
+        let cm = manager();
+        assert!(cm.current().route_id > second);
+        assert_eq!(cm.current_grid().id(), GridId(cm.current().route_id));
     }
 }
