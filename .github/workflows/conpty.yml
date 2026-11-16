@@ -8,10 +8,14 @@ on:
     branches: [main]
     paths:
       - 'misc/windows/conhost/fetch.ps1'
+      - 'misc/windows/conhost/tests.ps1'
+      - 'misc/windows/runtime-utils.ps1'
       - '.github/workflows/conpty.yml'
   pull_request:
     paths:
       - 'misc/windows/conhost/fetch.ps1'
+      - 'misc/windows/conhost/tests.ps1'
+      - 'misc/windows/runtime-utils.ps1'
       - '.github/workflows/conpty.yml'
 
 concurrency:
@@ -24,4 +28,5 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
+      - run: pwsh -NoProfile -File misc/windows/conhost/tests.ps1
       - run: pwsh -NoProfile -File misc/windows/conhost/fetch.ps1

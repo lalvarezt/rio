@@ -24,6 +24,11 @@ Authenticode signature and must not be re-signed. `LICENSE` here is
 the project's MIT notice and ships beside the files as
 `LICENSE-ConPTY.txt`, as the license requires.
 
+The archive stays in `nupkg/<version>/conpty.zip`. Later installs reuse it
+only when its SHA-256 matches the pinned hash. Corrupt caches are downloaded
+again, and `-SkipHash` always downloads a fresh package. Windows runs still
+check every extracted file's Microsoft signature.
+
 ## Layout
 
 - `conpty.dll` sits next to `rio.exe` and matches its architecture.

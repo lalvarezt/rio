@@ -19,27 +19,32 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. "$PSScriptRoot/../runtime-utils.ps1"
 
 $here = $PSScriptRoot
 $package = "microsoft.windows.console.conpty"
 $url = "https://api.nuget.org/v3-flatcontainer/$package/$Version/$package.$Version.nupkg"
-$work = Join-Path $here "nupkg"
+$work = Join-Path (Join-Path $here "nupkg") $Version
 # Expand-Archive only opens .zip, and a .nupkg is a zip.
 $archive = Join-Path $work "conpty.zip"
 
 New-Item -ItemType Directory -Force -Path $work | Out-Null
-Write-Host "Downloading $url"
-for ($attempt = 0; ; $attempt++) {
-    try {
-        Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing
-        break
-    } catch {
-        if ($attempt -ge 3) { throw }
-        Start-Sleep -Seconds 5
+if (!$SkipHash -and (Test-FileHash $archive $Sha256)) {
+    Write-Host "Using verified cached ConPTY package $Version"
+} else {
+    Write-Host "Downloading $url"
+    for ($attempt = 0; ; $attempt++) {
+        try {
+            Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing
+            break
+        } catch {
+            if ($attempt -ge 3) { throw }
+            Start-Sleep -Seconds 5
+        }
     }
 }
 
-$hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+$hash = (Get-FileHashString $archive).ToLowerInvariant()
 if ($SkipHash) {
     Write-Host "SHA-256 $hash"
 } elseif ($hash -ne $Sha256.ToLowerInvariant()) {
@@ -49,7 +54,6 @@ if ($SkipHash) {
 # Get-AuthenticodeSignature exists on Windows only, and no package is
 # built anywhere else, so elsewhere the script ends here.
 if ($env:OS -ne "Windows_NT") {
-    Remove-Item -Recurse -Force $work
     Write-Host "Not on Windows: signatures cannot be checked, nothing laid out"
     exit 0
 }
@@ -86,5 +90,5 @@ foreach ($file in $files) {
     Write-Host "  $($file.dst)"
 }
 
-Remove-Item -Recurse -Force $work
+Remove-Item -Recurse -Force $extracted
 Write-Host "ConPTY $Version ready"
