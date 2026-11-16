@@ -481,7 +481,7 @@ pub struct Island {
     pub active_text_color: [f32; 4],
     program_status: Option<ProgramStatusRecord>,
     program_status_source: Option<(usize, u64)>,
-    status_colors: [[f32; 4]; 3],
+    status_colors: [[f32; 4]; 4],
     /// Which tab has the color picker open (None = closed)
     color_picker_tab: Option<usize>,
     /// Current rename input text while picker is open
@@ -519,7 +519,7 @@ impl Island {
             active_text_color,
             program_status: None,
             program_status_source: None,
-            status_colors: [colors.green, colors.yellow, colors.red],
+            status_colors: [colors.blue, colors.green, colors.yellow, colors.red],
             color_picker_tab: None,
             rename_input: String::new(),
             rename_caret_time: Instant::now(),
@@ -672,7 +672,7 @@ impl Island {
         self.window_header.theme.radius = radius;
         self.inactive_text_color = colors.tabs;
         self.active_text_color = colors.tabs_active;
-        self.status_colors = [colors.green, colors.yellow, colors.red];
+        self.status_colors = [colors.blue, colors.green, colors.yellow, colors.red];
     }
 
     /// Read the published status without waiting for the PTY parser.
@@ -719,9 +719,10 @@ impl Island {
 
     fn status_color(&self, record: &ProgramStatusRecord) -> Option<[f32; 4]> {
         match record.state {
-            ProgramState::Working | ProgramState::Done => Some(self.status_colors[0]),
-            ProgramState::Blocked => Some(self.status_colors[1]),
-            ProgramState::Error => Some(self.status_colors[2]),
+            ProgramState::Working => Some(self.status_colors[0]),
+            ProgramState::Done => Some(self.status_colors[1]),
+            ProgramState::Blocked => Some(self.status_colors[2]),
+            ProgramState::Error => Some(self.status_colors[3]),
             ProgramState::Idle | ProgramState::Clear => None,
         }
     }
@@ -1703,7 +1704,7 @@ mod tests {
         );
         assert_eq!(
             background.as_ref().and_then(|r| island.status_color(r)),
-            Some(island.status_colors[0])
+            Some(Colors::default().green)
         );
         assert_eq!(island.program_status.as_ref().unwrap().progress, Some(20));
         let background_route = cm.contexts_mut()[0].current().route_id;
@@ -1724,7 +1725,7 @@ mod tests {
         );
         assert_eq!(
             background.as_ref().and_then(|r| island.status_color(r)),
-            Some(island.status_colors[1])
+            Some(Colors::default().yellow)
         );
         assert_eq!(island.program_status.as_ref().unwrap().progress, Some(20));
         parser.advance(
@@ -1760,7 +1761,7 @@ mod tests {
             .status_rim(island.program_status.as_ref(), 1.0)
             .expect("OSC 7501 must produce a status rim in a live tab");
         assert_eq!(rim.progress, Some(40));
-        assert_eq!(rim.color, island.status_colors[0]);
+        assert_eq!(rim.color, Colors::default().blue);
     }
 
     #[test]
