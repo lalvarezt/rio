@@ -704,7 +704,7 @@ impl CommandPalette {
                 }
             }
         }
-        let grouped = matches!(self.mode, PaletteMode::Commands);
+        let grouped = matches!(self.mode, PaletteMode::Commands) && query.is_empty();
         self.matches.sort_unstable_by_key(|m| {
             (
                 if grouped {
@@ -729,6 +729,9 @@ impl CommandPalette {
     }
 
     fn group(&self, index: usize) -> Option<(u8, &'static str)> {
+        if !self.query.is_empty() {
+            return None;
+        }
         self.row(self.matches[index].source)
             .action()
             .map(command_group)
@@ -1282,6 +1285,30 @@ mod tests {
         let filtered = palette.filtered_rows();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].1.title(), "Quit");
+    }
+
+    #[test]
+    fn settings_prefix_is_selected_ahead_of_other_command_groups() {
+        let mut palette = CommandPalette::new();
+        assert!(palette.group(0).is_some());
+        palette.set_query("sett".into());
+        let rows = palette.filtered_rows();
+        assert_eq!(
+            rows.first().map(|(_, row)| row.title()),
+            Some("Settings"),
+            "filtered results: {:?}",
+            rows.iter()
+                .map(|(score, row)| (*score, row.title()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            palette.get_selected_action(),
+            Some(PaletteAction::ConfigEditor)
+        );
+        assert!(rows.windows(2).all(|pair| pair[0].0 >= pair[1].0));
+        assert!(palette.group(0).is_none());
+        palette.set_query(String::new());
+        assert!(palette.group(0).is_some());
     }
 
     #[test]
