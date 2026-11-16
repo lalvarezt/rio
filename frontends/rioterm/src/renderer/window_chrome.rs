@@ -187,6 +187,13 @@ pub fn centered_text_y(
     snap(cy - top - height / 2.0, sugarloaf.scale_factor())
 }
 
+fn centered_icon_y(cy: f32, top: f32, height: f32, scale: f32) -> f32 {
+    // Round to the nearest pixel, preferring the upper row on ties so
+    // odd-height glyphs do not land below the visible center of bitmap icons.
+    let origin = (cy - top - height / 2.0) * scale;
+    (origin - 0.5).ceil() / scale
+}
+
 pub fn fit_text<'a>(
     sugarloaf: &mut Sugarloaf,
     text: &'a str,
@@ -270,11 +277,60 @@ pub fn draw_font_icon(
         font_id: Some(font_id),
         ..DrawOpts::default()
     };
-    let y = centered_text_y(sugarloaf, icon, cy, &opts);
+    let (top, height) = sugarloaf
+        .text_mut()
+        .vertical_bounds(icon, &opts)
+        .unwrap_or((0.0, opts.font_size));
+    let y = centered_icon_y(cy, top, height, scale);
     let ui = sugarloaf.text_mut();
     let width = ui.measure(icon, &opts);
     ui.draw(snap(cx - width / 2.0, scale), y, icon, &opts);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rio_backend::sugarloaf::text::Text;
+
+    #[test]
+    fn terminal_icon_visible_pixels_are_centered() {
+        let library = FontLibrary::default();
+        let font_id = crate::renderer::app_icons::load_font(&library).unwrap();
+        let mut text = Text::new(&library);
+        text.init_cpu();
+        let icon = "\u{ea85}";
+        let center = 43.0;
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            text.clear();
+            text.set_scale_factor(scale);
+            let opts = DrawOpts {
+                font_size: snap(24.0, scale),
+                font_id: Some(font_id),
+                ..DrawOpts::default()
+            };
+            let (top, height) = text.vertical_bounds(icon, &opts).unwrap();
+            text.draw(
+                40.0,
+                centered_icon_y(center, top, height, scale),
+                icon,
+                &opts,
+            );
+            let mut pixels = vec![0; 240 * 240];
+            text.render_cpu(&mut pixels, 240, 240);
+            let mut rows = pixels.chunks_exact(240).enumerate().filter_map(|(y, row)| {
+                row.iter().any(|pixel| (pixel >> 24) > 150).then_some(y)
+            });
+            let first = rows.next().expect("visible terminal icon");
+            let last = rows.last().unwrap_or(first);
+            let visible_center = (first + last + 1) as f32 / 2.0;
+            let expected = center * scale;
+            assert!(
+                (visible_center - expected).abs() <= 0.5,
+                "scale {scale}: visible center {visible_center}, expected {expected}"
+            );
+        }
+    }
 }
 
 pub struct Header {
